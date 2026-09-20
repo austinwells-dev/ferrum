@@ -50,6 +50,9 @@ impl Transformer {
         // Sum actual retained tensor payloads, including the tied LM transpose allocation.
         let mut weight_bytes =
             embedding.weight_bytes() + final_norm.weight.byte_size() + lm_head.weight_bytes();
+        if config.tie_word_embeddings {
+            weight_bytes -= embedding.weight_bytes();
+        }
         for layer in &layers {
             weight_bytes +=
                 layer.input_norm.weight.byte_size() + layer.post_norm.weight.byte_size();

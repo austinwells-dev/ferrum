@@ -240,3 +240,20 @@ impl MetalDevice {
         self.run("attention_context", probs, Some(v), &dims, p, [n, 1])
     }
 }
+
+impl MetalDevice {
+    /// Linear projection with retained row-major [N,K] weights.
+    pub(crate) fn project(&self, a: &Tensor, weight: &Tensor) -> Result<Output> {
+        let ad = a.shape().dimensions();
+        let bd = weight.shape().dimensions();
+        if ad.len() != 2 || bd.len() != 2 || ad[1] != bd[1] || ad[1] > u32::MAX as usize - 32 {
+            return Err(Error::Shape("projection requires [M,K] and [N,K]".into()));
+        }
+        let mut p = [0; 9];
+        p[1] = index(ad[0])?;
+        p[2] = index(ad[1])?;
+        p[3] = index(bd[0])?;
+        let name = if ad[0] == 1 && a.dtype() != DType::F32 { "gemv" } else { "matmul_nt" };
+        self.run(name, a, Some(weight), &[ad[0], bd[0]], p, [bd[0], ad[0]])
+    }
+}

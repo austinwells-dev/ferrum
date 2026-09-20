@@ -28,7 +28,7 @@ fn official_qwen_bf16_cached_generation() {
     assert_eq!(weights.bytes(), 988065536);
     let model = qwen::construct(&d, c.clone(), &weights).unwrap();
     drop(weights);
-    assert_eq!(model.weight_bytes(), 1260334848);
+    assert_eq!(model.weight_bytes(), 988065536);
     let mut step = 0;
     let mut emitted = Vec::new();
     let r = generation::generate(

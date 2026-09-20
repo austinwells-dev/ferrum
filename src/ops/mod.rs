@@ -51,7 +51,7 @@ impl MetalDevice {
             &[a.binding(), b.unwrap_or(a).binding(), tensor.binding()],
             &p,
             grid,
-            name == "matmul",
+            matches!(name, "matmul" | "matmul_nt"),
         )?;
         let metrics = Metrics {
             operation: name,

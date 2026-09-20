@@ -23,7 +23,7 @@ impl Embedding {
     }
 }
 pub struct Linear {
-    transposed: Tensor,
+    weight: Tensor,
     bias: Option<Tensor>,
     input: usize,
     output: usize,
@@ -47,15 +47,18 @@ impl Linear {
                 return Err(Error::DeviceMismatch);
             }
         }
+        if !d.owns(weight.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
         Ok(Self {
             input: dims[1],
             output: dims[0],
-            transposed: d.transpose2(&weight)?.tensor,
+            weight,
             bias,
         })
     }
     pub fn weight_bytes(&self) -> usize {
-        self.transposed.byte_size() + self.bias.as_ref().map_or(0, Tensor::byte_size)
+        self.weight.byte_size() + self.bias.as_ref().map_or(0, Tensor::byte_size)
     }
     pub fn forward(&self, d: &MetalDevice, x: &Tensor) -> Result<Tensor> {
         let dims = x.shape().dimensions();
@@ -69,7 +72,7 @@ impl Linear {
             .last_mut()
             .ok_or_else(|| Error::Shape("linear rank".into()))? = self.output;
         let x = x.reshape([x.numel() / self.input, self.input])?;
-        let mut y = d.matmul(&x, &self.transposed)?.tensor;
+        let mut y = d.project(&x, &self.weight)?.tensor;
         if let Some(b) = &self.bias {
             y = d.bias_add(&y, b)?.tensor;
         }

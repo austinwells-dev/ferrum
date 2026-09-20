@@ -113,3 +113,24 @@ kernel void attention_context(ARGS, uint i [[thread_position_in_grid]]) {
     for(uint t=0;t<p[2];t++) sum+=load(a,(h*p[1]+s)*p[2]+t,p[4])*load(b,(t*p[5]+kv)*p[6]+j,p[4]);
     store(c,i,p[4],sum);
 }
+// Row-major [N,K] weights; one SIMD group per output row, four groups per TG.
+kernel void gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, row=group*4+tid/32;
+    float sum=0;
+    if(row<p[3]) for(uint j=lane;j<p[2];j+=32) sum+=load(a,j,p[4])*load(b,row*p[2]+j,p[4]);
+    sum=simd_sum(sum);
+    if(lane==0 && row<p[3]) store(c,row,p[4],sum);
+}
+kernel void matmul_nt(ARGS, uint2 tid [[thread_position_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup float aa[16][16], bb[16][16];
+    uint row=group.y*16+tid.y, col=group.x*16+tid.x, k=p[2], n=p[3], m=p[1];
+    float sum=0;
+    for(uint tile=0;tile<k;tile+=16) {
+        aa[tid.y][tid.x]=(row<m && tile+tid.x<k)?load(a,row*k+tile+tid.x,p[4]):0;
+        bb[tid.y][tid.x]=(col<n && tile+tid.y<k)?load(b,col*k+tile+tid.y,p[4]):0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint j=0;j<16;j++) sum+=aa[tid.y][j]*bb[j][tid.x];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if(row<m && col<n) store(c,row*n+col,p[4],sum);
+}

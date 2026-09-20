@@ -481,7 +481,26 @@ impl MetalDevice {
                     3,
                 );
             }
-            if tiled {
+            if name == "gemv" {
+                if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
+                {
+                    return Err(Error::Dispatch(
+                        "GEMV requires 32-wide SIMD and 128-thread groups".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0].div_ceil(4),
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if tiled {
                 if p.raw.maxTotalThreadsPerThreadgroup() < 256 {
                     return Err(Error::Dispatch("16x16 tile unsupported".into()));
                 }
