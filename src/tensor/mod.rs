@@ -104,6 +104,17 @@ impl Tensor {
             dtype,
         })
     }
+    pub(crate) fn output(device: &MetalDevice, dims: &[usize], dtype: DType) -> Result<Self> {
+        let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape)?;
+        let storage = Rc::new(device.allocate_output(shape.byte_size(dtype)?)?);
+        Ok(Self {
+            storage,
+            shape,
+            layout,
+            dtype,
+        })
+    }
     pub fn from_f32(
         device: &MetalDevice,
         dims: impl AsRef<[usize]>,

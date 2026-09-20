@@ -38,7 +38,11 @@ impl MetalDevice {
         let shape = crate::tensor::Shape::new(dims)?;
         index(shape.numel())?;
         let allocation_start = profile_start.map(|_| std::time::Instant::now());
-        let tensor = Tensor::zeros(self, dims, a.dtype())?;
+        let tensor = if shape.numel() == 0 {
+            Tensor::zeros(self, dims, a.dtype())?
+        } else {
+            Tensor::output(self, dims, a.dtype())?
+        };
         let allocation_time = allocation_start.map(|s| s.elapsed()).unwrap_or_default();
         p[0] = index(a.numel())?;
         p[4] = a.dtype() as u32;

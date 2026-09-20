@@ -92,6 +92,11 @@ pub fn counter_delta(
         encode: b.encode - a.encode,
         wait: b.wait - a.wait,
         gpu: b.gpu - a.gpu,
+        reused_bytes: b.reused_bytes - a.reused_bytes,
+        transient_live_bytes: b.transient_live_bytes,
+        transient_peak_bytes: b.transient_peak_bytes,
+        arena_capacity: b.arena_capacity,
+        arena_high_water: b.arena_high_water,
     }
 }
 /// The callback sees non-EOS IDs only. It may buffer incomplete UTF-8 sequences.
@@ -129,6 +134,7 @@ pub fn generate(
         return Ok(result);
     }
     let start = Instant::now();
+    d.reset_transient_peak();
     let before = d.counters();
     let (logits, mut cache) = model.forward_prefill(d, prompt)?;
     result.prefill = start.elapsed();
@@ -158,6 +164,7 @@ pub fn generate(
             result.stop = reason;
             break;
         }
+        d.reset_transient_peak();
         let before = d.counters();
         let start = Instant::now();
         let logits = model.forward_decode(d, token, &mut cache)?;

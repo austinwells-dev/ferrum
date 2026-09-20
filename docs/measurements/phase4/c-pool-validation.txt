@@ -1,0 +1,27 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 2 tests
+2026-09-20 19:57:52.248 ferrum-508026e7fa9bdb9b[97806:3937808] Metal API Validation Enabled
+2026-09-20 19:57:52.249 ferrum-508026e7fa9bdb9b[97806:3937808] Metal GPU Validation Enabled
+test metal::tests::mapping_is_excluded_until_scope_completion ... ok
+test metal::tests::execution_owns_dropped_intermediates_and_drains_on_error ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/transformer.rs (target/debug/deps/transformer-cf6d7fad40122823)
+
+running 8 tests
+2026-09-20 19:57:52.403 transformer-cf6d7fad40122823[97807:3937820] Metal API Validation Enabled
+2026-09-20 19:57:52.404 transformer-cf6d7fad40122823[97807:3937820] Metal GPU Validation Enabled
+test mask_absolute_positions ... ok
+test cache_order_capacity_reset_and_errors ... ok
+test integer_embedding_ids_and_long_rope_offsets ... ok
+test primitive_invalid_inputs_and_bias ... ok
+test embeddings_linear_layout_all_dtypes ... ok
+test alternative_dimensions_mha_and_single_kv_head ... ok
+test model_configuration_weights_and_cache_validation ... ok
+test complete_transformer_oracle_and_cached_equivalence ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
+

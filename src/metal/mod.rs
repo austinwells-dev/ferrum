@@ -23,11 +23,51 @@ pub struct ComputePipeline {
 }
 /// Shared, owned allocation. No mapped pointers escape this module.
 /// Rc deliberately makes storage and the device !Send and !Sync in Phase 1.
+type RetiredBuffer = (
+    Retained<ProtocolObject<dyn MTLBuffer>>,
+    Option<Rc<Cell<bool>>>,
+);
+#[derive(Default)]
+struct Arena {
+    free: HashMap<usize, Vec<RetiredBuffer>>,
+    live: usize,
+    peak: usize,
+    capacity: usize,
+    high_water: usize,
+}
+impl Arena {
+    fn acquire(&mut self, bytes: usize) {
+        self.live += bytes;
+        self.peak = self.peak.max(self.live);
+        self.high_water = self.high_water.max(self.capacity);
+    }
+}
 pub struct MetalBuffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
     owner: Rc<()>,
     ready: RefCell<Option<Rc<Cell<bool>>>>,
+    arena: Option<Rc<RefCell<Arena>>>,
+}
+impl Drop for MetalBuffer {
+    fn drop(&mut self) {
+        if let Some(arena) = &self.arena {
+            let mut arena = arena.borrow_mut();
+            let bytes = self.raw.length();
+            arena.live -= bytes;
+            // A pool entry exists only after the final Tensor owner is gone.
+            // A pending epoch keeps it ineligible until successful completion.
+            if arena.capacity <= 64 * 1024 * 1024 {
+                arena
+                    .free
+                    .entry(bytes)
+                    .or_default()
+                    .push((self.raw.clone(), self.ready.borrow().clone()));
+            } else {
+                arena.capacity -= bytes;
+            }
+        }
+    }
 }
 impl MetalBuffer {
     pub fn len_bytes(&self) -> usize {
@@ -79,6 +119,11 @@ pub struct Counters {
     pub encode: Duration,
     pub wait: Duration,
     pub gpu: Duration,
+    pub reused_bytes: usize,
+    pub transient_live_bytes: usize,
+    pub transient_peak_bytes: usize,
+    pub arena_capacity: usize,
+    pub arena_high_water: usize,
 }
 
 /// Opt-in aggregate operation measurements, with no tensor retention.
@@ -119,6 +164,7 @@ impl Drop for Execution<'_> {
     }
 }
 pub struct MetalDevice {
+    arena: Rc<RefCell<Arena>>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
     pending: RefCell<Option<Submission>>,
@@ -144,6 +190,7 @@ impl MetalDevice {
             .newCommandQueue()
             .ok_or_else(|| Error::Initialization("command queue creation failed".into()))?;
         Ok(Self {
+            arena: Rc::new(RefCell::new(Arena::default())),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
             pending: RefCell::new(None),
@@ -234,7 +281,18 @@ impl MetalDevice {
         }
     }
     pub fn counters(&self) -> Counters {
-        self.counters.get()
+        let mut counters = self.counters.get();
+        let arena = self.arena.borrow();
+        counters.transient_live_bytes = arena.live;
+        counters.transient_peak_bytes = arena.peak;
+        counters.arena_capacity = arena.capacity;
+        counters.arena_high_water = arena.high_water;
+        counters
+    }
+    /// Reset the peak observation to the currently live transient payload.
+    pub fn reset_transient_peak(&self) {
+        let mut arena = self.arena.borrow_mut();
+        arena.peak = arena.live;
     }
     pub fn name(&self) -> &str {
         &self.name
@@ -278,7 +336,46 @@ impl MetalDevice {
             len: bytes,
             owner: self.owner.clone(),
             ready: RefCell::new(None),
+            arena: None,
         })
+    }
+    /// Only fully overwritten trusted kernel outputs use the bounded transient arena.
+    /// Fresh storage remains zero-initialized. Reused storage is already initialized,
+    /// so skipping redundant zeroing cannot expose uninitialized Rust bytes.
+    pub(crate) fn allocate_output(&self, bytes: usize) -> Result<MetalBuffer> {
+        if !self.batching.get() {
+            return self.allocate(bytes);
+        }
+        let length = bytes
+            .max(4)
+            .checked_next_power_of_two()
+            .ok_or(Error::Allocation(bytes))?;
+        let mut arena = self.arena.borrow_mut();
+        let bin = arena.free.entry(length).or_default();
+        let available = bin
+            .iter()
+            .rposition(|(_, ready)| ready.as_ref().is_none_or(|r| r.get()));
+        let mut buffer = if let Some(i) = available {
+            let (raw, _) = bin.swap_remove(i);
+            let mut counters = self.counters.get();
+            counters.reused_bytes += length;
+            self.counters.set(counters);
+            MetalBuffer {
+                raw,
+                len: bytes,
+                owner: self.owner.clone(),
+                ready: RefCell::new(None),
+                arena: None,
+            }
+        } else {
+            let mut buffer = self.allocate(length)?;
+            buffer.len = bytes;
+            arena.capacity += length;
+            buffer
+        };
+        arena.acquire(length);
+        buffer.arena = Some(self.arena.clone());
+        Ok(buffer)
     }
     pub fn compile_kernel(&self, source: &str, name: &str) -> Result<Rc<ComputePipeline>> {
         autoreleasepool(|_| {
@@ -434,7 +531,11 @@ impl MetalDevice {
             Ok(DispatchTiming {
                 submission: submission_time,
                 synchronized,
-                gpu: if self.batching.get() && self.batch_limit.get() != 1 { None } else { gpu },
+                gpu: if self.batching.get() && self.batch_limit.get() != 1 {
+                    None
+                } else {
+                    gpu
+                },
                 dispatches: 1,
             })
         })
