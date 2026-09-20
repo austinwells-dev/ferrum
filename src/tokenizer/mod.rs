@@ -29,7 +29,23 @@ impl Tokenizer {
             .decode(ids, false)
             .map_err(|e| Error::Tokenizer(e.to_string()))
     }
+    pub fn decode_stream(
+        &self,
+    ) -> tokenizers::tokenizer::DecodeStream<
+        '_,
+        tokenizers::ModelWrapper,
+        tokenizers::NormalizerWrapper,
+        tokenizers::PreTokenizerWrapper,
+        tokenizers::PostProcessorWrapper,
+        tokenizers::DecoderWrapper,
+    > {
+        self.0.decode_stream(false)
+    }
+    pub fn is_defined(&self, id: u32) -> bool {
+        self.0.id_to_token(id).is_some()
+    }
     pub fn vocab_size(&self) -> usize {
         self.0.get_vocab_size(true)
     }
 }
+pub mod qwen;

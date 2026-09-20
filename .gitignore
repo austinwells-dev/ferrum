@@ -1,2 +1,7 @@
 /target/
 .DS_Store
+/models/
+/.cache/
+/.venv-reference/
+*.safetensors
+__pycache__/

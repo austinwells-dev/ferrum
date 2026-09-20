@@ -24,6 +24,7 @@ impl MetalDevice {
         mut p: [u32; 9],
         grid: [usize; 2],
     ) -> Result<Output> {
+        let profile_start = self.profiling().then(std::time::Instant::now);
         if !self.owns(a.buffer()) || b.is_some_and(|b| !self.owns(b.buffer())) {
             return Err(Error::DeviceMismatch);
         }
@@ -36,7 +37,9 @@ impl MetalDevice {
         }
         let shape = crate::tensor::Shape::new(dims)?;
         index(shape.numel())?;
+        let allocation_start = profile_start.map(|_| std::time::Instant::now());
         let tensor = Tensor::zeros(self, dims, a.dtype())?;
+        let allocation_time = allocation_start.map(|s| s.elapsed()).unwrap_or_default();
         p[0] = index(a.numel())?;
         p[4] = a.dtype() as u32;
         let timing = self.dispatch(
@@ -55,6 +58,15 @@ impl MetalDevice {
             allocation_bytes: tensor.storage_info().allocation_bytes,
             timing,
         };
+        if let Some(start) = profile_start {
+            self.record_profile(
+                name,
+                start.elapsed(),
+                allocation_time,
+                metrics.allocation_bytes,
+                &metrics.timing,
+            );
+        }
         Ok(Output { tensor, metrics })
     }
     fn binary(&self, name: &'static str, a: &Tensor, b: &Tensor) -> Result<Output> {

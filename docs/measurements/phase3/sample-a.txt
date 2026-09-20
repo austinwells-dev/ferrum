@@ -1,0 +1,23 @@
+COMMAND ['target/release/ferrum', 'run', '--model', '/Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775', '--prompt', 'Hello!', '--max-new-tokens', '12', '--warmup', '--temperature', '0.7', '--top-k', '20', '--top-p', '0.8', '--seed', '42']
+Ferrum
+Model: Qwen2.5-0.5B-Instruct (local checkpoint)
+Device: Apple M5
+Backend: Metal
+Dtype: BF16
+Layers: 24; hidden: 896; intermediate: 4864; Q heads: 14; KV heads: 2; head dim: 64
+Parameters: 494032768; tensors: 290
+Source weight bytes: 988065536
+Retained weight bytes: 1260334848
+Construction/transposition bytes: 987922432
+Recommended working set: 25769803776 bytes
+config/tokenizer load: 103.122 ms; weight load: 192.189 ms; construction: 266.134 ms; tokenization: 0.088 ms
+Prompt: 21 tokens; sampler: SamplingConfig { temperature: 0.7, top_k: 20, top_p: 0.8, seed: 42 }
+Hello! How can I assist you today?
+
+---
+prompt: 21 tokens; generated: 10; stop: Eos
+prefill: 797.716 ms (26.325 tok/s); first token: 800.985 ms
+prefill + final row: 3796 dispatches; 3797 allocations; 48459476 allocation bytes
+decode: median 727.898 ms (1.374 tok/s); per-token ms: [747.361625, 717.321208, 747.6408329999999, 729.364458, 696.47975, 699.613291, 727.897625, 750.371208, 712.1454160000001]
+decode counters per step: [Counters { allocations: 3845, allocated_bytes: 5579524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 5723524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 5867524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6011524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6155524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6299524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6443524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6587524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6731524, dispatches: 3844 }]
+sampling: 28.199 ms total; active KV: 368640 bytes; generated IDs: [9707, 0, 2585, 646, 358, 7789, 498, 3351, 30, 151645]

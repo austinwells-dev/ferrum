@@ -1,0 +1,2 @@
+F32: all 8 tokens and ordered top10 IDs match. Maximum absolute error over selected/top10 logits: 7.820129395e-05
+BF16: first 5 tokens match; sixth differs at a 25.75 tie in Transformers (1492 help / 7789 assist). Ferrum: 25.625 help / 25.75 assist.

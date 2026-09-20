@@ -1,0 +1,13 @@
+Before (cdf400c):
+cdf400c:src/metal/mod.rs:19:unsafe extern "C" {}
+cdf400c:src/metal/mod.rs:45:        let bytes = unsafe {
+cdf400c:src/metal/mod.rs:53:        let bytes = unsafe {
+cdf400c:src/metal/mod.rs:138:        unsafe {
+cdf400c:src/metal/mod.rs:229:            unsafe {
+
+After:
+src/metal/mod.rs:19:unsafe extern "C" {}
+src/metal/mod.rs:45:        let bytes = unsafe {
+src/metal/mod.rs:53:        let bytes = unsafe {
+src/metal/mod.rs:186:        unsafe {
+src/metal/mod.rs:277:            unsafe {

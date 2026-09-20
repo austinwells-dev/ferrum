@@ -13,7 +13,9 @@ pub use error::{Error, Result};
 pub use metal::MetalDevice;
 pub use tensor::{DType, Tensor};
 
+pub mod generation;
 pub mod loader;
 pub mod model;
 pub mod nn;
+pub mod sampling;
 pub mod tokenizer;

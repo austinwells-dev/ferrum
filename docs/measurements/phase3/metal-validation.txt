@@ -1,0 +1,39 @@
+
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ['cargo', 'test', '--test', 'correctness', '--', '--test-threads=1']
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running tests/correctness.rs (target/debug/deps/correctness-cb180eb36390ebcc)
+
+running 9 tests
+test bf16_gpu_rounding_ties_and_nan ... 2026-09-20 15:10:24.469 correctness-cb180eb36390ebcc[92052:3634967] Metal API Validation Enabled
+2026-09-20 15:10:24.470 correctness-cb180eb36390ebcc[92052:3634967] Metal GPU Validation Enabled
+ok
+test chained_gpu_outputs_preserve_inputs ... ok
+test compilation_diagnostics_and_cache ... ok
+test elementwise_all_dtypes_and_edges ... ok
+test invalid_inputs_and_contexts_are_rejected ... ok
+test metadata_roundtrip_and_reshape ... ok
+test rotary_all_dtypes ... ok
+test row_operations_all_dtypes ... ok
+test tiled_matmul_all_dtypes_and_edges ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.30s
+
+
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 ['cargo', 'test', '--test', 'transformer', '--', '--test-threads=1']
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running tests/transformer.rs (target/debug/deps/transformer-cf6d7fad40122823)
+
+running 8 tests
+test alternative_dimensions_mha_and_single_kv_head ... 2026-09-20 15:10:24.842 transformer-cf6d7fad40122823[92059:3635022] Metal API Validation Enabled
+2026-09-20 15:10:24.842 transformer-cf6d7fad40122823[92059:3635022] Metal GPU Validation Enabled
+ok
+test cache_order_capacity_reset_and_errors ... ok
+test complete_transformer_oracle_and_cached_equivalence ... ok
+test embeddings_linear_layout_all_dtypes ... ok
+test integer_embedding_ids_and_long_rope_offsets ... ok
+test mask_absolute_positions ... ok
+test model_configuration_weights_and_cache_validation ... ok
+test primitive_invalid_inputs_and_bias ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s
+

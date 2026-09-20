@@ -71,7 +71,22 @@ pub struct Counters {
     pub dispatches: usize,
 }
 
+/// Opt-in aggregate operation measurements, with no tensor retention.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct ProfileEntry {
+    pub calls: usize,
+    pub wall: Duration,
+    pub allocation: Duration,
+    pub submission: Duration,
+    pub synchronized: Duration,
+    pub gpu: Duration,
+    pub gpu_samples: usize,
+    pub allocation_bytes: usize,
+}
+pub type Profile = std::collections::BTreeMap<&'static str, ProfileEntry>;
 pub struct MetalDevice {
+    profiling: Cell<bool>,
+    profile: RefCell<Profile>,
     counters: Cell<Counters>,
     raw: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
@@ -93,6 +108,8 @@ impl MetalDevice {
             .ok_or_else(|| Error::Initialization("command queue creation failed".into()))?;
         Ok(Self {
             counters: Cell::new(Counters::default()),
+            profiling: Cell::new(false),
+            profile: RefCell::new(Profile::new()),
             name: raw.name().to_string(),
             raw,
             queue,
@@ -101,6 +118,37 @@ impl MetalDevice {
             pipelines: RefCell::new(HashMap::new()),
             builtins: RefCell::new(HashMap::new()),
         })
+    }
+    pub fn set_profiling(&self, enabled: bool) {
+        self.profiling.set(enabled);
+        self.profile.borrow_mut().clear();
+    }
+    pub(crate) fn profiling(&self) -> bool {
+        self.profiling.get()
+    }
+    pub fn take_profile(&self) -> Profile {
+        std::mem::take(&mut *self.profile.borrow_mut())
+    }
+    pub(crate) fn record_profile(
+        &self,
+        name: &'static str,
+        wall: Duration,
+        allocation: Duration,
+        bytes: usize,
+        timing: &DispatchTiming,
+    ) {
+        let mut profile = self.profile.borrow_mut();
+        let entry = profile.entry(name).or_default();
+        entry.calls += 1;
+        entry.wall += wall;
+        entry.allocation += allocation;
+        entry.submission += timing.submission;
+        entry.synchronized += timing.synchronized;
+        entry.allocation_bytes += bytes;
+        if let Some(gpu) = timing.gpu {
+            entry.gpu += gpu;
+            entry.gpu_samples += 1;
+        }
     }
     pub fn counters(&self) -> Counters {
         self.counters.get()

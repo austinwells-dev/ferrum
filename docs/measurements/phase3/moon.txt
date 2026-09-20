@@ -1,0 +1,23 @@
+COMMAND ['target/release/ferrum', 'run', '--model', '/Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775', '--prompt', 'Write one sentence about the Moon.', '--max-new-tokens', '32', '--warmup']
+Ferrum
+Model: Qwen2.5-0.5B-Instruct (local checkpoint)
+Device: Apple M5
+Backend: Metal
+Dtype: BF16
+Layers: 24; hidden: 896; intermediate: 4864; Q heads: 14; KV heads: 2; head dim: 64
+Parameters: 494032768; tensors: 290
+Source weight bytes: 988065536
+Retained weight bytes: 1260334848
+Construction/transposition bytes: 987922432
+Recommended working set: 25769803776 bytes
+config/tokenizer load: 106.939 ms; weight load: 189.255 ms; construction: 250.419 ms; tokenization: 0.099 ms
+Prompt: 26 tokens; sampler: SamplingConfig { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+The Moon is a natural satellite of Earth and a celestial body that orbits around the planet.
+
+---
+prompt: 26 tokens; generated: 19; stop: Eos
+prefill: 792.631 ms (32.802 tok/s); first token: 793.201 ms
+prefill + final row: 3796 dispatches; 3797 allocations; 60274536 allocation bytes
+decode: median 705.606 ms (1.417 tok/s); per-token ms: [791.011209, 703.083792, 682.7562499999999, 711.1795, 705.606167, 667.243375, 725.4879579999999, 689.312083, 645.363625, 682.574458, 692.62175, 738.693458, 723.335083, 715.8076249999999, 692.1206669999999, 735.0550420000001, 669.229791, 805.5292910000001]
+decode counters per step: [Counters { allocations: 3845, allocated_bytes: 6299524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6443524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6587524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6731524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6875524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7019524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7163524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7307524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7451524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7595524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7739524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7883524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8027524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8171524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8315524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8459524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8603524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8747524, dispatches: 3844 }]
+sampling: 4.837 ms total; active KV: 540672 bytes; generated IDs: [785, 17330, 374, 264, 5810, 23210, 315, 9237, 323, 264, 76380, 2487, 429, 85128, 2163, 279, 11580, 13, 151645]

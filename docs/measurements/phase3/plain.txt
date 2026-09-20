@@ -1,0 +1,23 @@
+COMMAND ['target/release/ferrum', 'run', '--model', '/Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775', '--prompt', 'The capital of France is', '--max-new-tokens', '8', '--warmup', '--raw']
+Ferrum
+Model: Qwen2.5-0.5B-Instruct (local checkpoint)
+Device: Apple M5
+Backend: Metal
+Dtype: BF16
+Layers: 24; hidden: 896; intermediate: 4864; Q heads: 14; KV heads: 2; head dim: 64
+Parameters: 494032768; tensors: 290
+Source weight bytes: 988065536
+Retained weight bytes: 1260334848
+Construction/transposition bytes: 987922432
+Recommended working set: 25769803776 bytes
+config/tokenizer load: 95.701 ms; weight load: 179.185 ms; construction: 256.745 ms; tokenization: 0.053 ms
+Prompt: 5 tokens; sampler: SamplingConfig { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+ Paris. It is the largest city in
+
+---
+prompt: 5 tokens; generated: 8; stop: MaxNewTokens
+prefill: 658.523 ms (7.593 tok/s); first token: 659.041 ms
+prefill + final row: 3796 dispatches; 3797 allocations; 11554452 allocation bytes
+decode: median 697.871 ms (1.433 tok/s); per-token ms: [716.931875, 650.670625, 731.998958, 669.872416, 687.822917, 697.870875, 703.83425]
+decode counters per step: [Counters { allocations: 3845, allocated_bytes: 3275524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 3419524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 3563524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 3707524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 3851524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 3995524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 4139524, dispatches: 3844 }]
+sampling: 1.903 ms total; active KV: 147456 bytes; generated IDs: [12095, 13, 1084, 374, 279, 7772, 3283, 304]

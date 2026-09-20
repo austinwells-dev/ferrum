@@ -46,14 +46,20 @@ pub(crate) fn checked(
     c: &ModelConfig,
     d: &MetalDevice,
 ) -> Result<Tensor> {
-    let t = w.get(name)?;
-    let message = if t.shape().dimensions() != shape {
+    let t = w.optional(name).ok_or_else(|| Error::Weight {
+        name: name.into(),
+        message: format!(
+            "missing tensor; expected shape {shape:?}, expected dtype {:?}",
+            c.dtype
+        ),
+    })?;
+    let message = if t.shape().dimensions() != shape || t.dtype() != c.dtype {
         Some(format!(
-            "expected shape {shape:?}, got {:?}",
-            t.shape().dimensions()
+            "expected shape {shape:?}, actual shape {:?}; expected dtype {:?}, actual dtype {:?}",
+            t.shape().dimensions(),
+            c.dtype,
+            t.dtype()
         ))
-    } else if t.dtype() != c.dtype {
-        Some(format!("expected dtype {:?}, got {:?}", c.dtype, t.dtype()))
     } else if !d.owns(t.buffer()) {
         Some("different MetalDevice context".into())
     } else {

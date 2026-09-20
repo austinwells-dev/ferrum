@@ -1,0 +1,11 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 0.54s
+     Running tests/real_model.rs (target/release/deps/real_model-87438668e8662d80)
+
+running 1 test
+Hello! How can I assist you today?
+Generation { tokens: [9707, 0, 2585, 646, 358, 7789, 498, 3351, 30, 151645], stop: Eos, prefill: 771.543666ms, first_token: 772.2785ms, decode: [719.507791ms, 722.164417ms, 675.389208ms, 676.726833ms, 650.098084ms, 673.584167ms, 712.599125ms, 1.132734917s, 924.900334ms], sampling: 2.832667ms, prefill_counters: Counters { allocations: 3797, allocated_bytes: 48459476, dispatches: 3796 }, decode_counters: [Counters { allocations: 3845, allocated_bytes: 5579524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 5723524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 5867524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6011524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6155524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6299524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6443524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6587524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6731524, dispatches: 3844 }], kv_bytes: 368640, prefill_profile: {}, decode_profiles: [{}, {}, {}, {}, {}, {}, {}, {}, {}] }
+test official_qwen_bf16_cached_generation ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.26s
+

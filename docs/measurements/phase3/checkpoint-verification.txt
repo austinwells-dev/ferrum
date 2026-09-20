@@ -1,0 +1,2 @@
+Warning: 5 remote file(s) are missing locally. Use --fail-on-missing-files for details.
+repo_id=Qwen/Qwen2.5-0.5B-Instruct repo_type=model checked=5 path=/Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775

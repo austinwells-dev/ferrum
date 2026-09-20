@@ -1,0 +1,10 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 4.16s
+     Running `target/release/examples/qwen_probe /Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775`
+prompt="<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello!<|im_end|>\n<|im_start|>assistant\n"
+ids=[151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 9707, 0, 151645, 198, 151644, 77091, 198]
+source=988065536 load=459.460041ms
+retained=1260334848 construction=444.296542ms transpose_bytes=987922432 recommended=25769803776
+prefill=812.650375ms next=9707 text="Hello"
+top10=[(9707, 24.875), (13048, 18.75), (4340, 17.25), (15216, 17.125), (18665, 16.875), (14990, 16.625), (91786, 16.375), (108386, 16.25), (13936, 15.75), (21927, 15.5)]
+selected=[(0, 9.875), (1, 9.625), (13, 4.9375), (198, 1.625), (9707, 24.875), (151643, 2.96875), (151645, -5.90625)]

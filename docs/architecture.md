@@ -101,7 +101,7 @@ RoPE convention and scaling are model-dependent; current adjacent-pair rotation 
 
 `loader` parses local safetensors into named, immutable tensors; `tokenizer` independently handles local Hugging Face tokenizer JSON. `model::weights` validates every required shape/dtype/device and optional projection bias before preprocessing weights. It constructs `Embedding`, `Linear`, `RmsNorm`, `Attention`, `Mlp`, and `DecoderLayer` values. Runtime execution uses those fields, never string weight lookups. `model::tiny` creates deterministic synthetic safetensors fixtures. `reference::transformer` is a scalar CPU oracle used by validation, never a numerical fallback.
 
-`ModelConfig` requires vocabulary, hidden/intermediate sizes, layer count, query/KV head counts, head dimension, RMSNorm epsilon, RoPE theta, maximum context, tied-embedding setting, and dtype. Dimensions must be positive, the head dimension even, Q heads divisible by KV heads, and checked tensor element products within u32 indexing. Query projection width need not equal hidden size. Configuration is explicit Rust data; real model config JSON/name adaptation belongs to Phase 3.
+`ModelConfig` requires vocabulary, hidden/intermediate sizes, layer count, query/KV head counts, head dimension, RMSNorm epsilon, RoPE theta, maximum context, tied-embedding setting, and dtype. Dimensions must be positive, the head dimension even, Q heads divisible by KV heads, and checked tensor element products within u32 indexing. Query projection width need not equal hidden size. Phase 2 configuration is explicit Rust data; Phase 3 adds the strict Qwen JSON/name adapter described below.
 
 ## Phase 2 shapes and weights
 
@@ -172,3 +172,45 @@ Device counters are monotonic totals of successful allocations, physical allocat
 ## Phase 3 handoff
 
 Fundamental dense full-attention Qwen2-style execution is ready. Phase 3 needs a locally supplied compatible small Qwen-family model, config JSON parsing/validation, real tensor-name mapping (and local shard assembly if needed), tokenizer/chat-template integration, prefill/decode calls, sampling, and coherent-text validation. It should select the supported structural subset rather than silently accept sliding-window, QK-normalized Qwen3, MoE, multimodal, or scaled-RoPE configurations. No pretrained checkpoint, network downloader, chat template, sampling loop, or generation command is included in Phase 2.
+
+
+## Phase 3 production boundary
+
+`model::qwen` parses the inspected official Qwen2.5 config, validates the dense
+full-attention subset and BF16 storage, resolves mandatory official names and
+Q/K/V biases, and rejects unrecognized tensors. Its construction-time remap
+shares immutable tensor handles under the Phase 2 canonical names. Every shape,
+dtype and device check precedes preprocessing dispatch. Runtime weight access
+remains typed. `Transformer::weight_bytes` now sums the actual retained tensor
+payloads, including the separate transposed tied LM allocation.
+
+`tokenizer::qwen` validates pinned tokenizer/generation metadata, the exact
+upstream chat template, 151665 defined IDs versus 151936 padded embedding rows,
+and BOS/EOS/PAD mappings. It implements only the explicit system/user no-tools
+branch. It uses the existing tokenizer wrapper and never runs Jinja or contacts
+the network. Tokenizer maximum length does not override model context capacity.
+
+`generation` validates prompt plus generation capacity, prefills once, copies
+only the final vocabulary row through the existing checked copy kernel, performs
+CPU selection, then repeatedly feeds one selected token to `forward_decode`.
+The last generated token at EOS/limit is not appended to the cache. Zero requested
+new tokens runs no inference. `sampling` supplies finite-logit greedy argmax,
+F64 temperature/top-k/top-p probabilities and seeded ChaCha8 selection. It does
+not call a CPU transformer or external engine. CPU reference code is confined
+to explicit validation tools/tests.
+
+The `run` CLI composes these pieces, loads local files, drops source weights after
+construction, uses tokenizers' incremental decoder for Unicode-safe text, and
+reports model load, construction, tokenization, prefill, first selection, per-step
+decode, counters and active KV separately. Streaming/text output is excluded
+from decode kernel timings. Failed file/config/token/sampling/context checks
+return contextual errors; there is no numerical fallback.
+
+Opt-in `MetalDevice::set_profiling` aggregates operation timings in a small host
+map and retains no tensors. Output allocation/zeroing and dispatch submission,
+synchronized wall, and GPU timestamps are reported independently. Disabled
+profiling does not change execution boundaries. The four unsafe blocks, Rc
+ownership, shared storage, fresh output allocations and completion waits are
+unchanged. No kernels were changed in Phase 3. See [Phase 3 results](phase3-results.md)
+for exact model mapping, reference arithmetic differences, measured throughput,
+and ranked Phase 4 recommendations.

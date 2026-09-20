@@ -47,23 +47,23 @@ impl Transformer {
     pub fn from_weights(d: &MetalDevice, config: ModelConfig, w: &Weights) -> Result<Self> {
         config.validate()?;
         let (embedding, layers, final_norm, lm_head) = weights::construct(d, &config, w)?;
-        // Retained weights include transposed linear storage, not the caller's source bundle.
-        let mut weight_bytes = 0;
-        for (_, shape) in weights::specifications(&config) {
-            weight_bytes += shape.iter().product::<usize>() * config.dtype.size_bytes();
-        }
-        if config.tie_word_embeddings {
-            weight_bytes += config.vocab_size * config.hidden_size * config.dtype.size_bytes();
-        }
-        for layer in 0..config.num_layers {
-            for projection in ["q", "k", "v", "o", "gate", "up", "down"] {
-                if let Some(t) = w.optional(&format!("layers.{layer}.{projection}.bias")) {
-                    weight_bytes += t.byte_size();
-                }
+        // Sum actual retained tensor payloads, including the tied LM transpose allocation.
+        let mut weight_bytes =
+            embedding.weight_bytes() + final_norm.weight.byte_size() + lm_head.weight_bytes();
+        for layer in &layers {
+            weight_bytes +=
+                layer.input_norm.weight.byte_size() + layer.post_norm.weight.byte_size();
+            for linear in [
+                &layer.attention.q,
+                &layer.attention.k,
+                &layer.attention.v,
+                &layer.attention.output,
+                &layer.mlp.gate,
+                &layer.mlp.up,
+                &layer.mlp.down,
+            ] {
+                weight_bytes += linear.weight_bytes();
             }
-        }
-        if let Some(t) = w.optional("lm_head.bias") {
-            weight_bytes += t.byte_size();
         }
 
         Ok(Self {

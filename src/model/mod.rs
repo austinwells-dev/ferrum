@@ -5,3 +5,4 @@ pub mod tiny;
 pub mod transformer;
 pub mod weights;
 pub use transformer::Transformer;
+pub mod qwen;

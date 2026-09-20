@@ -1,0 +1,28 @@
+COMMAND ['target/release/ferrum', 'run', '--model', '/Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775', '--prompt', 'What is Rust?', '--max-new-tokens', '32', '--warmup', '--tokenizer-diagnostic']
+input: "What is Rust?"
+formatted: "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is Rust?<|im_end|>\n<|im_start|>assistant\n"
+token count: 23
+IDs: [151644, 8948, 198, 2610, 525, 264, 10950, 17847, 13, 151645, 198, 151644, 872, 198, 3838, 374, 33789, 30, 151645, 198, 151644, 77091, 198]
+roundtrip: "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is Rust?<|im_end|>\n<|im_start|>assistant\n"
+Ferrum
+Model: Qwen2.5-0.5B-Instruct (local checkpoint)
+Device: Apple M5
+Backend: Metal
+Dtype: BF16
+Layers: 24; hidden: 896; intermediate: 4864; Q heads: 14; KV heads: 2; head dim: 64
+Parameters: 494032768; tensors: 290
+Source weight bytes: 988065536
+Retained weight bytes: 1260334848
+Construction/transposition bytes: 987922432
+Recommended working set: 25769803776 bytes
+config/tokenizer load: 105.039 ms; weight load: 190.543 ms; construction: 278.126 ms; tokenization: 0.090 ms
+Prompt: 23 tokens; sampler: SamplingConfig { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+Rust is a high-level, statically typed, compiled programming language. It was created by the Rust developers in 2009. Rust is designed to
+
+---
+prompt: 23 tokens; generated: 32; stop: MaxNewTokens
+prefill: 750.848 ms (30.632 tok/s); first token: 751.380 ms
+prefill + final row: 3796 dispatches; 3797 allocations; 53169372 allocation bytes
+decode: median 751.324 ms (1.331 tok/s); per-token ms: [775.580417, 772.704709, 769.497833, 815.1532500000001, 810.371958, 728.941583, 656.331875, 736.761167, 710.088125, 789.044667, 764.666792, 665.985458, 649.811167, 683.0956249999999, 655.14225, 712.63225, 776.593875, 778.838291, 741.6070420000001, 818.937292, 816.7426250000001, 769.025458, 663.257875, 678.4005, 708.341666, 734.2758339999999, 814.152333, 749.479458, 751.323917, 792.7905830000001, 751.981416]
+decode counters per step: [Counters { allocations: 3845, allocated_bytes: 5867524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6011524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6155524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6299524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6443524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6587524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6731524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6875524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7019524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7163524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7307524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7451524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7595524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7739524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 7883524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8027524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8171524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8315524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8459524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8603524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8747524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 8891524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 9035524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 9179524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 9323524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 9467524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 9611524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 9755524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 9899524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 10043524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 10187524, dispatches: 3844 }]
+sampling: 8.121 ms total; active KV: 663552 bytes; generated IDs: [49, 590, 374, 264, 1550, 11591, 11, 91174, 31969, 11, 19697, 15473, 4128, 13, 1084, 572, 3465, 553, 279, 33789, 13402, 304, 220, 17, 15, 15, 24, 13, 33789, 374, 6188, 311]

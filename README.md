@@ -2,7 +2,7 @@
 
 Ferrum is an independent Rust + Metal machine-learning runtime for Apple Silicon. The long-term goal is native LLM execution without MLX, llama.cpp, PyTorch, Python, MPSGraph, or another inference engine in the execution path.
 
-**Phase 2 implements and validates a complete synthetic decoder transformer. Real pretrained model execution is reserved for Phase 3.**
+**Phase 3 generates text from the official Qwen2.5-0.5B-Instruct BF16 checkpoint entirely through Ferrum’s Rust + Metal execution path.**
 
 ## Requirements and commands
 
@@ -82,7 +82,7 @@ Criterion stores machine-readable results in `target/criterion`. Use `--save-bas
 - RMSNorm/softmax use one GPU thread per row and serial F32 reductions. They are not optimized parallel reductions. Extremely large RMSNorm inputs can overflow F32 sum-of-squares. Finite, representable arithmetic is the numerical validation domain; NaN/infinity semantics for reductions are not promised.
 - The original RoPE API rotates adjacent pairs at one position. Phase 2 also provides sequence-aware split-half RoPE. Neither supports partial rotation or scaling variants. F32 phase error grows with position; the test at position 2048 uses a 5e-4 absolute tolerance against an F64 oracle. Very long-context precision has not been established.
 - F16/BF16 have reduced storage bandwidth but still use F32 arithmetic. There are no tensor-core/SIMD-group matrix instructions or peak-performance claims.
-- No real pretrained models, generation/sampling, downloads, quantization, graph scheduler, autograd, training, bindings, or service interface.
+- One supported production checkpoint: Qwen2.5-0.5B-Instruct. No runtime downloads, quantization, graph scheduler, autograd, training, bindings, or service interface.
 
 Phase 2 preserves the validated tensor/storage contracts. Asynchronous execution and storage reuse still require a future explicit completion/lifetime design.
 
@@ -118,3 +118,48 @@ MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --test transformer -- --tes
 ```
 
 The smoke command generates a deterministic two-layer model, serializes it through safetensors, loads it through the production loader, checks 41 intermediate tensors against an independent CPU oracle, and verifies cached logits. It reports timings, dispatches, allocations, weight/KV payloads, and cumulative temporary allocation volume. The numerical path uses only Ferrum Metal operations. See [Phase 2 results](docs/phase2-results.md) for measured errors and timings, and [architecture](docs/architecture.md) for layouts and the Phase 3 handoff.
+
+## Phase 3: real Qwen generation
+
+Download the five official execution files once using an external tool, or use an
+existing local snapshot. Ferrum itself is local-only and has no Python or other
+inference-engine dependency.
+
+```sh
+hf download Qwen/Qwen2.5-0.5B-Instruct \
+  config.json model.safetensors tokenizer.json tokenizer_config.json generation_config.json \
+  --revision 7ae557604adf67be50417f59c2c2f167def9a775
+export FERRUM_QWEN_MODEL="$HOME/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775"
+cargo run --release -- run --model "$FERRUM_QWEN_MODEL" \
+  --prompt "What is Rust?" --max-new-tokens 32 --temperature 0
+cargo test --release --test real_model -- --ignored --nocapture
+```
+
+The CLI uses an explicit `You are a helpful assistant.` system message and the
+checkpoint's Qwen chat formatting. `--system TEXT` changes that message; `--raw`
+disables chat formatting. No BOS is automatically inserted. EOS/end-of-text or
+the new-token limit stops generation. Text streams safely across UTF-8 fragments;
+metadata and timings go to stderr. `--tokenizer-diagnostic` displays formatted
+text, IDs, count and roundtrip. `--max-new-tokens` defaults to 32.
+
+Greedy is the default (`--temperature 0`). For sampling, use for example
+`--temperature 0.7 --top-k 20 --top-p 0.8 --seed 42`. Top-k zero and top-p one
+disable their filters. The checkpoint's repetition penalty is not applied.
+`--warmup` performs an unreported prefill/decode before timing;
+`--profile` adds per-operation timing aggregates for diagnosis.
+
+The inspected model has 494,032,768 BF16 parameters in 290 tensors. Retained
+weight payload is 1,260,334,848 bytes, including the existing tied LM transpose.
+On Apple M5 the **first unoptimized warmed baseline** processed a 21-token Hello
+prompt in **800.050 ms (26.248 tok/s)**, then decoded at **1.314 tok/s** median,
+with **3844 dispatches and 3845 allocations per cached token**. Output:
+`Hello! How can I assist you today?`, followed by EOS. These are correctness
+baseline measurements, not optimized throughput claims.
+
+The trusted CPU Transformers reference matches prompt IDs and the first five
+BF16 greedy tokens. A later near-tie chooses “help” instead of “assist”; the
+investigation and temporary F32 diagnostic (eight matching tokens, recorded
+logit error below 8e-5) are documented in [Phase 3 results](docs/phase3-results.md).
+Ordinary tests use small fixtures; only the explicit ignored integration test
+loads the real checkpoint. No weights are committed. Phase 4 optimization has
+not begun.

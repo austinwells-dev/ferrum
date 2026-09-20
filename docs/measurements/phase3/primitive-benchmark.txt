@@ -1,0 +1,173 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `bench` profile [optimized] target(s) in 0.97s
+     Running benches/runtime.rs (target/release/deps/runtime-03647252a9a03515)
+Gnuplot not found, using plotters backend
+DEVICE Apple M5; pipeline warm-up 1.583166ms; samples include fresh output allocation and synchronization
+TIMING add/f32/1024: median_us e2e=222.291 submit=4.875 synchronized=218.625 gpu=3.250
+Benchmarking metal/add_f32/1024
+Benchmarking metal/add_f32/1024: Warming up for 300.00 ms
+Benchmarking metal/add_f32/1024: Collecting 10 samples in estimated 1.0062 s (5775 iterations)
+Benchmarking metal/add_f32/1024: Analyzing
+metal/add_f32/1024      time:   [148.65 µs 152.94 µs 160.71 µs]
+                        thrpt:  [72.919 MiB/s 76.623 MiB/s 78.833 MiB/s]
+                 change:
+                        time:   [−11.417% −3.2800% +6.2662%] (p = 0.51 > 0.05)
+                        thrpt:  [−5.8967% +3.3912% +12.888%]
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+TIMING add/f32/65536: median_us e2e=169.834 submit=4.084 synchronized=148.125 gpu=4.750
+Benchmarking metal/add_f32/65536
+Benchmarking metal/add_f32/65536: Warming up for 300.00 ms
+Benchmarking metal/add_f32/65536: Collecting 10 samples in estimated 1.0097 s (4895 iterations)
+Benchmarking metal/add_f32/65536: Analyzing
+metal/add_f32/65536     time:   [199.82 µs 200.95 µs 202.05 µs]
+                        thrpt:  [3.6250 GiB/s 3.6449 GiB/s 3.6653 GiB/s]
+                 change:
+                        time:   [+1.1412% +2.4594% +3.8978%] (p = 0.00 < 0.05)
+                        thrpt:  [−3.7516% −2.4004% −1.1283%]
+                        Performance has regressed.
+TIMING add/f32/1048576: median_us e2e=477.292 submit=5.375 synchronized=279.625 gpu=97.250
+Benchmarking metal/add_f32/1048576
+Benchmarking metal/add_f32/1048576: Warming up for 300.00 ms
+Benchmarking metal/add_f32/1048576: Collecting 10 samples in estimated 1.0094 s (1870 iterations)
+Benchmarking metal/add_f32/1048576: Analyzing
+metal/add_f32/1048576   time:   [551.79 µs 562.80 µs 572.29 µs]
+                        thrpt:  [20.477 GiB/s 20.822 GiB/s 21.238 GiB/s]
+                 change:
+                        time:   [+34.176% +36.618% +39.190%] (p = 0.00 < 0.05)
+                        thrpt:  [−28.156% −26.803% −25.471%]
+                        Performance has regressed.
+TIMING rmsnorm/f32/1x128: median_us e2e=205.708 submit=4.625 synchronized=203.083 gpu=21.333
+Benchmarking metal/rmsnorm_f32/1x128
+Benchmarking metal/rmsnorm_f32/1x128: Warming up for 300.00 ms
+Benchmarking metal/rmsnorm_f32/1x128: Collecting 10 samples in estimated 1.0077 s (4840 iterations)
+Benchmarking metal/rmsnorm_f32/1x128: Analyzing
+metal/rmsnorm_f32/1x128 time:   [221.96 µs 264.21 µs 293.82 µs]
+                        thrpt:  [435.64 Kelem/s 484.47 Kelem/s 576.67 Kelem/s]
+                 change:
+                        time:   [+3.7663% +15.321% +29.683%] (p = 0.02 < 0.05)
+                        thrpt:  [−22.889% −13.286% −3.6296%]
+                        Performance has regressed.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+TIMING softmax/f32/1x128: median_us e2e=347.666 submit=5.917 synchronized=344.333 gpu=120.167
+Benchmarking metal/softmax_f32/1x128
+Benchmarking metal/softmax_f32/1x128: Warming up for 300.00 ms
+Benchmarking metal/softmax_f32/1x128: Collecting 10 samples in estimated 1.0134 s (2640 iterations)
+Benchmarking metal/softmax_f32/1x128: Analyzing
+metal/softmax_f32/1x128 time:   [252.53 µs 279.21 µs 317.82 µs]
+                        thrpt:  [402.74 Kelem/s 458.44 Kelem/s 506.86 Kelem/s]
+                 change:
+                        time:   [+22.409% +30.129% +39.035%] (p = 0.00 < 0.05)
+                        thrpt:  [−28.076% −23.153% −18.307%]
+                        Performance has regressed.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) high mild
+  1 (10.00%) high severe
+TIMING rmsnorm/f32/4x4096: median_us e2e=1299.500 submit=9.125 synchronized=1278.459 gpu=1101.625
+Benchmarking metal/rmsnorm_f32/4x4096
+Benchmarking metal/rmsnorm_f32/4x4096: Warming up for 300.00 ms
+Benchmarking metal/rmsnorm_f32/4x4096: Collecting 10 samples in estimated 1.0345 s (1155 iterations)
+Benchmarking metal/rmsnorm_f32/4x4096: Analyzing
+metal/rmsnorm_f32/4x4096
+                        time:   [882.19 µs 888.39 µs 893.30 µs]
+                        thrpt:  [18.341 Melem/s 18.442 Melem/s 18.572 Melem/s]
+                 change:
+                        time:   [+6.3847% +7.7137% +9.3541%] (p = 0.00 < 0.05)
+                        thrpt:  [−8.5539% −7.1613% −6.0016%]
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+TIMING softmax/f32/4x4096: median_us e2e=985.042 submit=8.209 synchronized=965.583 gpu=808.708
+Benchmarking metal/softmax_f32/4x4096
+Benchmarking metal/softmax_f32/4x4096: Warming up for 300.00 ms
+Benchmarking metal/softmax_f32/4x4096: Collecting 10 samples in estimated 1.0320 s (990 iterations)
+Benchmarking metal/softmax_f32/4x4096: Analyzing
+metal/softmax_f32/4x4096
+                        time:   [1.0243 ms 1.0465 ms 1.0775 ms]
+                        thrpt:  [15.205 Melem/s 15.656 Melem/s 15.996 Melem/s]
+                 change:
+                        time:   [+4.1115% +5.9275% +7.8287%] (p = 0.00 < 0.05)
+                        thrpt:  [−7.2603% −5.5958% −3.9491%]
+                        Performance has regressed.
+TIMING rmsnorm/f32/32x4096: median_us e2e=892.208 submit=6.292 synchronized=848.834 gpu=676.125
+Benchmarking metal/rmsnorm_f32/32x4096
+Benchmarking metal/rmsnorm_f32/32x4096: Warming up for 300.00 ms
+Benchmarking metal/rmsnorm_f32/32x4096: Collecting 10 samples in estimated 1.0109 s (1100 iterations)
+Benchmarking metal/rmsnorm_f32/32x4096: Analyzing
+metal/rmsnorm_f32/32x4096
+                        time:   [913.69 µs 919.39 µs 930.57 µs]
+                        thrpt:  [140.85 Melem/s 142.56 Melem/s 143.45 Melem/s]
+                 change:
+                        time:   [+5.3117% +6.7496% +8.6917%] (p = 0.00 < 0.05)
+                        thrpt:  [−7.9966% −6.3229% −5.0437%]
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+TIMING softmax/f32/32x4096: median_us e2e=1102.916 submit=7.042 synchronized=1054.458 gpu=875.750
+Benchmarking metal/softmax_f32/32x4096
+Benchmarking metal/softmax_f32/32x4096: Warming up for 300.00 ms
+Benchmarking metal/softmax_f32/32x4096: Collecting 10 samples in estimated 1.0112 s (880 iterations)
+Benchmarking metal/softmax_f32/32x4096: Analyzing
+metal/softmax_f32/32x4096
+                        time:   [1.1505 ms 1.1626 ms 1.1766 ms]
+                        thrpt:  [111.40 Melem/s 112.74 Melem/s 113.92 Melem/s]
+                 change:
+                        time:   [+5.8067% +6.9240% +8.0850%] (p = 0.00 < 0.05)
+                        thrpt:  [−7.4802% −6.4756% −5.4880%]
+                        Performance has regressed.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low mild
+  1 (10.00%) high mild
+TIMING matmul/F32/17x19x23: median_us e2e=182.708 submit=4.875 synchronized=177.667 gpu=2.458
+Benchmarking metal/matmul_F32/17x19x23
+Benchmarking metal/matmul_F32/17x19x23: Warming up for 300.00 ms
+Benchmarking metal/matmul_F32/17x19x23: Collecting 10 samples in estimated 1.0047 s (5005 iterations)
+Benchmarking metal/matmul_F32/17x19x23: Analyzing
+metal/matmul_F32/17x19x23
+                        time:   [157.10 µs 161.71 µs 164.93 µs]
+                        thrpt:  [90.086 Melem/s 91.879 Melem/s 94.578 Melem/s]
+                 change:
+                        time:   [−1.5755% +3.3750% +8.8083%] (p = 0.24 > 0.05)
+                        thrpt:  [−8.0953% −3.2648% +1.6007%]
+                        No change in performance detected.
+TIMING matmul/F32/128x128x128: median_us e2e=211.167 submit=6.083 synchronized=198.666 gpu=11.000
+Benchmarking metal/matmul_F32/128x128x128
+Benchmarking metal/matmul_F32/128x128x128: Warming up for 300.00 ms
+Benchmarking metal/matmul_F32/128x128x128: Collecting 10 samples in estimated 1.0014 s (4895 iterations)
+Benchmarking metal/matmul_F32/128x128x128: Analyzing
+metal/matmul_F32/128x128x128
+                        time:   [207.43 µs 216.52 µs 226.86 µs]
+                        thrpt:  [18.488 Gelem/s 19.372 Gelem/s 20.220 Gelem/s]
+                 change:
+                        time:   [+4.7262% +7.7858% +11.425%] (p = 0.00 < 0.05)
+                        thrpt:  [−10.254% −7.2234% −4.5129%]
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+TIMING matmul/F32/256x512x256: median_us e2e=334.208 submit=7.042 synchronized=309.208 gpu=127.375
+Benchmarking metal/matmul_F32/256x512x256
+Benchmarking metal/matmul_F32/256x512x256: Warming up for 300.00 ms
+Benchmarking metal/matmul_F32/256x512x256: Collecting 10 samples in estimated 1.0045 s (2640 iterations)
+Benchmarking metal/matmul_F32/256x512x256: Analyzing
+metal/matmul_F32/256x512x256
+                        time:   [334.98 µs 340.55 µs 349.38 µs]
+                        thrpt:  [192.08 Gelem/s 197.06 Gelem/s 200.34 Gelem/s]
+                 change:
+                        time:   [+5.7339% +8.0448% +10.376%] (p = 0.00 < 0.05)
+                        thrpt:  [−9.4008% −7.4458% −5.4230%]
+                        Performance has regressed.
+TIMING matmul/F16/256x512x256: median_us e2e=314.166 submit=4.834 synchronized=299.166 gpu=126.625
+Benchmarking metal/matmul_F16/256x512x256
+Benchmarking metal/matmul_F16/256x512x256: Warming up for 300.00 ms
+Benchmarking metal/matmul_F16/256x512x256: Collecting 10 samples in estimated 1.0113 s (3080 iterations)
+Benchmarking metal/matmul_F16/256x512x256: Analyzing
+metal/matmul_F16/256x512x256
+                        time:   [322.80 µs 326.19 µs 330.14 µs]
+                        thrpt:  [203.27 Gelem/s 205.74 Gelem/s 207.90 Gelem/s]
+                 change:
+                        time:   [+1.1137% +2.6994% +4.4236%] (p = 0.00 < 0.05)
+                        thrpt:  [−4.2362% −2.6284% −1.1014%]
+                        Performance has regressed.
+

@@ -15,6 +15,9 @@ impl Embedding {
         }
         Ok(Self { weight })
     }
+    pub fn weight_bytes(&self) -> usize {
+        self.weight.byte_size()
+    }
     pub fn forward(&self, d: &MetalDevice, tokens: &[u32]) -> Result<Tensor> {
         Ok(d.embedding_gather(&self.weight, tokens)?.tensor)
     }
@@ -50,6 +53,9 @@ impl Linear {
             transposed: d.transpose2(&weight)?.tensor,
             bias,
         })
+    }
+    pub fn weight_bytes(&self) -> usize {
+        self.transposed.byte_size() + self.bias.as_ref().map_or(0, Tensor::byte_size)
     }
     pub fn forward(&self, d: &MetalDevice, x: &Tensor) -> Result<Tensor> {
         let dims = x.shape().dimensions();

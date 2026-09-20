@@ -37,6 +37,25 @@ impl Weights {
         }
         Ok(Self { tensors })
     }
+    /// Rename validated entries by sharing immutable storage; no payload copy.
+    pub(crate) fn remap<'a>(
+        &self,
+        names: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<Self> {
+        let mut tensors = BTreeMap::new();
+        for (source, target) in names {
+            if tensors
+                .insert(target.to_owned(), self.get(source)?.clone())
+                .is_some()
+            {
+                return Err(Error::Weight {
+                    name: target.into(),
+                    message: "duplicate mapping".into(),
+                });
+            }
+        }
+        Ok(Self { tensors })
+    }
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }

@@ -1,0 +1,234 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.26
+   Compiling quote v1.0.47
+   Compiling libc v0.2.189
+   Compiling serde_core v1.0.229
+   Compiling cfg-if v1.0.5
+   Compiling zerocopy v0.8.57
+   Compiling memchr v2.8.3
+   Compiling serde v1.0.229
+   Compiling crossbeam-utils v0.8.23
+   Compiling crossbeam-epoch v0.9.21
+   Compiling zmij v1.0.23
+   Compiling getrandom v0.3.4
+   Compiling either v1.18.0
+   Compiling crossbeam-deque v0.8.8
+   Compiling fnv v1.0.7
+   Compiling strsim v0.11.1
+   Compiling ident_case v1.0.1
+   Compiling serde_json v1.0.151
+   Compiling itoa v1.0.18
+   Compiling bitflags v2.13.2
+   Compiling rayon-core v1.13.0
+   Compiling aho-corasick v1.1.5
+   Compiling rustversion v1.0.23
+   Compiling objc2 v0.6.4
+   Compiling regex-syntax v0.8.11
+   Compiling objc2-encode v4.1.0
+   Compiling syn v2.0.119
+   Compiling syn v3.0.6
+   Compiling once_cell v1.21.4
+   Compiling getrandom v0.4.3
+   Compiling rustix v1.1.5
+   Compiling version_check v0.9.5
+   Compiling rand_core v0.9.5
+   Compiling ahash v0.8.12
+   Compiling errno v0.3.14
+   Compiling rayon v1.12.0
+   Compiling paste v1.0.15
+   Compiling esaxx-rs v0.1.10
+   Compiling bit-vec v0.8.0
+   Compiling regex-automata v0.4.18
+   Compiling autocfg v1.5.1
+   Compiling thiserror v2.0.20
+   Compiling serde_derive v1.0.229
+   Compiling shlex v2.0.1
+   Compiling minimal-lexical v0.2.1
+   Compiling find-msvc-tools v0.1.13
+   Compiling nom v7.1.3
+   Compiling cc v1.4.7
+   Compiling darling_core v0.20.11
+   Compiling thiserror-impl v2.0.20
+   Compiling num-traits v0.2.19
+   Compiling bit-set v0.8.0
+   Compiling zerocopy-derive v0.8.57
+   Compiling monostate-impl v0.1.18
+   Compiling castaway v0.2.4
+   Compiling darling_macro v0.20.11
+   Compiling itertools v0.14.0
+   Compiling regex v1.13.1
+   Compiling foldhash v0.2.0
+   Compiling fastrand v2.5.0
+   Compiling ryu v1.0.23
+   Compiling darling v0.20.11
+   Compiling static_assertions v1.1.0
+   Compiling base64 v0.13.1
+   Compiling macro_rules_attribute-proc_macro v0.2.3
+   Compiling derive_builder_core v0.20.2
+   Compiling equivalent v1.0.2
+   Compiling smallvec v1.16.1
+   Compiling pastey v0.2.3
+   Compiling unicode-segmentation v1.13.3
+   Compiling allocator-api2 v0.2.21
+   Compiling macro_rules_attribute v0.2.3
+   Compiling hashbrown v0.16.1
+   Compiling derive_builder_macro v0.20.2
+   Compiling spm_precompiled v0.1.4
+   Compiling rayon-cond v0.4.0
+   Compiling derive_builder v0.20.2
+   Compiling unicode-normalization-alignments v0.1.12
+   Compiling tempfile v3.27.0
+   Compiling dary_heap v0.3.9
+   Compiling compact_str v0.9.1
+   Compiling fancy-regex v0.17.0
+   Compiling monostate v0.1.18
+   Compiling alloca v0.4.0
+   Compiling objc2-foundation v0.3.2
+   Compiling objc2-core-foundation v0.3.2
+   Compiling clap_lex v1.1.1
+   Compiling plotters-backend v0.3.7
+   Compiling daachorse v3.0.3
+   Compiling unicode_categories v0.1.1
+   Compiling ciborium-io v0.2.2
+   Compiling anstyle v1.0.14
+   Compiling log v0.4.34
+   Compiling plotters-svg v0.3.7
+   Compiling clap_builder v4.6.7
+   Compiling safetensors v0.8.0
+   Compiling itertools v0.13.0
+   Compiling objc2-metal v0.3.2
+   Compiling cast v0.3.0
+   Compiling same-file v1.0.6
+   Compiling walkdir v2.5.0
+   Compiling plotters v0.3.7
+   Compiling half v2.7.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling rand_chacha v0.9.0
+   Compiling ciborium-ll v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling page_size v0.6.0
+   Compiling anes v0.1.6
+   Compiling rand v0.9.5
+   Compiling clap v4.6.7
+   Compiling ciborium v0.2.2
+   Compiling criterion-plot v0.8.2
+   Compiling oorandom v11.1.5
+   Compiling tokenizers v0.23.2
+   Compiling criterion v0.8.2
+   Compiling ferrum v0.1.0 (/tmp/ferrum-phase2-control)
+    Finished `bench` profile [optimized] target(s) in 18.19s
+     Running benches/runtime.rs (target/phase2-control/release/deps/runtime-2195f9568b438a32)
+Gnuplot not found, using plotters backend
+DEVICE Apple M5; pipeline warm-up 48.904125ms; samples include fresh output allocation and synchronization
+TIMING add/f32/1024: median_us e2e=278.167 submit=4.875 synchronized=273.917 gpu=6.000
+Benchmarking metal/add_f32/1024
+Benchmarking metal/add_f32/1024: Warming up for 300.00 ms
+Benchmarking metal/add_f32/1024: Collecting 10 samples in estimated 1.0088 s (5225 iterations)
+Benchmarking metal/add_f32/1024: Analyzing
+metal/add_f32/1024      time:   [179.30 µs 195.97 µs 227.78 µs]
+                        thrpt:  [51.447 MiB/s 59.799 MiB/s 65.358 MiB/s]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+TIMING add/f32/65536: median_us e2e=182.292 submit=3.875 synchronized=160.709 gpu=4.583
+Benchmarking metal/add_f32/65536
+Benchmarking metal/add_f32/65536: Warming up for 300.00 ms
+Benchmarking metal/add_f32/65536: Collecting 10 samples in estimated 1.0091 s (5115 iterations)
+Benchmarking metal/add_f32/65536: Analyzing
+metal/add_f32/65536     time:   [199.60 µs 201.20 µs 204.03 µs]
+                        thrpt:  [3.5897 GiB/s 3.6402 GiB/s 3.6694 GiB/s]
+TIMING add/f32/1048576: median_us e2e=449.958 submit=4.417 synchronized=269.417 gpu=90.000
+Benchmarking metal/add_f32/1048576
+Benchmarking metal/add_f32/1048576: Warming up for 300.00 ms
+Benchmarking metal/add_f32/1048576: Collecting 10 samples in estimated 1.0194 s (2090 iterations)
+Benchmarking metal/add_f32/1048576: Analyzing
+metal/add_f32/1048576   time:   [489.87 µs 504.77 µs 515.31 µs]
+                        thrpt:  [22.741 GiB/s 23.216 GiB/s 23.922 GiB/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+TIMING rmsnorm/f32/1x128: median_us e2e=202.750 submit=4.583 synchronized=199.375 gpu=21.500
+Benchmarking metal/rmsnorm_f32/1x128
+Benchmarking metal/rmsnorm_f32/1x128: Warming up for 300.00 ms
+Benchmarking metal/rmsnorm_f32/1x128: Collecting 10 samples in estimated 1.0078 s (4675 iterations)
+Benchmarking metal/rmsnorm_f32/1x128: Analyzing
+metal/rmsnorm_f32/1x128 time:   [217.37 µs 219.33 µs 220.38 µs]
+                        thrpt:  [580.80 Kelem/s 583.60 Kelem/s 588.86 Kelem/s]
+TIMING softmax/f32/1x128: median_us e2e=205.708 submit=4.417 synchronized=201.959 gpu=25.750
+Benchmarking metal/softmax_f32/1x128
+Benchmarking metal/softmax_f32/1x128: Warming up for 300.00 ms
+Benchmarking metal/softmax_f32/1x128: Collecting 10 samples in estimated 1.0086 s (4510 iterations)
+Benchmarking metal/softmax_f32/1x128: Analyzing
+metal/softmax_f32/1x128 time:   [220.84 µs 224.04 µs 226.98 µs]
+                        thrpt:  [563.93 Kelem/s 571.33 Kelem/s 579.60 Kelem/s]
+TIMING rmsnorm/f32/4x4096: median_us e2e=815.375 submit=7.958 synchronized=796.000 gpu=631.625
+Benchmarking metal/rmsnorm_f32/4x4096
+Benchmarking metal/rmsnorm_f32/4x4096: Warming up for 300.00 ms
+Benchmarking metal/rmsnorm_f32/4x4096: Collecting 10 samples in estimated 1.0291 s (1210 iterations)
+Benchmarking metal/rmsnorm_f32/4x4096: Analyzing
+metal/rmsnorm_f32/4x4096
+                        time:   [847.04 µs 849.23 µs 851.63 µs]
+                        thrpt:  [19.238 Melem/s 19.293 Melem/s 19.343 Melem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low severe
+TIMING softmax/f32/4x4096: median_us e2e=989.542 submit=8.375 synchronized=965.500 gpu=786.000
+Benchmarking metal/softmax_f32/4x4096
+Benchmarking metal/softmax_f32/4x4096: Warming up for 300.00 ms
+Benchmarking metal/softmax_f32/4x4096: Collecting 10 samples in estimated 1.0009 s (990 iterations)
+Benchmarking metal/softmax_f32/4x4096: Analyzing
+metal/softmax_f32/4x4096
+                        time:   [1.0031 ms 1.0075 ms 1.0107 ms]
+                        thrpt:  [16.210 Melem/s 16.262 Melem/s 16.334 Melem/s]
+TIMING rmsnorm/f32/32x4096: median_us e2e=886.625 submit=4.000 synchronized=827.083 gpu=652.875
+Benchmarking metal/rmsnorm_f32/32x4096
+Benchmarking metal/rmsnorm_f32/32x4096: Warming up for 300.00 ms
+Benchmarking metal/rmsnorm_f32/32x4096: Collecting 10 samples in estimated 1.0022 s (1100 iterations)
+Benchmarking metal/rmsnorm_f32/32x4096: Analyzing
+metal/rmsnorm_f32/32x4096
+                        time:   [909.73 µs 912.67 µs 916.45 µs]
+                        thrpt:  [143.02 Melem/s 143.61 Melem/s 144.08 Melem/s]
+TIMING softmax/f32/32x4096: median_us e2e=1096.958 submit=4.375 synchronized=1041.167 gpu=854.500
+Benchmarking metal/softmax_f32/32x4096
+Benchmarking metal/softmax_f32/32x4096: Warming up for 300.00 ms
+Benchmarking metal/softmax_f32/32x4096: Collecting 10 samples in estimated 1.0135 s (880 iterations)
+Benchmarking metal/softmax_f32/32x4096: Analyzing
+metal/softmax_f32/32x4096
+                        time:   [1.1580 ms 1.1603 ms 1.1636 ms]
+                        thrpt:  [112.64 Melem/s 112.96 Melem/s 113.19 Melem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+TIMING matmul/F32/17x19x23: median_us e2e=178.125 submit=4.416 synchronized=175.208 gpu=2.500
+Benchmarking metal/matmul_F32/17x19x23
+Benchmarking metal/matmul_F32/17x19x23: Warming up for 300.00 ms
+Benchmarking metal/matmul_F32/17x19x23: Collecting 10 samples in estimated 1.0089 s (5720 iterations)
+Benchmarking metal/matmul_F32/17x19x23: Analyzing
+metal/matmul_F32/17x19x23
+                        time:   [165.40 µs 168.79 µs 171.88 µs]
+                        thrpt:  [86.443 Melem/s 88.029 Melem/s 89.831 Melem/s]
+TIMING matmul/F32/128x128x128: median_us e2e=192.416 submit=4.458 synchronized=183.000 gpu=10.917
+Benchmarking metal/matmul_F32/128x128x128
+Benchmarking metal/matmul_F32/128x128x128: Warming up for 300.00 ms
+Benchmarking metal/matmul_F32/128x128x128: Collecting 10 samples in estimated 1.0094 s (4785 iterations)
+Benchmarking metal/matmul_F32/128x128x128: Analyzing
+metal/matmul_F32/128x128x128
+                        time:   [209.18 µs 210.23 µs 211.74 µs]
+                        thrpt:  [19.809 Gelem/s 19.951 Gelem/s 20.051 Gelem/s]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+TIMING matmul/F32/256x512x256: median_us e2e=319.666 submit=4.583 synchronized=300.583 gpu=127.125
+Benchmarking metal/matmul_F32/256x512x256
+Benchmarking metal/matmul_F32/256x512x256: Warming up for 300.00 ms
+Benchmarking metal/matmul_F32/256x512x256: Collecting 10 samples in estimated 1.0039 s (2915 iterations)
+Benchmarking metal/matmul_F32/256x512x256: Analyzing
+metal/matmul_F32/256x512x256
+                        time:   [336.89 µs 339.89 µs 344.71 µs]
+                        thrpt:  [194.68 Gelem/s 197.45 Gelem/s 199.20 Gelem/s]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) low mild
+TIMING matmul/F16/256x512x256: median_us e2e=314.291 submit=4.833 synchronized=298.083 gpu=126.750
+Benchmarking metal/matmul_F16/256x512x256
+Benchmarking metal/matmul_F16/256x512x256: Warming up for 300.00 ms
+Benchmarking metal/matmul_F16/256x512x256: Collecting 10 samples in estimated 1.0093 s (3025 iterations)
+Benchmarking metal/matmul_F16/256x512x256: Analyzing
+metal/matmul_F16/256x512x256
+                        time:   [332.26 µs 333.62 µs 335.16 µs]
+                        thrpt:  [200.23 Gelem/s 201.15 Gelem/s 201.98 Gelem/s]
+

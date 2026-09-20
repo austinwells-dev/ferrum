@@ -1,0 +1,38 @@
+Ferrum
+Model: Qwen2.5-0.5B-Instruct (local checkpoint)
+Device: Apple M5
+Backend: Metal
+Dtype: BF16
+Layers: 24; hidden: 896; intermediate: 4864; Q heads: 14; KV heads: 2; head dim: 64
+Parameters: 494032768; tensors: 290
+Source weight bytes: 988065536
+Retained weight bytes: 1260334848
+Construction/transposition bytes: 987922432
+Recommended working set: 25769803776 bytes
+config/tokenizer load: 93.955 ms; weight load: 184.780 ms; construction: 254.401 ms; tokenization: 0.083 ms
+Prompt: 21 tokens; sampler: SamplingConfig { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+Hello
+
+---
+prompt: 21 tokens; generated: 1; stop: MaxNewTokens
+prefill: 788.560 ms (26.631 tok/s); first token: 789.185 ms
+prefill + final row: 3796 dispatches; 3797 allocations; 48459476 allocation bytes
+sampling: 0.241 ms total; active KV: 258048 bytes; generated IDs: [9707]
+        1.38 real         0.19 user         0.33 sys
+          3053092864  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              191413  page reclaims
+                  15  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               17205  involuntary context switches
+          4822197611  instructions retired
+          2106217280  cycles elapsed
+          3055192920  peak memory footprint
