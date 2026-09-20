@@ -104,6 +104,9 @@ impl MetalDevice {
     }
     pub fn rmsnorm(&self, a: &Tensor, weight: &Tensor, eps: f32) -> Result<Output> {
         let w = width(a)?;
+        if w > u32::MAX as usize - 256 {
+            return Err(Error::Shape("reduction width exceeds index limit".into()));
+        }
         if weight.shape().dimensions() != [w] {
             return Err(Error::Shape(
                 "RMSNorm weight must match the last dimension".into(),
@@ -132,10 +135,17 @@ impl MetalDevice {
     }
     pub fn softmax(&self, a: &Tensor) -> Result<Output> {
         let w = width(a)?;
+        if w > u32::MAX as usize - 256 {
+            return Err(Error::Shape("reduction width exceeds index limit".into()));
+        }
         let mut p = [0; 9];
         p[1] = index(w)?;
         self.run(
-            "softmax",
+            if self.reference_math() && a.dtype() == DType::F32 {
+                "softmax_ordered"
+            } else {
+                "softmax"
+            },
             a,
             None,
             a.shape().dimensions(),
@@ -145,6 +155,9 @@ impl MetalDevice {
     }
     pub fn rope(&self, a: &Tensor, head_dim: usize, position: u32, theta: f32) -> Result<Output> {
         let w = width(a)?;
+        if w > u32::MAX as usize - 256 {
+            return Err(Error::Shape("reduction width exceeds index limit".into()));
+        }
         if head_dim == 0 || !head_dim.is_multiple_of(2) || !w.is_multiple_of(head_dim) {
             return Err(Error::Parameter(
                 "head dimension must be positive, even and divide the last axis".into(),

@@ -495,7 +495,7 @@ impl MetalDevice {
                     3,
                 );
             }
-            if name == "rmsnorm" {
+            if matches!(name, "rmsnorm" | "softmax") {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 256
                 {
                     return Err(Error::Dispatch(

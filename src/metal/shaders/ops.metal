@@ -55,11 +55,23 @@ kernel void rmsnorm(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[t
     for(uint j=tid;j<w;j+=256) store(c,base+j,p[4],load(a,base+j,p[4])*inv*load(b,j,p[4]));
 
 }
-kernel void softmax(ARGS, uint row [[thread_position_in_grid]]) {
-    uint w=p[1], base=row*w; if(base>=p[0]) return;
-    float mx=-INFINITY; for(uint j=0;j<w;j++) mx=max(mx,load(a,base+j,p[4]));
-    float sum=0; for(uint j=0;j<w;j++) sum+=exp(load(a,base+j,p[4])-mx);
-    for(uint j=0;j<w;j++) store(c,base+j,p[4],exp(load(a,base+j,p[4])-mx)/sum);
+kernel void softmax(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[8];
+    uint w=p[1], base=row*w, lane=tid%32, simd=tid/32;
+    float mx=-INFINITY;
+    for(uint j=tid;j<w;j+=256) mx=max(mx,load(a,base+j,p[4]));
+    mx=simd_max(mx);
+    if(lane==0) partial[simd]=mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx=simd_max(lane<8?partial[lane]:-INFINITY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum=0;
+    for(uint j=tid;j<w;j+=256) sum+=exp(load(a,base+j,p[4])-mx);
+    sum=simd_sum(sum);
+    if(lane==0) partial[simd]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum=simd_sum(lane<8?partial[lane]:0.f);
+    for(uint j=tid;j<w;j+=256) store(c,base+j,p[4],exp(load(a,base+j,p[4])-mx)/sum);
 }
 // Adjacent-pair (interleaved) RoPE. The same supplied position applies to all heads.
 kernel void rope(ARGS, uint pair [[thread_position_in_grid]]) {
@@ -169,4 +181,11 @@ kernel void rmsnorm_ordered(ARGS, uint row [[thread_position_in_grid]]) {
     float sum=0; for(uint j=0;j<w;j++) {float x=load(a,base+j,p[4]);sum+=x*x;}
     float inv=rsqrt(sum/float(w)+as_type<float>(p[7]));
     for(uint j=0;j<w;j++) store(c,base+j,p[4],load(a,base+j,p[4])*inv*load(b,j,p[4]));
+}
+
+kernel void softmax_ordered(ARGS, uint row [[thread_position_in_grid]]) {
+    uint w=p[1], base=row*w; if(base>=p[0]) return;
+    float mx=-INFINITY; for(uint j=0;j<w;j++) mx=max(mx,load(a,base+j,p[4]));
+    float sum=0; for(uint j=0;j<w;j++) sum+=exp(load(a,base+j,p[4])-mx);
+    for(uint j=0;j<w;j++) store(c,base+j,p[4],exp(load(a,base+j,p[4])-mx)/sum);
 }
