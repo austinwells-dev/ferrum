@@ -14,6 +14,7 @@ fn main() -> Result<()> {
     let cfg = qwen::QwenConfig::from_file(dir.join("config.json"))?;
     let mut c = cfg.convert()?;
     let diagnostic_f32 = std::env::args().any(|a| a == "--diagnostic-f32");
+    d.set_reference_math(diagnostic_f32)?;
     let tok = QwenTokenizer::load(dir, &cfg)?;
     let (text, ids) = tok.encode_prompt("Hello!", DEFAULT_SYSTEM, false)?;
     println!("prompt={text:?}\nids={ids:?}");

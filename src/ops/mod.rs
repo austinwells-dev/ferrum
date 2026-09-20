@@ -118,7 +118,11 @@ impl MetalDevice {
         p[1] = index(w)?;
         p[7] = eps.to_bits();
         self.run(
-            "rmsnorm",
+            if self.reference_math() && a.dtype() == DType::F32 {
+                "rmsnorm_ordered"
+            } else {
+                "rmsnorm"
+            },
             a,
             Some(weight),
             a.shape().dimensions(),

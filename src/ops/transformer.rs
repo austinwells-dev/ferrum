@@ -253,7 +253,11 @@ impl MetalDevice {
         p[1] = index(ad[0])?;
         p[2] = index(ad[1])?;
         p[3] = index(bd[0])?;
-        let name = if ad[0] == 1 && a.dtype() != DType::F32 { "gemv" } else { "matmul_nt" };
+        let name = if ad[0] == 1 && a.dtype() != DType::F32 {
+            "gemv"
+        } else {
+            "matmul_nt"
+        };
         self.run(name, a, Some(weight), &[ad[0], bd[0]], p, [bd[0], ad[0]])
     }
 }

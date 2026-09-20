@@ -165,6 +165,7 @@ impl Drop for Execution<'_> {
 }
 pub struct MetalDevice {
     arena: Rc<RefCell<Arena>>,
+    reference_math: Cell<bool>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
     pending: RefCell<Option<Submission>>,
@@ -191,6 +192,7 @@ impl MetalDevice {
             .ok_or_else(|| Error::Initialization("command queue creation failed".into()))?;
         Ok(Self {
             arena: Rc::new(RefCell::new(Arena::default())),
+            reference_math: Cell::new(false),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
             pending: RefCell::new(None),
@@ -205,6 +207,18 @@ impl MetalDevice {
             pipelines: RefCell::new(HashMap::new()),
             builtins: RefCell::new(HashMap::new()),
         })
+    }
+    /// Validation-only ordered reductions reproduce the immutable F32 diagnostic.
+    /// Ordinary inference uses the parallel kernels.
+    pub fn set_reference_math(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter("cannot change math in execution".into()));
+        }
+        self.reference_math.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn reference_math(&self) -> bool {
+        self.reference_math.get()
     }
     /// Maximum kernels per completion boundary in model execution. One is the control.
     pub fn set_batch_limit(&self, limit: usize) -> Result<()> {
@@ -481,7 +495,26 @@ impl MetalDevice {
                     3,
                 );
             }
-            if name == "gemv" {
+            if name == "rmsnorm" {
+                if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 256
+                {
+                    return Err(Error::Dispatch(
+                        "parallel reduction requires 32-wide SIMD and 256-thread groups".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0],
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 256,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if name == "gemv" {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
                     return Err(Error::Dispatch(

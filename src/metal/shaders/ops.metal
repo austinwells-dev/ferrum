@@ -21,11 +21,39 @@ inline void store(device uchar* p, uint i, uint dtype, float x) {
 kernel void add(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) store(c,i,p[4],load(a,i,p[4])+load(b,i,p[4])); }
 kernel void mul(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) store(c,i,p[4],load(a,i,p[4])*load(b,i,p[4])); }
 kernel void silu(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) { float x=load(a,i,p[4]); float s=x>=0 ? 1.f/(1.f+exp(-x)) : exp(x)/(1.f+exp(x)); store(c,i,p[4],x*s); } }
-kernel void rmsnorm(ARGS, uint row [[thread_position_in_grid]]) {
-    uint w=p[1], base=row*w; if(base>=p[0]) return;
-    float sum=0; for(uint j=0;j<w;j++) { float x=load(a,base+j,p[4]); sum+=x*x; }
+kernel void rmsnorm(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[8];
+    uint w=p[1], base=row*w, lane=tid%32, simd=tid/32;
+    float sum=0;
+    for(uint j=tid;j<w;j+=256) { float x=load(a,base+j,p[4]); sum+=x*x; }
+    sum=simd_sum(sum);
+    if(lane==0) partial[simd]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum=simd_sum(lane<8?partial[lane]:0.f);
     float inv=rsqrt(sum/float(w)+as_type<float>(p[7]));
-    for(uint j=0;j<w;j++) store(c,base+j,p[4],load(a,base+j,p[4])*inv*load(b,j,p[4]));
+    // BF16 midpoint sensitivity: only rows close to a storage rounding boundary
+    // need the legacy ascending sum to preserve the established model path.
+    threadgroup uint ambiguous[8];
+    threadgroup float ordered_inv;
+    uint near=0;
+    if(p[4]==2) for(uint j=tid;j<w;j+=256) {
+        float value=load(a,base+j,p[4])*inv*load(b,j,p[4]);
+        uint fraction=as_type<uint>(value)&65535;
+        near |= uint(abs(int(fraction)-32768)<=8);
+    }
+    near=simd_max(near);
+    if(lane==0) ambiguous[simd]=near;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    near=simd_max(lane<8?ambiguous[lane]:0u);
+    if(near && tid==0) {
+        float ordered=0;
+        for(uint j=0;j<w;j++) {float x=load(a,base+j,p[4]);ordered+=x*x;}
+        ordered_inv=rsqrt(ordered/float(w)+as_type<float>(p[7]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(near) inv=ordered_inv;
+    for(uint j=tid;j<w;j+=256) store(c,base+j,p[4],load(a,base+j,p[4])*inv*load(b,j,p[4]));
+
 }
 kernel void softmax(ARGS, uint row [[thread_position_in_grid]]) {
     uint w=p[1], base=row*w; if(base>=p[0]) return;
@@ -133,4 +161,12 @@ kernel void matmul_nt(ARGS, uint2 tid [[thread_position_in_threadgroup]], uint2 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     if(row<m && col<n) store(c,row*n+col,p[4],sum);
+}
+
+// Diagnostic-only ordered reduction; never selected for production BF16 inference.
+kernel void rmsnorm_ordered(ARGS, uint row [[thread_position_in_grid]]) {
+    uint w=p[1], base=row*w; if(base>=p[0]) return;
+    float sum=0; for(uint j=0;j<w;j++) {float x=load(a,base+j,p[4]);sum+=x*x;}
+    float inv=rsqrt(sum/float(w)+as_type<float>(p[7]));
+    for(uint j=0;j<w;j++) store(c,base+j,p[4],load(a,base+j,p[4])*inv*load(b,j,p[4]));
 }
