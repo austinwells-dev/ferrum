@@ -88,6 +88,7 @@ pub struct StorageInfo {
 #[derive(Clone)]
 pub struct Tensor {
     storage: Rc<MetalBuffer>,
+    offset: usize,
     shape: Shape,
     layout: Layout,
     dtype: DType,
@@ -99,6 +100,7 @@ impl Tensor {
         let storage = Rc::new(device.allocate(shape.byte_size(dtype)?)?);
         Ok(Self {
             storage,
+            offset: 0,
             shape,
             layout,
             dtype,
@@ -110,6 +112,7 @@ impl Tensor {
         let storage = Rc::new(device.allocate_output(shape.byte_size(dtype)?)?);
         Ok(Self {
             storage,
+            offset: 0,
             shape,
             layout,
             dtype,
@@ -143,6 +146,7 @@ impl Tensor {
         });
         Ok(Self {
             storage: Rc::new(storage),
+            offset: 0,
             shape,
             layout,
             dtype,
@@ -164,6 +168,7 @@ impl Tensor {
         storage.with_bytes_mut(|dst| dst.copy_from_slice(data)); // Apple Silicon is little-endian.
         Ok(Self {
             storage: Rc::new(storage),
+            offset: 0,
             shape,
             layout,
             dtype,
@@ -171,7 +176,7 @@ impl Tensor {
     }
     pub fn to_f32(&self) -> Vec<f32> {
         self.storage.with_bytes(|bytes| {
-            bytes
+            bytes[self.offset..self.offset + self.byte_size()]
                 .chunks_exact(self.dtype.size_bytes())
                 .map(|b| match self.dtype {
                     DType::F32 => f32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
@@ -194,12 +199,12 @@ impl Tensor {
         self.shape.numel()
     }
     pub fn byte_size(&self) -> usize {
-        self.storage.len_bytes()
+        self.numel() * self.dtype.size_bytes()
     }
     pub fn storage_info(&self) -> StorageInfo {
         StorageInfo {
             allocation_bytes: self.storage.allocation_bytes(),
-            offset_bytes: 0,
+            offset_bytes: self.offset,
             length_bytes: self.byte_size(),
             alignment: self.storage.alignment(),
             mode: "shared",
@@ -214,10 +219,42 @@ impl Tensor {
         let layout = Layout::contiguous(&shape)?;
         Ok(Self {
             storage: self.storage.clone(),
+            offset: self.offset,
             shape,
             layout,
             dtype: self.dtype,
         })
+    }
+    /// Restricted contiguous view. No arbitrary strides or mutable mapping.
+    pub fn view(&self, start: usize, dims: impl AsRef<[usize]>) -> Result<Self> {
+        let shape = Shape::new(dims)?;
+        if start
+            .checked_add(shape.numel())
+            .is_none_or(|end| end > self.numel())
+        {
+            return Err(Error::Range("view exceeds logical input range".into()));
+        }
+        let offset = start
+            .checked_mul(self.dtype.size_bytes())
+            .and_then(|n| self.offset.checked_add(n))
+            .ok_or_else(|| Error::Range("view offset overflow".into()))?;
+        let end = offset
+            .checked_add(shape.byte_size(self.dtype)?)
+            .ok_or_else(|| Error::Range("view range overflow".into()))?;
+        if end > self.storage.len_bytes() {
+            return Err(Error::Range("view exceeds storage".into()));
+        }
+        let layout = Layout::contiguous(&shape)?;
+        Ok(Self {
+            storage: self.storage.clone(),
+            offset,
+            shape,
+            layout,
+            dtype: self.dtype,
+        })
+    }
+    pub(crate) fn binding(&self) -> (&MetalBuffer, usize) {
+        (&self.storage, self.offset)
     }
     pub(crate) fn buffer(&self) -> &MetalBuffer {
         &self.storage

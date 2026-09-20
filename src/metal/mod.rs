@@ -427,12 +427,15 @@ impl MetalDevice {
     pub(crate) fn dispatch(
         &self,
         name: &'static str,
-        buffers: &[&MetalBuffer],
+        buffers: &[(&MetalBuffer, usize)],
         params: &[u32; 9],
         grid: [usize; 2],
         tiled: bool,
     ) -> Result<DispatchTiming> {
-        for b in buffers {
+        for (b, offset) in buffers {
+            if *offset > b.len_bytes() {
+                return Err(Error::Range("binding offset exceeds allocation".into()));
+            }
             if !self.owns(b) {
                 return Err(Error::DeviceMismatch);
             }
@@ -469,8 +472,8 @@ impl MetalDevice {
             // SAFETY: crate-private callers validate dimensions, dtypes and lengths against the
             // embedded kernel ABI. Buffers stay alive through completion; params is copied by Metal.
             unsafe {
-                for (i, b) in buffers.iter().enumerate() {
-                    encoder.setBuffer_offset_atIndex(Some(&b.raw), 0, i);
+                for (i, (b, offset)) in buffers.iter().enumerate() {
+                    encoder.setBuffer_offset_atIndex(Some(&b.raw), *offset, i);
                 }
                 encoder.setBytes_length_atIndex(
                     NonNull::from(params).cast(),
@@ -512,8 +515,8 @@ impl MetalDevice {
             encoder.endEncoding();
             submission
                 .resources
-                .extend(buffers.iter().map(|b| b.raw.clone()));
-            *buffers[2].ready.borrow_mut() = Some(submission.ready.clone());
+                .extend(buffers.iter().map(|(b, _)| b.raw.clone()));
+            *buffers[2].0.ready.borrow_mut() = Some(submission.ready.clone());
             submission.dispatches += 1;
             let flush = !self.batching.get() || submission.dispatches >= self.batch_limit.get();
             let mut counters = self.counters.get();

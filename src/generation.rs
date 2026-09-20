@@ -2,18 +2,14 @@
 #![forbid(unsafe_code)]
 use crate::{Error, MetalDevice, Result, Tensor};
 /// Copy only the final [vocabulary] row using the existing checked copy operation.
-pub fn final_logits(d: &MetalDevice, logits: &Tensor) -> Result<Vec<f32>> {
+pub fn final_logits(_d: &MetalDevice, logits: &Tensor) -> Result<Vec<f32>> {
     let shape = logits.shape().dimensions();
     if shape.len() != 2 || shape.contains(&0) {
         return Err(Error::Shape(
             "logits require nonempty [sequence,vocabulary]".into(),
         ));
     }
-    Ok(
-        d.copy_range(logits, (shape[0] - 1) * shape[1], &[shape[1]])?
-            .tensor
-            .to_f32(),
-    )
+    Ok(logits.view((shape[0] - 1) * shape[1], [shape[1]])?.to_f32())
 }
 pub fn argmax(logits: &[f32]) -> Result<u32> {
     if logits.is_empty()

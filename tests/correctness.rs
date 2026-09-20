@@ -315,3 +315,21 @@ fn bf16_gpu_rounding_ties_and_nan() {
     assert!(values[2].is_nan());
     assert_eq!(values[3], f32::INFINITY);
 }
+
+#[test]
+fn contiguous_views_check_ranges_and_dispatch_offsets() {
+    let d = MetalDevice::new().unwrap();
+    for ty in [DType::F32, DType::F16, DType::BF16] {
+        let a = Tensor::from_f32(&d, [8], ty, &[0., 1., 2., 3., 4., 5., 6., 7.]).unwrap();
+        let v = a.view(2, [2, 2]).unwrap();
+        assert_eq!(v.to_f32(), [2., 3., 4., 5.]);
+        assert_eq!(v.storage_info().offset_bytes, 2 * ty.size_bytes());
+        let nested = v.view(1, [2]).unwrap();
+        assert_eq!(d.add(&nested, &nested).unwrap().tensor.to_f32(), [6., 8.]);
+        assert!(v.view(3, [2]).is_err());
+        assert!(v.view(usize::MAX, [2]).is_err());
+        assert_eq!(a.view(8, [0]).unwrap().to_f32(), Vec::<f32>::new());
+        drop(a);
+        assert_eq!(nested.to_f32(), [3., 4.]);
+    }
+}

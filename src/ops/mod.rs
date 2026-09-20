@@ -48,7 +48,7 @@ impl MetalDevice {
         p[4] = a.dtype() as u32;
         let timing = self.dispatch(
             name,
-            &[a.buffer(), b.unwrap_or(a).buffer(), tensor.buffer()],
+            &[a.binding(), b.unwrap_or(a).binding(), tensor.binding()],
             &p,
             grid,
             name == "matmul",

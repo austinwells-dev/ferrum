@@ -163,3 +163,24 @@ impl MetalDevice {
         self.run("rope_split", a, None, d, p, [a.numel() / 2, 1])
     }
 }
+
+impl MetalDevice {
+    /// Internal append-only KV write. Caller reserves an unpublished suffix before
+    /// calling; no published tensor may cover the destination range.
+    pub(crate) fn write_kv(&self, source: &Tensor, suffix: &Tensor) -> Result<()> {
+        if source.dtype() != suffix.dtype() || source.numel() != suffix.numel() {
+            return Err(Error::Cache("KV write shape/dtype mismatch".into()));
+        }
+        let mut p = [0; 9];
+        p[0] = index(source.numel())?;
+        p[4] = source.dtype() as u32;
+        self.dispatch(
+            "copy_range",
+            &[source.binding(), source.binding(), suffix.binding()],
+            &p,
+            [source.numel(), 1],
+            false,
+        )?;
+        Ok(())
+    }
+}

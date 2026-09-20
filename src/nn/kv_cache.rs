@@ -1,8 +1,17 @@
 use crate::{DType, Error, MetalDevice, Result, Tensor};
-/// Immutable active K/V tensors [length, KV heads, head dim]. Appends copy.
+use std::{cell::Cell, rc::Rc};
+#[derive(Clone)]
+struct LayerCache {
+    active: (Tensor, Tensor),
+    storage: (Tensor, Tensor),
+    // Monotonic reservation, shared with snapshots. A fork must allocate its own
+    // storage if it would overwrite any previously published/reserved suffix.
+    reserved: Rc<Cell<usize>>,
+}
+/// Immutable active prefix views over append-only, capacity-backed K/V storage.
 #[derive(Clone)]
 pub struct KvCache {
-    layers: Vec<Option<(Tensor, Tensor)>>,
+    layers: Vec<Option<LayerCache>>,
     capacity: usize,
     heads: usize,
     dim: usize,
@@ -52,7 +61,7 @@ impl KvCache {
             .get(layer)
             .ok_or_else(|| Error::Cache("layer index out of range".into()))?
             .as_ref()
-            .map_or(0, |(k, _)| k.shape().dimensions()[0]))
+            .map_or(0, |entry| entry.active.0.shape().dimensions()[0]))
     }
     pub fn active(&self, layer: usize) -> Result<Option<(&Tensor, &Tensor)>> {
         Ok(self
@@ -60,7 +69,7 @@ impl KvCache {
             .get(layer)
             .ok_or_else(|| Error::Cache("layer index out of range".into()))?
             .as_ref()
-            .map(|(k, v)| (k, v)))
+            .map(|entry| (&entry.active.0, &entry.active.1)))
     }
     pub fn validate_for(&self, c: &crate::model::ModelConfig, extra: usize) -> Result<usize> {
         if self.layers.len() != c.num_layers
@@ -99,14 +108,48 @@ impl KvCache {
         {
             return Err(Error::Cache("capacity overflow".into()));
         }
-        let pair = match self.active(layer)? {
-            None => (k.clone(), v.clone()),
-            Some((oldk, oldv)) => (
-                d.concat_first(oldk, k)?.tensor,
-                d.concat_first(oldv, v)?.tensor,
-            ),
+        let end = offset + dims[0];
+        let row = self.heads * self.dim;
+        let existing = self.layers[layer].as_ref();
+        let entry = if let Some(entry) = existing.filter(|e| e.reserved.get() == offset) {
+            entry.clone()
+        } else {
+            let storage = (
+                Tensor::zeros(d, [self.capacity, self.heads, self.dim], self.dtype)?,
+                Tensor::zeros(d, [self.capacity, self.heads, self.dim], self.dtype)?,
+            );
+            if let Some(old) = existing {
+                // Explicit cache branching/rollback only; ordinary decode never copies history.
+                d.write_kv(
+                    &old.active.0,
+                    &storage.0.view(0, old.active.0.shape().dimensions())?,
+                )?;
+                d.write_kv(
+                    &old.active.1,
+                    &storage.1.view(0, old.active.1.shape().dimensions())?,
+                )?;
+            }
+            LayerCache {
+                active: (
+                    storage.0.view(0, [offset, self.heads, self.dim])?,
+                    storage.1.view(0, [offset, self.heads, self.dim])?,
+                ),
+                storage,
+                reserved: Rc::new(Cell::new(offset)),
+            }
         };
-        self.layers[layer] = Some(pair);
+        // Reserve before any fallible dispatch; failures can never authorize reuse
+        // of a range that an already encoded command might still write.
+        entry.reserved.set(end);
+        d.write_kv(k, &entry.storage.0.view(offset * row, dims)?)?;
+        d.write_kv(v, &entry.storage.1.view(offset * row, dims)?)?;
+        self.layers[layer] = Some(LayerCache {
+            active: (
+                entry.storage.0.view(0, [end, self.heads, self.dim])?,
+                entry.storage.1.view(0, [end, self.heads, self.dim])?,
+            ),
+            ..entry
+        });
         Ok(())
     }
     pub fn reset(&mut self) {
@@ -116,7 +159,7 @@ impl KvCache {
         self.layers
             .iter()
             .flatten()
-            .map(|(k, v)| k.byte_size() + v.byte_size())
+            .map(|entry| entry.active.0.byte_size() + entry.active.1.byte_size())
             .sum()
     }
 }

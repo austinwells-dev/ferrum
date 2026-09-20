@@ -341,3 +341,31 @@ fn integer_embedding_ids_and_long_rope_offsets() {
         assert!(d.rope_split(&x, usize::MAX, 10000.).is_err());
     }
 }
+
+#[test]
+fn capacity_cache_preserves_snapshots_and_branch_prefixes() {
+    let d = MetalDevice::new().unwrap();
+    let mut cache = KvCache::new(1, 8, 1, 2, DType::F32).unwrap();
+    let a = Tensor::from_f32(&d, [1, 1, 2], DType::F32, &[1., 2.]).unwrap();
+    let b = Tensor::from_f32(&d, [1, 1, 2], DType::F32, &[3., 4.]).unwrap();
+    let c = Tensor::from_f32(&d, [1, 1, 2], DType::F32, &[5., 6.]).unwrap();
+    cache.append(&d, 0, &a, &a).unwrap();
+    let prefix = cache.active(0).unwrap().unwrap().0.clone();
+    let mut branch = cache.clone();
+    let before = d.counters().allocated_bytes;
+    cache.append(&d, 0, &b, &b).unwrap();
+    assert_eq!(d.counters().allocated_bytes, before);
+    branch.append(&d, 0, &c, &c).unwrap();
+    assert_eq!(prefix.to_f32(), [1., 2.]);
+    assert_eq!(
+        cache.active(0).unwrap().unwrap().0.to_f32(),
+        [1., 2., 3., 4.]
+    );
+    assert_eq!(
+        branch.active(0).unwrap().unwrap().0.to_f32(),
+        [1., 2., 5., 6.]
+    );
+    cache.reset();
+    cache.append(&d, 0, &c, &c).unwrap();
+    assert_eq!(prefix.to_f32(), [1., 2.]);
+}
