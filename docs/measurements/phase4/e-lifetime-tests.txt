@@ -1,0 +1,13 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.62s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 5 tests
+test metal::tests::mapping_is_excluded_until_scope_completion ... ok
+test metal::arena_tests::arena_never_recycles_live_or_pending_tensors ... ok
+test metal::failed_completion_tests::failed_suffix_does_not_poison_published_cache_prefix ... ok
+test metal::transaction_tests::late_encoder_failure_preserves_cache_and_retry ... ok
+test metal::tests::execution_owns_dropped_intermediates_and_drains_on_error ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s
+

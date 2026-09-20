@@ -5,6 +5,7 @@ fn main() -> Result<()> {
     let device = MetalDevice::new()?;
     match std::env::args().nth(1).as_deref().unwrap_or("info") {
         "info" => {
+            println!("Capabilities: {}", device.capabilities()?);
             println!(
                 "Runtime device: {}\nBackend: Metal\nUnified memory: {}\nRecommended max working set: {} bytes\nMax buffer: {} bytes\nSupported Apple GPU families (queried 1–10): {:?}",
                 device.name(),
@@ -14,7 +15,7 @@ fn main() -> Result<()> {
                 device.apple_families()
             );
         }
-        "run" => run::run(&device)?,
+        "run" | "profile" => run::run(&device)?,
         "transformer-smoke" => transformer_smoke::run(&device)?,
         "smoke" => {
             println!("Metal device: {}", device.name());

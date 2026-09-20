@@ -189,3 +189,33 @@ kernel void softmax_ordered(ARGS, uint row [[thread_position_in_grid]]) {
     float sum=0; for(uint j=0;j<w;j++) sum+=exp(load(a,base+j,p[4])-mx);
     for(uint j=0;j<w;j++) store(c,base+j,p[4],exp(load(a,base+j,p[4])-mx)/sum);
 }
+// Experimental native storage SIMD-group GEMM. Capability gated on the host.
+template<typename T>
+void native_project(device const uchar* a, device const uchar* b, device uchar* c, constant uint* p,
+                    uint tid, uint2 group, threadgroup T* aa, threadgroup T* bb, threadgroup float* cc) {
+    uint row=group.y*8, col=group.x*8, k=p[2], n=p[3], m=p[1];
+    simdgroup_float8x8 sum(0.f);
+    for(uint tile=0;tile<k;tile+=8) {
+        for(uint i=tid;i<64;i+=32) {
+            uint r=i/8, j=i%8;
+            aa[i]=(row+r<m && tile+j<k)?((device const T*)a)[(row+r)*k+tile+j]:T(0);
+            bb[i]=(col+j<n && tile+r<k)?((device const T*)b)[(col+j)*k+tile+r]:T(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_matrix<T,8,8> x,y;
+        simdgroup_load(x,aa,8); simdgroup_load(y,bb,8);
+        simdgroup_multiply_accumulate(sum,x,y,sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(sum,cc,8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint i=tid;i<64;i+=32) if(row+i/8<m && col+i%8<n) store(c,(row+i/8)*n+col+i%8,p[4],cc[i]);
+}
+kernel void project_bf16(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat aa[64],bb[64]; threadgroup float cc[64];
+    native_project<bfloat>(a,b,c,p,tid,group,aa,bb,cc);
+}
+kernel void project_f16(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup half aa[64],bb[64]; threadgroup float cc[64];
+    native_project<half>(a,b,c,p,tid,group,aa,bb,cc);
+}

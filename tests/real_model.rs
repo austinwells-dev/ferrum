@@ -13,6 +13,9 @@ fn official_qwen_bf16_cached_generation() {
         .map(std::path::PathBuf::from)
         .expect("set FERRUM_QWEN_MODEL to the official checkpoint directory");
     let d = MetalDevice::new().unwrap();
+    if let Ok(value) = std::env::var("FERRUM_NATIVE_MATMUL") {
+        d.set_native_matmul(value != "0").unwrap();
+    }
     let qc = QwenConfig::from_file(dir.join("config.json")).unwrap();
     let c = qc.convert().unwrap();
     let tok = QwenTokenizer::load(&dir, &qc).unwrap();
@@ -97,4 +100,36 @@ fn official_qwen_bf16_cached_generation() {
         }
     }
     assert_eq!(output, "Hello 世界 🌙 café!");
+}
+
+#[test]
+#[ignore = "128-token lifetime stress requires official local Qwen checkpoint"]
+fn official_qwen_long_lifetime_stress() {
+    let dir =
+        std::path::PathBuf::from(std::env::var_os("FERRUM_QWEN_MODEL").expect("model directory"));
+    let d = MetalDevice::new().unwrap();
+    let qc = QwenConfig::from_file(dir.join("config.json")).unwrap();
+    let config = qc.convert().unwrap();
+    let tok = QwenTokenizer::load(&dir, &qc).unwrap();
+    let (_, ids) = tok.encode_prompt("Hello!", DEFAULT_SYSTEM, false).unwrap();
+    let w = Weights::from_file(&d, dir.join("model.safetensors")).unwrap();
+    let model = qwen::construct(&d, config, &w).unwrap();
+    drop(w);
+    // Suppress EOS solely to stress 128 successive actual cached invocations.
+    let result =
+        generation::generate(&d, &model, &ids, 128, &[], generation::argmax, |_| Ok(())).unwrap();
+    assert_eq!(result.tokens.len(), 128);
+    assert_eq!(result.decode.len(), 127);
+    assert!(
+        result
+            .decode_counters
+            .iter()
+            .all(|c| c.completion_waits <= 2)
+    );
+    println!("stress_final_counters={:?}", result.decode_counters.last());
+    let (first, mut cache) = model.forward_prefill(&d, &ids).unwrap();
+    let expected = first.to_f32();
+    cache.reset();
+    let again = model.forward(&d, &ids, &mut cache, None).unwrap();
+    assert_eq!(again.to_f32(), expected);
 }

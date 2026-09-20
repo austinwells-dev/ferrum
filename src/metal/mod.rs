@@ -23,9 +23,16 @@ pub struct ComputePipeline {
 }
 /// Shared, owned allocation. No mapped pointers escape this module.
 /// Rc deliberately makes storage and the device !Send and !Sync in Phase 1.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Completion {
+    Encoding,
+    Completed,
+    Failed,
+}
 type RetiredBuffer = (
     Retained<ProtocolObject<dyn MTLBuffer>>,
-    Option<Rc<Cell<bool>>>,
+    Option<Rc<Cell<Completion>>>,
+    bool,
 );
 #[derive(Default)]
 struct Arena {
@@ -36,17 +43,42 @@ struct Arena {
     high_water: usize,
 }
 impl Arena {
+    fn complete(&mut self) {
+        let mut retired = 0;
+        let mut released = 0;
+        let over_capacity = self.capacity > 64 * 1024 * 1024;
+        for (bytes, bin) in &mut self.free {
+            bin.retain_mut(|(_, ready, counted)| {
+                let state = ready.as_ref().map_or(Completion::Completed, |r| r.get());
+                if state != Completion::Encoding && *counted {
+                    retired += *bytes;
+                    *counted = false;
+                }
+                if state == Completion::Failed || (over_capacity && state == Completion::Completed)
+                {
+                    released += *bytes;
+                    false
+                } else {
+                    true
+                }
+            });
+        }
+        self.live -= retired;
+        self.capacity -= released;
+    }
     fn acquire(&mut self, bytes: usize) {
         self.live += bytes;
         self.peak = self.peak.max(self.live);
         self.high_water = self.high_water.max(self.capacity);
     }
 }
+type WriteRange = (usize, usize, Rc<Cell<Completion>>);
 pub struct MetalBuffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
     owner: Rc<()>,
-    ready: RefCell<Option<Rc<Cell<bool>>>>,
+    ready: RefCell<Option<Rc<Cell<Completion>>>>,
+    writes: RefCell<Vec<WriteRange>>,
     arena: Option<Rc<RefCell<Arena>>>,
 }
 impl Drop for MetalBuffer {
@@ -54,15 +86,23 @@ impl Drop for MetalBuffer {
         if let Some(arena) = &self.arena {
             let mut arena = arena.borrow_mut();
             let bytes = self.raw.length();
-            arena.live -= bytes;
+            let state = self
+                .ready
+                .borrow()
+                .as_ref()
+                .map_or(Completion::Completed, |r| r.get());
+            let pending = state == Completion::Encoding;
+            if !pending {
+                arena.live -= bytes;
+            }
             // A pool entry exists only after the final Tensor owner is gone.
             // A pending epoch keeps it ineligible until successful completion.
-            if arena.capacity <= 64 * 1024 * 1024 {
-                arena
-                    .free
-                    .entry(bytes)
-                    .or_default()
-                    .push((self.raw.clone(), self.ready.borrow().clone()));
+            if pending || (state == Completion::Completed && arena.capacity <= 64 * 1024 * 1024) {
+                arena.free.entry(bytes).or_default().push((
+                    self.raw.clone(),
+                    self.ready.borrow().clone(),
+                    pending,
+                ));
             } else {
                 arena.capacity -= bytes;
             }
@@ -88,15 +128,33 @@ impl MetalBuffer {
         };
         f(bytes)
     }
-    pub(crate) fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+    fn readable(&self, offset: usize, length: usize) -> bool {
+        self.writes.borrow().iter().all(|(start, end, state)| {
+            offset + length <= *start || offset >= *end || state.get() == Completion::Completed
+        })
+    }
+    pub(crate) fn with_bytes<T>(
+        &self,
+        offset: usize,
+        length: usize,
+        f: impl FnOnce(&[u8]) -> T,
+    ) -> T {
         assert!(
-            self.ready.borrow().as_ref().is_none_or(|r| r.get()),
-            "GPU output is not successfully completed"
+            offset
+                .checked_add(length)
+                .is_some_and(|end| end <= self.len)
+        );
+        assert!(
+            self.readable(offset, length),
+            "GPU output range is not successfully completed"
         );
         // SAFETY: all bytes are initialized; dispatch waits before returning on both success
         // and GPU error. Rc prevents cross-thread use; only read-only tensors are published.
         let bytes = unsafe {
-            std::slice::from_raw_parts(self.raw.contents().as_ptr().cast::<u8>(), self.len)
+            std::slice::from_raw_parts(
+                self.raw.contents().as_ptr().cast::<u8>().add(offset),
+                length,
+            )
         };
         f(bytes)
     }
@@ -109,7 +167,7 @@ pub struct DispatchTiming {
     pub dispatches: usize,
 }
 /// Single-threaded synchronous execution context with one queue and cached pipelines.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
 pub struct Counters {
     pub allocations: usize,
     pub allocated_bytes: usize,
@@ -119,6 +177,7 @@ pub struct Counters {
     pub encode: Duration,
     pub wait: Duration,
     pub gpu: Duration,
+    pub allocation_time: Duration,
     pub reused_bytes: usize,
     pub transient_live_bytes: usize,
     pub transient_peak_bytes: usize,
@@ -144,7 +203,7 @@ pub type Profile = std::collections::BTreeMap<&'static str, ProfileEntry>;
 struct Submission {
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     resources: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
-    ready: Rc<Cell<bool>>,
+    ready: Rc<Cell<Completion>>,
     dispatches: usize,
 }
 /// Private scope: model code must finish before publishing cache or results.
@@ -164,7 +223,12 @@ impl Drop for Execution<'_> {
     }
 }
 pub struct MetalDevice {
+    #[cfg(test)]
+    fail_after: Cell<Option<usize>>,
+    #[cfg(test)]
+    fail_completion: Cell<bool>,
     arena: Rc<RefCell<Arena>>,
+    native_matmul: Cell<bool>,
     reference_math: Cell<bool>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
@@ -191,7 +255,12 @@ impl MetalDevice {
             .newCommandQueue()
             .ok_or_else(|| Error::Initialization("command queue creation failed".into()))?;
         Ok(Self {
+            #[cfg(test)]
+            fail_after: Cell::new(None),
+            #[cfg(test)]
+            fail_completion: Cell::new(false),
             arena: Rc::new(RefCell::new(Arena::default())),
+            native_matmul: Cell::new(raw.supportsFamily(MTLGPUFamily::Apple7)),
             reference_math: Cell::new(false),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
@@ -207,6 +276,24 @@ impl MetalDevice {
             pipelines: RefCell::new(HashMap::new()),
             builtins: RefCell::new(HashMap::new()),
         })
+    }
+    pub fn set_native_matmul(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() || (enabled && !self.raw.supportsFamily(MTLGPUFamily::Apple7)) {
+            return Err(Error::Parameter(
+                "native SIMD matrix support required".into(),
+            ));
+        }
+        self.native_matmul.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn native_matmul(&self) -> bool {
+        self.native_matmul.get()
+    }
+    pub fn capabilities(&self) -> Result<serde_json::Value> {
+        let pipeline = self.builtin("gemv")?;
+        Ok(
+            serde_json::json!({"apple_families":self.apple_families(),"metal4":self.raw.supportsFamily(MTLGPUFamily::Metal4),"msl_requested":"3.1","simdgroup_matrix":self.raw.supportsFamily(MTLGPUFamily::Apple7),"native_bfloat_compiled":self.builtin("project_bf16").is_ok(),"thread_execution_width":pipeline.raw.threadExecutionWidth(),"pipeline_max_threads":pipeline.raw.maxTotalThreadsPerThreadgroup(),"device_max_threads":self.raw.maxThreadsPerThreadgroup().width,"recommended_working_set":self.recommended_max_working_set(),"storage":"shared","hazards":"tracked"}),
+        )
     }
     /// Validation-only ordered reductions reproduce the immutable F32 diagnostic.
     /// Ordinary inference uses the parallel kernels.
@@ -250,7 +337,12 @@ impl MetalDevice {
             counters.gpu += Duration::from_secs_f64(seconds);
         }
         self.counters.set(counters);
-        if submission.command.status() != MTLCommandBufferStatus::Completed {
+        let succeeded = submission.command.status() == MTLCommandBufferStatus::Completed;
+        #[cfg(test)]
+        let succeeded = succeeded && !self.fail_completion.replace(false);
+        if !succeeded {
+            submission.ready.set(Completion::Failed);
+            self.arena.borrow_mut().complete();
             return Err(Error::Synchronization(
                 submission
                     .command
@@ -259,7 +351,8 @@ impl MetalDevice {
                     .unwrap_or_else(|| format!("status {:?}", submission.command.status())),
             ));
         }
-        submission.ready.set(true);
+        submission.ready.set(Completion::Completed);
+        self.arena.borrow_mut().complete();
         // submission.resources drops only after the wait and status check.
         Ok(())
     }
@@ -329,6 +422,7 @@ impl MetalDevice {
         self.pipelines.borrow().len()
     }
     pub fn allocate(&self, bytes: usize) -> Result<MetalBuffer> {
+        let start = Instant::now();
         let length = bytes.max(4);
         if length > self.max_buffer_length() {
             return Err(Error::Allocation(bytes));
@@ -344,12 +438,14 @@ impl MetalDevice {
         let mut counters = self.counters.get();
         counters.allocations += 1;
         counters.allocated_bytes += length;
+        counters.allocation_time += start.elapsed();
         self.counters.set(counters);
         Ok(MetalBuffer {
             raw,
             len: bytes,
             owner: self.owner.clone(),
             ready: RefCell::new(None),
+            writes: RefCell::new(Vec::new()),
             arena: None,
         })
     }
@@ -366,11 +462,13 @@ impl MetalDevice {
             .ok_or(Error::Allocation(bytes))?;
         let mut arena = self.arena.borrow_mut();
         let bin = arena.free.entry(length).or_default();
-        let available = bin
-            .iter()
-            .rposition(|(_, ready)| ready.as_ref().is_none_or(|r| r.get()));
+        let available = bin.iter().rposition(|(_, ready, _)| {
+            ready
+                .as_ref()
+                .is_none_or(|r| r.get() == Completion::Completed)
+        });
         let mut buffer = if let Some(i) = available {
-            let (raw, _) = bin.swap_remove(i);
+            let (raw, _, _) = bin.swap_remove(i);
             let mut counters = self.counters.get();
             counters.reused_bytes += length;
             self.counters.set(counters);
@@ -379,6 +477,7 @@ impl MetalDevice {
                 len: bytes,
                 owner: self.owner.clone(),
                 ready: RefCell::new(None),
+                writes: RefCell::new(Vec::new()),
                 arena: None,
             }
         } else {
@@ -400,6 +499,7 @@ impl MetalDevice {
             let mut libraries = self.libraries.borrow_mut();
             if !libraries.contains_key(source) {
                 let options = MTLCompileOptions::new();
+                options.setLanguageVersion(MTLLanguageVersion::Version3_1);
                 options.setMathMode(MTLMathMode::Safe);
                 options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
                 let lib = self
@@ -441,17 +541,37 @@ impl MetalDevice {
     pub(crate) fn dispatch(
         &self,
         name: &'static str,
-        buffers: &[(&MetalBuffer, usize)],
+        buffers: &[(&MetalBuffer, usize, usize)],
         params: &[u32; 9],
         grid: [usize; 2],
         tiled: bool,
     ) -> Result<DispatchTiming> {
-        for (b, offset) in buffers {
-            if *offset > b.len_bytes() {
+        #[cfg(test)]
+        if self
+            .fail_after
+            .get()
+            .is_some_and(|n| self.counters.get().dispatches >= n)
+        {
+            return Err(Error::Dispatch("injected encoder failure".into()));
+        }
+        for (b, offset, length) in buffers {
+            if offset
+                .checked_add(*length)
+                .is_none_or(|end| end > b.len_bytes())
+            {
                 return Err(Error::Range("binding offset exceeds allocation".into()));
             }
             if !self.owns(b) {
                 return Err(Error::DeviceMismatch);
+            }
+        }
+        for (buffer, offset, length) in &buffers[..buffers.len().min(2)] {
+            if buffer.writes.borrow().iter().any(|(start, end, state)| {
+                *offset < *end && offset + length > *start && state.get() == Completion::Failed
+            }) {
+                return Err(Error::Synchronization(
+                    "input range belongs to a failed submission".into(),
+                ));
             }
         }
         if grid.contains(&0) {
@@ -460,6 +580,18 @@ impl MetalDevice {
         debug_assert_eq!(buffers.len(), 3);
         debug_assert!(params[4] <= 2);
         let p = self.builtin(name)?;
+        let required = if tiled || matches!(name, "rmsnorm" | "softmax") {
+            256
+        } else if name == "gemv" {
+            128
+        } else {
+            32
+        };
+        if p.raw.maxTotalThreadsPerThreadgroup() < required || p.raw.threadExecutionWidth() != 32 {
+            return Err(Error::Dispatch(
+                "required modern Apple SIMD configuration unavailable".into(),
+            ));
+        }
         autoreleasepool(|_| {
             let start = Instant::now();
             if self.pending.borrow().is_none() {
@@ -470,7 +602,7 @@ impl MetalDevice {
                 *self.pending.borrow_mut() = Some(Submission {
                     command,
                     resources: Vec::new(),
-                    ready: Rc::new(Cell::new(false)),
+                    ready: Rc::new(Cell::new(Completion::Encoding)),
                     dispatches: 0,
                 });
             }
@@ -486,7 +618,7 @@ impl MetalDevice {
             // SAFETY: crate-private callers validate dimensions, dtypes and lengths against the
             // embedded kernel ABI. Buffers stay alive through completion; params is copied by Metal.
             unsafe {
-                for (i, (b, offset)) in buffers.iter().enumerate() {
+                for (i, (b, offset, _)) in buffers.iter().enumerate() {
                     encoder.setBuffer_offset_atIndex(Some(&b.raw), *offset, i);
                 }
                 encoder.setBytes_length_atIndex(
@@ -495,7 +627,25 @@ impl MetalDevice {
                     3,
                 );
             }
-            if matches!(name, "rmsnorm" | "softmax") {
+            if matches!(name, "project_bf16" | "project_f16") {
+                if p.raw.threadExecutionWidth() != 32 {
+                    return Err(Error::Dispatch(
+                        "native matrix requires 32-wide SIMD".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0].div_ceil(8),
+                        height: grid[1].div_ceil(8),
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if matches!(name, "rmsnorm" | "softmax") {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 256
                 {
                     return Err(Error::Dispatch(
@@ -567,8 +717,13 @@ impl MetalDevice {
             encoder.endEncoding();
             submission
                 .resources
-                .extend(buffers.iter().map(|(b, _)| b.raw.clone()));
+                .extend(buffers.iter().map(|(b, _, _)| b.raw.clone()));
             *buffers[2].0.ready.borrow_mut() = Some(submission.ready.clone());
+            let (output, offset, length) = buffers[2];
+            let mut writes = output.writes.borrow_mut();
+            writes.retain(|(_, _, state)| state.get() != Completion::Completed);
+            writes.push((offset, offset + length, submission.ready.clone()));
+            drop(writes);
             submission.dispatches += 1;
             let flush = !self.batching.get() || submission.dispatches >= self.batch_limit.get();
             let mut counters = self.counters.get();
@@ -585,7 +740,11 @@ impl MetalDevice {
             let gpu = flush.then(|| self.counters.get().gpu - before_gpu);
             Ok(DispatchTiming {
                 submission: submission_time,
-                synchronized,
+                synchronized: if self.batching.get() && self.batch_limit.get() != 1 {
+                    submission_time
+                } else {
+                    synchronized
+                },
                 gpu: if self.batching.get() && self.batch_limit.get() != 1 {
                     None
                 } else {
@@ -638,5 +797,123 @@ mod tests {
         assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| x.to_f32())).is_err());
         scope.finish().unwrap();
         assert_eq!(x.to_f32(), vec![4.]);
+    }
+}
+
+#[cfg(test)]
+mod transaction_tests {
+    use super::*;
+    use crate::{
+        DType,
+        loader::Weights,
+        model::{ModelConfig, Transformer, tiny},
+    };
+    #[test]
+    fn late_encoder_failure_preserves_cache_and_retry() {
+        let d = MetalDevice::new().unwrap();
+        d.set_batch_limit(8).unwrap();
+        let c = ModelConfig::tiny(DType::F32);
+        let w = Weights::from_bytes(
+            &d,
+            &tiny::serialize(&c, &tiny::weights(&c).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let model = Transformer::from_weights(&d, c, &w).unwrap();
+        let (_, mut cache) = model.forward_prefill(&d, &[1, 2]).unwrap();
+        let before = cache.active(0).unwrap().unwrap().0.to_f32();
+        let mut expected_cache = cache.clone();
+        let expected = model
+            .forward_decode(&d, 3, &mut expected_cache)
+            .unwrap()
+            .to_f32();
+        d.fail_after.set(Some(d.counters().dispatches + 35));
+        assert!(model.forward_decode(&d, 3, &mut cache).is_err());
+        assert_eq!(cache.len().unwrap(), 2);
+        assert_eq!(cache.active(0).unwrap().unwrap().0.to_f32(), before);
+        d.fail_after.set(None);
+        assert_eq!(
+            model.forward_decode(&d, 3, &mut cache).unwrap().to_f32(),
+            expected
+        );
+    }
+}
+
+#[cfg(test)]
+mod arena_tests {
+    use super::*;
+    use crate::{DType, Tensor};
+    #[test]
+    fn arena_never_recycles_live_or_pending_tensors() {
+        let d = MetalDevice::new().unwrap();
+        let a = Tensor::from_f32(&d, [257], DType::F32, &[1.; 257]).unwrap();
+        let mut retained = Vec::new();
+        for round in 0..4 {
+            let scope = d.execution().unwrap();
+            let before = d.counters();
+            let x = d.add(&a, &a).unwrap().tensor;
+            let first = d.counters().allocations;
+            let y = d.add(&x, &a).unwrap().tensor;
+            drop(x);
+            let z = d.add(&y, &a).unwrap().tensor;
+            if round == 0 {
+                assert!(d.counters().allocations > first);
+            }
+            scope.finish().unwrap();
+            assert_eq!(y.to_f32(), vec![3.; 257]);
+            assert_eq!(z.to_f32(), vec![4.; 257]);
+            retained.push(z);
+            if round > 1 {
+                assert!(d.counters().reused_bytes > before.reused_bytes);
+            }
+        }
+        for z in retained {
+            assert_eq!(z.to_f32(), vec![4.; 257]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod failed_completion_tests {
+    use super::*;
+    use crate::{
+        DType,
+        loader::Weights,
+        model::{ModelConfig, Transformer, tiny},
+        nn::attention::Trace,
+    };
+    #[test]
+    fn failed_suffix_does_not_poison_published_cache_prefix() {
+        let d = MetalDevice::new().unwrap();
+        let c = ModelConfig::tiny(DType::F32);
+        let w = Weights::from_bytes(
+            &d,
+            &tiny::serialize(&c, &tiny::weights(&c).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let model = Transformer::from_weights(&d, c, &w).unwrap();
+        let (_, mut cache) = model.forward_prefill(&d, &[1, 2]).unwrap();
+        let prefix = cache.active(0).unwrap().unwrap().0.to_f32();
+        let mut trace = Trace::new();
+        d.fail_completion.set(true);
+        assert!(
+            model
+                .forward(&d, &[3], &mut cache, Some(&mut trace))
+                .is_err()
+        );
+        assert_eq!(cache.len().unwrap(), 2);
+        assert_eq!(cache.active(0).unwrap().unwrap().0.to_f32(), prefix);
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| trace["logits"].to_f32()))
+                .is_err()
+        );
+        let retry = model.forward_decode(&d, 3, &mut cache).unwrap();
+        let full = model.forward_prefill(&d, &[1, 2, 3]).unwrap().0;
+        crate::reference::check(
+            &retry.to_f32(),
+            &full.view(64, [1, 32]).unwrap().to_f32(),
+            3e-5,
+            3e-5,
+        )
+        .unwrap();
     }
 }

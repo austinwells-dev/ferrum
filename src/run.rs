@@ -33,7 +33,7 @@ impl Options {
             max_new: 32,
             sampling: Default::default(),
             warmup: false,
-            profile: false,
+            profile: std::env::args().nth(1).as_deref() == Some("profile"),
         };
         let mut supplied_prompt = false;
         let mut args = std::env::args().skip(2);
@@ -126,6 +126,9 @@ fn report(r: &Generation, prompt: usize) {
 }
 pub fn run(d: &MetalDevice) -> Result<()> {
     let o = Options::parse()?;
+    if let Ok(value) = std::env::var("FERRUM_NATIVE_MATMUL") {
+        d.set_native_matmul(value != "0")?;
+    }
     if let Ok(limit) = std::env::var("FERRUM_BATCH_LIMIT") {
         d.set_batch_limit(
             limit
@@ -246,6 +249,13 @@ pub fn run(d: &MetalDevice) -> Result<()> {
     writeln!(stdout).map_err(ioerr)?;
     report(&r, ids.len());
     if o.profile {
+        let mut sorted = r.decode.clone();
+        sorted.sort();
+        let median = sorted.get(sorted.len() / 2).copied().unwrap_or_default();
+        eprintln!(
+            "SUMMARY {}",
+            serde_json::json!({"prompt_tokens":ids.len(),"generated_ids":r.tokens,"prefill_ms":ms(r.prefill),"prefill_tps":ids.len() as f64/r.prefill.as_secs_f64(),"first_token_ms":ms(r.first_token),"decode_median_ms":ms(median),"decode_tps":if median.is_zero(){0.}else{1./median.as_secs_f64()},"decode_ms":r.decode.iter().map(|x|ms(*x)).collect::<Vec<_>>(),"prefill_counters":r.prefill_counters,"decode_counters":r.decode_counters,"sampling_ms":ms(r.sampling),"retained_weight_bytes":model.weight_bytes(),"kv_active_bytes":r.kv_bytes,"kv_reserved_bytes":r.kv_reserved_bytes})
+        );
         eprintln!(
             "PROFILE prefill: {}",
             serde_json::to_string(&r.prefill_profile)

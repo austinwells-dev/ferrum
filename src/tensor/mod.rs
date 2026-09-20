@@ -175,16 +175,21 @@ impl Tensor {
         })
     }
     pub fn to_f32(&self) -> Vec<f32> {
-        self.storage.with_bytes(|bytes| {
-            bytes[self.offset..self.offset + self.byte_size()]
-                .chunks_exact(self.dtype.size_bytes())
-                .map(|b| match self.dtype {
-                    DType::F32 => f32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
-                    DType::F16 => half::f16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32(),
-                    DType::BF16 => half::bf16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32(),
-                })
-                .collect()
-        })
+        self.storage
+            .with_bytes(self.offset, self.byte_size(), |bytes| {
+                bytes
+                    .chunks_exact(self.dtype.size_bytes())
+                    .map(|b| match self.dtype {
+                        DType::F32 => f32::from_ne_bytes([b[0], b[1], b[2], b[3]]),
+                        DType::F16 => {
+                            half::f16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32()
+                        }
+                        DType::BF16 => {
+                            half::bf16::from_bits(u16::from_ne_bytes([b[0], b[1]])).to_f32()
+                        }
+                    })
+                    .collect()
+            })
     }
     pub fn shape(&self) -> &Shape {
         &self.shape
@@ -206,7 +211,13 @@ impl Tensor {
             allocation_bytes: self.storage.allocation_bytes(),
             offset_bytes: self.offset,
             length_bytes: self.byte_size(),
-            alignment: self.storage.alignment(),
+            alignment: if self.offset == 0 {
+                self.storage.alignment()
+            } else {
+                self.storage
+                    .alignment()
+                    .min(1usize << self.offset.trailing_zeros())
+            },
             mode: "shared",
             owners: Rc::strong_count(&self.storage),
         }
@@ -253,8 +264,8 @@ impl Tensor {
             dtype: self.dtype,
         })
     }
-    pub(crate) fn binding(&self) -> (&MetalBuffer, usize) {
-        (&self.storage, self.offset)
+    pub(crate) fn binding(&self) -> (&MetalBuffer, usize, usize) {
+        (&self.storage, self.offset, self.byte_size())
     }
     pub(crate) fn buffer(&self) -> &MetalBuffer {
         &self.storage

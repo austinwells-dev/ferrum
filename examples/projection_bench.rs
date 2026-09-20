@@ -1,6 +1,9 @@
 use ferrum::{DType, MetalDevice, Tensor, nn::Linear};
 fn main() -> ferrum::Result<()> {
     let d = MetalDevice::new()?;
+    if let Ok(value) = std::env::var("FERRUM_NATIVE_MATMUL") {
+        d.set_native_matmul(value != "0")?;
+    }
     for (label, k, n) in [
         ("q", 896, 896),
         ("kv", 896, 128),

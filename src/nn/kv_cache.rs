@@ -155,6 +155,13 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.layers.fill(None);
     }
+    pub fn reserved_bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|entry| entry.storage.0.byte_size() + entry.storage.1.byte_size())
+            .sum()
+    }
     pub fn bytes(&self) -> usize {
         self.layers
             .iter()

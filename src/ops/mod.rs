@@ -25,6 +25,9 @@ impl MetalDevice {
         grid: [usize; 2],
     ) -> Result<Output> {
         let profile_start = self.profiling().then(std::time::Instant::now);
+        let wait_before = profile_start
+            .map(|_| self.counters().wait)
+            .unwrap_or_default();
         if !self.owns(a.buffer()) || b.is_some_and(|b| !self.owns(b.buffer())) {
             return Err(Error::DeviceMismatch);
         }
@@ -65,7 +68,9 @@ impl MetalDevice {
         if let Some(start) = profile_start {
             self.record_profile(
                 name,
-                start.elapsed(),
+                start
+                    .elapsed()
+                    .saturating_sub(self.counters().wait - wait_before),
                 allocation_time,
                 metrics.allocation_bytes,
                 &metrics.timing,

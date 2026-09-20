@@ -72,6 +72,7 @@ pub struct Generation {
     pub prefill_counters: crate::metal::Counters,
     pub decode_counters: Vec<crate::metal::Counters>,
     pub kv_bytes: usize,
+    pub kv_reserved_bytes: usize,
     pub prefill_profile: crate::metal::Profile,
     pub decode_profiles: Vec<crate::metal::Profile>,
 }
@@ -88,6 +89,7 @@ pub fn counter_delta(
         encode: b.encode - a.encode,
         wait: b.wait - a.wait,
         gpu: b.gpu - a.gpu,
+        allocation_time: b.allocation_time - a.allocation_time,
         reused_bytes: b.reused_bytes - a.reused_bytes,
         transient_live_bytes: b.transient_live_bytes,
         transient_peak_bytes: b.transient_peak_bytes,
@@ -123,6 +125,7 @@ pub fn generate(
         prefill_counters: Default::default(),
         decode_counters: Vec::new(),
         kv_bytes: 0,
+        kv_reserved_bytes: 0,
         prefill_profile: Default::default(),
         decode_profiles: Vec::new(),
     };
@@ -172,5 +175,6 @@ pub fn generate(
             .push(counter_delta(before, d.counters()));
     }
     result.kv_bytes = cache.bytes();
+    result.kv_reserved_bytes = cache.reserved_bytes();
     Ok(result)
 }

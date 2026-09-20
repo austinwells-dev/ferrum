@@ -174,13 +174,25 @@ impl MetalDevice {
         let mut p = [0; 9];
         p[0] = index(source.numel())?;
         p[4] = source.dtype() as u32;
-        self.dispatch(
+        let start = self.profiling().then(std::time::Instant::now);
+        let timing = self.dispatch(
             "copy_range",
             &[source.binding(), source.binding(), suffix.binding()],
             &p,
             [source.numel(), 1],
             false,
         )?;
+        if let Some(start) = start {
+            self.record_profile(
+                "kv_append",
+                start
+                    .elapsed()
+                    .saturating_sub(timing.synchronized.saturating_sub(timing.submission)),
+                std::time::Duration::ZERO,
+                0,
+                &timing,
+            );
+        }
         Ok(())
     }
 }
@@ -253,7 +265,13 @@ impl MetalDevice {
         p[1] = index(ad[0])?;
         p[2] = index(ad[1])?;
         p[3] = index(bd[0])?;
-        let name = if ad[0] == 1 && a.dtype() != DType::F32 {
+        let name = if ad[0] > 1 && self.native_matmul() && a.dtype() != DType::F32 {
+            if a.dtype() == DType::BF16 {
+                "project_bf16"
+            } else {
+                "project_f16"
+            }
+        } else if ad[0] == 1 && a.dtype() != DType::F32 {
             "gemv"
         } else {
             "matmul_nt"

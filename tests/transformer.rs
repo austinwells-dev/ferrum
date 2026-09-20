@@ -369,3 +369,22 @@ fn capacity_cache_preserves_snapshots_and_branch_prefixes() {
     cache.append(&d, 0, &c, &c).unwrap();
     assert_eq!(prefix.to_f32(), [1., 2.]);
 }
+
+#[test]
+fn native_projection_tiles_match_oracle() {
+    let d = MetalDevice::new().unwrap();
+    d.set_native_matmul(true).unwrap();
+    for ty in [DType::BF16, DType::F16, DType::F32] {
+        for (m, k, n) in [(1, 129, 257), (3, 19, 23), (21, 64, 129), (32, 128, 256)] {
+            let x = Tensor::from_f32(&d, [m, k], ty, &cpu::deterministic(m * k)).unwrap();
+            let w = Tensor::from_f32(&d, [n, k], ty, &cpu::deterministic(n * k)).unwrap();
+            let vals = w.to_f32();
+            let wt: Vec<_> = (0..n * k).map(|i| vals[(i % n) * k + i / n]).collect();
+            let linear = Linear::new(&d, w, None).unwrap();
+            check(
+                &linear.forward(&d, &x).unwrap(),
+                &cpu::matmul(&x.to_f32(), &wt, m, k, n),
+            );
+        }
+    }
+}
