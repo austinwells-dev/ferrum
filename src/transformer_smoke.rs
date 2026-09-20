@@ -7,11 +7,7 @@ use ferrum::{
 };
 use std::time::{Duration, Instant};
 fn delta(a: ferrum::metal::Counters, b: ferrum::metal::Counters) -> ferrum::metal::Counters {
-    ferrum::metal::Counters {
-        allocations: b.allocations - a.allocations,
-        allocated_bytes: b.allocated_bytes - a.allocated_bytes,
-        dispatches: b.dispatches - a.dispatches,
-    }
+    ferrum::generation::counter_delta(a, b)
 }
 pub fn run(d: &MetalDevice) -> Result<()> {
     let c = ModelConfig::tiny(DType::F32);

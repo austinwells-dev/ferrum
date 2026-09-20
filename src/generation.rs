@@ -87,6 +87,11 @@ pub fn counter_delta(
         allocations: b.allocations - a.allocations,
         allocated_bytes: b.allocated_bytes - a.allocated_bytes,
         dispatches: b.dispatches - a.dispatches,
+        command_buffers: b.command_buffers - a.command_buffers,
+        completion_waits: b.completion_waits - a.completion_waits,
+        encode: b.encode - a.encode,
+        wait: b.wait - a.wait,
+        gpu: b.gpu - a.gpu,
     }
 }
 /// The callback sees non-EOS IDs only. It may buffer incomplete UTF-8 sequences.

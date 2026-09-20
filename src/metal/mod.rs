@@ -27,6 +27,7 @@ pub struct MetalBuffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
     owner: Rc<()>,
+    ready: RefCell<Option<Rc<Cell<bool>>>>,
 }
 impl MetalBuffer {
     pub fn len_bytes(&self) -> usize {
@@ -48,6 +49,10 @@ impl MetalBuffer {
         f(bytes)
     }
     pub(crate) fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+        assert!(
+            self.ready.borrow().as_ref().is_none_or(|r| r.get()),
+            "GPU output is not successfully completed"
+        );
         // SAFETY: all bytes are initialized; dispatch waits before returning on both success
         // and GPU error. Rc prevents cross-thread use; only read-only tensors are published.
         let bytes = unsafe {
@@ -69,6 +74,11 @@ pub struct Counters {
     pub allocations: usize,
     pub allocated_bytes: usize,
     pub dispatches: usize,
+    pub command_buffers: usize,
+    pub completion_waits: usize,
+    pub encode: Duration,
+    pub wait: Duration,
+    pub gpu: Duration,
 }
 
 /// Opt-in aggregate operation measurements, with no tensor retention.
@@ -84,7 +94,34 @@ pub struct ProfileEntry {
     pub allocation_bytes: usize,
 }
 pub type Profile = std::collections::BTreeMap<&'static str, ProfileEntry>;
+/// An encoding epoch owns every referenced Metal resource through completion.
+/// No tensor carrying this epoch may be mapped until successful completion.
+struct Submission {
+    command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    resources: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
+    ready: Rc<Cell<bool>>,
+    dispatches: usize,
+}
+/// Private scope: model code must finish before publishing cache or results.
+/// Unwinding and early errors still drain submitted work.
+pub(crate) struct Execution<'a> {
+    device: &'a MetalDevice,
+}
+impl Execution<'_> {
+    pub(crate) fn finish(self) -> Result<()> {
+        self.device.flush()
+    }
+}
+impl Drop for Execution<'_> {
+    fn drop(&mut self) {
+        let _ = self.device.flush();
+        self.device.batching.set(false);
+    }
+}
 pub struct MetalDevice {
+    batching: Cell<bool>,
+    batch_limit: Cell<usize>,
+    pending: RefCell<Option<Submission>>,
     profiling: Cell<bool>,
     profile: RefCell<Profile>,
     counters: Cell<Counters>,
@@ -107,6 +144,9 @@ impl MetalDevice {
             .newCommandQueue()
             .ok_or_else(|| Error::Initialization("command queue creation failed".into()))?;
         Ok(Self {
+            batching: Cell::new(false),
+            batch_limit: Cell::new(1024),
+            pending: RefCell::new(None),
             counters: Cell::new(Counters::default()),
             profiling: Cell::new(false),
             profile: RefCell::new(Profile::new()),
@@ -118,6 +158,49 @@ impl MetalDevice {
             pipelines: RefCell::new(HashMap::new()),
             builtins: RefCell::new(HashMap::new()),
         })
+    }
+    /// Maximum kernels per completion boundary in model execution. One is the control.
+    pub fn set_batch_limit(&self, limit: usize) -> Result<()> {
+        if limit == 0 || self.batching.get() {
+            return Err(Error::Parameter("invalid active batch limit".into()));
+        }
+        self.batch_limit.set(limit);
+        Ok(())
+    }
+    pub(crate) fn execution(&self) -> Result<Execution<'_>> {
+        if self.batching.replace(true) {
+            return Err(Error::Dispatch("nested execution".into()));
+        }
+        Ok(Execution { device: self })
+    }
+    fn flush(&self) -> Result<()> {
+        let Some(submission) = self.pending.borrow_mut().take() else {
+            return Ok(());
+        };
+        let start = Instant::now();
+        submission.command.commit();
+        submission.command.waitUntilCompleted();
+        let mut counters = self.counters.get();
+        counters.command_buffers += 1;
+        counters.completion_waits += 1;
+        counters.wait += start.elapsed();
+        let seconds = submission.command.GPUEndTime() - submission.command.GPUStartTime();
+        if seconds.is_finite() && seconds > 0. {
+            counters.gpu += Duration::from_secs_f64(seconds);
+        }
+        self.counters.set(counters);
+        if submission.command.status() != MTLCommandBufferStatus::Completed {
+            return Err(Error::Synchronization(
+                submission
+                    .command
+                    .error()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| format!("status {:?}", submission.command.status())),
+            ));
+        }
+        submission.ready.set(true);
+        // submission.resources drops only after the wait and status check.
+        Ok(())
     }
     pub fn set_profiling(&self, enabled: bool) {
         self.profiling.set(enabled);
@@ -194,6 +277,7 @@ impl MetalDevice {
             raw,
             len: bytes,
             owner: self.owner.clone(),
+            ready: RefCell::new(None),
         })
     }
     pub fn compile_kernel(&self, source: &str, name: &str) -> Result<Rc<ComputePipeline>> {
@@ -264,10 +348,23 @@ impl MetalDevice {
         let p = self.builtin(name)?;
         autoreleasepool(|_| {
             let start = Instant::now();
-            let command = self
-                .queue
-                .commandBuffer()
-                .ok_or_else(|| Error::Dispatch("command buffer creation failed".into()))?;
+            if self.pending.borrow().is_none() {
+                let command = self
+                    .queue
+                    .commandBuffer()
+                    .ok_or_else(|| Error::Dispatch("command buffer creation failed".into()))?;
+                *self.pending.borrow_mut() = Some(Submission {
+                    command,
+                    resources: Vec::new(),
+                    ready: Rc::new(Cell::new(false)),
+                    dispatches: 0,
+                });
+            }
+            let mut pending = self.pending.borrow_mut();
+            let submission = pending
+                .as_mut()
+                .ok_or_else(|| Error::Dispatch("missing submission".into()))?;
+            let command = &submission.command;
             let encoder = command
                 .computeCommandEncoder()
                 .ok_or_else(|| Error::Dispatch("compute encoder creation failed".into()))?;
@@ -316,29 +413,74 @@ impl MetalDevice {
                 );
             }
             encoder.endEncoding();
-            command.commit();
+            submission
+                .resources
+                .extend(buffers.iter().map(|b| b.raw.clone()));
+            *buffers[2].ready.borrow_mut() = Some(submission.ready.clone());
+            submission.dispatches += 1;
+            let flush = !self.batching.get() || submission.dispatches >= self.batch_limit.get();
             let mut counters = self.counters.get();
             counters.dispatches += 1;
+            let submission_time = start.elapsed();
+            counters.encode += submission_time;
             self.counters.set(counters);
-            let submission = start.elapsed();
-            command.waitUntilCompleted();
-            let synchronized = start.elapsed();
-            if command.status() != MTLCommandBufferStatus::Completed {
-                return Err(Error::Synchronization(
-                    command
-                        .error()
-                        .map(|e| e.to_string())
-                        .unwrap_or_else(|| format!("status {:?}", command.status())),
-                ));
+            drop(pending);
+            let before_gpu = counters.gpu;
+            if flush {
+                self.flush()?;
             }
-            let seconds = command.GPUEndTime() - command.GPUStartTime();
+            let synchronized = start.elapsed();
+            let gpu = flush.then(|| self.counters.get().gpu - before_gpu);
             Ok(DispatchTiming {
-                submission,
+                submission: submission_time,
                 synchronized,
-                gpu: (seconds.is_finite() && seconds > 0.)
-                    .then(|| Duration::from_secs_f64(seconds)),
+                gpu: if self.batching.get() && self.batch_limit.get() != 1 { None } else { gpu },
                 dispatches: 1,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DType, Tensor};
+
+    #[test]
+    fn execution_owns_dropped_intermediates_and_drains_on_error() {
+        let d = MetalDevice::new().unwrap();
+        d.set_batch_limit(32).unwrap();
+        let a = Tensor::from_f32(&d, [257], DType::F32, &[1.; 257]).unwrap();
+        for _ in 0..20 {
+            let before = d.counters();
+            let scope = d.execution().unwrap();
+            let mut x = a.clone();
+            for _ in 0..70 {
+                x = d.add(&x, &a).unwrap().tensor;
+            }
+            scope.finish().unwrap();
+            assert_eq!(x.to_f32(), vec![71.; 257]);
+            assert_eq!(d.counters().completion_waits - before.completion_waits, 3);
+        }
+        let x;
+        {
+            let _scope = d.execution().unwrap();
+            x = d.add(&a, &a).unwrap().tensor;
+            assert!(d.matmul(&a, &a).is_err());
+            // Drop completes pending work even when the caller returns an error.
+        }
+        assert_eq!(x.to_f32(), vec![2.; 257]);
+        assert_eq!(a.to_f32(), vec![1.; 257]);
+    }
+
+    #[test]
+    fn mapping_is_excluded_until_scope_completion() {
+        let d = MetalDevice::new().unwrap();
+        let a = Tensor::from_f32(&d, [1], DType::F32, &[2.]).unwrap();
+        let scope = d.execution().unwrap();
+        let x = d.add(&a, &a).unwrap().tensor;
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| x.to_f32())).is_err());
+        scope.finish().unwrap();
+        assert_eq!(x.to_f32(), vec![4.]);
     }
 }

@@ -95,9 +95,9 @@ fn main() -> Result<()> {
     let report = serde_json::json!({"prompt_ids":ids,"steps":steps,"generated_ids":generated});
     std::fs::write(
         if diagnostic_f32 {
-            "docs/measurements/phase3/ferrum-probe-f32.json"
+            "docs/measurements/phase4/ferrum-probe-f32.json"
         } else {
-            "docs/measurements/phase3/ferrum-probe.json"
+            "docs/measurements/phase4/ferrum-probe.json"
         },
         serde_json::to_vec_pretty(&report).map_err(|e| ferrum::Error::Validation(e.to_string()))?,
     )

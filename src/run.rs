@@ -105,6 +105,7 @@ fn report(r: &Generation, prompt: usize) {
         r.prefill_counters.allocations,
         r.prefill_counters.allocated_bytes
     );
+    eprintln!("prefill runtime counters: {:?}", r.prefill_counters);
     if !r.decode.is_empty() {
         let mut sorted = r.decode.clone();
         sorted.sort();
@@ -125,6 +126,13 @@ fn report(r: &Generation, prompt: usize) {
 }
 pub fn run(d: &MetalDevice) -> Result<()> {
     let o = Options::parse()?;
+    if let Ok(limit) = std::env::var("FERRUM_BATCH_LIMIT") {
+        d.set_batch_limit(
+            limit
+                .parse()
+                .map_err(|_| Error::Parameter("invalid FERRUM_BATCH_LIMIT".into()))?,
+        )?;
+    }
     let start = Instant::now();
     let qc = QwenConfig::from_file(o.model.join("config.json"))?;
     let c = qc.convert()?;

@@ -128,6 +128,7 @@ impl Transformer {
                 });
             }
         }
+        let execution = d.execution()?;
         let mut staged = cache.clone();
         let mut x = self.embedding.forward(d, tokens)?;
         record(&mut trace, "embedding", &x);
@@ -138,6 +139,7 @@ impl Transformer {
         record(&mut trace, "final_hidden", &x);
         let logits = self.lm_head.forward(d, &x)?;
         record(&mut trace, "logits", &logits);
+        execution.finish()?;
         *cache = staged;
         Ok(logits)
     }

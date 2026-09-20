@@ -1,0 +1,24 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running `target/release/ferrum run --model /Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775 --prompt 'Hello'\!'' --max-new-tokens 32 --temperature 0 --warmup`
+Ferrum
+Model: Qwen2.5-0.5B-Instruct (local checkpoint)
+Device: Apple M5
+Backend: Metal
+Dtype: BF16
+Layers: 24; hidden: 896; intermediate: 4864; Q heads: 14; KV heads: 2; head dim: 64
+Parameters: 494032768; tensors: 290
+Source weight bytes: 988065536
+Retained weight bytes: 1260334848
+Construction/transposition bytes: 987922432
+Recommended working set: 25769803776 bytes
+config/tokenizer load: 116.083 ms; weight load: 170.696 ms; construction: 250.762 ms; tokenization: 0.182 ms
+Prompt: 21 tokens; sampler: SamplingConfig { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+Hello! How can I assist you today?
+
+---
+prompt: 21 tokens; generated: 10; stop: Eos
+prefill: 838.923 ms (25.032 tok/s); first token: 839.746 ms
+prefill + final row: 3796 dispatches; 3797 allocations; 48459476 allocation bytes
+decode: median 782.163 ms (1.279 tok/s); per-token ms: [801.638208, 811.541417, 798.78525, 772.06525, 779.824708, 782.162875, 762.313042, 771.025708, 789.308667]
+decode counters per step: [Counters { allocations: 3845, allocated_bytes: 5579524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 5723524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 5867524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6011524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6155524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6299524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6443524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6587524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6731524, dispatches: 3844 }]
+sampling: 2.276 ms total; active KV: 368640 bytes; generated IDs: [9707, 0, 2585, 646, 358, 7789, 498, 3351, 30, 151645]
