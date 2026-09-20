@@ -1,0 +1,25 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 2.93s
+     Running `target/release/ferrum transformer-smoke`
+Ferrum transformer smoke
+device: Apple M5
+dtype: F32
+layers: 2
+hidden: 16
+q heads: 4
+kv heads: 2
+sequence: 5
+safetensors load PASS (59.8015ms, includes projection transpose)
+embedding / attention / MLP / decoder blocks / final logits PASS
+41 intermediate comparisons: max_abs=4.76837158e-7
+KV cache / cached decode equivalence PASS max_abs=0.00000000e0
+prefill median (10 samples): 445.708µs
+decode token median (10 samples, 4 -> 5): 456.292µs
+prefill: 53 dispatches, 5 allocations, 2068 allocated bytes
+decode: 57 dispatches, 5 allocations, 2052 allocated bytes
+weight memory: 23104 bytes
+KV cache memory (5 tokens): 640 bytes
+KV cache capacity payload: 2048 bytes
+prefill temporary allocation volume: 788 bytes
+decode temporary allocation volume: 1284 bytes (cumulative allocated bytes minus returned logits and final active KV; not peak live memory)
+Phase 2 transformer smoke: PASS

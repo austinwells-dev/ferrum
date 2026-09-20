@@ -62,32 +62,33 @@ impl Attention {
         let (k, v) = cache
             .active(layer)?
             .ok_or_else(|| Error::Cache("missing active K/V".into()))?;
-        let mut contexts = None;
-        for h in 0..self.q_heads {
-            let kv = h / (self.q_heads / self.kv_heads);
-            let q = d.select_head(&q, h)?.tensor;
-            let k = d.select_head(k, kv)?.tensor;
-            let v = d.select_head(v, kv)?.tensor;
-            let scores = d.matmul(&q, &d.transpose2(&k)?.tensor)?.tensor;
-            let scores = d
-                .scale(&scores, (self.head_dim as f32).sqrt().recip())?
-                .tensor;
-            record(&mut trace, format!("{prefix}.head.{h}.scores"), &scores);
-            let scores = d.causal_mask(&scores, offset)?.tensor;
-            let probs = d.softmax(&scores)?.tensor;
-            record(&mut trace, format!("{prefix}.head.{h}.probs"), &probs);
-            let context = d
-                .matmul(&probs, &v)?
-                .tensor
-                .reshape([1, s, self.head_dim])?;
-            contexts = Some(match contexts {
-                None => context,
-                Some(prev) => d.concat_first(&prev, &context)?.tensor,
-            });
+        let scores = d.attention_scores(&q, k)?.tensor;
+        let scores = d
+            .scale(&scores, (self.head_dim as f32).sqrt().recip())?
+            .tensor;
+        let t = k.shape().dimensions()[0];
+        if trace.is_some() {
+            for h in 0..self.q_heads {
+                record(
+                    &mut trace,
+                    format!("{prefix}.head.{h}.scores"),
+                    &scores.view(h * s * t, [s, t])?,
+                );
+            }
         }
-        let contexts = contexts.ok_or_else(|| Error::Config("no query heads".into()))?;
+        let masked = d.attention_mask(&scores, offset)?.tensor;
+        let probs = d.softmax(&masked)?.tensor;
+        if trace.is_some() {
+            for h in 0..self.q_heads {
+                record(
+                    &mut trace,
+                    format!("{prefix}.head.{h}.probs"),
+                    &probs.view(h * s * t, [s, t])?,
+                );
+            }
+        }
         let merged = d
-            .swap01(&contexts)?
+            .attention_context(&probs, v)?
             .tensor
             .reshape([s, self.q_heads * self.head_dim])?;
         record(&mut trace, format!("{prefix}.context"), &merged);

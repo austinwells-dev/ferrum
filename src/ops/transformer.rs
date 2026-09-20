@@ -184,3 +184,59 @@ impl MetalDevice {
         Ok(())
     }
 }
+
+impl MetalDevice {
+    /// Grouped products read sequence-major Q/K directly, retaining the original
+    /// dot-product and storage-rounding boundaries without head materialization.
+    pub(crate) fn attention_scores(&self, q: &Tensor, k: &Tensor) -> Result<Output> {
+        let a = q.shape().dimensions();
+        let b = k.shape().dimensions();
+        if a.len() != 3
+            || b.len() != 3
+            || a[2] != b[2]
+            || a.contains(&0)
+            || b.contains(&0)
+            || !a[1].is_multiple_of(b[1])
+        {
+            return Err(Error::Shape("grouped Q/K shapes".into()));
+        }
+        let mut p = [0; 9];
+        for (i, n) in [(1, a[0]), (2, b[0]), (3, a[1]), (5, b[1]), (6, a[2])] {
+            p[i] = index(n)?;
+        }
+        let dims = [a[1], a[0], b[0]];
+        let n = crate::tensor::Shape::new(dims)?.numel();
+        self.run("attention_scores", q, Some(k), &dims, p, [n, 1])
+    }
+    pub(crate) fn attention_mask(&self, scores: &Tensor, offset: usize) -> Result<Output> {
+        let dims = scores.shape().dimensions();
+        if dims.len() != 3 || dims[1] == 0 || offset.checked_add(dims[1]) != Some(dims[2]) {
+            return Err(Error::Shape("grouped causal scores".into()));
+        }
+        let mut p = [0; 9];
+        p[1] = index(dims[1])?;
+        p[2] = index(dims[2])?;
+        p[5] = index(offset)?;
+        self.run("attention_mask", scores, None, dims, p, [scores.numel(), 1])
+    }
+    pub(crate) fn attention_context(&self, probs: &Tensor, v: &Tensor) -> Result<Output> {
+        let a = probs.shape().dimensions();
+        let b = v.shape().dimensions();
+        if a.len() != 3
+            || b.len() != 3
+            || a.contains(&0)
+            || b.contains(&0)
+            || a[2] != b[0]
+            || !a[0].is_multiple_of(b[1])
+        {
+            return Err(Error::Shape("grouped probabilities/V shapes".into()));
+        }
+        let mut p = [0; 9];
+        for (i, n) in [(1, a[1]), (2, b[0]), (3, a[0]), (5, b[1]), (6, b[2])] {
+            p[i] = index(n)?;
+        }
+        let dims = [a[1], a[0], b[2]];
+        let n = crate::tensor::Shape::new(dims)?.numel();
+        self.run("attention_context", probs, Some(v), &dims, p, [n, 1])
+    }
+}

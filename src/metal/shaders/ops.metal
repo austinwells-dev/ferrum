@@ -95,3 +95,21 @@ kernel void embedding_gather(ARGS, uint i [[thread_position_in_grid]]) {
     uint token=((device const uint*)b)[i/p[1]];
     store(c,i,p[4],load(a,token*p[1]+i%p[1],p[4]));
 }
+// Direct grouped layout products. Each dot retains the original ascending-K sum
+// and separate storage rounding; scaling/masking/softmax remain separate kernels.
+kernel void attention_scores(ARGS, uint i [[thread_position_in_grid]]) {
+    uint t=i%p[2], s=(i/p[2])%p[1], h=i/(p[1]*p[2]);
+    uint kv=h/(p[3]/p[5]); float sum=0;
+    for(uint j=0;j<p[6];j++) sum+=load(a,(s*p[3]+h)*p[6]+j,p[4])*load(b,(t*p[5]+kv)*p[6]+j,p[4]);
+    store(c,i,p[4],sum);
+}
+kernel void attention_mask(ARGS, uint i [[thread_position_in_grid]]) {
+    uint s=(i/p[2])%p[1], t=i%p[2];
+    store(c,i,p[4],t>p[5]+s?-INFINITY:load(a,i,p[4]));
+}
+kernel void attention_context(ARGS, uint i [[thread_position_in_grid]]) {
+    uint j=i%p[6], h=(i/p[6])%p[3], s=i/(p[3]*p[6]);
+    uint kv=h/(p[3]/p[5]); float sum=0;
+    for(uint t=0;t<p[2];t++) sum+=load(a,(h*p[1]+s)*p[2]+t,p[4])*load(b,(t*p[5]+kv)*p[6]+j,p[4]);
+    store(c,i,p[4],sum);
+}
