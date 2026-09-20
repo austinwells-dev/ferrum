@@ -1,4 +1,4 @@
-# Phase 1 architecture
+# Ferrum architecture
 
 ## Modules and dependency direction
 
@@ -88,10 +88,87 @@ Submission duration starts at command creation and ends immediately after commit
 
 `Error` distinguishes initialization, shader compilation, missing kernel, pipeline creation, invalid shape/reshape, dtype/context mismatch, allocation, dispatch, synchronization, parameter, and numerical-validation failures. Metal error descriptions are retained; no silent CPU fallback exists.
 
-## Future work: graph execution and Phase 2
+## Future execution constraints
 
-No graph executor, model, memory planner, or transformer is implemented. Phase 2 can compose the existing synchronous tensor operations immediately, but should not remove waits in-place. Before asynchronous batching or allocation reuse, introduce submission/completion ownership that keeps buffers alive, prevents premature CPU mapping, and tracks when each write completes. Keep encoding distinct from completion, submit several operations together, and publish readable tensors only behind the appropriate completion token.
+No graph executor or memory planner is implemented. Phase 2 composes synchronous tensor operations without removing waits. Before asynchronous batching or allocation reuse, introduce submission/completion ownership that keeps buffers alive, prevents premature CPU mapping, and tracks when each write completes. Keep encoding distinct from completion, submit several operations together, and publish readable tensors only behind the appropriate completion token.
 
 A future planner can consume byte size, alignment, storage mode, and liveness to allocate arenas. Nonzero offsets and views will require checked ranges and dtype alignment in both tensor metadata and encoder bindings. Thread-safe execution will require an explicit synchronization design rather than replacing `Rc` with `Arc` or adding unsafe Send/Sync implementations.
 
 RoPE convention and scaling are model-dependent; current adjacent-pair rotation is not interchangeable with split-half variants. F32 long-position phase accuracy and native BF16/SIMD-group matmul acceleration need separate designs and tests. Serial reductions and per-operation allocations are measured optimization targets, not architectural promises.
+
+
+## Phase 2 module boundaries
+
+`loader` parses local safetensors into named, immutable tensors; `tokenizer` independently handles local Hugging Face tokenizer JSON. `model::weights` validates every required shape/dtype/device and optional projection bias before preprocessing weights. It constructs `Embedding`, `Linear`, `RmsNorm`, `Attention`, `Mlp`, and `DecoderLayer` values. Runtime execution uses those fields, never string weight lookups. `model::tiny` creates deterministic synthetic safetensors fixtures. `reference::transformer` is a scalar CPU oracle used by validation, never a numerical fallback.
+
+`ModelConfig` requires vocabulary, hidden/intermediate sizes, layer count, query/KV head counts, head dimension, RMSNorm epsilon, RoPE theta, maximum context, tied-embedding setting, and dtype. Dimensions must be positive, the head dimension even, Q heads divisible by KV heads, and checked tensor element products within u32 indexing. Query projection width need not equal hidden size. Configuration is explicit Rust data; real model config JSON/name adaptation belongs to Phase 3.
+
+## Phase 2 shapes and weights
+
+Let `S` be new tokens, `P` cached tokens, `T=P+S`, `H` hidden width, `I` intermediate width, `Q` query heads, `K` KV heads, `D` head width, and `V` vocabulary. All tensors are contiguous row-major and dtype-homogeneous.
+
+| Tensor | Shape |
+|---|---|
+| Token IDs (host slice) | `[S]` u32 |
+| Embedding weight | `[V,H]` |
+| Hidden/residual states | `[S,H]` |
+| Q / K / V projection weights | `[Q*D,H]` / `[K*D,H]` / `[K*D,H]` |
+| Optional projection bias | `[output_width]` |
+| Q / K / V activations | `[S,Q,D]` / `[S,K,D]` / `[S,K,D]` |
+| Cached K and V, each layer | `[T,K,D]` |
+| Selected Q head / K head / V head | `[S,D]` / `[T,D]` / `[T,D]` |
+| Scores and probabilities per query head | `[S,T]` |
+| Stacked head contexts / merged context | `[Q,S,D]` / `[S,Q*D]` |
+| Attention output weight | `[H,Q*D]` |
+| Gate/up / down weights | `[I,H]` / `[H,I]` |
+| Norm weights | `[H]` |
+| LM head weight / logits | `[V,H]` / `[S,V]` |
+
+The synthetic canonical names are `embedding.weight`, `final_norm.weight`, `lm_head.weight`, and `layers.{index}.{input_norm,post_norm,q,k,v,o,gate,up,down}.weight`. Projection `.bias` tensors are optional. Tied mode uses the embedding matrix and does not require an LM-head weight. A transposed LM matrix still has its own allocation in this deliberately contiguous implementation. Unknown bundle tensors are ignored by model construction; source bundles can be dropped after construction.
+
+Linear accepts rank ≥1, flattens leading dimensions, multiplies by a construction-time contiguous weight transpose, applies optional bias, and restores the leading shape. All matmuls use the unchanged Phase 1 tiled kernel. Input and output dtype must match.
+
+Embedding gather validates every host ID before dispatch. IDs are uploaded as exact little-endian u32 bytes, never converted to F16/BF16/F32 numbers. The private carrier tensor matches the weight dtype for the existing binding contract, while its shader interpretation is u32. Byte length and four-byte alignment are checked. The public gather API accepts IDs, never a forgeable carrier tensor.
+
+## Attention and RoPE
+
+Each block executes RMSNorm → separate Q/K/V linears → split-half RoPE on Q/K → cache append → per-head matmul → scalar scale → causal mask → softmax → matmul → merge → output linear → residual add. The second path is RMSNorm → gate/up linears → SiLU(gate) × up → down linear → residual add.
+
+Query head `h` reads KV head `h / (Q/K)`. Cache storage never contains expanded Q-count copies of K/V. Separate contiguous per-head working tensors are copied as needed; repeated query groups can temporarily copy the same KV head. This is intentionally unoptimized and makes reuse of existing matmul straightforward.
+
+The Qwen split-half convention pairs component `j` with `j+D/2`, with angle `(P+token_index) * theta^(-2*j/D)` for `0 <= j < D/2`. The complete head rotates; theta is configurable. Qwen's upstream [reference implementation](https://github.com/huggingface/transformers/blob/main/src/transformers/models/qwen2/modeling_qwen2.py) explicitly uses half rotation. Phase 1 `rope` remains adjacent-pair/single-position; Phase 2 `rope_split` names its different convention explicitly.
+
+RoPE uses F32 phase/trigonometry and rounds the result to storage dtype. It does not emulate every intermediate low-precision rounding choice of another engine. The CPU oracle uses F64 angles. Existing long-context uncertainty remains: tests include offsets 2048/2049, but no very-long-context accuracy claim or scaling support is made.
+
+Causal mask keeps key `j` exactly when `j <= P+i` for query row `i`. The kernel writes negative infinity for excluded entries without allocating a mask matrix. Shape validation requires `[S,P+S]`, so every nonempty row has a visible key. Softmax remains the existing serial F32 row reduction, with output stored in the configured dtype.
+
+## Cache and forward semantics
+
+`KvCache` holds one optional immutable `(K,V)` pair per layer, capacity/layout/dtype metadata, and no mutable published allocation. Initial append retains new tensors. Later appends allocate concatenated tensors, wait for completion, then replace that layer's pair. `active` borrows the current pair; reset drops all pairs. Layers can be appended independently, but a model forward requires all lengths equal and matching layer count/head layout/dtype. Payload bytes report only active storage, not a reserved maximum allocation.
+
+`forward_prefill` creates an empty cache and returns all position logits plus the cache. `forward_decode` adds one token (including to an empty cache), returning `[1,V]`. General `forward` accepts a nonempty chunk and optional diagnostic trace. It validates token IDs, context/capacity, and cache layout, clones the cache's Rc handles, then publishes the staged cache only after final logits succeed. Errors preserve the caller's cache. A diagnostic trace may contain partial snapshots on error and retains additional tensors when enabled. Caches must be used with the model that produced them; matching shape alone does not establish matching weights.
+
+## New copy kernel ABI and safety
+
+The existing three-buffer/nine-u32 dispatcher is unchanged. New kernels reinterpret unused scalar slots with checked host contracts:
+
+| Kernel | Scalar fields beyond common dtype/length |
+|---|---|
+| embedding_gather | p1=hidden width; B contains validated u32 IDs |
+| copy_range | p1=source element offset; dispatch size=checked output count |
+| concat_flat | p0=A length; dispatch size=A+B elements |
+| transpose2 | p1=rows, p2=columns |
+| swap01 | p1=A, p2=B, p3=C for `[A,B,C] → [B,A,C]` |
+| select_head | p1=head index, p2=head count, p3=head width |
+| bias_add | p1=last-axis width |
+| scale | p7=F32 scalar bits |
+| causal_mask | p1=key count, p5=absolute query offset |
+| rope_split | p1=head count, p5=offset, p6=head width, p8=theta bits |
+
+These are fresh-output copies, not views or arbitrary strides. Exact dispatch grids and validated shape products bound every access. Zero-size grids do not dispatch. No new unsafe Rust was added; the four backend blocks and framework linkage remain the only unsafe sites. Counter bookkeeping uses single-threaded `Cell` alongside the existing Rc ownership.
+
+Device counters are monotonic totals of successful allocations, physical allocation bytes, and submitted dispatches. A caller snapshots before/after a forward. They include ID carrier and output allocations. Cumulative allocation volume is not peak live memory or DRAM traffic. Smoke subtracts final active cache and returned logits from allocation volume to estimate temporary allocation volume. Construction/source weight copies and diagnostic traces are excluded from steady-state samples.
+
+## Phase 3 handoff
+
+Fundamental dense full-attention Qwen2-style execution is ready. Phase 3 needs a locally supplied compatible small Qwen-family model, config JSON parsing/validation, real tensor-name mapping (and local shard assembly if needed), tokenizer/chat-template integration, prefill/decode calls, sampling, and coherent-text validation. It should select the supported structural subset rather than silently accept sliding-window, QK-normalized Qwen3, MoE, multimodal, or scaled-RoPE configurations. No pretrained checkpoint, network downloader, chat template, sampling loop, or generation command is included in Phase 2.

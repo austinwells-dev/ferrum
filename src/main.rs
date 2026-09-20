@@ -1,3 +1,4 @@
+mod transformer_smoke;
 use ferrum::{DType, MetalDevice, Result, Tensor, reference as cpu};
 fn main() -> Result<()> {
     let device = MetalDevice::new()?;
@@ -12,6 +13,7 @@ fn main() -> Result<()> {
                 device.apple_families()
             );
         }
+        "transformer-smoke" => transformer_smoke::run(&device)?,
         "smoke" => {
             println!("Metal device: {}", device.name());
             let start = std::time::Instant::now();
@@ -51,7 +53,7 @@ fn main() -> Result<()> {
         }
         other => {
             return Err(ferrum::Error::Parameter(format!(
-                "unknown command {other}; use info or smoke"
+                "unknown command {other}; use info, smoke or transformer-smoke"
             )));
         }
     }

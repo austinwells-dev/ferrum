@@ -2,7 +2,7 @@
 
 Ferrum is an independent Rust + Metal machine-learning runtime for Apple Silicon. The long-term goal is native LLM execution without MLX, llama.cpp, PyTorch, Python, MPSGraph, or another inference engine in the execution path.
 
-**Phase 1 implements the runtime foundation only. It does not load or run models.**
+**Phase 2 implements and validates a complete synthetic decoder transformer. Real pretrained model execution is reserved for Phase 3.**
 
 ## Requirements and commands
 
@@ -13,6 +13,7 @@ Ferrum is an independent Rust + Metal machine-learning runtime for Apple Silicon
 ```sh
 cargo run --release -- info
 cargo run --release -- smoke
+cargo run --release -- transformer-smoke
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
@@ -77,10 +78,43 @@ Criterion stores machine-readable results in `target/criterion`. Use `--save-bas
 
 - Apple Silicon macOS only; synchronous, single-threaded contexts; full contiguous allocations; fresh output allocation per operation.
 - Kernel indices and element counts fit `u32`; matmul K is capped below `u32::MAX - 16` to avoid tiled-loop overflow. Allocation also obeys the device's reported maximum buffer length.
-- Matmul accepts only `[M,K] × [K,N]`; no batching, transpose, or broadcasting. RMSNorm and softmax reduce the last axis, which must be nonempty. Leading zero dimensions are supported. Empty elementwise/matmul outputs skip dispatch; K=0 matmul produces zero.
+- The matmul primitive accepts only `[M,K] × [K,N]`; no batching or broadcasting. Phase 2 adds separate controlled transpose/copy operations. RMSNorm and softmax reduce the last axis, which must be nonempty. Leading zero dimensions are supported. Empty elementwise/matmul outputs skip dispatch; K=0 matmul produces zero.
 - RMSNorm/softmax use one GPU thread per row and serial F32 reductions. They are not optimized parallel reductions. Extremely large RMSNorm inputs can overflow F32 sum-of-squares. Finite, representable arithmetic is the numerical validation domain; NaN/infinity semantics for reductions are not promised.
-- RoPE rotates adjacent pairs, applies one position to all heads in the call, and supports no partial rotation or scaling variants. F32 phase error grows with position; the test at position 2048 uses a 5e-4 absolute tolerance against an F64 oracle. Very long-context precision has not been established.
+- The original RoPE API rotates adjacent pairs at one position. Phase 2 also provides sequence-aware split-half RoPE. Neither supports partial rotation or scaling variants. F32 phase error grows with position; the test at position 2048 uses a 5e-4 absolute tolerance against an F64 oracle. Very long-context precision has not been established.
 - F16/BF16 have reduced storage bandwidth but still use F32 arithmetic. There are no tensor-core/SIMD-group matrix instructions or peak-performance claims.
-- No model formats, tokenizer, transformer, attention, KV cache, quantization, graph scheduler, autograd, training, bindings, or service interface.
+- No real pretrained models, generation/sampling, downloads, quantization, graph scheduler, autograd, training, bindings, or service interface.
 
-Phase 2 should preserve the validated tensor/storage contracts and introduce explicit lifetime/completion tracking before allowing asynchronous execution or storage reuse. It has not been started.
+Phase 2 preserves the validated tensor/storage contracts. Asynchronous execution and storage reuse still require a future explicit completion/lifetime design.
+
+## Phase 2 transformer
+
+The `loader` uses safetensors for local F32/F16/BF16 weights, copying validated bytes directly into shared Metal storage. `tokenizer` wraps the Rust Hugging Face tokenizers implementation for local `tokenizer.json` files, with no network feature enabled. `nn` provides embedding gather, linear with optional bias, RMSNorm, GQA attention, SwiGLU, and immutable-copy KV caches. `model` supplies validated configuration, typed decoder layers, and a transformer; string-based weight lookup ends at construction.
+
+The supported structure is a dense full-attention Qwen2-style decoder: token embedding, repeated pre-norm attention/SwiGLU residual blocks, final RMSNorm, and separate or tied LM head. All dimensions, GQA ratio, epsilon, theta, context capacity, and dtype are configurable. Split-half RoPE matches Qwen's pairing; Phase 1's adjacent-pair operation remains unchanged.
+
+```rust
+use ferrum::{MetalDevice, Result};
+use ferrum::{loader::Weights, model::{ModelConfig, Transformer, tiny}};
+
+fn transformer_example(device: &MetalDevice) -> Result<()> {
+    let config = ModelConfig::tiny(ferrum::DType::F32);
+    let fixture = tiny::serialize(&config, &tiny::weights(&config)?)?;
+    let weights = Weights::from_bytes(device, &fixture)?;
+    let model = Transformer::from_weights(device, config, &weights)?;
+    let (logits, mut cache) = model.forward_prefill(device, &[3, 8, 4])?;
+    assert_eq!(logits.shape().dimensions(), &[3, 32]);
+    let next = model.forward_decode(device, 11, &mut cache)?;
+    assert_eq!(next.shape().dimensions(), &[1, 32]);
+    Ok(())
+}
+```
+
+Prefill returns `[sequence, vocabulary]` logits, including the final relevant row, and a populated cache. Decode returns `[1, vocabulary]`. `forward` supports multi-token appends and optional diagnostic tensor snapshots; cache changes commit only when the entire forward succeeds. Cache tensors are `[active_sequence, kv_heads, head_dim]`; no capacity buffer is preallocated.
+
+```sh
+cargo test --test loading
+cargo test --test transformer -- --nocapture --test-threads=1
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --test transformer -- --test-threads=1
+```
+
+The smoke command generates a deterministic two-layer model, serializes it through safetensors, loads it through the production loader, checks 41 intermediate tensors against an independent CPU oracle, and verifies cached logits. It reports timings, dispatches, allocations, weight/KV payloads, and cumulative temporary allocation volume. The numerical path uses only Ferrum Metal operations. See [Phase 2 results](docs/phase2-results.md) for measured errors and timings, and [architecture](docs/architecture.md) for layouts and the Phase 3 handoff.

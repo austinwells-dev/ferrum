@@ -137,6 +137,27 @@ impl Tensor {
             dtype,
         })
     }
+    /// Copy validated little-endian file bytes directly into fresh shared storage.
+    pub fn from_le_bytes(
+        device: &MetalDevice,
+        dims: impl AsRef<[usize]>,
+        dtype: DType,
+        data: &[u8],
+    ) -> Result<Self> {
+        let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape)?;
+        if shape.byte_size(dtype)? != data.len() {
+            return Err(Error::Shape("byte length differs from shape/dtype".into()));
+        }
+        let mut storage = device.allocate(data.len())?;
+        storage.with_bytes_mut(|dst| dst.copy_from_slice(data)); // Apple Silicon is little-endian.
+        Ok(Self {
+            storage: Rc::new(storage),
+            shape,
+            layout,
+            dtype,
+        })
+    }
     pub fn to_f32(&self) -> Vec<f32> {
         self.storage.with_bytes(|bytes| {
             bytes

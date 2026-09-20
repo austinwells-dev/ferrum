@@ -53,3 +53,45 @@ kernel void matmul(ARGS, uint2 tid [[thread_position_in_threadgroup]], uint2 gro
     }
     if(row<m && col<n) store(c,row*n+col,p[4],sum);
 }
+// Phase 2 copies never alias their inputs. p[1..3,5..8] are operation-specific.
+kernel void copy_range(ARGS, uint i [[thread_position_in_grid]]) {
+    store(c,i,p[4],load(a,p[1]+i,p[4]));
+}
+kernel void concat_flat(ARGS, uint i [[thread_position_in_grid]]) {
+    store(c,i,p[4],i<p[0]?load(a,i,p[4]):load(b,i-p[0],p[4]));
+}
+kernel void transpose2(ARGS, uint i [[thread_position_in_grid]]) {
+    store(c,i,p[4],load(a,(i%p[1])*p[2]+i/p[1],p[4]));
+}
+// [A,B,C] -> [B,A,C]
+kernel void swap01(ARGS, uint i [[thread_position_in_grid]]) {
+    uint z=i%p[3], x=(i/p[3])%p[1], y=i/(p[3]*p[1]);
+    store(c,i,p[4],load(a,(x*p[2]+y)*p[3]+z,p[4]));
+}
+// [sequence,heads,dim] -> [sequence,dim], selecting one head.
+kernel void select_head(ARGS, uint i [[thread_position_in_grid]]) {
+    store(c,i,p[4],load(a,(i/p[3]*p[2]+p[1])*p[3]+i%p[3],p[4]));
+}
+kernel void bias_add(ARGS, uint i [[thread_position_in_grid]]) {
+    store(c,i,p[4],load(a,i,p[4])+load(b,i%p[1],p[4]));
+}
+kernel void scale(ARGS, uint i [[thread_position_in_grid]]) {
+    store(c,i,p[4],load(a,i,p[4])*as_type<float>(p[7]));
+}
+kernel void causal_mask(ARGS, uint i [[thread_position_in_grid]]) {
+    store(c,i,p[4],i%p[1]>p[5]+i/p[1]?-INFINITY:load(a,i,p[4]));
+}
+// Split-half pairing, sequence-major [S,H,D], absolute position offset + token.
+kernel void rope_split(ARGS, uint pair [[thread_position_in_grid]]) {
+    uint halfdim=p[6]/2, head=pair/halfdim, j=pair%halfdim;
+    uint i=head*p[6]+j;
+    float angle=float(p[5]+head/p[1])*pow(as_type<float>(p[8]),-float(2*j)/float(p[6]));
+    float co=cos(angle), si=sin(angle), x=load(a,i,p[4]), y=load(a,i+halfdim,p[4]);
+    store(c,i,p[4],x*co-y*si); store(c,i+halfdim,p[4],x*si+y*co);
+}
+// IDs are validated on the host and uploaded as little-endian u32 words.
+// Their private carrier tensor has the weight dtype only to use the common dispatcher.
+kernel void embedding_gather(ARGS, uint i [[thread_position_in_grid]]) {
+    uint token=((device const uint*)b)[i/p[1]];
+    store(c,i,p[4],load(a,token*p[1]+i%p[1],p[4]));
+}

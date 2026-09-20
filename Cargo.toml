@@ -10,8 +10,10 @@ half = "2.7.1"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError"] }
 objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLBuffer", "MTLResource", "MTLComputePipeline", "MTLLibrary", "MTLTypes", "MTLAllocation", "objc2-core-foundation"] }
+safetensors = "0.8.0"
 smallvec = "1.16.1"
 thiserror = "2.0.20"
+tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 
 [dev-dependencies]
 criterion = "0.8.2"

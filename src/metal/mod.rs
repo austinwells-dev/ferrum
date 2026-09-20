@@ -7,7 +7,7 @@ use objc2::{
 use objc2_foundation::NSString;
 use objc2_metal::*;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     ptr::NonNull,
     rc::Rc,
@@ -64,7 +64,15 @@ pub struct DispatchTiming {
     pub dispatches: usize,
 }
 /// Single-threaded synchronous execution context with one queue and cached pipelines.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Counters {
+    pub allocations: usize,
+    pub allocated_bytes: usize,
+    pub dispatches: usize,
+}
+
 pub struct MetalDevice {
+    counters: Cell<Counters>,
     raw: Retained<ProtocolObject<dyn MTLDevice>>,
     queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
     name: String,
@@ -84,6 +92,7 @@ impl MetalDevice {
             .newCommandQueue()
             .ok_or_else(|| Error::Initialization("command queue creation failed".into()))?;
         Ok(Self {
+            counters: Cell::new(Counters::default()),
             name: raw.name().to_string(),
             raw,
             queue,
@@ -92,6 +101,9 @@ impl MetalDevice {
             pipelines: RefCell::new(HashMap::new()),
             builtins: RefCell::new(HashMap::new()),
         })
+    }
+    pub fn counters(&self) -> Counters {
+        self.counters.get()
     }
     pub fn name(&self) -> &str {
         &self.name
@@ -126,6 +138,10 @@ impl MetalDevice {
         unsafe {
             std::ptr::write_bytes(raw.contents().as_ptr().cast::<u8>(), 0, length);
         }
+        let mut counters = self.counters.get();
+        counters.allocations += 1;
+        counters.allocated_bytes += length;
+        self.counters.set(counters);
         Ok(MetalBuffer {
             raw,
             len: bytes,
@@ -253,6 +269,9 @@ impl MetalDevice {
             }
             encoder.endEncoding();
             command.commit();
+            let mut counters = self.counters.get();
+            counters.dispatches += 1;
+            self.counters.set(counters);
             let submission = start.elapsed();
             command.waitUntilCompleted();
             let synchronized = start.elapsed();

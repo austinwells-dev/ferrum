@@ -1,6 +1,19 @@
 use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("invalid model configuration: {0}")]
+    Config(String),
+    #[error("weight {name}: {message}")]
+    Weight { name: String, message: String },
+    #[error("invalid token ID {id}; vocabulary size {vocab}")]
+    Token { id: u32, vocab: usize },
+    #[error("KV cache: {0}")]
+    Cache(String),
+    #[error("safetensors: {0}")]
+    Safetensors(String),
+    #[error("tokenizer: {0}")]
+    Tokenizer(String),
+
     #[error("Metal initialization: {0}")]
     Initialization(String),
     #[error("Metal shader compilation: {0}")]

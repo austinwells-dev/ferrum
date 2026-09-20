@@ -180,3 +180,5 @@ fn width(a: &Tensor) -> Result<usize> {
 fn index(n: usize) -> Result<u32> {
     u32::try_from(n).map_err(|_| Error::Shape("kernel index exceeds u32".into()))
 }
+
+mod transformer;
