@@ -1,0 +1,8 @@
+    Finished `release` profile [optimized] target(s) in 0.01s
+     Running `target/release/ferrum info`
+Runtime device: Apple M5
+Backend: Metal
+Unified memory: true
+Recommended max working set: 25769803776 bytes
+Max buffer: 20100448256 bytes
+Supported Apple GPU families (queried 1–10): [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]

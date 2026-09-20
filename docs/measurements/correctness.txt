@@ -1,0 +1,145 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.02s
+     Running tests/correctness.rs (target/debug/deps/correctness-d32ea46880d44bad)
+
+running 9 tests
+test bf16_gpu_rounding_ties_and_nan ... ok
+test chained_gpu_outputs_preserve_inputs ... chain F32 [1, 2, 1, 3, 1, 2]: max_abs=2.980232e-8
+ok
+test compilation_diagnostics_and_cache ... ok
+test elementwise_all_dtypes_and_edges ... add F32 []: max_abs=0.000000e0
+mul F32 []: max_abs=0.000000e0
+silu F32 []: max_abs=0.000000e0
+add F32 [0]: max_abs=0.000000e0
+mul F32 [0]: max_abs=0.000000e0
+silu F32 [0]: max_abs=0.000000e0
+add F32 [1]: max_abs=0.000000e0
+mul F32 [1]: max_abs=0.000000e0
+silu F32 [1]: max_abs=0.000000e0
+add F32 [3, 7]: max_abs=0.000000e0
+mul F32 [3, 7]: max_abs=0.000000e0
+silu F32 [3, 7]: max_abs=5.960464e-8
+add F32 [257]: max_abs=0.000000e0
+mul F32 [257]: max_abs=0.000000e0
+silu F32 [257]: max_abs=1.788139e-7
+add F32 [2, 3, 4096]: max_abs=0.000000e0
+mul F32 [2, 3, 4096]: max_abs=0.000000e0
+silu F32 [2, 3, 4096]: max_abs=1.788139e-7
+add F16 []: max_abs=0.000000e0
+mul F16 []: max_abs=0.000000e0
+silu F16 []: max_abs=0.000000e0
+add F16 [0]: max_abs=0.000000e0
+mul F16 [0]: max_abs=0.000000e0
+silu F16 [0]: max_abs=0.000000e0
+add F16 [1]: max_abs=0.000000e0
+mul F16 [1]: max_abs=0.000000e0
+silu F16 [1]: max_abs=0.000000e0
+add F16 [3, 7]: max_abs=0.000000e0
+mul F16 [3, 7]: max_abs=0.000000e0
+silu F16 [3, 7]: max_abs=0.000000e0
+add F16 [257]: max_abs=0.000000e0
+mul F16 [257]: max_abs=0.000000e0
+silu F16 [257]: max_abs=0.000000e0
+add F16 [2, 3, 4096]: max_abs=0.000000e0
+mul F16 [2, 3, 4096]: max_abs=0.000000e0
+silu F16 [2, 3, 4096]: max_abs=0.000000e0
+add BF16 []: max_abs=0.000000e0
+mul BF16 []: max_abs=0.000000e0
+silu BF16 []: max_abs=0.000000e0
+add BF16 [0]: max_abs=0.000000e0
+mul BF16 [0]: max_abs=0.000000e0
+silu BF16 [0]: max_abs=0.000000e0
+add BF16 [1]: max_abs=0.000000e0
+mul BF16 [1]: max_abs=0.000000e0
+silu BF16 [1]: max_abs=0.000000e0
+add BF16 [3, 7]: max_abs=0.000000e0
+mul BF16 [3, 7]: max_abs=0.000000e0
+silu BF16 [3, 7]: max_abs=0.000000e0
+add BF16 [257]: max_abs=0.000000e0
+mul BF16 [257]: max_abs=0.000000e0
+silu BF16 [257]: max_abs=0.000000e0
+add BF16 [2, 3, 4096]: max_abs=0.000000e0
+mul BF16 [2, 3, 4096]: max_abs=0.000000e0
+silu BF16 [2, 3, 4096]: max_abs=0.000000e0
+ok
+test invalid_inputs_and_contexts_are_rejected ... ok
+test metadata_roundtrip_and_reshape ... ok
+test rotary_all_dtypes ... rope F32 [2]: max_abs=0.000000e0
+rope F32 [3, 12]: max_abs=1.192093e-7
+rope F32 [2, 3, 128]: max_abs=1.445413e-5
+rope F32 [3, 256]: max_abs=1.429319e-4
+rope F32 [0, 128]: max_abs=0.000000e0
+rope F16 [2]: max_abs=0.000000e0
+rope F16 [3, 12]: max_abs=0.000000e0
+rope F16 [2, 3, 128]: max_abs=7.629395e-6
+rope F16 [3, 256]: max_abs=9.765625e-4
+rope F16 [0, 128]: max_abs=0.000000e0
+rope BF16 [2]: max_abs=0.000000e0
+rope BF16 [3, 12]: max_abs=0.000000e0
+rope BF16 [2, 3, 128]: max_abs=0.000000e0
+rope BF16 [3, 256]: max_abs=3.906250e-3
+rope BF16 [0, 128]: max_abs=0.000000e0
+ok
+test row_operations_all_dtypes ... rmsnorm F32 [1]: max_abs=0.000000e0
+softmax F32 [1]: max_abs=0.000000e0
+rmsnorm F32 [3, 7]: max_abs=2.384186e-7
+softmax F32 [3, 7]: max_abs=2.980232e-8
+rmsnorm F32 [2, 3, 129]: max_abs=2.384186e-7
+softmax F32 [2, 3, 129]: max_abs=5.587935e-9
+rmsnorm F32 [4, 4096]: max_abs=3.099442e-6
+softmax F32 [4, 4096]: max_abs=1.513399e-9
+rmsnorm F32 [0, 128]: max_abs=0.000000e0
+softmax F32 [0, 128]: max_abs=0.000000e0
+stable softmax F32 [2, 3]: max_abs=7.450581e-9
+stable silu F32 [5]: max_abs=3.783506e-42
+rmsnorm F16 [1]: max_abs=0.000000e0
+softmax F16 [1]: max_abs=0.000000e0
+rmsnorm F16 [3, 7]: max_abs=0.000000e0
+softmax F16 [3, 7]: max_abs=0.000000e0
+rmsnorm F16 [2, 3, 129]: max_abs=0.000000e0
+softmax F16 [2, 3, 129]: max_abs=0.000000e0
+rmsnorm F16 [4, 4096]: max_abs=0.000000e0
+softmax F16 [4, 4096]: max_abs=2.384186e-7
+rmsnorm F16 [0, 128]: max_abs=0.000000e0
+softmax F16 [0, 128]: max_abs=0.000000e0
+stable softmax F16 [2, 3]: max_abs=0.000000e0
+stable silu F16 [5]: max_abs=0.000000e0
+rmsnorm BF16 [1]: max_abs=0.000000e0
+softmax BF16 [1]: max_abs=0.000000e0
+rmsnorm BF16 [3, 7]: max_abs=0.000000e0
+softmax BF16 [3, 7]: max_abs=0.000000e0
+rmsnorm BF16 [2, 3, 129]: max_abs=0.000000e0
+softmax BF16 [2, 3, 129]: max_abs=0.000000e0
+rmsnorm BF16 [4, 4096]: max_abs=0.000000e0
+softmax BF16 [4, 4096]: max_abs=0.000000e0
+rmsnorm BF16 [0, 128]: max_abs=0.000000e0
+softmax BF16 [0, 128]: max_abs=0.000000e0
+stable softmax BF16 [2, 3]: max_abs=0.000000e0
+stable silu BF16 [5]: max_abs=0.000000e0
+ok
+test tiled_matmul_all_dtypes_and_edges ... matmul F32 [1, 1]: max_abs=0.000000e0
+matmul F32 [3, 7]: max_abs=1.192093e-7
+matmul F32 [17, 23]: max_abs=1.430511e-6
+matmul F32 [64, 65]: max_abs=7.629395e-6
+matmul F32 [2, 33]: max_abs=5.035400e-4
+matmul F32 [0, 7]: max_abs=0.000000e0
+matmul F32 [3, 7]: max_abs=0.000000e0
+matmul F32 [3, 0]: max_abs=0.000000e0
+matmul F16 [1, 1]: max_abs=0.000000e0
+matmul F16 [3, 7]: max_abs=0.000000e0
+matmul F16 [17, 23]: max_abs=3.814697e-6
+matmul F16 [64, 65]: max_abs=1.525879e-5
+matmul F16 [2, 33]: max_abs=0.000000e0
+matmul F16 [0, 7]: max_abs=0.000000e0
+matmul F16 [3, 7]: max_abs=0.000000e0
+matmul F16 [3, 0]: max_abs=0.000000e0
+matmul BF16 [1, 1]: max_abs=0.000000e0
+matmul BF16 [3, 7]: max_abs=0.000000e0
+matmul BF16 [17, 23]: max_abs=0.000000e0
+matmul BF16 [64, 65]: max_abs=0.000000e0
+matmul BF16 [2, 33]: max_abs=0.000000e0
+matmul BF16 [0, 7]: max_abs=0.000000e0
+matmul BF16 [3, 7]: max_abs=0.000000e0
+matmul BF16 [3, 0]: max_abs=0.000000e0
+ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.20s

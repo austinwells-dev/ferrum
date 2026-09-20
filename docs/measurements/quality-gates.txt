@@ -1,0 +1,48 @@
+All commands exited 0 on 2026-09-20.
+
+$ cargo fmt --check
+
+$ cargo clippy --all-targets --all-features -- -D warnings
+    Checking ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s
+
+$ cargo test
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.52s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-e1319b4bb3bf1640)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (target/debug/deps/ferrum-7b44c2fbb36a8e98)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/correctness.rs (target/debug/deps/correctness-d32ea46880d44bad)
+
+running 9 tests
+test metadata_roundtrip_and_reshape ... ok
+test invalid_inputs_and_contexts_are_rejected ... ok
+test bf16_gpu_rounding_ties_and_nan ... ok
+test chained_gpu_outputs_preserve_inputs ... ok
+test rotary_all_dtypes ... ok
+test compilation_diagnostics_and_cache ... ok
+test elementwise_all_dtypes_and_edges ... ok
+test row_operations_all_dtypes ... ok
+test tiled_matmul_all_dtypes_and_edges ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+   Doc-tests ferrum
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+
+$ cargo build --release
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 0.44s

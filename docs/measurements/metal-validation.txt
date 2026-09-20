@@ -1,0 +1,17 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.03s
+     Running tests/correctness.rs (target/debug/deps/correctness-d32ea46880d44bad)
+
+running 9 tests
+test bf16_gpu_rounding_ties_and_nan ... 2026-09-20 10:08:05.973 correctness-d32ea46880d44bad[85489:3306036] Metal API Validation Enabled
+2026-09-20 10:08:05.973 correctness-d32ea46880d44bad[85489:3306036] Metal GPU Validation Enabled
+ok
+test chained_gpu_outputs_preserve_inputs ... ok
+test compilation_diagnostics_and_cache ... ok
+test elementwise_all_dtypes_and_edges ... ok
+test invalid_inputs_and_contexts_are_rejected ... ok
+test metadata_roundtrip_and_reshape ... ok
+test rotary_all_dtypes ... ok
+test row_operations_all_dtypes ... ok
+test tiled_matmul_all_dtypes_and_edges ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.84s

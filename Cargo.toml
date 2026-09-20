@@ -1,0 +1,26 @@
+[package]
+name = "ferrum"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "An independent Rust and Metal tensor runtime for Apple Silicon"
+
+[dependencies]
+half = "2.7.1"
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLBuffer", "MTLResource", "MTLComputePipeline", "MTLLibrary", "MTLTypes", "MTLAllocation", "objc2-core-foundation"] }
+smallvec = "1.16.1"
+thiserror = "2.0.20"
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "runtime"
+harness = false
+
+# macOS 27's dyld rejects some stripped proc-macro dylibs (LINKEDIT alignment).
+# Build-time tools are not shipped; keeping them unstripped avoids E0463 at release build.
+[profile.release.build-override]
+strip = false
