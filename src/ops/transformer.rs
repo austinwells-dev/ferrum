@@ -386,6 +386,24 @@ impl MetalDevice {
 mod fusion_tests {
     use super::*;
     #[test]
+    fn fused_silu_multiply_preserves_storage_rounding() {
+        let d = MetalDevice::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            let values: Vec<_> = (-500..501).map(|i| i as f32 / 10.).collect();
+            let x = Tensor::from_f32(&d, [values.len()], dtype, &values).unwrap();
+            let y = Tensor::from_f32(
+                &d,
+                [values.len()],
+                dtype,
+                &crate::reference::deterministic(values.len()),
+            )
+            .unwrap();
+            let staged = d.mul(&d.silu(&x).unwrap().tensor, &y).unwrap().tensor;
+            let fused = d.silu_mul(&x, &y).unwrap().tensor;
+            assert_eq!(staged.to_f32(), fused.to_f32(), "{dtype:?}");
+        }
+    }
+    #[test]
     fn decode_context_partitions_cover_threshold_and_column_tails() {
         let d = MetalDevice::new().unwrap();
         for dtype in [DType::BF16, DType::F16] {

@@ -17,6 +17,15 @@ inline void store(device uchar* p, uint i, uint dtype, float x) {
         ((device ushort*)p)[i] = b;
     }
 }
+inline float round_storage(float x, uint dtype) {
+    if(dtype==1) return float(half(x));
+    if(dtype==2) {
+        uint bits=as_type<uint>(x);
+        uint rounded=isnan(x)?((bits>>16)|0x40):((bits+0x7fff+((bits>>16)&1))>>16);
+        return as_type<float>(rounded<<16);
+    }
+    return x;
+}
 #define ARGS device const uchar* a [[buffer(0)]], device const uchar* b [[buffer(1)]], device uchar* c [[buffer(2)]], constant uint* p [[buffer(3)]]
 kernel void add(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) store(c,i,p[4],load(a,i,p[4])+load(b,i,p[4])); }
 kernel void mul(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) store(c,i,p[4],load(a,i,p[4])*load(b,i,p[4])); }
@@ -368,4 +377,12 @@ kernel void attention_context_decode(ARGS, uint tid [[thread_index_in_threadgrou
         for(uint j=0;j<8;j++) sum+=partial[j*32+tid];
         store(c,h*d+col,p[4],sum);
     }
+}
+
+// Preserve the SiLU output's storage rounding before the gated multiply.
+kernel void silu_mul(ARGS, uint i [[thread_position_in_grid]]) {
+    if(i>=p[0]) return;
+    float x=load(a,i,p[4]);
+    float sigmoid=x>=0?1.f/(1.f+exp(-x)):exp(x)/(1.f+exp(x));
+    store(c,i,p[4],round_storage(x*sigmoid,p[4])*load(b,i,p[4]));
 }

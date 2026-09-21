@@ -97,6 +97,9 @@ impl MetalDevice {
     pub fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Output> {
         self.binary("mul", a, b)
     }
+    pub(crate) fn silu_mul(&self, a: &Tensor, b: &Tensor) -> Result<Output> {
+        self.binary("silu_mul", a, b)
+    }
     pub fn silu(&self, a: &Tensor) -> Result<Output> {
         self.run(
             "silu",

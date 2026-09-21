@@ -97,7 +97,7 @@ impl Mlp {
     pub fn forward(&self, d: &MetalDevice, x: &Tensor) -> Result<Tensor> {
         let gate = self.gate.forward(d, x)?;
         let up = self.up.forward(d, x)?;
-        let hidden = d.mul(&d.silu(&gate)?.tensor, &up)?.tensor;
+        let hidden = d.silu_mul(&gate, &up)?.tensor;
         self.down.forward(d, &hidden)
     }
 }
