@@ -100,6 +100,17 @@ impl Transformer {
         let logits = self.forward(d, tokens, &mut cache, None)?;
         Ok((logits, cache))
     }
+    /// Generation prefill computes only the requested final-position logits.
+    /// All transformer positions and cache updates still execute inside this call.
+    pub fn forward_prefill_last(
+        &self,
+        d: &MetalDevice,
+        tokens: &[u32],
+    ) -> Result<(Tensor, KvCache)> {
+        let mut cache = self.new_cache()?;
+        let logits = self.forward_impl(d, tokens, &mut cache, None, true)?;
+        Ok((logits, cache))
+    }
     /// One new token, returning [1,vocab]; an empty cache is also supported.
     pub fn forward_decode(
         &self,
@@ -115,7 +126,17 @@ impl Transformer {
         d: &MetalDevice,
         tokens: &[u32],
         cache: &mut KvCache,
+        trace: Option<&mut Trace>,
+    ) -> Result<Tensor> {
+        self.forward_impl(d, tokens, cache, trace, false)
+    }
+    fn forward_impl(
+        &self,
+        d: &MetalDevice,
+        tokens: &[u32],
+        cache: &mut KvCache,
         mut trace: Option<&mut Trace>,
+        last_only: bool,
     ) -> Result<Tensor> {
         if tokens.is_empty() {
             return Err(Error::Parameter(
@@ -140,7 +161,15 @@ impl Transformer {
         }
         let x = self.final_norm.forward(d, &x)?;
         record(&mut trace, "final_hidden", &x);
-        let logits = d.profile_lm_head(|| self.lm_head.forward(d, &x))?;
+        let head_input = if last_only {
+            x.view(
+                (tokens.len() - 1) * self.config.hidden_size,
+                [1, self.config.hidden_size],
+            )?
+        } else {
+            x
+        };
+        let logits = d.profile_lm_head(|| self.lm_head.forward(d, &head_input))?;
         record(&mut trace, "logits", &logits);
         execution.finish()?;
         *cache = staged;

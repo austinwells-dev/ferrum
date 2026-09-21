@@ -135,7 +135,7 @@ pub fn generate(
     let start = Instant::now();
     d.reset_transient_peak();
     let before = d.counters();
-    let (logits, mut cache) = model.forward_prefill(d, prompt)?;
+    let (logits, mut cache) = model.forward_prefill_last(d, prompt)?;
     result.prefill = start.elapsed();
     let mut values = final_logits(d, &logits)?;
     drop(logits);

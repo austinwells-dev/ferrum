@@ -59,3 +59,38 @@ fn vector_projection_tail_and_misaligned_views() {
         }
     }
 }
+
+#[test]
+fn last_position_prefill_preserves_cache_and_requested_logits() {
+    use ferrum::{
+        generation::final_logits,
+        loader::Weights,
+        model::{ModelConfig, Transformer, tiny},
+    };
+    let d = MetalDevice::new().unwrap();
+    for ty in [DType::F32, DType::F16, DType::BF16] {
+        let c = ModelConfig::tiny(ty);
+        let bytes = tiny::serialize(&c, &tiny::weights(&c).unwrap()).unwrap();
+        let w = Weights::from_bytes(&d, &bytes).unwrap();
+        let model = Transformer::from_weights(&d, c, &w).unwrap();
+        let (full, mut a) = model.forward_prefill(&d, &[3, 8, 4]).unwrap();
+        let (last, mut b) = model.forward_prefill_last(&d, &[3, 8, 4]).unwrap();
+        assert_eq!(last.shape().dimensions(), &[1, 32]);
+        let (atol, rtol) = match ty {
+            DType::F32 => (3e-5, 3e-5),
+            DType::F16 => (2e-3, 2e-3),
+            DType::BF16 => (1.6e-2, 1e-2),
+        };
+        reference::check(
+            &last.to_f32(),
+            &final_logits(&d, &full).unwrap(),
+            atol,
+            rtol,
+        )
+        .unwrap();
+        let da = model.forward_decode(&d, 11, &mut a).unwrap();
+        let db = model.forward_decode(&d, 11, &mut b).unwrap();
+        assert_eq!(da.to_f32(), db.to_f32());
+        assert!(model.forward_prefill_last(&d, &[]).is_err());
+    }
+}
