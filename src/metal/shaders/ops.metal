@@ -73,6 +73,36 @@ kernel void softmax(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[t
     sum=simd_sum(lane<8?partial[lane]:0.f);
     for(uint j=tid;j<w;j+=256) store(c,base+j,p[4],exp(load(a,base+j,p[4])-mx)/sum);
 }
+// Preserve the storage rounding of the separate scale kernel before reduction.
+inline float attention_scaled(device const uchar* a, uint i, uint j, uint row, constant uint* p) {
+    if(j>p[5]+row%p[2]) return -INFINITY;
+    float x=load(a,i,p[4])*as_type<float>(p[7]);
+    if(p[4]==1) return float(half(x));
+    if(p[4]==2) {
+        uint bits=as_type<uint>(x);
+        uint rounded=isnan(x)?((bits>>16)|0x40):((bits+0x7fff+((bits>>16)&1))>>16);
+        return as_type<float>(rounded<<16);
+    }
+    return x;
+}
+kernel void attention_softmax(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[8];
+    uint w=p[1], base=row*w, lane=tid%32, simd=tid/32;
+    float mx=-INFINITY;
+    for(uint j=tid;j<w;j+=256) mx=max(mx,attention_scaled(a,base+j,j,row,p));
+    mx=simd_max(mx);
+    if(lane==0) partial[simd]=mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx=simd_max(lane<8?partial[lane]:-INFINITY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum=0;
+    for(uint j=tid;j<w;j+=256) sum+=exp(attention_scaled(a,base+j,j,row,p)-mx);
+    sum=simd_sum(sum);
+    if(lane==0) partial[simd]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum=simd_sum(lane<8?partial[lane]:0.f);
+    for(uint j=tid;j<w;j+=256) store(c,base+j,p[4],exp(attention_scaled(a,base+j,j,row,p)-mx)/sum);
+}
 // Adjacent-pair (interleaved) RoPE. The same supplied position applies to all heads.
 kernel void rope(ARGS, uint pair [[thread_position_in_grid]]) {
     uint i=pair*2; if(i>=p[0]) return;

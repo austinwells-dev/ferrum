@@ -231,6 +231,35 @@ impl MetalDevice {
         p[5] = index(offset)?;
         self.run("attention_mask", scores, None, dims, p, [scores.numel(), 1])
     }
+    pub(crate) fn attention_softmax(
+        &self,
+        scores: &Tensor,
+        offset: usize,
+        scale: f32,
+    ) -> Result<Output> {
+        let dims = scores.shape().dimensions();
+        if dims.len() != 3
+            || dims[1] == 0
+            || offset.checked_add(dims[1]) != Some(dims[2])
+            || dims[2] > u32::MAX as usize - 256
+            || !scale.is_finite()
+        {
+            return Err(Error::Shape("grouped causal softmax scores".into()));
+        }
+        let mut p = [0; 9];
+        p[1] = index(dims[2])?;
+        p[2] = index(dims[1])?;
+        p[5] = index(offset)?;
+        p[7] = scale.to_bits();
+        self.run(
+            "attention_softmax",
+            scores,
+            None,
+            dims,
+            p,
+            [scores.numel() / dims[2], 1],
+        )
+    }
     pub(crate) fn attention_context(&self, probs: &Tensor, v: &Tensor) -> Result<Output> {
         let a = probs.shape().dimensions();
         let b = v.shape().dimensions();
@@ -284,5 +313,27 @@ impl MetalDevice {
             "matmul_nt"
         };
         self.run(name, a, Some(weight), &[ad[0], bd[0]], p, [bd[0], ad[0]])
+    }
+}
+
+#[cfg(test)]
+mod fusion_tests {
+    use super::*;
+    #[test]
+    fn attention_softmax_preserves_staged_rounding_and_causal_offsets() {
+        let d = MetalDevice::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for (s, offset) in [(1, 0), (5, 3), (17, 256), (3, 1024)] {
+                let shape = [2, s, s + offset];
+                let values = crate::reference::deterministic(shape.iter().product());
+                let x = Tensor::from_f32(&d, shape, dtype, &values).unwrap();
+                let scale = 64f32.sqrt().recip();
+                let a = d.scale(&x, scale).unwrap().tensor;
+                let a = d.attention_mask(&a, offset).unwrap().tensor;
+                let a = d.softmax(&a).unwrap().tensor;
+                let b = d.attention_softmax(&x, offset, scale).unwrap().tensor;
+                assert_eq!(a.to_f32(), b.to_f32(), "{dtype:?} S={s} P={offset}");
+            }
+        }
     }
 }

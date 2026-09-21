@@ -1,5 +1,7 @@
 # Phase 4 — measured Rust/Metal runtime optimization
 
+> Historical short-context milestone. The expanded Phase 4 goal is still active; see [matrix optimization progress](phase4-matrix-progress.md).
+
 Measured on Apple M5, macOS 27, Rust 1.96, September 2026. Runtime: independent Rust + Metal, shared storage, batch one, Qwen2.5-0.5B-Instruct BF16. Checkpoint revision `7ae557604adf67be50417f59c2c2f167def9a775`. Immutable Phase 3 control: `7dc2dbdf3721a96d5a44055352084ede71f35ea2`; working branch: `codex/phase4-runtime-optimization`.
 
 **The additional requested pass materially improved performance:** median prefill increased from 324.45 to 512.40 tok/s (+57.9%); median decode increased from 68.14 to 87.51 tok/s (+28.4%). Initial KV reserve fell from 402,653,184 to 3,145,728 bytes for this prompt. No numerical tolerance or existing validation test was changed during this pass. No Ferrum quantization or GGUF implementation was started.

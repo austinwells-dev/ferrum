@@ -46,7 +46,7 @@ impl Arena {
     fn complete(&mut self) {
         let mut retired = 0;
         let mut released = 0;
-        let over_capacity = self.capacity > 64 * 1024 * 1024;
+        let over_capacity = self.capacity > 256 * 1024 * 1024;
         for (bytes, bin) in &mut self.free {
             bin.retain_mut(|(_, ready, counted)| {
                 let state = ready.as_ref().map_or(Completion::Completed, |r| r.get());
@@ -97,7 +97,7 @@ impl Drop for MetalBuffer {
             }
             // A pool entry exists only after the final Tensor owner is gone.
             // A pending epoch keeps it ineligible until successful completion.
-            if pending || (state == Completion::Completed && arena.capacity <= 64 * 1024 * 1024) {
+            if pending || (state == Completion::Completed && arena.capacity <= 256 * 1024 * 1024) {
                 arena.free.entry(bytes).or_default().push((
                     self.raw.clone(),
                     self.ready.borrow().clone(),
@@ -487,6 +487,12 @@ impl MetalDevice {
             .max(4)
             .checked_next_power_of_two()
             .ok_or(Error::Allocation(bytes))?;
+        // Bound resources retained by one encoding epoch independently of sequence
+        // length. Completing earlier work makes retired tensors reusable; live
+        // arguments/outputs may individually exceed this soft working-set budget.
+        if self.arena.borrow().live.saturating_add(length) > 256 * 1024 * 1024 {
+            self.flush()?;
+        }
         let mut arena = self.arena.borrow_mut();
         let bin = arena.free.entry(length).or_default();
         let available = bin.iter().rposition(|(_, ready, _)| {
@@ -607,7 +613,7 @@ impl MetalDevice {
         debug_assert_eq!(buffers.len(), 3);
         debug_assert!(params[4] <= 2);
         let p = self.builtin(name)?;
-        let required = if tiled || matches!(name, "rmsnorm" | "softmax") {
+        let required = if tiled || matches!(name, "rmsnorm" | "softmax" | "attention_softmax") {
             256
         } else if matches!(name, "gemv" | "gemv_vector") {
             128
@@ -672,7 +678,7 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if matches!(name, "rmsnorm" | "softmax") {
+            } else if matches!(name, "rmsnorm" | "softmax" | "attention_softmax") {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 256
                 {
                     return Err(Error::Dispatch(

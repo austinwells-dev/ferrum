@@ -1,0 +1,180 @@
+{
+  "source": "docs/measurements/phase4/h-trim-matrix.jsonl",
+  "cases": {
+    "short": {
+      "prefill_ms": 34.778833,
+      "prefill_tps": 603.8155449321717,
+      "first_token_ms": 35.078625,
+      "decode_median_ms": 11.680167,
+      "decode_tps": 85.6152142345225,
+      "prefill": {
+        "gpu": 33.636555666666666,
+        "encode": 0.24043866666666666,
+        "wait": 33.940861,
+        "allocation_time": 0.40253133333333335,
+        "allocations": 49,
+        "allocated_bytes": 3145812,
+        "reused_bytes": 44105728,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 603,
+        "peak_transient_bytes": 44105728,
+        "max_arena_capacity": 44926976
+      },
+      "decode": {
+        "gpu": 11.153604125,
+        "encode": 0.22007216666666668,
+        "wait": 11.394891645833333,
+        "allocation_time": 0.0047091875,
+        "allocations": 1,
+        "allocated_bytes": 4,
+        "reused_bytes": 2727936,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 603,
+        "peak_transient_bytes": 2820096,
+        "max_arena_capacity": 44926976
+      }
+    },
+    "medium": {
+      "prefill_ms": 147.35837500000002,
+      "prefill_tps": 868.6306428121237,
+      "first_token_ms": 147.689333,
+      "decode_median_ms": 12.276083999999999,
+      "decode_tps": 81.45920148477316,
+      "prefill": {
+        "gpu": 144.41588866666666,
+        "encode": 0.2536736666666667,
+        "wait": 145.26472233333334,
+        "allocation_time": 1.4155526666666667,
+        "allocations": 59,
+        "allocated_bytes": 24117760,
+        "reused_bytes": 298582016,
+        "command_buffers": 2,
+        "completion_waits": 2,
+        "dispatches": 603,
+        "peak_transient_bytes": 267943936,
+        "max_arena_capacity": 266602496
+      },
+      "decode": {
+        "gpu": 11.790352458333333,
+        "encode": 0.20578127083333334,
+        "wait": 12.037197916666667,
+        "allocation_time": 0.0035893958333333333,
+        "allocations": 1,
+        "allocated_bytes": 4,
+        "reused_bytes": 3016704,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 603,
+        "peak_transient_bytes": 3016704,
+        "max_arena_capacity": 266602496
+      }
+    },
+    "512": {
+      "prefill_ms": 818.804083,
+      "prefill_tps": 625.302206755117,
+      "first_token_ms": 819.131125,
+      "decode_median_ms": 15.594167,
+      "decode_tps": 64.1265416742042,
+      "prefill": {
+        "gpu": 723.975458,
+        "encode": 0.43823266666666666,
+        "wait": 748.8347493333333,
+        "allocation_time": 66.26581,
+        "allocations": 235,
+        "allocated_bytes": 1480635050.6666667,
+        "reused_bytes": 406279509.3333333,
+        "command_buffers": 8,
+        "completion_waits": 8,
+        "dispatches": 603,
+        "peak_transient_bytes": 268304384,
+        "max_arena_capacity": 264505344
+      },
+      "decode": {
+        "gpu": 14.660552125,
+        "encode": 0.21132022916666668,
+        "wait": 14.919710041666667,
+        "allocation_time": 0.05165641666666667,
+        "allocations": 4,
+        "allocated_bytes": 786436,
+        "reused_bytes": 4196352,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 606,
+        "peak_transient_bytes": 4196352,
+        "max_arena_capacity": 264505344
+      }
+    },
+    "1024": {
+      "prefill_ms": 2135.081333,
+      "prefill_tps": 479.607022071229,
+      "first_token_ms": 2135.400208,
+      "decode_median_ms": 19.685041000000002,
+      "decode_tps": 50.799995793760345,
+      "prefill": {
+        "gpu": 1904.0739996666666,
+        "encode": 0.714428,
+        "wait": 1970.9035826666666,
+        "allocation_time": 163.58184833333334,
+        "allocations": 215.66666666666666,
+        "allocated_bytes": 3646951424,
+        "reused_bytes": 1736966144,
+        "command_buffers": 21,
+        "completion_waits": 21,
+        "dispatches": 603,
+        "peak_transient_bytes": 268435456,
+        "max_arena_capacity": 267651072
+      },
+      "decode": {
+        "gpu": 18.693419291666668,
+        "encode": 0.21456008333333335,
+        "wait": 19.199605833333333,
+        "allocation_time": 0.09454345833333333,
+        "allocations": 4,
+        "allocated_bytes": 1572868,
+        "reused_bytes": 5769216,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 606,
+        "peak_transient_bytes": 5769216,
+        "max_arena_capacity": 267651072
+      }
+    },
+    "sustained": {
+      "prefill_ms": 35.436707999999996,
+      "prefill_tps": 592.6058368627245,
+      "first_token_ms": 35.754041,
+      "decode_median_ms": 12.166542000000002,
+      "decode_tps": 82.19262301482212,
+      "prefill": {
+        "gpu": 33.58108333333333,
+        "encode": 0.24465566666666666,
+        "wait": 34.723222,
+        "allocation_time": 0.38765166666666667,
+        "allocations": 49,
+        "allocated_bytes": 3145812,
+        "reused_bytes": 44105728,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 603,
+        "peak_transient_bytes": 44105728,
+        "max_arena_capacity": 258213888
+      },
+      "decode": {
+        "gpu": 11.646020830729167,
+        "encode": 0.21189333854166667,
+        "wait": 11.898739489583333,
+        "allocation_time": 0.003777005208333333,
+        "allocations": 1,
+        "allocated_bytes": 4,
+        "reused_bytes": 2934528,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 603,
+        "peak_transient_bytes": 3409920,
+        "max_arena_capacity": 258213888
+      }
+    }
+  }
+}

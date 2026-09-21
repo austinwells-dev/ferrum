@@ -63,21 +63,24 @@ impl Attention {
             .active(layer)?
             .ok_or_else(|| Error::Cache("missing active K/V".into()))?;
         let scores = d.attention_scores(&q, k)?.tensor;
-        let scores = d
-            .scale(&scores, (self.head_dim as f32).sqrt().recip())?
-            .tensor;
         let t = k.shape().dimensions()[0];
-        if trace.is_some() {
-            for h in 0..self.q_heads {
-                record(
-                    &mut trace,
-                    format!("{prefix}.head.{h}.scores"),
-                    &scores.view(h * s * t, [s, t])?,
-                );
+        let scale = (self.head_dim as f32).sqrt().recip();
+        let probs = if trace.is_none() && !d.reference_math() {
+            d.attention_softmax(&scores, offset, scale)?.tensor
+        } else {
+            let scores = d.scale(&scores, scale)?.tensor;
+            if trace.is_some() {
+                for h in 0..self.q_heads {
+                    record(
+                        &mut trace,
+                        format!("{prefix}.head.{h}.scores"),
+                        &scores.view(h * s * t, [s, t])?,
+                    );
+                }
             }
-        }
-        let masked = d.attention_mask(&scores, offset)?.tensor;
-        let probs = d.softmax(&masked)?.tensor;
+            let masked = d.attention_mask(&scores, offset)?.tensor;
+            d.softmax(&masked)?.tensor
+        };
         if trace.is_some() {
             for h in 0..self.q_heads {
                 record(
