@@ -1,0 +1,12 @@
+    Finished `release` profile [optimized] target(s) in 0.07s
+     Running `target/release/ferrum smoke`
+Metal device: Apple M5
+Pipeline warm-up: 2.05275ms
+add        PASS max_abs=0.000e0 wall=1.968875ms gpu=Some(7.5µs)
+mul        PASS max_abs=0.000e0 wall=485.125µs gpu=Some(6.5µs)
+silu       PASS max_abs=1.788e-7 wall=642.5µs gpu=Some(8.958µs)
+rmsnorm    PASS max_abs=1.192e-7 wall=438.291µs gpu=Some(11µs)
+softmax    PASS max_abs=1.863e-9 wall=554.916µs gpu=Some(10.833µs)
+rope       PASS max_abs=8.643e-7 wall=665.208µs gpu=Some(18.792µs)
+matmul     PASS max_abs=6.676e-6 wall=1.561875ms gpu=Some(1.348208ms)
+Phase 1 Metal smoke test: PASS

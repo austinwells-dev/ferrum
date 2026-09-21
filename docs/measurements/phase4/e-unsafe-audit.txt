@@ -1,0 +1,5 @@
+src/metal/mod.rs:19:unsafe extern "C" {}
+src/metal/mod.rs:126:        let bytes = unsafe {
+src/metal/mod.rs:153:        let bytes = unsafe {
+src/metal/mod.rs:435:        unsafe {
+src/metal/mod.rs:620:            unsafe {

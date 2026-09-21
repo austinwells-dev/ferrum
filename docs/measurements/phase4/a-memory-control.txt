@@ -1,0 +1,40 @@
+Ferrum
+Model: Qwen2.5-0.5B-Instruct (local checkpoint)
+Device: Apple M5
+Backend: Metal
+Dtype: BF16
+Layers: 24; hidden: 896; intermediate: 4864; Q heads: 14; KV heads: 2; head dim: 64
+Parameters: 494032768; tensors: 290
+Source weight bytes: 988065536
+Retained weight bytes: 1260334848
+Construction/transposition bytes: 987922432
+Recommended working set: 25769803776 bytes
+config/tokenizer load: 111.017 ms; weight load: 159.288 ms; construction: 300.758 ms; tokenization: 0.205 ms
+Prompt: 21 tokens; sampler: SamplingConfig { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+Hello! How can I assist you today?
+
+---
+prompt: 21 tokens; generated: 10; stop: Eos
+prefill: 831.882 ms (25.244 tok/s); first token: 832.395 ms
+prefill + final row: 3796 dispatches; 3797 allocations; 48459476 allocation bytes
+decode: median 801.071 ms (1.248 tok/s); per-token ms: [803.303333, 803.1729170000001, 781.84675, 801.071375, 799.859875, 800.23375, 807.07275, 804.5193750000001, 768.425041]
+decode counters per step: [Counters { allocations: 3845, allocated_bytes: 5579524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 5723524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 5867524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6011524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6155524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6299524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6443524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6587524, dispatches: 3844 }, Counters { allocations: 3845, allocated_bytes: 6731524, dispatches: 3844 }]
+sampling: 2.435 ms total; active KV: 368640 bytes; generated IDs: [9707, 0, 2585, 646, 358, 7789, 498, 3351, 30, 151645]
+       10.49 real         0.55 user         1.40 sys
+          3053256704  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              194837  page reclaims
+                  26  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+              186092  involuntary context switches
+         13993893385  instructions retired
+          7924702649  cycles elapsed
+          3055307584  peak memory footprint

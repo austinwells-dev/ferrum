@@ -1,0 +1,29 @@
+[
+  {
+    "run": 1,
+    "prefill_ms": 64.726,
+    "prefill_tps": 324.446,
+    "first_token_ms": 65.072,
+    "decode_ms": 14.858,
+    "decode_tps": 67.302,
+    "peak_rss_bytes": 2657304576
+  },
+  {
+    "run": 2,
+    "prefill_ms": 66.042,
+    "prefill_tps": 317.98,
+    "first_token_ms": 66.343,
+    "decode_ms": 14.478,
+    "decode_tps": 69.07,
+    "peak_rss_bytes": 2655928320
+  },
+  {
+    "run": 3,
+    "prefill_ms": 62.277,
+    "prefill_tps": 337.205,
+    "first_token_ms": 62.579,
+    "decode_ms": 14.676,
+    "decode_tps": 68.137,
+    "peak_rss_bytes": 2522873856
+  }
+]

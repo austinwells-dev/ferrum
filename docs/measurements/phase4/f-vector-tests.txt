@@ -1,0 +1,87 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1.95s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 5 tests
+test metal::tests::mapping_is_excluded_until_scope_completion ... ok
+test metal::arena_tests::arena_never_recycles_live_or_pending_tensors ... ok
+test metal::failed_completion_tests::failed_suffix_does_not_poison_published_cache_prefix ... ok
+test metal::transaction_tests::late_encoder_failure_preserves_cache_and_retry ... ok
+test metal::tests::execution_owns_dropped_intermediates_and_drains_on_error ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.29s
+
+     Running unittests src/main.rs (target/debug/deps/ferrum-e1f9f3a2a30f1a90)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/correctness.rs (target/debug/deps/correctness-cb180eb36390ebcc)
+
+running 10 tests
+test metadata_roundtrip_and_reshape ... ok
+test invalid_inputs_and_contexts_are_rejected ... ok
+test bf16_gpu_rounding_ties_and_nan ... ok
+test contiguous_views_check_ranges_and_dispatch_offsets ... ok
+test chained_gpu_outputs_preserve_inputs ... ok
+test rotary_all_dtypes ... ok
+test compilation_diagnostics_and_cache ... ok
+test row_operations_all_dtypes ... ok
+test elementwise_all_dtypes_and_edges ... ok
+test tiled_matmul_all_dtypes_and_edges ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/loading.rs (target/debug/deps/loading-265e19c64c03652c)
+
+running 3 tests
+test tokenizer_local_roundtrip_and_errors ... ok
+test byte_level_bpe_tokenizer_fixture ... ok
+test safetensors_dtypes_metadata_and_malformed_files ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+
+     Running tests/qwen.rs (target/debug/deps/qwen-dfe99e09fba53da1)
+
+running 7 tests
+test special_token_and_template_metadata_rejections ... ok
+test official_config_and_rejections ... ok
+test sampler_distribution_filters_and_determinism ... ok
+test final_row_argmax_context_and_template ... ok
+test profile_is_opt_in_and_counts_operations ... ok
+test official_names_small_payload_and_failures ... ok
+test generation_stops_and_does_not_append_terminal_token ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.22s
+
+     Running tests/real_model.rs (target/debug/deps/real_model-bd8f8e19bbc6cd92)
+
+running 2 tests
+test official_qwen_bf16_cached_generation ... ignored, requires official local Qwen checkpoint; set FERRUM_QWEN_MODEL
+test official_qwen_long_lifetime_stress ... ignored, 128-token lifetime stress requires official local Qwen checkpoint
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/transformer.rs (target/debug/deps/transformer-cf6d7fad40122823)
+
+running 10 tests
+test mask_absolute_positions ... ok
+test integer_embedding_ids_and_long_rope_offsets ... ok
+test cache_order_capacity_reset_and_errors ... ok
+test capacity_cache_preserves_snapshots_and_branch_prefixes ... ok
+test primitive_invalid_inputs_and_bias ... ok
+test model_configuration_weights_and_cache_validation ... ok
+test embeddings_linear_layout_all_dtypes ... ok
+test alternative_dimensions_mha_and_single_kv_head ... ok
+test complete_transformer_oracle_and_cached_equivalence ... ok
+test native_projection_tiles_match_oracle ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.23s
+
+   Doc-tests ferrum
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

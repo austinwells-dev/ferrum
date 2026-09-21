@@ -1,0 +1,21 @@
+Ferrum
+Model: Qwen2.5-0.5B-Instruct (local checkpoint)
+Device: Apple M5
+Backend: Metal
+Dtype: BF16
+Layers: 24; hidden: 896; intermediate: 4864; Q heads: 14; KV heads: 2; head dim: 64
+Parameters: 494032768; tensors: 290
+Source weight bytes: 988065536
+Retained weight bytes: 988065536
+Construction/transposition bytes: 0
+Recommended working set: 25769803776 bytes
+config/tokenizer load: 108.067 ms; weight load: 155.148 ms; construction: 0.278 ms; tokenization: 0.131 ms
+Prompt: 23 tokens; sampler: SamplingConfig { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+Rust is a high-level, statically typed, compiled language that is designed to be safe, efficient, and portable. It is a superset of the C
+
+---
+prompt: 23 tokens; generated: 32; stop: MaxNewTokens
+prefill: 41.124 ms (559.281 tok/s); first token: 41.444 ms
+prefill + final row: 603 dispatches; 49 allocations; 3145820 allocation bytes
+decode: median 11.647 ms (85.855 tok/s); per-token ms: [13.439625, 11.672165999999999, 11.455084000000001, 11.311042, 11.438083, 12.976750000000001, 11.471625, 11.647499999999999, 11.116042, 11.330083, 11.325792, 12.693583, 11.3365, 11.331416, 11.688625, 13.101708, 11.613083, 11.880666, 11.594667, 11.764916, 12.443209, 11.502333, 11.853208, 11.687332999999999, 13.072334, 11.712667, 11.558458, 11.571, 11.6135, 13.337709, 11.930375]
+sampling: 7.609 ms total; active KV: 663552 bytes; generated IDs: [49, 590, 374, 264, 1550, 11591, 11, 91174, 31969, 11, 19697, 4128, 429, 374, 6188, 311, 387, 6092, 11, 11050, 11, 323, 22819, 13, 1084, 374, 264, 1026, 44146, 315, 279, 356]

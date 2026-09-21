@@ -1,5 +1,7 @@
 # Ferrum architecture
 
+The Phase 4 section below describes the current runtime. Earlier sections are preserved as the historical Phase 1–3 design and are superseded where noted.
+
 ## Modules and dependency direction
 
 ```text
@@ -214,3 +216,23 @@ ownership, shared storage, fresh output allocations and completion waits are
 unchanged. No kernels were changed in Phase 3. See [Phase 3 results](phase3-results.md)
 for exact model mapping, reference arithmetic differences, measured throughput,
 and ranked Phase 4 recommendations.
+
+## Phase 4 current execution and storage model
+
+`MetalDevice` owns a single queue and an internal execution guard. Public tensor operations submit and wait synchronously. Transformer forward instead encodes separate tracked-hazard compute encoders into a bounded command buffer, default 1,024 dispatches. The measured model uses 603 dispatches and one completion boundary per forward. Limits 1/64/256/1024/8192 were measured; larger batches than 1024 did not improve the initial control. No broad threading or unsafe Send/Sync was introduced.
+
+A `Submission` retains its command buffer and every bound raw buffer until completion. Completion states are Encoding/Completed/Failed. Finishing checks command-buffer status before publishing the staged cache; guard drop drains partial work on error or unwind. Each allocation tracks write ranges and their completion epochs. Mapping checks the requested logical byte range, so a failed suffix cannot invalidate a previously published KV prefix. Pending/failed output cannot be mapped. Failed storage is not recycled. Tests inject late encoding and completion failures and verify publication, retry, mapping and lifetime behavior.
+
+Transient outputs created inside model execution use power-of-two size buckets. The arena retains at most 64 MiB of free storage; live/in-flight demand can exceed this. Reuse requires both completion and the last tensor owner dropping. Retired GPU-owned buffers count toward live/peak accounting until completion. Fresh physical storage is initialized; reused storage skips zeroing because audited kernels overwrite every logical output element before publication. Weights and persistent KV are excluded from the transient arena. Counters distinguish cumulative allocation volume, new/reused bytes, live/peak transient bytes and retained arena capacity.
+
+Tensor views are restricted to checked contiguous subranges. Shape products, byte offsets, allocation bounds and alignment are checked; bindings and CPU reads carry offset and logical length. There are no arbitrary strides. Reshape shares storage and final-logit extraction is a view. Weight tensors remain row-major `[out,in]`; tied embedding/LM head share one allocation, with unique retained payload counted once.
+
+KV retains logical maximum context separately from physical capacity. A first append reserves at least 256 tokens, rounded geometrically and capped at logical capacity. An append within physical capacity writes only the new suffix. Growth copies the active prefix once; reset drops storage. Immutable snapshots share a monotonic reservation watermark. A branch or retry whose offset no longer equals that watermark copies into fresh storage rather than overwriting a possibly visible/in-flight suffix. The whole model clones/stages the cache and publishes only after successful completion. The reservation may advance on a failed forward, but active published values and lengths remain unchanged. A 600-append test checks allocations only at 0/256/512, capped capacity and preserved snapshots; existing branch/transaction tests are unchanged.
+
+Attention kernels consume sequence-major `[S,Q,D]` query and `[T,KV,D]` cache directly with checked GQA mapping. Scores are `[Q,S,T]`; context writes `[S,Q,D]` directly. Separate scaling/mask/softmax/storage round boundaries are preserved. This removes head selection, transpose, stack and merge materializations without introducing a general stride system. Ordinary decode has no layout-copy kernel; geometric KV growth and branch recovery remain explicit exceptions.
+
+Low-precision M=1 projections use four rows per threadgroup, one SIMD group per output row. Aligned K divisible by four uses native `half4`/`bfloat4` loads and four independent F32 accumulation chains followed by SIMD reduction. Awkward widths or misaligned views use scalar GEMV. F32 projection retains ascending-order accumulation to preserve its recorded diagnostic tolerance. M>1 low-precision projection uses native SIMD-group 8×8 matrix tiles with FP32 accumulation on supported hardware. Scalar/tiled fallbacks remain, with explicit capability/compiler reporting.
+
+RMSNorm and softmax use 256 threads per row and cross-SIMD shared reductions. Softmax retains max subtraction. RMSNorm has an empirical BF16 midpoint safeguard: if a candidate output is within eight F32 low-bit units of a BF16 rounding midpoint, the row recomputes the original ordered sum. This restored the unchanged real-model test; it is not a universal bitwise-equivalence proof. `set_reference_math(true)` selects ordered RMSNorm/softmax for the explicit F32 reference diagnostic. Production BF16 uses the parallel paths.
+
+Profiling distinguishes LM-head projections from transformer projections. Default batching reports GPU timestamps at command-buffer level; per-operation GPU samples are absent, not zero-cost kernels. `FERRUM_BATCH_LIMIT=1` provides isolated category attribution with additional submission/cache effects. Logical payload divided by GPU duration is an effective bandwidth proxy, not a DRAM counter. The four unsafe backend blocks plus linkage remain unchanged; no unsafe Rust was added outside this boundary.

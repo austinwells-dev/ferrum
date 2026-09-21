@@ -1,0 +1,41 @@
+Hello! How can I help you today?
+Ferrum
+Model: Qwen2.5-0.5B-Instruct (local checkpoint)
+Device: Apple M5
+Backend: Metal
+Dtype: BF16
+Layers: 24; hidden: 896; intermediate: 4864; Q heads: 14; KV heads: 2; head dim: 64
+Parameters: 494032768; tensors: 290
+Source weight bytes: 988065536
+Retained weight bytes: 988065536
+Construction/transposition bytes: 0
+Recommended working set: 25769803776 bytes
+config/tokenizer load: 84.000 ms; weight load: 128.930 ms; construction: 0.259 ms; tokenization: 0.077 ms
+Prompt: 21 tokens; sampler: SamplingConfig { temperature: 0.0, top_k: 0, top_p: 1.0, seed: 0 }
+
+---
+prompt: 21 tokens; generated: 10; stop: Eos
+prefill: 62.277 ms (337.205 tok/s); first token: 62.579 ms
+prefill + final row: 603 dispatches; 49 allocations; 402653268 allocation bytes
+prefill runtime counters: Counters { allocations: 49, allocated_bytes: 402653268, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 278.962µs, wait: 43.721584ms, gpu: 39.495ms, allocation_time: 18.02483ms, reused_bytes: 51970048, transient_live_bytes: 0, transient_peak_bytes: 51970048, arena_capacity: 53118976, arena_high_water: 53118976 }
+decode: median 14.676 ms (68.137 tok/s); per-token ms: [15.013416999999999, 14.580209, 14.634209, 14.353292, 14.741917, 15.043959000000001, 15.211167, 14.676333, 14.491541999999999]
+decode counters per step: [Counters { allocations: 1, allocated_bytes: 4, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 230.66µs, wait: 14.498084ms, gpu: 14.256333ms, allocation_time: 5.084µs, reused_bytes: 2721792, transient_live_bytes: 524288, transient_peak_bytes: 2721792, arena_capacity: 53118976, arena_high_water: 53118976 }, Counters { allocations: 1, allocated_bytes: 4, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 207µs, wait: 14.098292ms, gpu: 13.828083ms, allocation_time: 3.625µs, reused_bytes: 2721792, transient_live_bytes: 524288, transient_peak_bytes: 2721792, arena_capacity: 53118976, arena_high_water: 53118976 }, Counters { allocations: 1, allocated_bytes: 4, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 214.536µs, wait: 14.133625ms, gpu: 13.886292ms, allocation_time: 4.792µs, reused_bytes: 2721792, transient_live_bytes: 524288, transient_peak_bytes: 2721792, arena_capacity: 53118976, arena_high_water: 53118976 }, Counters { allocations: 1, allocated_bytes: 4, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 238.918µs, wait: 13.815834ms, gpu: 13.575167ms, allocation_time: 7.042µs, reused_bytes: 2721792, transient_live_bytes: 524288, transient_peak_bytes: 2721792, arena_capacity: 53118976, arena_high_water: 53118976 }, Counters { allocations: 1, allocated_bytes: 4, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 203.186µs, wait: 14.261208ms, gpu: 14.029583ms, allocation_time: 4.042µs, reused_bytes: 2721792, transient_live_bytes: 524288, transient_peak_bytes: 2721792, arena_capacity: 53118976, arena_high_water: 53118976 }, Counters { allocations: 1, allocated_bytes: 4, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 213.587µs, wait: 14.526167ms, gpu: 14.186ms, allocation_time: 14µs, reused_bytes: 2721792, transient_live_bytes: 524288, transient_peak_bytes: 2721792, arena_capacity: 53118976, arena_high_water: 53118976 }, Counters { allocations: 1, allocated_bytes: 4, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 207.151µs, wait: 14.729292ms, gpu: 14.508917ms, allocation_time: 5.625µs, reused_bytes: 2721792, transient_live_bytes: 524288, transient_peak_bytes: 2721792, arena_capacity: 53118976, arena_high_water: 53118976 }, Counters { allocations: 1, allocated_bytes: 4, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 201.295µs, wait: 14.195917ms, gpu: 13.967708ms, allocation_time: 4.25µs, reused_bytes: 2721792, transient_live_bytes: 524288, transient_peak_bytes: 2721792, arena_capacity: 53118976, arena_high_water: 53118976 }, Counters { allocations: 1, allocated_bytes: 4, dispatches: 603, command_buffers: 1, completion_waits: 1, encode: 213.983µs, wait: 13.992125ms, gpu: 13.730333ms, allocation_time: 6.333µs, reused_bytes: 2721792, transient_live_bytes: 524288, transient_peak_bytes: 2721792, arena_capacity: 53118976, arena_high_water: 53118976 }]
+sampling: 2.390 ms total; active KV: 368640 bytes; generated IDs: [9707, 0, 2585, 646, 358, 1492, 498, 3351, 30, 151645]
+        0.55 real         0.14 user         0.17 sys
+          2522873856  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              180343  page reclaims
+                  15  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                  18  voluntary context switches
+                 315  involuntary context switches
+          3761806773  instructions retired
+          1347484125  cycles elapsed
+          2529561000  peak memory footprint

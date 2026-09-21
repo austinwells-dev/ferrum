@@ -1,0 +1,10 @@
+Metal device: Apple M5
+Pipeline warm-up: 1.839834ms
+add        PASS max_abs=0.000e0 wall=1.323875ms gpu=Some(2.083µs)
+mul        PASS max_abs=0.000e0 wall=148.5µs gpu=Some(1.708µs)
+silu       PASS max_abs=1.788e-7 wall=174.25µs gpu=Some(2.125µs)
+rmsnorm    PASS max_abs=1.192e-7 wall=182.083µs gpu=Some(3.125µs)
+softmax    PASS max_abs=1.863e-9 wall=164.792µs gpu=Some(2.708µs)
+rope       PASS max_abs=8.643e-7 wall=186.625µs gpu=Some(5µs)
+matmul     PASS max_abs=6.676e-6 wall=181.208µs gpu=Some(7.375µs)
+Phase 1 Metal smoke test: PASS

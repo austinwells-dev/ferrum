@@ -1,0 +1,9 @@
+    Updating crates.io index
+     Locking 101 packages to latest Rust 1.96.0 compatible versions
+   Compiling ferrum v0.1.0 (/tmp/ferrum-phase4-phase3-control)
+   Compiling ferrum-rounding-control v0.0.0 (/tmp/ferrum-phase4-rounding)
+    Finished `release` profile [optimized] target(s) in 4.08s
+     Running `/tmp/ferrum-phase4-control-target/release/ferrum-rounding-control /Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775`
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 0.47s
+     Running `target/release/examples/rounding_probe /Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775 docs/measurements/phase4/rust-phase3-logits.json`

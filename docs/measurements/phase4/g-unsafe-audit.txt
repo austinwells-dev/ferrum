@@ -1,0 +1,18 @@
+src/reference.rs:2:#![forbid(unsafe_code)]
+src/tensor/mod.rs:1:#![forbid(unsafe_code)]
+src/sampling.rs:2:#![forbid(unsafe_code)]
+src/ops/mod.rs:1:#![forbid(unsafe_code)]
+src/model/qwen.rs:2:#![forbid(unsafe_code)]
+src/model/mod.rs:1:#![forbid(unsafe_code)]
+src/loader/mod.rs:2:#![forbid(unsafe_code)]
+src/lib.rs:2:#![deny(unsafe_op_in_unsafe_fn)]
+src/lib.rs:3:#![deny(unsafe_code)]
+src/lib.rs:7:#[allow(unsafe_code)] // Audited FFI and shared-memory boundary.
+src/tokenizer/mod.rs:2:#![forbid(unsafe_code)]
+src/generation.rs:2:#![forbid(unsafe_code)]
+src/metal/mod.rs:19:unsafe extern "C" {}
+src/metal/mod.rs:126:        let bytes = unsafe {
+src/metal/mod.rs:153:        let bytes = unsafe {
+src/metal/mod.rs:462:        unsafe {
+src/metal/mod.rs:647:            unsafe {
+src/nn/mod.rs:1:#![forbid(unsafe_code)]
