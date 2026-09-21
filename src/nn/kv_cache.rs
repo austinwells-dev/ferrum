@@ -111,15 +111,20 @@ impl KvCache {
         let end = offset + dims[0];
         let row = self.heads * self.dim;
         let existing = self.layers[layer].as_ref();
-        let entry = if let Some(entry) = existing.filter(|e| e.reserved.get() == offset) {
+        let entry = if let Some(entry) = existing
+            .filter(|e| e.reserved.get() == offset && end <= e.storage.0.shape().dimensions()[0])
+        {
             entry.clone()
         } else {
+            // Reserve a small initial block, then grow geometrically. The logical
+            // context bound is unchanged; only growth/branching copies old history.
+            let physical_capacity = end.max(256).next_power_of_two().min(self.capacity);
             let storage = (
-                Tensor::zeros(d, [self.capacity, self.heads, self.dim], self.dtype)?,
-                Tensor::zeros(d, [self.capacity, self.heads, self.dim], self.dtype)?,
+                Tensor::zeros(d, [physical_capacity, self.heads, self.dim], self.dtype)?,
+                Tensor::zeros(d, [physical_capacity, self.heads, self.dim], self.dtype)?,
             );
             if let Some(old) = existing {
-                // Explicit cache branching/rollback only; ordinary decode never copies history.
+                // Copy only on geometric growth or explicit cache branching/rollback.
                 d.write_kv(
                     &old.active.0,
                     &storage.0.view(0, old.active.0.shape().dimensions())?,
