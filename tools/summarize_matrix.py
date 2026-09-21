@@ -19,6 +19,9 @@ for path in sys.argv[1:]:
     for case, runs in groups.items():
         result = {key: stats.median(x[key] for x in runs) for key in
                   ('prefill_ms', 'prefill_tps', 'first_token_ms', 'decode_median_ms', 'decode_tps')}
+        for key in ('generation_ms', 'generation_tps', 'post_first_token_tps', 'sampling_ms', 'decode_aggregate_tps'):
+            if all(key in x for x in runs):
+                result[key] = stats.median(x[key] for x in runs)
         for phase in ('prefill', 'decode'):
             counters = [x['prefill_counters'] for x in runs] if phase == 'prefill' else [c for x in runs for c in x['decode_counters']]
             result[phase] = {key: stats.mean(millis(x[key]) for x in counters)
