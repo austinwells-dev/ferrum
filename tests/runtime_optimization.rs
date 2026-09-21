@@ -1,0 +1,61 @@
+use ferrum::{
+    DType, MetalDevice, Tensor,
+    nn::{Linear, kv_cache::KvCache},
+    reference,
+};
+
+#[test]
+fn growing_cache_copies_only_at_geometric_boundaries() {
+    let d = MetalDevice::new().unwrap();
+    let mut cache = KvCache::new(1, 600, 1, 2, DType::F32).unwrap();
+    let mut allocations = Vec::new();
+    let mut snapshot = None;
+    for i in 0..600 {
+        let x = Tensor::from_f32(&d, [1, 1, 2], DType::F32, &[i as f32, -(i as f32)]).unwrap();
+        let before = d.counters().allocations;
+        cache.append(&d, 0, &x, &x).unwrap();
+        if d.counters().allocations != before {
+            allocations.push((i, d.counters().allocations - before));
+        }
+        if i == 255 {
+            snapshot = Some(cache.active(0).unwrap().unwrap().0.clone());
+        }
+    }
+    assert_eq!(allocations, [(0, 2), (256, 2), (512, 2)]);
+    assert_eq!(cache.reserved_bytes(), 600 * 2 * 4 * 2);
+    let expected: Vec<f32> = (0..600).flat_map(|i| [i as f32, -(i as f32)]).collect();
+    assert_eq!(cache.active(0).unwrap().unwrap().0.to_f32(), expected);
+    assert_eq!(snapshot.unwrap().to_f32(), expected[..512]);
+}
+
+#[test]
+fn vector_projection_tail_and_misaligned_views() {
+    let d = MetalDevice::new().unwrap();
+    for ty in [DType::BF16, DType::F16] {
+        for offset in [0, 1] {
+            let (k, n) = (128, 17);
+            let x = Tensor::from_f32(&d, [k + offset], ty, &reference::deterministic(k + offset))
+                .unwrap()
+                .view(offset, [1, k])
+                .unwrap();
+            let w = Tensor::from_f32(
+                &d,
+                [n * k + offset],
+                ty,
+                &reference::deterministic(n * k + offset),
+            )
+            .unwrap()
+            .view(offset, [n, k])
+            .unwrap();
+            let values = w.to_f32();
+            let wt: Vec<_> = (0..n * k).map(|i| values[(i % n) * k + i / n]).collect();
+            let expected: Vec<_> = reference::matmul(&x.to_f32(), &wt, 1, k, n)
+                .into_iter()
+                .map(|v| ty.round(v))
+                .collect();
+            let y = Linear::new(&d, w, None).unwrap().forward(&d, &x).unwrap();
+            let tolerance = if ty == DType::BF16 { 1.6e-2 } else { 2e-3 };
+            reference::check(&y.to_f32(), &expected, tolerance, tolerance).unwrap();
+        }
+    }
+}

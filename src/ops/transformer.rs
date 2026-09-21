@@ -272,7 +272,14 @@ impl MetalDevice {
                 "project_f16"
             }
         } else if ad[0] == 1 && a.dtype() != DType::F32 {
-            "gemv"
+            if ad[1].is_multiple_of(4)
+                && a.storage_info().alignment >= 8
+                && weight.storage_info().alignment >= 8
+            {
+                "gemv_vector"
+            } else {
+                "gemv"
+            }
         } else {
             "matmul_nt"
         };

@@ -219,3 +219,19 @@ kernel void project_f16(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 gr
     threadgroup half aa[64],bb[64]; threadgroup float cc[64];
     native_project<half>(a,b,c,p,tid,group,aa,bb,cc);
 }
+
+// Aligned four-element loads expose independent accumulation chains and reduce
+// loop/addressing overhead. Host selects only aligned, K-divisible-by-four inputs.
+template<typename T>
+void gemv_vector_impl(device const vec<T,4>* a, device const vec<T,4>* b, device uchar* c,
+                      constant uint* p, uint tid, uint group) {
+    uint lane=tid%32, row=group*4+tid/32, k4=p[2]/4;
+    float4 sum=0.f;
+    if(row<p[3]) for(uint j=lane;j<k4;j+=32) sum+=float4(a[j])*float4(b[row*k4+j]);
+    float total=simd_sum((sum.x+sum.y)+(sum.z+sum.w));
+    if(lane==0 && row<p[3]) store(c,row,p[4],total);
+}
+kernel void gemv_vector(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    if(p[4]==2) gemv_vector_impl<bfloat>((device const bfloat4*)a,(device const bfloat4*)b,c,p,tid,group);
+    else gemv_vector_impl<half>((device const half4*)a,(device const half4*)b,c,p,tid,group);
+}

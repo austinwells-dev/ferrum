@@ -222,7 +222,17 @@ impl Drop for Execution<'_> {
         self.device.batching.set(false);
     }
 }
+struct ProfileScope<'a> {
+    flag: &'a Cell<bool>,
+    previous: bool,
+}
+impl Drop for ProfileScope<'_> {
+    fn drop(&mut self) {
+        self.flag.set(self.previous);
+    }
+}
 pub struct MetalDevice {
+    lm_head_profile: Cell<bool>,
     #[cfg(test)]
     fail_after: Cell<Option<usize>>,
     #[cfg(test)]
@@ -255,6 +265,7 @@ impl MetalDevice {
             .newCommandQueue()
             .ok_or_else(|| Error::Initialization("command queue creation failed".into()))?;
         Ok(Self {
+            lm_head_profile: Cell::new(false),
             #[cfg(test)]
             fail_after: Cell::new(None),
             #[cfg(test)]
@@ -356,6 +367,13 @@ impl MetalDevice {
         // submission.resources drops only after the wait and status check.
         Ok(())
     }
+    pub(crate) fn profile_lm_head<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        let _scope = ProfileScope {
+            flag: &self.lm_head_profile,
+            previous: self.lm_head_profile.replace(true),
+        };
+        f()
+    }
     pub fn set_profiling(&self, enabled: bool) {
         self.profiling.set(enabled);
         self.profile.borrow_mut().clear();
@@ -374,6 +392,15 @@ impl MetalDevice {
         bytes: usize,
         timing: &DispatchTiming,
     ) {
+        let name = if self.lm_head_profile.get() {
+            match name {
+                "gemv" | "gemv_vector" => "lm_head_gemv",
+                "project_bf16" | "project_f16" | "matmul_nt" => "lm_head_matmul",
+                _ => name,
+            }
+        } else {
+            name
+        };
         let mut profile = self.profile.borrow_mut();
         let entry = profile.entry(name).or_default();
         entry.calls += 1;
@@ -582,7 +609,7 @@ impl MetalDevice {
         let p = self.builtin(name)?;
         let required = if tiled || matches!(name, "rmsnorm" | "softmax") {
             256
-        } else if name == "gemv" {
+        } else if matches!(name, "gemv" | "gemv_vector") {
             128
         } else {
             32
@@ -664,7 +691,7 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if name == "gemv" {
+            } else if matches!(name, "gemv" | "gemv_vector") {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
                     return Err(Error::Dispatch(

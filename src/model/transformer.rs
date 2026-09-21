@@ -140,7 +140,7 @@ impl Transformer {
         }
         let x = self.final_norm.forward(d, &x)?;
         record(&mut trace, "final_hidden", &x);
-        let logits = self.lm_head.forward(d, &x)?;
+        let logits = d.profile_lm_head(|| self.lm_head.forward(d, &x))?;
         record(&mut trace, "logits", &logits);
         execution.finish()?;
         *cache = staged;
