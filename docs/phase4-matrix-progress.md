@@ -51,3 +51,13 @@ A direct unit test verifies exact staged/fused equality for F32/F16/BF16 with mu
 The isolated 1k prefill profile (`h-fused-isolated.jsonl`) measures transformer projections 952.16 ms, attention scores 451.30 ms and attention context 447.92 ms. Fused softmax is 27.69 ms, RMSNorm 11.08 ms and LM head GEMV 2.15 ms. Thus the next major experiments must address both GEMM and attention products, unlike the short-prompt case. Isolated timing changes scheduling and is attribution evidence rather than normal production latency.
 
 The current candidate passes Metal API/shader validation for the full backend/correctness/transformer/runtime optimization suites and both official real-model tests. The unchanged F32 diagnostic still passes its existing 8e-5 tolerance. Logs: `h-fused-validation.txt`, `h-fused-real-validation.txt`, `h-fused-f32-check.json`, `h-fused-clippy.txt`. This is an intermediate checkpoint, not goal completion.
+
+### Tiled BF16 attention products (i-attention checkpoint)
+
+Multi-token BF16 score/context products now use ordinary 8×8 SIMD-group matrix tiles with FP32 accumulation, preserving the separate score/probability storage boundaries. Single-token decode and other dtypes retain their existing kernels. This is not fused/Flash attention: score matrices still exist and their storage is quadratic. GQA head mapping, partial sequence/head-dimension tiles, and causal offsets are generic, without model constants or tested-length conditionals.
+
+Three-run medians: short 35.60 ms, 128 tokens 152.34 ms, 512 tokens 577.54 ms, 1024 tokens 1260.68 ms. The comparable fused-scalar attention candidate was 34.64/163.79/771.22/2000.61 ms. The short difference requires a later matched control; larger improvements are substantial. Decode arithmetic is unchanged. All matrix generated IDs match `h-fused`, including the sustained case. Peak transient storage retains the bounded epoch policy.
+
+`i-attention-validation.txt` and `i-attention-real-validation.txt` pass Metal API/shader validation, including new direct scalar-versus-tiled comparisons for GQA, awkward widths/tiles and a 1k prefix. No existing numerical tests or tolerances changed. `i-epoch-validation.txt` adds a 40-operation live dependency chain crossing the memory-driven completion boundary and asserts correct values and bounded transient peak.
+
+Next: improve prefill GEMM reuse/staging, then return to long-context decode/GEMV and remaining fusion opportunities. The full expanded goal is still active; neither the target throughput nor the stopping audit has been satisfied.

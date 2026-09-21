@@ -218,7 +218,28 @@ impl MetalDevice {
         }
         let dims = [a[1], a[0], b[0]];
         let n = crate::tensor::Shape::new(dims)?.numel();
-        self.run("attention_scores", q, Some(k), &dims, p, [n, 1])
+        if self.native_matmul()
+            && q.dtype() == DType::BF16
+            && a[0] > 1
+            && a[0] <= u32::MAX as usize - 8
+            && a[2] <= u32::MAX as usize - 8
+        {
+            let rows = a[0]
+                .div_ceil(8)
+                .checked_mul(8)
+                .and_then(|n| n.checked_mul(a[1]))
+                .ok_or_else(|| Error::Shape("attention grid overflow".into()))?;
+            self.run(
+                "attention_scores_matrix",
+                q,
+                Some(k),
+                &dims,
+                p,
+                [b[0], rows],
+            )
+        } else {
+            self.run("attention_scores", q, Some(k), &dims, p, [n, 1])
+        }
     }
     pub(crate) fn attention_mask(&self, scores: &Tensor, offset: usize) -> Result<Output> {
         let dims = scores.shape().dimensions();
@@ -278,7 +299,28 @@ impl MetalDevice {
         }
         let dims = [a[1], a[0], b[2]];
         let n = crate::tensor::Shape::new(dims)?.numel();
-        self.run("attention_context", probs, Some(v), &dims, p, [n, 1])
+        if self.native_matmul()
+            && probs.dtype() == DType::BF16
+            && a[1] > 1
+            && a[1] <= u32::MAX as usize - 8
+            && b[0] <= u32::MAX as usize - 8
+        {
+            let rows = a[1]
+                .div_ceil(8)
+                .checked_mul(8)
+                .and_then(|n| n.checked_mul(a[0]))
+                .ok_or_else(|| Error::Shape("attention grid overflow".into()))?;
+            self.run(
+                "attention_context_matrix",
+                probs,
+                Some(v),
+                &dims,
+                p,
+                [b[2], rows],
+            )
+        } else {
+            self.run("attention_context", probs, Some(v), &dims, p, [n, 1])
+        }
     }
 }
 
@@ -319,6 +361,39 @@ impl MetalDevice {
 #[cfg(test)]
 mod fusion_tests {
     use super::*;
+    #[test]
+    fn tiled_attention_products_match_scalar_for_grouping_and_tails() {
+        let d = MetalDevice::new().unwrap();
+        for (s, t, width) in [(3, 5, 12), (17, 33, 64), (3, 1027, 64)] {
+            let q = Tensor::from_f32(
+                &d,
+                [s, 6, width],
+                DType::BF16,
+                &crate::reference::deterministic(s * 6 * width),
+            )
+            .unwrap();
+            let k = Tensor::from_f32(
+                &d,
+                [t, 2, width],
+                DType::BF16,
+                &crate::reference::deterministic(t * 2 * width),
+            )
+            .unwrap();
+            d.set_native_matmul(true).unwrap();
+            let fast = d.attention_scores(&q, &k).unwrap().tensor;
+            d.set_native_matmul(false).unwrap();
+            let slow = d.attention_scores(&q, &k).unwrap().tensor;
+            crate::reference::check(&fast.to_f32(), &slow.to_f32(), 1.6e-2, 1e-2).unwrap();
+            let probs = d
+                .attention_softmax(&slow, t - s, (width as f32).sqrt().recip())
+                .unwrap()
+                .tensor;
+            let slow = d.attention_context(&probs, &k).unwrap().tensor;
+            d.set_native_matmul(true).unwrap();
+            let fast = d.attention_context(&probs, &k).unwrap().tensor;
+            crate::reference::check(&fast.to_f32(), &slow.to_f32(), 1.6e-2, 1e-2).unwrap();
+        }
+    }
     #[test]
     fn attention_softmax_preserves_staged_rounding_and_causal_offsets() {
         let d = MetalDevice::new().unwrap();

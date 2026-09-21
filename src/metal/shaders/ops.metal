@@ -265,3 +265,45 @@ kernel void gemv_vector(ARGS, uint tid [[thread_index_in_threadgroup]], uint gro
     if(p[4]==2) gemv_vector_impl<bfloat>((device const bfloat4*)a,(device const bfloat4*)b,c,p,tid,group);
     else gemv_vector_impl<half>((device const half4*)a,(device const half4*)b,c,p,tid,group);
 }
+
+// Grouped attention products: retain explicit score/probability storage boundaries.
+template<typename T, bool context>
+void attention_matrix(device const uchar* a, device const uchar* b, device uchar* c,
+                      constant uint* p, uint tid, uint2 group,
+                      threadgroup T* aa, threadgroup T* bb, threadgroup float* cc) {
+    uint s=p[1], t=p[2], heads=p[3], kv=p[5], d=p[6];
+    uint blocks=(s+7)/8, h=group.y/blocks, row=(group.y%blocks)*8, col=group.x*8;
+    uint kh=h/(heads/kv), inner=context?t:d, width=context?d:t;
+    simdgroup_float8x8 sum(0.f);
+    for(uint tile=0;tile<inner;tile+=8) {
+        for(uint i=tid;i<64;i+=32) {
+            uint r=i/8,j=i%8;
+            if(context) {
+                aa[i]=(row+r<s && tile+j<t)?((device const T*)a)[(h*s+row+r)*t+tile+j]:T(0);
+                bb[i]=(tile+r<t && col+j<d)?((device const T*)b)[(tile+r)*kv*d+kh*d+col+j]:T(0);
+            } else {
+                aa[i]=(row+r<s && tile+j<d)?((device const T*)a)[(row+r)*heads*d+h*d+tile+j]:T(0);
+                bb[i]=(col+j<t && tile+r<d)?((device const T*)b)[(col+j)*kv*d+kh*d+tile+r]:T(0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_matrix<T,8,8> x,y;
+        simdgroup_load(x,aa,8); simdgroup_load(y,bb,8);
+        simdgroup_multiply_accumulate(sum,x,y,sum);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(sum,cc,8);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint i=tid;i<64;i+=32) if(row+i/8<s && col+i%8<width) {
+        uint dest=context?((row+i/8)*heads*d+h*d+col+i%8):((h*s+row+i/8)*t+col+i%8);
+        store(c,dest,p[4],cc[i]);
+    }
+}
+kernel void attention_scores_matrix(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat aa[64],bb[64]; threadgroup float cc[64];
+    attention_matrix<bfloat,false>(a,b,c,p,tid,group,aa,bb,cc);
+}
+kernel void attention_context_matrix(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat aa[64],bb[64]; threadgroup float cc[64];
+    attention_matrix<bfloat,true>(a,b,c,p,tid,group,aa,bb,cc);
+}

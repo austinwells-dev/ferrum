@@ -660,7 +660,13 @@ impl MetalDevice {
                     3,
                 );
             }
-            if matches!(name, "project_bf16" | "project_f16") {
+            if matches!(
+                name,
+                "project_bf16"
+                    | "project_f16"
+                    | "attention_scores_matrix"
+                    | "attention_context_matrix"
+            ) {
                 if p.raw.threadExecutionWidth() != 32 {
                     return Err(Error::Dispatch(
                         "native matrix requires 32-wide SIMD".into(),
@@ -948,5 +954,28 @@ mod failed_completion_tests {
             3e-5,
         )
         .unwrap();
+    }
+    #[test]
+    fn bounded_epochs_preserve_live_dependency_chain() {
+        use crate::{DType, Tensor};
+        let d = MetalDevice::new().unwrap();
+        let mut x = Tensor::from_f32(
+            &d,
+            [2 * 1024 * 1024],
+            DType::F32,
+            &vec![0.01; 2 * 1024 * 1024],
+        )
+        .unwrap();
+        let before = d.counters();
+        d.reset_transient_peak();
+        let execution = d.execution().unwrap();
+        for _ in 0..40 {
+            x = d.add(&x, &x).unwrap().tensor;
+        }
+        execution.finish().unwrap();
+        let after = d.counters();
+        assert!(after.command_buffers - before.command_buffers >= 2);
+        assert!(after.transient_peak_bytes <= 256 * 1024 * 1024);
+        assert!(x.to_f32().iter().all(|&v| v == 0.01f32 * 2f32.powi(40)));
     }
 }

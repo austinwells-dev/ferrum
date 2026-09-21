@@ -4,6 +4,8 @@ Ferrum is an independent Rust + Metal LLM runtime for Apple Silicon. Qwen2.5-0.5
 
 Phase 4 adds completion-owned command batching, completion-safe storage reuse, checked contiguous views, growing KV storage, direct grouped attention layouts, vectorized decode GEMV, native SIMD-group prefill GEMM, and parallel reductions. On the tested Apple M5, three warm runs measured **511–514 prefill tok/s and 84–88 decode tok/s** for the pinned 21-token Hello workload. See [Phase 4 results](docs/phase4-results.md) for controls, numerical qualifications, memory, external comparisons and remaining bottlenecks.
 
+The broader workload optimization is **still in progress**; see the [matrix experiment journal](docs/phase4-matrix-progress.md) for long-prefill measurements and current work.
+
 ## Build and run
 
 Requires Apple Silicon macOS (tested on macOS 27, Apple M5), Rust 1.96+, Apple's Command Line Tools/macOS SDK, and Metal's runtime shader compiler. Native BF16 kernels require the supported Metal compiler/device capabilities; `info` reports these. We do not claim validation on older devices.
