@@ -606,7 +606,10 @@ impl MetalDevice {
         if let Some(p) = self.builtins.borrow().get(name) {
             return Ok(p.clone());
         }
-        let p = if name == "project_mpp" {
+        let p = if matches!(
+            name,
+            "project_mpp" | "attention_scores_mpp" | "attention_context_mpp"
+        ) {
             self.compile_kernel_version(
                 include_str!("shaders/project_mpp.metal"),
                 name,
@@ -672,7 +675,13 @@ impl MetalDevice {
             256
         } else if matches!(
             name,
-            "gemv" | "gemv_vector" | "project_wide_bf16" | "project_wide_f16" | "project_mpp"
+            "gemv"
+                | "gemv_vector"
+                | "project_wide_bf16"
+                | "project_wide_f16"
+                | "project_mpp"
+                | "attention_scores_mpp"
+                | "attention_context_mpp"
         ) {
             128
         } else {
@@ -718,7 +727,10 @@ impl MetalDevice {
                     3,
                 );
             }
-            if name == "project_mpp" {
+            if matches!(
+                name,
+                "project_mpp" | "attention_scores_mpp" | "attention_context_mpp"
+            ) {
                 if p.raw.threadExecutionWidth() != 32 {
                     return Err(Error::Dispatch("MPP requires 32-wide SIMD".into()));
                 }
@@ -726,7 +738,11 @@ impl MetalDevice {
                     MTLSize {
                         width: grid[0].div_ceil(64),
                         height: grid[1].div_ceil(64),
-                        depth: 1,
+                        depth: if name == "project_mpp" {
+                            1
+                        } else {
+                            params[3] as usize
+                        },
                     },
                     MTLSize {
                         width: 128,

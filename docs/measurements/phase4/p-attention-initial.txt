@@ -1,0 +1,19 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.48s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 1 test
+
+thread 'ops::transformer::fusion_tests::tiled_attention_products_match_scalar_for_grouping_and_tails' (4601196) panicked at src/ops/transformer.rs:504:51:
+called `Result::unwrap()` on an `Err` value: Compilation("program_source:53:20: error: use 'template' keyword to treat 'get_destination_cooperative_tensor' as a dependent template name\n    auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(right),float>();\n                   ^\n                   template \n")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test ops::transformer::fusion_tests::tiled_attention_products_match_scalar_for_grouping_and_tails ... FAILED
+
+failures:
+
+failures:
+    ops::transformer::fusion_tests::tiled_attention_products_match_scalar_for_grouping_and_tails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.34s
+
+error: test failed, to rerun pass `--lib`

@@ -218,7 +218,15 @@ impl MetalDevice {
         }
         let dims = [a[1], a[0], b[0]];
         let n = crate::tensor::Shape::new(dims)?.numel();
-        if self.native_matmul()
+        if self.mpp_projection()
+            && q.dtype() == DType::BF16
+            && a[0] > 1
+            && [q.numel(), k.numel(), n]
+                .iter()
+                .all(|&x| x <= i32::MAX as usize)
+        {
+            self.run("attention_scores_mpp", q, Some(k), &dims, p, [b[0], a[0]])
+        } else if self.native_matmul()
             && q.dtype() == DType::BF16
             && a[0] > 1
             && a[0] <= u32::MAX as usize - 8
@@ -316,6 +324,21 @@ impl MetalDevice {
                 &dims,
                 p,
                 [groups, 1],
+            )
+        } else if self.mpp_projection()
+            && probs.dtype() == DType::BF16
+            && a[1] > 1
+            && [probs.numel(), v.numel(), n]
+                .iter()
+                .all(|&x| x <= i32::MAX as usize)
+        {
+            self.run(
+                "attention_context_mpp",
+                probs,
+                Some(v),
+                &dims,
+                p,
+                [b[2], a[1]],
             )
         } else if self.native_matmul()
             && probs.dtype() == DType::BF16
