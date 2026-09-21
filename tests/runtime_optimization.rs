@@ -118,3 +118,35 @@ fn shared_projection_tiles_cover_dispatch_boundary_and_tails() {
         }
     }
 }
+
+#[test]
+fn projection_matrix_views_allow_unaligned_base_offsets() {
+    let d = MetalDevice::new().unwrap();
+    let (m, k, n) = (33, 63, 17);
+    let x = Tensor::from_f32(
+        &d,
+        [m * k + 1],
+        DType::BF16,
+        &reference::deterministic(m * k + 1),
+    )
+    .unwrap()
+    .view(1, [m, k])
+    .unwrap();
+    let w = Tensor::from_f32(
+        &d,
+        [n * k + 1],
+        DType::BF16,
+        &reference::deterministic(n * k + 1),
+    )
+    .unwrap()
+    .view(1, [n, k])
+    .unwrap();
+    let vals = w.to_f32();
+    let wt: Vec<_> = (0..n * k).map(|i| vals[(i % n) * k + i / n]).collect();
+    let expected: Vec<_> = reference::matmul(&x.to_f32(), &wt, m, k, n)
+        .into_iter()
+        .map(|v| DType::BF16.round(v))
+        .collect();
+    let y = Linear::new(&d, w, None).unwrap().forward(&d, &x).unwrap();
+    reference::check(&y.to_f32(), &expected, 1.6e-2, 1e-2).unwrap();
+}

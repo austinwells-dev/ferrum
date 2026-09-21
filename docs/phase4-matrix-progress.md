@@ -1,6 +1,6 @@
 # Phase 4 broader workload optimization — in progress
 
-The expanded user goal supersedes the short-context completion assessment in `phase4-results.md`. Phase 4 is active: the 100 tok/s decode and 1,000 tok/s approximately 1k-token prefill targets are directions, not stopping criteria. Remaining major bottlenecks still need systematic matrix evaluation and concrete experiments.
+The expanded user goal supersedes the short-context completion assessment in `phase4-results.md`. Phase 4 is active: the updated 150 tok/s decode and 2,500 tok/s approximately 1k-token prefill targets are directions, not stopping criteria. Remaining major bottlenecks still need systematic matrix evaluation and concrete experiments.
 
 ## Reproducible matrix
 
@@ -89,3 +89,27 @@ Median prefill times: short 32.68 ms, 128 tokens 75.66 ms, 512 tokens 316.85 ms,
 Before a fresh transient allocation would exceed the retained pool budget, the arena now discards unused completed buffers, largest first. It never discards an in-flight buffer or one with a live tensor owner. This differs from the rejected h-trim experiment: reclamation happens before allocating a missing size, avoiding the later over-capacity flush that previously discarded reusable completed buffers wholesale.
 
 The full matrix records 1k fresh allocation volume falling from 1,020,268,544 to 242,225,152 bytes and allocation time from 45.9 to 12.6 ms. At 512 tokens, fresh allocation volume falls to 18,876,416 bytes. Sequential GPU times drifted in unchanged paths, so saved control/candidate binaries were run in A/B/A order (`m-control-a1`, `m-candidate-b1`, `m-control-a2`; SHA256/commit metadata in `m-matched-metadata.json`). 512-token prefill was 342.2/321.4/341.1 ms; 1k was 731.6/722.8/710.4 ms. Decode also varied across the unchanged controls. The evidence supports a substantial allocation benefit and no consistent material broad latency regression, not a precise claimed end-to-end speedup at every length.
+
+## Expanded objective and end-to-end baseline (n checkpoint)
+
+The updated goal file raises the performance directions to >150 tok/s short decode and >2,500 tok/s near 1k prefill, and explicitly requires sampling-inclusive throughput and long-horizon scaling. These remain directions, not stopping conditions. The remaining completion audit must cover every named bottleneck and the complete numerical/failure/Metal validation gates.
+
+`runtime_matrix` now records elapsed generation time, complete-generation tok/s, post-first-token tok/s, aggregate cached-forward tok/s, and sampling time. The measured generation call includes all transformer work, readback, selection, cache management and a no-op output callback; terminal rendering is explicitly excluded. `FERRUM_MATRIX_LONG=1` adds a 368-token prose prefix with 1,600 cached decode steps (1,601 generated tokens), each run with a fresh cache. `FERRUM_MATRIX_CASE` selects a measurement case only in the example harness, never in production inference. Previous logs lack these additional metrics and must not be relabeled end-to-end measurements.
+
+`n-e2e-baseline.jsonl` long-horizon result: cached decode aggregate 75.48 tok/s, post-first-token 74.14 tok/s, complete-generation 73.28 tok/s. Sampling totals 384.25 ms, under 2% of elapsed generation. Cached-forward here retains the existing timing definition, including final-logit readback. The first/last 128-step windows are 78.41/68.40 tok/s, with system variation between windows. This demonstrates a real context-scaling concern; host selection alone does not explain the gap.
+
+### Closer external reference
+
+`tools/compare_mlx_matrix.py` uses the exact recorded IDs, BF16 weights, fresh prompt caches per invocation and no KV quantization. The loaded parameters are all BF16 and total 988,065,536 bytes. On this run MLX 0.32.2 / MLX-LM 0.31.3 measured 103.57 complete-generation tok/s over the long-horizon case, and 103.87 post-first-token tok/s. At 1k, first-token time is about 96 ms (~10,659 prompt tok/s including first selection). Raw evidence is `n-mlx-matrix.jsonl`. Its public generator prefetches work asynchronously, so yield intervals are labeled as such rather than GPU/model-forward time; full elapsed time includes final synchronization and any prefetched tail work.
+
+The user-reported Unsloth Desktop/MLX 368-token prefill (~4,226 tok/s) and 1,600-token generation (~184.7 tok/s) were not reproduced in this environment. Different prompts, runtime versions, scheduling/timing definitions and machine conditions remain possible differences; none is asserted as the cause. The exact-ID reference still establishes a large meaningful prefill gap and a smaller but material generation gap.
+
+## Metal 4 BF16 tensor projection (o checkpoint)
+
+Apple's [inline Metal 4 sample](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4) and the installed public `MPPTensorOpsMatMul2d.h` document tensor operations that access Apple10/M5 per-core neural accelerators. Ferrum's previous SIMD-group matrix kernels did not use that API. The new shader uses public MPP inline `matmul2d`, not another host inference engine or copied MLX kernel. The library is compiled as MSL 4.0 only on the capability-gated path; existing shaders remain MSL 3.1, and compilation caches include the language version.
+
+The first specialization is BF16 M>=32 on Apple10 + Metal4, using a 64x64 output tile, raw-buffer tensor views, FP32 cooperative results, `relaxed_precision=false`, and an explicit overwrite operation. It preserves Ferrum's final BF16 store rounding. Dimensions and input/output element spans must fit signed 32-bit tensor indexing; zero-K and other cases keep the existing fallback. MPP requires mutable element types in its tensor template, but the shader only reads input views. Existing completion-owned buffer bindings remain unchanged; no new unsafe Rust is required.
+
+Initial complete matrix including long horizon: prefill 31.90/22.39/87.36/261.61 ms for short/128/512/1024. The short path is unchanged. All generated IDs match the n baseline, including the full 1,600-step run. The unchanged suite and Metal validation pass, along with CPU-reference checks at tile boundaries/awkward K and N and a new unaligned-base view test. F32 diagnostic error remains 7.82012939453125e-5. Compilation experiments exposed SDK/runtime differences in const tensor element support and fragment mask APIs; resolved using the installed API and guarded output coordinates, without changing tolerances.
+
+Re-profiled 1k isolated GPU categories: projection 74.03 ms; attention scores/context 73.30/60.31 ms; causal softmax 26.94 ms; RMSNorm 11.52 ms; SwiGLU 8.13 ms. Thus attention products and their intermediates now collectively dominate prefill. Further hardware-native attention and small-M projection experiments are still reasonable Phase 4 work. GEMV, scheduling and final matched controls remain outstanding; the goal is not complete.

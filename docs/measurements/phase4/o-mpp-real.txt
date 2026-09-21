@@ -1,0 +1,10 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 3.25s
+     Running tests/real_model.rs (target/release/deps/real_model-87438668e8662d80)
+
+running 2 tests
+test official_qwen_bf16_cached_generation ... ok
+test official_qwen_long_lifetime_stress ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.23s
+

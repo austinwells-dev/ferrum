@@ -1,0 +1,11 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.67s
+     Running tests/runtime_optimization.rs (target/debug/deps/runtime_optimization-9a0380143b8b5c4e)
+
+running 1 test
+test projection_matrix_views_allow_unaligned_base_offsets ... 2026-09-21 20:44:30.560 runtime_optimization-9a0380143b8b5c4e[44287:4594190] Metal API Validation Enabled
+2026-09-21 20:44:30.560 runtime_optimization-9a0380143b8b5c4e[44287:4594190] Metal GPU Validation Enabled
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.53s
+

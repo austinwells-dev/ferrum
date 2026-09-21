@@ -324,13 +324,18 @@ impl MetalDevice {
         self.native_matmul.set(enabled);
         Ok(())
     }
+    pub(crate) fn mpp_projection(&self) -> bool {
+        self.native_matmul.get()
+            && self.raw.supportsFamily(MTLGPUFamily::Apple10)
+            && self.raw.supportsFamily(MTLGPUFamily::Metal4)
+    }
     pub(crate) fn native_matmul(&self) -> bool {
         self.native_matmul.get()
     }
     pub fn capabilities(&self) -> Result<serde_json::Value> {
         let pipeline = self.builtin("gemv")?;
         Ok(
-            serde_json::json!({"apple_families":self.apple_families(),"metal4":self.raw.supportsFamily(MTLGPUFamily::Metal4),"msl_requested":"3.1","simdgroup_matrix":self.raw.supportsFamily(MTLGPUFamily::Apple7),"native_bfloat_compiled":self.builtin("project_bf16").is_ok(),"thread_execution_width":pipeline.raw.threadExecutionWidth(),"pipeline_max_threads":pipeline.raw.maxTotalThreadsPerThreadgroup(),"device_max_threads":self.raw.maxThreadsPerThreadgroup().width,"recommended_working_set":self.recommended_max_working_set(),"storage":"shared","hazards":"tracked"}),
+            serde_json::json!({"apple_families":self.apple_families(),"metal4":self.raw.supportsFamily(MTLGPUFamily::Metal4),"msl_requested":"3.1","mpp_msl_requested":"4.0","mpp_available":self.mpp_projection(),"mpp_compiled":self.mpp_projection() && self.builtin("project_mpp").is_ok(),"simdgroup_matrix":self.raw.supportsFamily(MTLGPUFamily::Apple7),"native_bfloat_compiled":self.builtin("project_bf16").is_ok(),"thread_execution_width":pipeline.raw.threadExecutionWidth(),"pipeline_max_threads":pipeline.raw.maxTotalThreadsPerThreadgroup(),"device_max_threads":self.raw.maxThreadsPerThreadgroup().width,"recommended_working_set":self.recommended_max_working_set(),"storage":"shared","hazards":"tracked"}),
         )
     }
     /// Validation-only ordered reductions reproduce the immutable F32 diagnostic.
@@ -423,7 +428,7 @@ impl MetalDevice {
             match name {
                 "gemv" | "gemv_vector" => "lm_head_gemv",
                 "project_bf16" | "project_f16" | "project_wide_bf16" | "project_wide_f16"
-                | "matmul_nt" => "lm_head_matmul",
+                | "project_mpp" | "matmul_nt" => "lm_head_matmul",
                 _ => name,
             }
         } else {
@@ -553,25 +558,34 @@ impl MetalDevice {
         Ok(buffer)
     }
     pub fn compile_kernel(&self, source: &str, name: &str) -> Result<Rc<ComputePipeline>> {
+        self.compile_kernel_version(source, name, MTLLanguageVersion::Version3_1)
+    }
+    fn compile_kernel_version(
+        &self,
+        source: &str,
+        name: &str,
+        version: MTLLanguageVersion,
+    ) -> Result<Rc<ComputePipeline>> {
         autoreleasepool(|_| {
-            let key = (source.to_owned(), name.to_owned());
+            let library_key = format!("{}:{source}", version.0);
+            let key = (library_key.clone(), name.to_owned());
             if let Some(p) = self.pipelines.borrow().get(&key) {
                 return Ok(p.clone());
             }
             let mut libraries = self.libraries.borrow_mut();
-            if !libraries.contains_key(source) {
+            if !libraries.contains_key(&library_key) {
                 let options = MTLCompileOptions::new();
-                options.setLanguageVersion(MTLLanguageVersion::Version3_1);
+                options.setLanguageVersion(version);
                 options.setMathMode(MTLMathMode::Safe);
                 options.setMathFloatingPointFunctions(MTLMathFloatingPointFunctions::Precise);
                 let lib = self
                     .raw
                     .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
                     .map_err(|e| Error::Compilation(e.to_string()))?;
-                libraries.insert(source.to_owned(), lib);
+                libraries.insert(library_key.clone(), lib);
             }
             let lib = libraries
-                .get(source)
+                .get(&library_key)
                 .ok_or_else(|| Error::Compilation("library cache invariant".into()))?;
             let function = lib
                 .newFunctionWithName(&NSString::from_str(name))
@@ -592,7 +606,15 @@ impl MetalDevice {
         if let Some(p) = self.builtins.borrow().get(name) {
             return Ok(p.clone());
         }
-        let p = self.compile_kernel(include_str!("shaders/ops.metal"), name)?;
+        let p = if name == "project_mpp" {
+            self.compile_kernel_version(
+                include_str!("shaders/project_mpp.metal"),
+                name,
+                MTLLanguageVersion::Version4_0,
+            )?
+        } else {
+            self.compile_kernel(include_str!("shaders/ops.metal"), name)?
+        };
         self.builtins.borrow_mut().insert(name, p.clone());
         Ok(p)
     }
@@ -650,7 +672,7 @@ impl MetalDevice {
             256
         } else if matches!(
             name,
-            "gemv" | "gemv_vector" | "project_wide_bf16" | "project_wide_f16"
+            "gemv" | "gemv_vector" | "project_wide_bf16" | "project_wide_f16" | "project_mpp"
         ) {
             128
         } else {
@@ -696,7 +718,23 @@ impl MetalDevice {
                     3,
                 );
             }
-            if matches!(name, "project_wide_bf16" | "project_wide_f16") {
+            if name == "project_mpp" {
+                if p.raw.threadExecutionWidth() != 32 {
+                    return Err(Error::Dispatch("MPP requires 32-wide SIMD".into()));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0].div_ceil(64),
+                        height: grid[1].div_ceil(64),
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if matches!(name, "project_wide_bf16" | "project_wide_f16") {
                 if p.raw.threadExecutionWidth() != 32 {
                     return Err(Error::Dispatch(
                         "native matrix requires 32-wide SIMD".into(),

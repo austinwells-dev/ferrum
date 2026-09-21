@@ -1,0 +1,19 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.61s
+     Running tests/runtime_optimization.rs (target/debug/deps/runtime_optimization-9a0380143b8b5c4e)
+
+running 1 test
+
+thread 'shared_projection_tiles_cover_dispatch_boundary_and_tails' (4585153) panicked at tests/runtime_optimization.rs:111:71:
+called `Result::unwrap()` on an `Err` value: Compilation("program_source:26:19: error: no member named 'get_mask' in 'metal::cooperative_tensor<float, metal::extents<int, 18446744073709551615, 18446744073709551615>, mpp::tensor_ops::__mutmul2d_detail::__operand_layout<{64, 64, -1, false, true, false, 0}, mpp::tensor_ops::__mutmul2d_detail::__matmul2d_cooperative_operand_index::destination, metal::execution_simdgroups<4>, bfloat, bfloat, float, int>>'\n        if(result.get_mask(i)) {\n           ~~~~~~ ^\n")
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test shared_projection_tiles_cover_dispatch_boundary_and_tails ... FAILED
+
+failures:
+
+failures:
+    shared_projection_tiles_cover_dispatch_boundary_and_tails
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.35s
+
+error: test failed, to rerun pass `--test runtime_optimization`

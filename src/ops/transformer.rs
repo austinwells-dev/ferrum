@@ -355,7 +355,21 @@ impl MetalDevice {
         p[2] = index(ad[1])?;
         p[3] = index(bd[0])?;
         let name = if ad[0] > 1 && self.native_matmul() && a.dtype() != DType::F32 {
-            if ad[0] >= 32 {
+            if ad[0] >= 32
+                && ad[1] > 0
+                && a.numel() <= i32::MAX as usize
+                && weight.numel() <= i32::MAX as usize
+                && ad[0]
+                    .checked_mul(bd[0])
+                    .is_some_and(|n| n <= i32::MAX as usize)
+                && a.dtype() == DType::BF16
+                && self.mpp_projection()
+                && [ad[0], ad[1], bd[0]]
+                    .iter()
+                    .all(|&x| x <= i32::MAX as usize)
+            {
+                "project_mpp"
+            } else if ad[0] >= 32 {
                 if a.dtype() == DType::BF16 {
                     "project_wide_bf16"
                 } else {

@@ -1,0 +1,9 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.82s
+     Running tests/runtime_optimization.rs (target/debug/deps/runtime_optimization-9a0380143b8b5c4e)
+
+running 1 test
+test shared_projection_tiles_cover_dispatch_boundary_and_tails ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.34s
+
