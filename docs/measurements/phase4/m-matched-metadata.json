@@ -1,0 +1,14 @@
+{
+  "control_commit": "c60833a",
+  "candidate_base": "c60833a",
+  "candidate_change": "Arena::make_room before fresh transient allocation",
+  "order": [
+    "control",
+    "candidate",
+    "control"
+  ],
+  "binaries": {
+    "/tmp/ferrum-pool-control-matrix": "c837c25b92645df9dafad4e784c3f1b8ba55a4acc5acfbee2dcb94f7be446afb",
+    "/tmp/ferrum-pool-candidate-matrix": "fcc82f74a5bd754fb6d422f688658ce7e032def60f5aedd0f2e011d688ea3e04"
+  }
+}

@@ -1,0 +1,12 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 0.68s
+     Running tests/real_model.rs (target/release/deps/real_model-87438668e8662d80)
+
+running 2 tests
+test official_qwen_bf16_cached_generation ... 2026-09-21 16:31:59.096 real_model-87438668e8662d80[36772:4306763] Metal API Validation Enabled
+2026-09-21 16:31:59.096 real_model-87438668e8662d80[36772:4306763] Metal GPU Validation Enabled
+ok
+test official_qwen_long_lifetime_stress ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.80s
+

@@ -43,6 +43,33 @@ struct Arena {
     high_water: usize,
 }
 impl Arena {
+    // Reclaim completed, unowned storage before a fresh allocation would overflow
+    // the retention budget. In-flight and live buffers are never candidates.
+    fn make_room(&mut self, requested: usize) {
+        let target = (256usize * 1024 * 1024).saturating_sub(requested);
+        if self.capacity <= target {
+            return;
+        }
+        let mut sizes: Vec<_> = self.free.keys().copied().collect();
+        sizes.sort_unstable_by(|a, b| b.cmp(a));
+        for size in sizes {
+            let bin = self.free.get_mut(&size).unwrap();
+            bin.retain(|(_, ready, counted)| {
+                let completed = ready
+                    .as_ref()
+                    .is_none_or(|x| x.get() == Completion::Completed);
+                if self.capacity > target && completed && !counted {
+                    self.capacity -= size;
+                    false
+                } else {
+                    true
+                }
+            });
+            if self.capacity <= target {
+                break;
+            }
+        }
+    }
     fn complete(&mut self) {
         let mut retired = 0;
         let mut released = 0;
@@ -515,6 +542,7 @@ impl MetalDevice {
                 arena: None,
             }
         } else {
+            arena.make_room(length);
             let mut buffer = self.allocate(length)?;
             buffer.len = bytes;
             arena.capacity += length;

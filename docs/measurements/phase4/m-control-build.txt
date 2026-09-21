@@ -1,0 +1,2 @@
+   Compiling ferrum v0.1.0 (/tmp/ferrum-phase4-current-control)
+    Finished `release` profile [optimized] target(s) in 3.15s
