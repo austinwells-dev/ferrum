@@ -61,3 +61,11 @@ Three-run medians: short 35.60 ms, 128 tokens 152.34 ms, 512 tokens 577.54 ms, 1
 `i-attention-validation.txt` and `i-attention-real-validation.txt` pass Metal API/shader validation, including new direct scalar-versus-tiled comparisons for GQA, awkward widths/tiles and a 1k prefix. No existing numerical tests or tolerances changed. `i-epoch-validation.txt` adds a 40-operation live dependency chain crossing the memory-driven completion boundary and asserts correct values and bounded transient peak.
 
 Next: improve prefill GEMM reuse/staging, then return to long-context decode/GEMV and remaining fusion opportunities. The full expanded goal is still active; neither the target throughput nor the stopping audit has been satisfied.
+
+### Shared projection staging (j-wide checkpoint)
+
+For multi-token projections with M >= 32, four SIMD groups now share a 16x32 output tile and K=32 staging; each accumulates two 8x8 tiles. Smaller M retains the previous 8x8 kernel to avoid a poorly filled larger tile. This dimension-based specialization applies to BF16/F16 generally, without model dimensions or prompt recognition. Decode is unchanged.
+
+Three-run medians: short 35.75 ms, 128 tokens 101.59 ms, 512 tokens 356.03 ms, 1024 tokens 818.95 ms (~1,250 tok/s). This crosses the prefill target but does not satisfy the goal stopping conditions. All matrix generated IDs match the previous candidate. Existing tests pass, along with new CPU-reference checks for M=31/32/33/65 and awkward K/N tails at unchanged dtype tolerances. Metal API/shader validation and official real-model tests pass (`j-wide-validation.txt`, `j-wide-real-validation.txt`).
+
+The isolated long-decode profile also identifies attention context as a separate bottleneck: about 7.7 ms versus 0.47 ms at short context (`h-fused-isolated.jsonl`). Its serial reduction over cached positions is the next concrete target.

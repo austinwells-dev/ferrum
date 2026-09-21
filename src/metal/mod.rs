@@ -395,7 +395,8 @@ impl MetalDevice {
         let name = if self.lm_head_profile.get() {
             match name {
                 "gemv" | "gemv_vector" => "lm_head_gemv",
-                "project_bf16" | "project_f16" | "matmul_nt" => "lm_head_matmul",
+                "project_bf16" | "project_f16" | "project_wide_bf16" | "project_wide_f16"
+                | "matmul_nt" => "lm_head_matmul",
                 _ => name,
             }
         } else {
@@ -615,7 +616,10 @@ impl MetalDevice {
         let p = self.builtin(name)?;
         let required = if tiled || matches!(name, "rmsnorm" | "softmax" | "attention_softmax") {
             256
-        } else if matches!(name, "gemv" | "gemv_vector") {
+        } else if matches!(
+            name,
+            "gemv" | "gemv_vector" | "project_wide_bf16" | "project_wide_f16"
+        ) {
             128
         } else {
             32
@@ -660,7 +664,25 @@ impl MetalDevice {
                     3,
                 );
             }
-            if matches!(
+            if matches!(name, "project_wide_bf16" | "project_wide_f16") {
+                if p.raw.threadExecutionWidth() != 32 {
+                    return Err(Error::Dispatch(
+                        "native matrix requires 32-wide SIMD".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0].div_ceil(32),
+                        height: grid[1].div_ceil(16),
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if matches!(
                 name,
                 "project_bf16"
                     | "project_f16"

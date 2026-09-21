@@ -94,3 +94,27 @@ fn last_position_prefill_preserves_cache_and_requested_logits() {
         assert!(model.forward_prefill_last(&d, &[]).is_err());
     }
 }
+
+#[test]
+fn shared_projection_tiles_cover_dispatch_boundary_and_tails() {
+    let d = MetalDevice::new().unwrap();
+    for ty in [DType::BF16, DType::F16] {
+        for (m, k, n) in [(31, 63, 17), (32, 63, 17), (33, 129, 48), (65, 128, 65)] {
+            let x = Tensor::from_f32(&d, [m, k], ty, &reference::deterministic(m * k)).unwrap();
+            let w = Tensor::from_f32(&d, [n, k], ty, &reference::deterministic(n * k)).unwrap();
+            let values = w.to_f32();
+            let wt: Vec<_> = (0..n * k).map(|i| values[(i % n) * k + i / n]).collect();
+            let expected: Vec<_> = reference::matmul(&x.to_f32(), &wt, m, k, n)
+                .into_iter()
+                .map(|x| ty.round(x))
+                .collect();
+            let y = Linear::new(&d, w, None).unwrap().forward(&d, &x).unwrap();
+            let (atol, rtol) = if ty == DType::BF16 {
+                (1.6e-2, 1e-2)
+            } else {
+                (2e-3, 2e-3)
+            };
+            reference::check(&y.to_f32(), &expected, atol, rtol).unwrap();
+        }
+    }
+}

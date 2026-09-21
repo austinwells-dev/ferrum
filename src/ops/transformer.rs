@@ -337,7 +337,13 @@ impl MetalDevice {
         p[2] = index(ad[1])?;
         p[3] = index(bd[0])?;
         let name = if ad[0] > 1 && self.native_matmul() && a.dtype() != DType::F32 {
-            if a.dtype() == DType::BF16 {
+            if ad[0] >= 32 {
+                if a.dtype() == DType::BF16 {
+                    "project_wide_bf16"
+                } else {
+                    "project_wide_f16"
+                }
+            } else if a.dtype() == DType::BF16 {
                 "project_bf16"
             } else {
                 "project_f16"

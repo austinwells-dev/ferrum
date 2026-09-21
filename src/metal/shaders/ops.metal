@@ -307,3 +307,47 @@ kernel void attention_context_matrix(ARGS, uint tid [[thread_index_in_threadgrou
     threadgroup bfloat aa[64],bb[64]; threadgroup float cc[64];
     attention_matrix<bfloat,true>(a,b,c,p,tid,group,aa,bb,cc);
 }
+
+// Four SIMD groups share a 16x32 output tile and K=32 staging. Each SIMD
+// accumulates two 8x8 tiles; input reuse amortizes threadgroup barriers.
+template<typename T>
+void project_wide(device const uchar* a, device const uchar* b, device uchar* c,
+                  constant uint* p, uint tid, uint2 group,
+                  threadgroup T* aa, threadgroup T* bb, threadgroup float* cc) {
+    uint m=p[1],k=p[2],n=p[3],row=group.y*16,col=group.x*32;
+    uint sg=tid/32,rr=(sg/2)*8,cr=(sg%2)*16;
+    simdgroup_float8x8 sum0(0.f),sum1(0.f);
+    for(uint tile=0;tile<k;tile+=32) {
+        for(uint i=tid;i<512;i+=128) {
+            uint r=i/32,j=i%32;
+            aa[i]=(row+r<m && tile+j<k)?((device const T*)a)[(row+r)*k+tile+j]:T(0);
+        }
+        for(uint i=tid;i<1024;i+=128) {
+            uint r=i/32,j=i%32;
+            bb[j*32+r]=(col+r<n && tile+j<k)?((device const T*)b)[(col+r)*k+tile+j]:T(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint j=0;j<32;j+=8) {
+            simdgroup_matrix<T,8,8> x,y0,y1;
+            simdgroup_load(x,aa+rr*32+j,32);
+            simdgroup_load(y0,bb+j*32+cr,32);
+            simdgroup_load(y1,bb+j*32+cr+8,32);
+            simdgroup_multiply_accumulate(sum0,x,y0,sum0);
+            simdgroup_multiply_accumulate(sum1,x,y1,sum1);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    simdgroup_store(sum0,cc+rr*32+cr,32);
+    simdgroup_store(sum1,cc+rr*32+cr+8,32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint i=tid;i<512;i+=128) if(row+i/32<m && col+i%32<n)
+        store(c,(row+i/32)*n+col+i%32,p[4],cc[i]);
+}
+kernel void project_wide_bf16(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat aa[512],bb[1024]; threadgroup float cc[512];
+    project_wide<bfloat>(a,b,c,p,tid,group,aa,bb,cc);
+}
+kernel void project_wide_f16(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup half aa[512],bb[1024]; threadgroup float cc[512];
+    project_wide<half>(a,b,c,p,tid,group,aa,bb,cc);
+}
