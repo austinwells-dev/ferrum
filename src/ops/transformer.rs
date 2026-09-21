@@ -299,7 +299,25 @@ impl MetalDevice {
         }
         let dims = [a[1], a[0], b[2]];
         let n = crate::tensor::Shape::new(dims)?.numel();
-        if self.native_matmul()
+        if a[1] == 1
+            && b[0] >= 128
+            && b[0] <= u32::MAX as usize - 8
+            && b[2] <= u32::MAX as usize - 32
+            && probs.dtype() != DType::F32
+        {
+            let groups = b[2]
+                .div_ceil(32)
+                .checked_mul(a[0])
+                .ok_or_else(|| Error::Shape("decode context grid overflow".into()))?;
+            self.run(
+                "attention_context_decode",
+                probs,
+                Some(v),
+                &dims,
+                p,
+                [groups, 1],
+            )
+        } else if self.native_matmul()
             && probs.dtype() == DType::BF16
             && a[1] > 1
             && a[1] <= u32::MAX as usize - 8
@@ -367,6 +385,48 @@ impl MetalDevice {
 #[cfg(test)]
 mod fusion_tests {
     use super::*;
+    #[test]
+    fn decode_context_partitions_cover_threshold_and_column_tails() {
+        let d = MetalDevice::new().unwrap();
+        for dtype in [DType::BF16, DType::F16] {
+            for (t, width) in [(127, 13), (128, 13), (1025, 65)] {
+                let p = Tensor::from_f32(
+                    &d,
+                    [6, 1, t],
+                    dtype,
+                    &crate::reference::deterministic(6 * t),
+                )
+                .unwrap();
+                let p = d.softmax(&p).unwrap().tensor;
+                let v = Tensor::from_f32(
+                    &d,
+                    [t, 2, width],
+                    dtype,
+                    &crate::reference::deterministic(t * 2 * width),
+                )
+                .unwrap();
+                let pv = p.to_f32();
+                let vv = v.to_f32();
+                let mut expected = Vec::new();
+                for h in 0..6 {
+                    for col in 0..width {
+                        let mut sum = 0f32;
+                        for pos in 0..t {
+                            sum += pv[h * t + pos] * vv[(pos * 2 + h / 3) * width + col];
+                        }
+                        expected.push(dtype.round(sum));
+                    }
+                }
+                let y = d.attention_context(&p, &v).unwrap().tensor;
+                let (atol, rtol) = if dtype == DType::BF16 {
+                    (1.6e-2, 1e-2)
+                } else {
+                    (2e-3, 2e-3)
+                };
+                crate::reference::check(&y.to_f32(), &expected, atol, rtol).unwrap();
+            }
+        }
+    }
     #[test]
     fn tiled_attention_products_match_scalar_for_grouping_and_tails() {
         let d = MetalDevice::new().unwrap();

@@ -614,7 +614,11 @@ impl MetalDevice {
         debug_assert_eq!(buffers.len(), 3);
         debug_assert!(params[4] <= 2);
         let p = self.builtin(name)?;
-        let required = if tiled || matches!(name, "rmsnorm" | "softmax" | "attention_softmax") {
+        let required = if tiled
+            || matches!(
+                name,
+                "rmsnorm" | "softmax" | "attention_softmax" | "attention_context_decode"
+            ) {
             256
         } else if matches!(
             name,
@@ -706,7 +710,10 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if matches!(name, "rmsnorm" | "softmax" | "attention_softmax") {
+            } else if matches!(
+                name,
+                "rmsnorm" | "softmax" | "attention_softmax" | "attention_context_decode"
+            ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 256
                 {
                     return Err(Error::Dispatch(

@@ -351,3 +351,21 @@ kernel void project_wide_f16(ARGS, uint tid [[thread_index_in_threadgroup]], uin
     threadgroup half aa[512],bb[1024]; threadgroup float cc[512];
     project_wide<half>(a,b,c,p,tid,group,aa,bb,cc);
 }
+
+// Decode context: 32 adjacent output columns, eight independent T partitions.
+// Neighboring lanes read adjacent V elements; shared storage combines partials.
+kernel void attention_context_decode(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint d=p[6], tiles=(d+31)/32, h=group/tiles, col=(group%tiles)*32+tid%32;
+    uint part=tid/32, kv=h/(p[3]/p[5]);
+    float sum=0;
+    if(col<d) for(uint t=part;t<p[2];t+=8)
+        sum+=load(a,h*p[2]+t,p[4])*load(b,(t*p[5]+kv)*d+col,p[4]);
+    threadgroup float partial[256];
+    partial[tid]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid<32 && col<d) {
+        sum=0;
+        for(uint j=0;j<8;j++) sum+=partial[j*32+tid];
+        store(c,h*d+col,p[4],sum);
+    }
+}

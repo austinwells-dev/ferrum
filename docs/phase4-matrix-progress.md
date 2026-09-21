@@ -69,3 +69,11 @@ For multi-token projections with M >= 32, four SIMD groups now share a 16x32 out
 Three-run medians: short 35.75 ms, 128 tokens 101.59 ms, 512 tokens 356.03 ms, 1024 tokens 818.95 ms (~1,250 tok/s). This crosses the prefill target but does not satisfy the goal stopping conditions. All matrix generated IDs match the previous candidate. Existing tests pass, along with new CPU-reference checks for M=31/32/33/65 and awkward K/N tails at unchanged dtype tolerances. Metal API/shader validation and official real-model tests pass (`j-wide-validation.txt`, `j-wide-real-validation.txt`).
 
 The isolated long-decode profile also identifies attention context as a separate bottleneck: about 7.7 ms versus 0.47 ms at short context (`h-fused-isolated.jsonl`). Its serial reduction over cached positions is the next concrete target.
+
+### Parallel decode context (k-context checkpoint)
+
+For low-precision single-token attention with at least 128 cached positions, 256 threads cover 32 adjacent output columns and eight independent partitions of the sequence reduction. V loads remain coalesced; eight partial sums are combined before the existing dtype store. Short contexts and F32 retain ascending-order scalar reductions. The threshold amortizes the shared-reduction cost and is independent of model/prompt values.
+
+Three-run decode medians: short 92.83 tok/s, 128-context 94.71, 512-context 76.64, 1024-context 71.25, sustained 90.41. The previous candidate's 1024-context decode was 49.03 tok/s. Prefill kernels are unchanged. Existing suites and real-model stress pass, including Metal validation and new CPU-reference checks at 127/128/1025 positions with GQA and awkward column tails.
+
+The 16-step matrix outputs match the previous candidate. Sustained generation first differs at step 126. This was investigated with the same teacher-forced history against a detached `25f11e1` control: token 23893 drops from 16.75 to 16.625, tying tokens 9645/9735/22201 at 16.625, so greedy selection chooses the lowest ID. This is one BF16 logit step at a near tie from the changed reduction order, not unexplained divergence. Evidence: `k-control-probe.jsonl`, `k-context-probe.jsonl`; the generic `token_probe` example reproduces the same-history comparison. No tolerance was widened and no expected token list in existing tests was changed.
