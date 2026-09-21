@@ -83,7 +83,7 @@ impl Options {
 fn ms(d: std::time::Duration) -> f64 {
     d.as_secs_f64() * 1000.
 }
-fn report(r: &Generation, prompt: usize) {
+fn report(r: &Generation, prompt: usize, profile: bool) {
     eprintln!(
         "\n---\nprompt: {prompt} tokens; generated: {}; stop: {:?}",
         r.tokens.len(),
@@ -105,7 +105,9 @@ fn report(r: &Generation, prompt: usize) {
         r.prefill_counters.allocations,
         r.prefill_counters.allocated_bytes
     );
-    eprintln!("prefill runtime counters: {:?}", r.prefill_counters);
+    if profile {
+        eprintln!("prefill runtime counters: {:?}", r.prefill_counters);
+    }
     if !r.decode.is_empty() {
         let mut sorted = r.decode.clone();
         sorted.sort();
@@ -115,7 +117,9 @@ fn report(r: &Generation, prompt: usize) {
             1. / sorted[sorted.len() / 2].as_secs_f64(),
             r.decode.iter().map(|&d| ms(d)).collect::<Vec<_>>()
         );
-        eprintln!("decode counters per step: {:?}", r.decode_counters);
+        if profile {
+            eprintln!("decode counters per step: {:?}", r.decode_counters);
+        }
     }
     eprintln!(
         "sampling: {:.3} ms total; active KV: {} bytes; generated IDs: {:?}",
@@ -247,7 +251,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         .ok_or_else(|| Error::Tokenizer("stream/full decode prefix mismatch".into()))?;
     stdout.write_all(tail.as_bytes()).map_err(ioerr)?;
     writeln!(stdout).map_err(ioerr)?;
-    report(&r, ids.len());
+    report(&r, ids.len(), o.profile);
     if o.profile {
         let mut sorted = r.decode.clone();
         sorted.sort();
