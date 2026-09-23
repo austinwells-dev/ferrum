@@ -18,7 +18,10 @@ impl MetalDevice {
         p[2] = index(ad[1])?;
         p[3] = index(weight.rows())?;
         let supports_mpp = ad[0] >= 16
-            && a.dtype() == DType::BF16
+            && ((weight.format() == QuantizationFormat::MlxAffine4Group64
+                && a.dtype() == DType::F16)
+                || (weight.format() != QuantizationFormat::MlxAffine4Group64
+                    && a.dtype() == DType::BF16))
             && ad[1].is_multiple_of(128)
             && self.mpp_projection();
         let name = match (weight.format(), ad[0] == 1, supports_mpp) {
@@ -43,6 +46,9 @@ impl MetalDevice {
             (QuantizationFormat::Q6_K, true, _) => "q6_k_gemv",
             (QuantizationFormat::Q6_K, false, true) => "q6_k_gemm_mpp",
             (QuantizationFormat::Q6_K, false, false) => "q6_k_gemm",
+            (QuantizationFormat::MlxAffine4Group64, true, _) => "mlx_affine4_gemv",
+            (QuantizationFormat::MlxAffine4Group64, false, true) => "mlx_affine4_gemm_mpp",
+            (QuantizationFormat::MlxAffine4Group64, false, false) => "mlx_affine4_gemm",
         };
         self.run_quantized(
             name,
@@ -70,6 +76,7 @@ impl MetalDevice {
                 | QuantizationFormat::Q5_K
                 | QuantizationFormat::Q8_0
                 | QuantizationFormat::Q6_K
+                | QuantizationFormat::MlxAffine4Group64
         ) || weight.columns() > u32::MAX as usize
         {
             return Err(Error::Gguf(format!(
@@ -1538,5 +1545,165 @@ mod q6_k_tests {
         assert!(
             QuantizedMatrix::from_reader(&d, 3, 255, QuantizationFormat::Q6_K, |_| Ok(())).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod mlx_affine4_tests {
+    use super::*;
+    use crate::quantization::{QuantizationFormat, QuantizedMatrix};
+    use half::f16;
+
+    fn scale(row: usize, group: usize) -> f32 {
+        let magnitude = 1 + (row * 3 + group * 5) % 5;
+        let sign = if (row + group).is_multiple_of(2) {
+            1.0
+        } else {
+            -1.0
+        };
+        f16::from_f32(sign * magnitude as f32 / 512.0).to_f32()
+    }
+
+    fn bias(row: usize, group: usize) -> f32 {
+        f16::from_f32(((row + 2 * group) % 5) as f32 / 128.0 - 0.015625).to_f32()
+    }
+
+    fn quant(row: usize, column: usize) -> u8 {
+        ((row * 3 + column * 7 + 5) & 15) as u8
+    }
+
+    fn packed(device: &MetalDevice, rows: usize, columns: usize) -> QuantizedMatrix {
+        assert!(columns.is_multiple_of(64));
+        let mut bytes = Vec::with_capacity(rows * columns / 64 * 36);
+        for row in 0..rows {
+            for group in 0..columns / 64 {
+                bytes.extend_from_slice(&f16::from_f32(scale(row, group)).to_bits().to_le_bytes());
+                bytes.extend_from_slice(&f16::from_f32(bias(row, group)).to_bits().to_le_bytes());
+                for pair in 0..32 {
+                    let even = quant(row, group * 64 + pair * 2);
+                    let odd = quant(row, group * 64 + pair * 2 + 1);
+                    bytes.push(even | (odd << 4));
+                }
+            }
+        }
+        QuantizedMatrix::from_reader(
+            device,
+            rows,
+            columns,
+            QuantizationFormat::MlxAffine4Group64,
+            |destination| {
+                destination.copy_from_slice(&bytes);
+                Ok(())
+            },
+        )
+        .unwrap()
+    }
+
+    fn value(row: usize, column: usize) -> f32 {
+        let group = column / 64;
+        scale(row, group) * f32::from(quant(row, column)) + bias(row, group)
+    }
+
+    fn input(rows: usize, columns: usize) -> Vec<f32> {
+        (0..rows * columns)
+            .map(|index| ((index * 29 + 11) % 113) as f32 / 127.0 - 0.42)
+            .collect()
+    }
+
+    #[test]
+    fn affine4_direct_gemv_and_gemm_match_signed_scale_reference_with_tails() {
+        let device = MetalDevice::new().unwrap();
+        let (n, k) = (5, 128);
+        let weight = packed(&device, n, k);
+        for m in [1, 2, 3, 5] {
+            let values = input(m, k);
+            let x = Tensor::from_f32(&device, [m, k], DType::F16, &values).unwrap();
+            let rounded_input = x.to_f32();
+            let rounded_input = &rounded_input;
+            let actual = device.project_quantized(&x, &weight).unwrap();
+            assert_eq!(
+                actual.metrics.operation,
+                if m == 1 {
+                    "mlx_affine4_gemv"
+                } else {
+                    "mlx_affine4_gemm"
+                }
+            );
+            let expected = (0..m)
+                .flat_map(|row| {
+                    (0..n).map(move |column| {
+                        (0..k)
+                            .map(|index| rounded_input[row * k + index] * value(column, index))
+                            .sum::<f32>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (index, (actual, expected)) in actual
+                .tensor
+                .to_f32()
+                .iter()
+                .zip(expected.iter().map(|&v| DType::F16.round(v)))
+                .enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 0.015,
+                    "M={m}, index {index}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn affine4_mpp_gemm_handles_batch_and_output_tails_across_k_tiles() {
+        let device = MetalDevice::new().unwrap();
+        if !device.mpp_projection() {
+            return;
+        }
+        let (m, n, k) = (19, 65, 256);
+        let weight = packed(&device, n, k);
+        let values = input(m, k);
+        let x = Tensor::from_f32(&device, [m, k], DType::F16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let rounded_input = &rounded_input;
+        let actual = device.project_quantized(&x, &weight).unwrap();
+        assert_eq!(actual.metrics.operation, "mlx_affine4_gemm_mpp");
+        let expected = (0..m)
+            .flat_map(|row| {
+                (0..n).map(move |column| {
+                    (0..k)
+                        .map(|index| {
+                            rounded_input[row * k + index] * DType::F16.round(value(column, index))
+                        })
+                        .sum::<f32>()
+                })
+            })
+            .map(|value| DType::F16.round(value))
+            .collect::<Vec<_>>();
+        for (index, (actual, expected)) in actual.tensor.to_f32().iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.06,
+                "index {index}: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn affine4_embedding_gather_dequantizes_only_requested_rows() {
+        let device = MetalDevice::new().unwrap();
+        let (vocab, hidden) = (5, 128);
+        let weight = packed(&device, vocab, hidden);
+        let ids = [4, 0, 3];
+        let actual = device
+            .embedding_gather_quantized(&weight, &ids, DType::F16)
+            .unwrap()
+            .tensor
+            .to_f32();
+        let expected = ids
+            .iter()
+            .flat_map(|&row| {
+                (0..hidden).map(move |column| DType::F16.round(value(row as usize, column)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
     }
 }

@@ -91,6 +91,9 @@ impl MetalDevice {
             crate::quantization::QuantizationFormat::Q5_K => "embedding_gather_q5_k",
             crate::quantization::QuantizationFormat::Q8_0 => "embedding_gather_q8_0",
             crate::quantization::QuantizationFormat::Q6_K => "embedding_gather_q6_k",
+            crate::quantization::QuantizationFormat::MlxAffine4Group64 => {
+                "embedding_gather_mlx_affine4"
+            }
         };
         let profile_start = self.profiling().then(std::time::Instant::now);
         let wait_before = profile_start
@@ -356,6 +359,9 @@ impl MetalDevice {
             "q6_k_gemm",
             "q8_0_gemv",
             "q8_0_gemm",
+            "mlx_affine4_gemv",
+            "mlx_affine4_gemm",
+            "mlx_affine4_gemm_mpp",
             "embedding_gather_q4_0",
             "embedding_gather_q5_0",
             "embedding_gather_q5_1",
@@ -363,6 +369,7 @@ impl MetalDevice {
             "embedding_gather_q5_k",
             "embedding_gather_q6_k",
             "embedding_gather_q8_0",
+            "embedding_gather_mlx_affine4",
         ] {
             self.builtin(name)?;
         }

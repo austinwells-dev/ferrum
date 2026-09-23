@@ -1,4 +1,4 @@
-//! Explicit GGML quantization formats and packed model-weight storage.
+//! Explicit packed quantization formats and model-weight storage.
 #![forbid(unsafe_code)]
 
 use crate::{Error, MetalDevice, Result, tensor::PackedStorage};
@@ -17,6 +17,8 @@ pub enum QuantizationFormat {
     Q8_0,
     #[allow(non_camel_case_types)]
     Q6_K,
+    /// MLX affine 4-bit weights, repacked as 64-value groups with f16 scale/bias.
+    MlxAffine4Group64,
 }
 impl QuantizationFormat {
     pub fn from_ggml_type(type_id: u32) -> Result<Self> {
@@ -33,15 +35,16 @@ impl QuantizationFormat {
             ))),
         }
     }
-    pub const fn ggml_type(self) -> u32 {
+    pub const fn ggml_type(self) -> Option<u32> {
         match self {
-            Self::Q4_0 => 2,
-            Self::Q5_0 => 6,
-            Self::Q5_1 => 7,
-            Self::Q4_K => 12,
-            Self::Q5_K => 13,
-            Self::Q8_0 => 8,
-            Self::Q6_K => 14,
+            Self::Q4_0 => Some(2),
+            Self::Q5_0 => Some(6),
+            Self::Q5_1 => Some(7),
+            Self::Q4_K => Some(12),
+            Self::Q5_K => Some(13),
+            Self::Q8_0 => Some(8),
+            Self::Q6_K => Some(14),
+            Self::MlxAffine4Group64 => None,
         }
     }
     pub const fn block_elements(self) -> usize {
@@ -53,6 +56,7 @@ impl QuantizationFormat {
             Self::Q5_K => 256,
             Self::Q8_0 => 32,
             Self::Q6_K => 256,
+            Self::MlxAffine4Group64 => 64,
         }
     }
     pub const fn block_bytes(self) -> usize {
@@ -64,6 +68,7 @@ impl QuantizationFormat {
             Self::Q5_K => 176,
             Self::Q8_0 => 34,
             Self::Q6_K => 210,
+            Self::MlxAffine4Group64 => 36,
         }
     }
 }
@@ -137,6 +142,7 @@ fn format_name(format: QuantizationFormat) -> &'static str {
         QuantizationFormat::Q5_K => "Q5_K",
         QuantizationFormat::Q8_0 => "Q8_0",
         QuantizationFormat::Q6_K => "Q6_K",
+        QuantizationFormat::MlxAffine4Group64 => "MLX affine 4-bit group-64",
     }
 }
 
@@ -159,7 +165,7 @@ mod tests {
             (QuantizationFormat::Q5_1, 24),
         ] {
             assert_eq!(
-                format.ggml_type(),
+                format.ggml_type().unwrap(),
                 if format == QuantizationFormat::Q5_0 {
                     6
                 } else {
@@ -179,9 +185,17 @@ mod tests {
             (13, QuantizationFormat::Q5_K, 176),
         ] {
             assert_eq!(QuantizationFormat::from_ggml_type(type_id).unwrap(), format);
-            assert_eq!(format.ggml_type(), type_id);
+            assert_eq!(format.ggml_type(), Some(type_id));
             assert_eq!(format.block_elements(), 256);
             assert_eq!(format.block_bytes(), bytes);
         }
+    }
+
+    #[test]
+    fn mlx_affine_runtime_layout_is_explicitly_not_a_ggml_type() {
+        let format = QuantizationFormat::MlxAffine4Group64;
+        assert_eq!(format.ggml_type(), None);
+        assert_eq!(format.block_elements(), 64);
+        assert_eq!(format.block_bytes(), 36);
     }
 }

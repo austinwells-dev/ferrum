@@ -1,9 +1,13 @@
 //! Teacher-forced Phase 5 quality check: BF16 reference versus a GGUF model.
+#[path = "support/phase5_common.rs"]
+mod phase5_common;
+
 use ferrum::{
-    Error, MetalDevice, Result,
-    loader::Weights,
-    model::{qwen, qwen_gguf},
-    tokenizer::qwen::QwenTokenizer,
+    Error, MetalDevice, Result, loader::Weights, model::qwen, tokenizer::qwen::QwenTokenizer,
+};
+use std::{
+    fs::File,
+    io::{BufWriter, Write},
 };
 
 const CORPUS: &str = "The capital of France is Paris. Rust is a systems programming language with ownership and borrowing. Quantized weights store scale metadata with compact integer blocks.";
@@ -28,6 +32,20 @@ fn nll(values: &[f32], target: u32) -> f64 {
         .map(|&value| f64::from((value - max).exp()))
         .sum();
     f64::from(max) + normalizer.ln() - f64::from(values[target as usize])
+}
+
+fn dump_logits(path: std::path::PathBuf, logits: &[f32]) -> Result<()> {
+    let file = File::create(&path)
+        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+    let mut output = BufWriter::new(file);
+    for value in logits {
+        output
+            .write_all(&value.to_le_bytes())
+            .map_err(|error| Error::Config(format!("{}: {error}", path.display())))?;
+    }
+    output
+        .flush()
+        .map_err(|error| Error::Config(format!("{}: {error}", path.display())))
 }
 
 fn teacher_forced_decode_logits(
@@ -120,11 +138,11 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() != 3 {
         return Err(Error::Parameter(
-            "usage: qwen_quant_quality BF16_CHECKPOINT_DIR QUANTIZED_GGUF".into(),
+            "usage: qwen_quant_quality BF16_CHECKPOINT_DIR QUANTIZED_GGUF_OR_MLX_DIR".into(),
         ));
     }
     let bf16_dir = std::path::Path::new(&args[1]);
-    let gguf_path = std::path::Path::new(&args[2]);
+    let quantized_path = std::path::Path::new(&args[2]);
     let device = MetalDevice::new()?;
 
     let bf16_config = qwen::QwenConfig::from_file(bf16_dir.join("config.json"))?;
@@ -133,13 +151,13 @@ fn main() -> Result<()> {
     let bf16_model = qwen::construct(&device, bf16_config.convert()?, &bf16_weights)?;
     drop(bf16_weights);
 
-    let quantized = qwen_gguf::load(&device, gguf_path)?;
+    let quantized = phase5_common::load(&device, quantized_path)?;
     let corpus = CORPUS.repeat(16);
     let (text, bf16_ids) = bf16_tokenizer.encode_prompt(&corpus, "", true)?;
     let (quantized_text, quantized_ids) = quantized.tokenizer.encode_prompt(&corpus, "", true)?;
     if text != quantized_text || bf16_ids != quantized_ids {
         return Err(Error::Tokenizer(
-            "BF16 and GGUF tokenizers produced different corpus IDs".into(),
+            "BF16 and quantized tokenizers produced different corpus IDs".into(),
         ));
     }
 
@@ -149,9 +167,12 @@ fn main() -> Result<()> {
         .forward_prefill(&device, &quantized_ids)?
         .0
         .to_f32();
+    if let Some(path) = std::env::var_os("FERRUM_QUANTIZED_LOGITS_PATH") {
+        dump_logits(path.into(), &quantized_logits)?;
+    }
     let vocabulary = bf16_model.config().vocab_size;
     let positions = bf16_ids.len();
-    if quantized.model.config().vocab_size != vocabulary
+    if quantized.config.vocab_size != vocabulary
         || bf16_logits.len() != positions * vocabulary
         || quantized_logits.len() != bf16_logits.len()
     {
@@ -165,6 +186,9 @@ fn main() -> Result<()> {
     let bf16_decode_logits = teacher_forced_decode_logits(&device, &bf16_model, &bf16_ids)?;
     let quantized_decode_logits =
         teacher_forced_decode_logits(&device, &quantized.model, &quantized_ids)?;
+    if let Some(path) = std::env::var_os("FERRUM_QUANTIZED_DECODE_LOGITS_PATH") {
+        dump_logits(path.into(), &quantized_decode_logits)?;
+    }
     let decode_quality = quality_metrics(
         &bf16_decode_logits,
         &quantized_decode_logits,
@@ -174,15 +198,16 @@ fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::json!({
-            "format": "GGUF",
-            "quantized_repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-            "quantized_revision": "9217f5db79a29953eb74d5343926648285ec7e67",
-            "quantized_file": gguf_path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown"),
+            "format": quantized.format,
+            "quantized_repository": quantized.repository,
+            "quantized_revision": quantized.revision,
+            "quantized_file": quantized_path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown"),
             "reference": format!("Qwen2.5-0.5B-Instruct BF16 safetensors revision {}", qwen::REVISION),
             "device": device.name(),
             "parameter_count": quantized.parameter_count,
+            "quantized_tensor_count": quantized.tensor_count,
             "bf16_retained_weight_bytes": bf16_model.weight_bytes(),
-            "gguf_source_tensor_bytes": quantized.source_tensor_bytes,
+            "quantized_source_tensor_bytes": quantized.source_tensor_bytes,
             "quantized_retained_weight_bytes": quantized.model.weight_bytes(),
             "quantized_retained_packed_bytes": quantized.quantized_tensor_bytes,
             "corpus": corpus,

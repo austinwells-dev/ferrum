@@ -99,6 +99,86 @@ impl QwenConfig {
         c.validate()?;
         Ok(c)
     }
+
+    /// Convert the supported mlx-community affine 4-bit, group-64 Qwen config.
+    /// MLX's published config keeps the source checkpoint's `torch_dtype` even
+    /// though its safetensors activations and dense tensors use f16.
+    pub(crate) fn convert_mlx_affine4(&self) -> Result<ModelConfig> {
+        let fail = |s: &str| Error::Config(s.into());
+        if self.architectures != ["Qwen2ForCausalLM"] || self.model_type != "qwen2" {
+            return Err(fail("supported architecture is Qwen2ForCausalLM / qwen2"));
+        }
+        if self.hidden_act != "silu" || self.use_sliding_window {
+            return Err(fail(
+                "only silu and full attention (use_sliding_window=false) are supported",
+            ));
+        }
+        for (key, value) in &self.extra {
+            let supported = match key.as_str() {
+                "initializer_range"
+                | "transformers_version"
+                | "_name_or_path"
+                | "max_window_layers"
+                | "sliding_window" => true,
+                "attention_dropout" => value.as_f64() == Some(0.),
+                "use_cache" | "attention_bias" => value.as_bool() == Some(true),
+                "mlp_bias" => value.as_bool() == Some(false),
+                "rope_scaling" => value.is_null(),
+                "head_dim" => value.as_u64().is_some_and(|d| {
+                    d.checked_mul(self.num_attention_heads as u64) == Some(self.hidden_size as u64)
+                }),
+                "quantization" => {
+                    let Some(params) = value.as_object() else {
+                        return Err(fail("MLX quantization config must be an object"));
+                    };
+                    params.get("bits").and_then(serde_json::Value::as_u64) == Some(4)
+                        && params.get("group_size").and_then(serde_json::Value::as_u64) == Some(64)
+                        && params.get("mode").is_none_or(|mode| mode == "affine")
+                        && params
+                            .keys()
+                            .all(|name| matches!(name.as_str(), "bits" | "group_size" | "mode"))
+                }
+                _ => false,
+            };
+            if !supported {
+                return Err(fail(&format!(
+                    "unsupported MLX Qwen config field {key}={value}"
+                )));
+            }
+        }
+        if !self.extra.contains_key("quantization") {
+            return Err(fail("MLX Qwen config is missing quantization metadata"));
+        }
+        if self.torch_dtype != "bfloat16" {
+            return Err(fail("MLX source config must identify the BF16 Qwen base"));
+        }
+        if self.num_attention_heads == 0
+            || !self.hidden_size.is_multiple_of(self.num_attention_heads)
+        {
+            return Err(fail("hidden_size must be divisible by num_attention_heads"));
+        }
+        if self.bos_token_id as usize >= self.vocab_size
+            || self.eos_token_id as usize >= self.vocab_size
+        {
+            return Err(fail("BOS/EOS ID outside model vocabulary"));
+        }
+        let config = ModelConfig {
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_key_value_heads,
+            head_dim: self.hidden_size / self.num_attention_heads,
+            rms_norm_epsilon: self.rms_norm_eps,
+            rope_theta: self.rope_theta,
+            max_context_length: self.max_position_embeddings,
+            tie_word_embeddings: self.tie_word_embeddings,
+            dtype: DType::F16,
+        };
+        config.validate()?;
+        Ok(config)
+    }
 }
 /// (official name, Phase 2 canonical name, exact shape). Q/K/V bias is mandatory.
 pub fn specifications(c: &ModelConfig) -> Vec<(String, String, Vec<usize>)> {

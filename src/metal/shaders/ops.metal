@@ -546,6 +546,81 @@ kernel void embedding_gather_q5_k(ARGS, uint i [[thread_position_in_grid]]) {
     uint id=((device const uint*)b)[token];
     store(c,i,p[4],q5_k_weight(a,id,column,width));
 }
+inline float mlx_affine4_weight(device const uchar* weights, uint row, uint column, uint k) {
+    uint block_index=column>>6, within=column&63, blocks=k>>6;
+    device const uchar* block=weights+(row*blocks+block_index)*36;
+    uchar packed=block[4+(within>>1)];
+    uint q=(within&1)==0 ? uint(packed&15) : uint(packed>>4);
+    float scale=float(*((device const half*)block));
+    float bias=float(*((device const half*)(block+2)));
+    return scale*float(q)+bias;
+}
+inline float mlx_affine4_pair_dot(device const uchar* block, device const uchar* activations,
+                                  uint column, uint byte_index, uint dtype) {
+    uchar packed=block[4+byte_index];
+    float scale=float(*((device const half*)block));
+    float bias=float(*((device const half*)(block+2)));
+    float w0=scale*float(packed&15)+bias;
+    float w1=scale*float(packed>>4)+bias;
+    return w0*load(activations,column+byte_index*2,dtype)
+         + w1*load(activations,column+byte_index*2+1,dtype);
+}
+// MLX affine Q4: eight low-to-high nibbles per uint32, 64-value scale/bias groups.
+kernel void mlx_affine4_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32, row=group*4+simd;
+    uint k=p[2], groups=k/64;
+    float sum0=0.f, sum1=0.f, sum2=0.f, sum3=0.f;
+    if(row<p[3]) {
+        for(uint tile=0;tile<groups/4;tile++) {
+            uint first_group=tile*4;
+            device const uchar* first=b+(row*groups+first_group+0)*36;
+            device const uchar* second=b+(row*groups+first_group+1)*36;
+            device const uchar* third=b+(row*groups+first_group+2)*36;
+            device const uchar* fourth=b+(row*groups+first_group+3)*36;
+            sum0+=mlx_affine4_pair_dot(first,a,(first_group+0)*64,lane,p[4]);
+            sum1+=mlx_affine4_pair_dot(second,a,(first_group+1)*64,lane,p[4]);
+            sum2+=mlx_affine4_pair_dot(third,a,(first_group+2)*64,lane,p[4]);
+            sum3+=mlx_affine4_pair_dot(fourth,a,(first_group+3)*64,lane,p[4]);
+        }
+        for(uint group_index=groups/4*4;group_index<groups;group_index++) {
+            device const uchar* block=b+(row*groups+group_index)*36;
+            sum0+=mlx_affine4_pair_dot(block,a,group_index*64,lane,p[4]);
+        }
+    }
+    float sum=simd_sum((sum0+sum1)+(sum2+sum3));
+    if(lane==0 && row<p[3]) store(c,row,p[4],sum);
+}
+kernel void mlx_affine4_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;
+    uint k=p[2], groups=k/64;
+    float sum0=0.f, sum1=0.f, sum2=0.f, sum3=0.f;
+    if(row<p[3]) for(uint group_index=0;group_index<groups;group_index++) {
+        uint column=group_index*64+lane*2;
+        device const uchar* block=b+(row*groups+group_index)*36;
+        uchar packed=block[4+lane];
+        float scale=float(*((device const half*)block));
+        float bias=float(*((device const half*)(block+2)));
+        float w0=scale*float(packed&15)+bias;
+        float w1=scale*float(packed>>4)+bias;
+        if(batch+0<p[1]) sum0+=w0*load(a,(batch+0)*k+column,p[4])+w1*load(a,(batch+0)*k+column+1,p[4]);
+        if(batch+1<p[1]) sum1+=w0*load(a,(batch+1)*k+column,p[4])+w1*load(a,(batch+1)*k+column+1,p[4]);
+        if(batch+2<p[1]) sum2+=w0*load(a,(batch+2)*k+column,p[4])+w1*load(a,(batch+2)*k+column+1,p[4]);
+        if(batch+3<p[1]) sum3+=w0*load(a,(batch+3)*k+column,p[4])+w1*load(a,(batch+3)*k+column+1,p[4]);
+    }
+    sum0=simd_sum(sum0); sum1=simd_sum(sum1); sum2=simd_sum(sum2); sum3=simd_sum(sum3);
+    if(lane==0 && row<p[3]) {
+        if(batch+0<p[1]) store(c,(batch+0)*p[3]+row,p[4],sum0);
+        if(batch+1<p[1]) store(c,(batch+1)*p[3]+row,p[4],sum1);
+        if(batch+2<p[1]) store(c,(batch+2)*p[3]+row,p[4],sum2);
+        if(batch+3<p[1]) store(c,(batch+3)*p[3]+row,p[4],sum3);
+    }
+}
+kernel void embedding_gather_mlx_affine4(ARGS, uint i [[thread_position_in_grid]]) {
+    if(i>=p[0]) return;
+    uint width=p[1], token=i/width, column=i%width;
+    uint id=((device const uint*)b)[token];
+    store(c,i,p[4],mlx_affine4_weight(a,id,column,width));
+}
 inline float q6_k_weight(device const uchar* weights, uint row, uint column, uint k) {
     uint block_index=column>>8, within=column&255, blocks=k>>8;
     device const uchar* block=weights+(row*blocks+block_index)*210;

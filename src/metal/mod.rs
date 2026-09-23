@@ -442,12 +442,31 @@ impl MetalDevice {
         let name = if self.lm_head_profile.get() {
             match name {
                 "gemv" | "gemv_vector" | "gemv_wide" | "q4_0_gemv" | "q5_0_gemv" | "q5_1_gemv"
-                | "q4_k_gemv" | "q5_k_gemv" | "q6_k_gemv" | "q8_0_gemv" => "lm_head_gemv",
-                "project_bf16" | "project_f16" | "project_wide_bf16" | "project_wide_f16"
-                | "project_mpp" | "q4_0_gemm_mpp" | "q5_0_gemm_mpp" | "q5_1_gemm_mpp"
-                | "q4_k_gemm_mpp" | "q5_k_gemm_mpp" | "q6_k_gemm_mpp" | "q8_0_gemm_mpp"
-                | "matmul_nt" | "q4_0_gemm" | "q5_0_gemm" | "q5_1_gemm" | "q4_k_gemm"
-                | "q5_k_gemm" | "q6_k_gemm" | "q8_0_gemm" => "lm_head_matmul",
+                | "q4_k_gemv" | "q5_k_gemv" | "q6_k_gemv" | "q8_0_gemv" | "mlx_affine4_gemv" => {
+                    "lm_head_gemv"
+                }
+                "project_bf16"
+                | "project_f16"
+                | "project_wide_bf16"
+                | "project_wide_f16"
+                | "project_mpp"
+                | "q4_0_gemm_mpp"
+                | "q5_0_gemm_mpp"
+                | "q5_1_gemm_mpp"
+                | "q4_k_gemm_mpp"
+                | "q5_k_gemm_mpp"
+                | "q6_k_gemm_mpp"
+                | "q8_0_gemm_mpp"
+                | "matmul_nt"
+                | "q4_0_gemm"
+                | "q5_0_gemm"
+                | "q5_1_gemm"
+                | "q4_k_gemm"
+                | "q5_k_gemm"
+                | "q6_k_gemm"
+                | "q8_0_gemm"
+                | "mlx_affine4_gemm"
+                | "mlx_affine4_gemm_mpp" => "lm_head_matmul",
                 _ => name,
             }
         } else {
@@ -633,6 +652,7 @@ impl MetalDevice {
                 | "q5_1_gemm_mpp"
                 | "q4_k_gemm_mpp"
                 | "q5_k_gemm_mpp"
+                | "mlx_affine4_gemm_mpp"
                 | "q6_k_gemm_mpp"
                 | "q8_0_gemm_mpp"
                 | "attention_scores_mpp"
@@ -714,6 +734,7 @@ impl MetalDevice {
                 | "q5_1_gemm_mpp"
                 | "q4_k_gemm_mpp"
                 | "q5_k_gemm_mpp"
+                | "mlx_affine4_gemm_mpp"
                 | "q6_k_gemm_mpp"
                 | "q8_0_gemm_mpp"
                 | "attention_scores_mpp"
@@ -732,6 +753,8 @@ impl MetalDevice {
                 | "q6_k_gemv"
                 | "q6_k_gemm"
                 | "q8_0_gemm"
+                | "mlx_affine4_gemv"
+                | "mlx_affine4_gemm"
         ) {
             128
         } else {
@@ -785,6 +808,7 @@ impl MetalDevice {
                     | "q5_1_gemm_mpp"
                     | "q4_k_gemm_mpp"
                     | "q5_k_gemm_mpp"
+                    | "mlx_affine4_gemm_mpp"
                     | "q6_k_gemm_mpp"
                     | "q8_0_gemm_mpp"
                     | "attention_scores_mpp"
@@ -805,6 +829,7 @@ impl MetalDevice {
                                 | "q5_1_gemm_mpp"
                                 | "q4_k_gemm_mpp"
                                 | "q5_k_gemm_mpp"
+                                | "mlx_affine4_gemm_mpp"
                                 | "q6_k_gemm_mpp"
                                 | "q8_0_gemm_mpp"
                         ) {
@@ -911,6 +936,7 @@ impl MetalDevice {
                     | "q5_k_gemv"
                     | "q6_k_gemv"
                     | "q8_0_gemv"
+                    | "mlx_affine4_gemv"
             ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
@@ -939,6 +965,7 @@ impl MetalDevice {
                     | "q5_k_gemm"
                     | "q6_k_gemm"
                     | "q8_0_gemm"
+                    | "mlx_affine4_gemm"
             ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {

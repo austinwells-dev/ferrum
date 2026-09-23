@@ -293,6 +293,11 @@ fn validate_quantized_payload(
                     return Err(invalid_quantized_scale(name, format));
                 }
             }
+            QuantizationFormat::MlxAffine4Group64 => {
+                if !half_at(0).is_finite() || !half_at(2).is_finite() {
+                    return Err(invalid_quantized_scale(name, format));
+                }
+            }
             QuantizationFormat::Q8_0 => {
                 let scale = half_at(0);
                 if !scale.is_finite() || scale < 0.0 {
@@ -331,6 +336,7 @@ fn format_name(format: QuantizationFormat) -> &'static str {
         QuantizationFormat::Q5_K => "Q5_K",
         QuantizationFormat::Q8_0 => "Q8_0",
         QuantizationFormat::Q6_K => "Q6_K",
+        QuantizationFormat::MlxAffine4Group64 => "MLX affine 4-bit group-64",
     }
 }
 

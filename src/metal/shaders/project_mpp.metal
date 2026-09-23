@@ -407,6 +407,59 @@ kernel void q5_k_gemm_mpp(device bfloat* a [[buffer(0)]],
     }
 }
 
+kernel void mlx_affine4_gemm_mpp(device half* a [[buffer(0)]],
+                                 device const uchar* packed [[buffer(1)]],
+                                 device ushort* c [[buffer(2)]],
+                                 constant uint* p [[buffer(3)]],
+                                 uint tid [[thread_index_in_threadgroup]],
+                                 uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr int TILE_M=64, TILE_N=64, TILE_K=128;
+    threadgroup half dequantized[TILE_N*TILE_K];
+    int m=int(p[1]), k=int(p[2]), n=int(p[3]);
+    int groups=k/64;
+    tensor<device half, dextents<int,2>, tensor_inline> A(a,dextents<int,2>(k,m));
+    tensor<threadgroup half, dextents<int,2>, tensor_inline> B(
+        dequantized,dextents<int,2>(TILE_K,TILE_N));
+    auto left=A.slice(0,int(group.y)*TILE_M);
+    constexpr auto desc=matmul2d_descriptor(
+        TILE_M,TILE_N,TILE_K,false,true,false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc,execution_simdgroups<4>> op;
+    auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
+    int k_tiles=(k+TILE_K-1)/TILE_K;
+    for(int kt=0;kt<k_tiles;kt++) {
+        if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+            uint out_col=i/(TILE_K/2), pair_index=i%(TILE_K/2);
+            uint group_in_tile=pair_index/32, lane=pair_index%32;
+            int channel=int(group.x)*TILE_N+int(out_col);
+            int source_k=kt*TILE_K+int(group_in_tile*64+lane*2);
+            uint tile_index=out_col*TILE_K+group_in_tile*64+lane*2;
+            if(channel<n && source_k<k) {
+                uint block_index=uint(source_k)/64;
+                device const uchar* block=packed+(uint(channel)*uint(groups)+block_index)*36;
+                uchar qs=block[4+lane];
+                float scale=float(*((device const half*)block));
+                float bias=float(*((device const half*)(block+2)));
+                dequantized[tile_index]=half(scale*float(qs&15)+bias);
+                dequantized[tile_index+1]=half(scale*float(qs>>4)+bias);
+            } else {
+                dequantized[tile_index]=half(0.0f);
+                dequantized[tile_index+1]=half(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto right=B;
+        auto left_k=A.slice(kt*TILE_K,int(group.y)*TILE_M);
+        op.run(left_k,right,result);
+    }
+    for(uint i=0;i<result.get_capacity();i++) {
+        auto coord=result.get_multidimensional_index(i);
+        uint col=group.x*TILE_N+coord[0], row=group.y*TILE_M+coord[1];
+        if(row<uint(m) && col<uint(n)) c[row*uint(n)+col]=as_type<ushort>(half(result[i]));
+    }
+}
+
 inline float q6_k_weight_mpp(device const uchar* weights, uint row, uint column, uint k) {
     uint block_index=column>>8, within=column&255, blocks=k>>8;
     device const uchar* block=weights+(row*blocks+block_index)*210;

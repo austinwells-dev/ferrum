@@ -1,0 +1,19 @@
+Phase 5 paired matrix: device=Apple M5; BF16 retained=988065536 bytes; MLX affine Q4 group-64 mlx-community/Qwen2.5-0.5B-Instruct-4bit@a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3 source=277996288 bytes; quantized retained=277996288 bytes; packed=277853184 bytes; tensors=628; parameters=494032768; repeats=3
+        2.05 real         0.36 user         0.27 sys
+          2505965568  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              156534  page reclaims
+                  26  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   4  voluntary context switches
+                1048  involuntary context switches
+          7126772007  instructions retired
+          2682330405  cycles elapsed
+          2511243736  peak memory footprint

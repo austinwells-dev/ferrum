@@ -64,5 +64,17 @@
         "Q6_K"
       ]
     }
-  ]
+  ],
+  "mlx": {
+    "repository": "mlx-community/Qwen2.5-0.5B-Instruct-4bit",
+    "revision": "a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3",
+    "file": "model.safetensors",
+    "bytes": 278064920,
+    "sha256": "ddffab9cbc7bf6dde941c6724841eeca8981fcfa81ca20ff8efff1396326d153",
+    "format": "MLX affine Q4, group size 64",
+    "comparison_runtime": {
+      "mlx": "0.32.2",
+      "mlx_lm": "0.31.3"
+    }
+  }
 }

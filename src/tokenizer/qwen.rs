@@ -70,11 +70,33 @@ impl QwenTokenizer {
     }
 
     pub fn load(dir: &Path, config: &QwenConfig) -> Result<Self> {
+        Self::load_inner(dir, config, false)
+    }
+
+    /// Load the MLX affine-Q4 Qwen repository variant. Some published MLX
+    /// conversions omit generation_config.json; in that case the already
+    /// validated Qwen config supplies the pinned BOS/EOS policy.
+    pub(crate) fn load_mlx_affine4(dir: &Path, config: &QwenConfig) -> Result<Self> {
+        Self::load_inner(dir, config, true)
+    }
+
+    fn load_inner(dir: &Path, config: &QwenConfig, allow_derived_generation: bool) -> Result<Self> {
         let tc = json(&dir.join("tokenizer_config.json"))?;
-        let gc = json(&dir.join("generation_config.json"))?;
+        let generation_path = dir.join("generation_config.json");
+        let gc = if generation_path.is_file() {
+            json(&generation_path)?
+        } else if allow_derived_generation {
+            serde_json::json!({
+                "bos_token_id": config.bos_token_id,
+                "pad_token_id": config.bos_token_id,
+                "eos_token_id": [config.eos_token_id, config.bos_token_id]
+            })
+        } else {
+            json(&generation_path)?
+        };
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let bad = |s: &str| Error::Tokenizer(format!("Qwen tokenizer/config mismatch: {s}"));
-        validate_metadata(config, &tc, &gc)?;
+        validate_metadata_inner(config, &tc, &gc, allow_derived_generation)?;
         // This checkpoint pads 151665 tokenizer IDs to 151936 embedding rows.
         if tokenizer.vocab_size() != 151665 || config.vocab_size != 151936 {
             return Err(bad(
@@ -121,8 +143,19 @@ impl QwenTokenizer {
 
 /// Validate the pinned text/special-token policy without loading vocabulary payloads.
 pub fn validate_metadata(config: &QwenConfig, tc: &Value, gc: &Value) -> Result<()> {
+    validate_metadata_inner(config, tc, gc, false)
+}
+
+fn validate_metadata_inner(
+    config: &QwenConfig,
+    tc: &Value,
+    gc: &Value,
+    allow_mlx_template: bool,
+) -> Result<()> {
     let bad = |s: &str| Error::Tokenizer(format!("Qwen tokenizer/config mismatch: {s}"));
-    if tc["chat_template"].as_str() != Some(CHAT_TEMPLATE) {
+    let template = tc["chat_template"].as_str();
+    let template_matches = chat_template_matches(template, allow_mlx_template);
+    if !template_matches {
         return Err(bad(
             "unsupported chat_template; expected pinned official template",
         ));
@@ -148,4 +181,32 @@ pub fn validate_metadata(config: &QwenConfig, tc: &Value, gc: &Value) -> Result<
         return Err(bad("invalid model/generation special token IDs"));
     }
     Ok(())
+}
+
+fn chat_template_matches(template: Option<&str>, allow_mlx_variant: bool) -> bool {
+    template == Some(CHAT_TEMPLATE)
+        || (allow_mlx_variant
+            && template.is_some_and(|template| {
+                template.replace(
+                    "{{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}}",
+                    "{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}",
+                ) == CHAT_TEMPLATE
+            }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mlx_chat_template_accepts_only_its_documentation_brace_variant() {
+        let mlx_template = CHAT_TEMPLATE.replace(
+            "{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}",
+            "{{\\\"name\\\": <function-name>, \\\"arguments\\\": <args-json-object>}}",
+        );
+        assert!(chat_template_matches(Some(CHAT_TEMPLATE), false));
+        assert!(!chat_template_matches(Some(&mlx_template), false));
+        assert!(chat_template_matches(Some(&mlx_template), true));
+        assert!(!chat_template_matches(Some("unrecognized template"), true));
+    }
 }

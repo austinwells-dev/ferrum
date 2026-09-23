@@ -4,7 +4,7 @@ use ferrum::{
     loader::Weights,
     model::{
         qwen::{self, QwenConfig},
-        qwen_gguf,
+        qwen_gguf, qwen_mlx,
     },
     sampling::{Sampler, SamplingConfig},
     tokenizer::qwen::{DEFAULT_SYSTEM, QwenTokenizer},
@@ -177,41 +177,62 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             "Qwen2 GGUF",
         )
     } else {
-        let start = Instant::now();
         let qc = QwenConfig::from_file(o.model.join("config.json"))?;
-        let c = qc.convert()?;
-        let tok = QwenTokenizer::load(&o.model, &qc)?;
-        let tokenizer_load = start.elapsed();
-        let start = Instant::now();
-        let source = Weights::from_file(d, o.model.join("model.safetensors"))?;
-        let weight_load = start.elapsed();
-        let source_bytes = source.bytes();
-        let tensor_count = source.names().count();
-        let parameter_count = source.names().try_fold(0usize, |total, name| {
-            total
-                .checked_add(source.get(name)?.numel())
-                .ok_or_else(|| Error::Shape("source parameter count overflow".into()))
-        })?;
-        let before = d.counters();
-        let start = Instant::now();
-        let model = qwen::construct(d, c.clone(), &source)?;
-        let construction = start.elapsed();
-        let construction_bytes = generation::counter_delta(before, d.counters()).allocated_bytes;
-        drop(source);
-        (
-            c,
-            tok,
-            model,
-            source_bytes,
-            tensor_count,
-            parameter_count,
-            0,
-            tokenizer_load,
-            weight_load,
-            construction,
-            construction_bytes,
-            "Qwen2.5-0.5B-Instruct safetensors",
-        )
+        if qc.extra.contains_key("quantization") {
+            let before = d.counters();
+            let loaded = qwen_mlx::load(d, &o.model)?;
+            let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
+            (
+                loaded.config,
+                loaded.tokenizer,
+                loaded.model,
+                loaded.source_tensor_bytes,
+                loaded.tensor_count,
+                loaded.parameter_count,
+                loaded.quantized_tensor_bytes,
+                loaded.config_tokenizer_load,
+                loaded.weight_load,
+                loaded.construction,
+                allocated,
+                "Qwen2 MLX affine Q4",
+            )
+        } else {
+            let start = Instant::now();
+            let c = qc.convert()?;
+            let tok = QwenTokenizer::load(&o.model, &qc)?;
+            let tokenizer_load = start.elapsed();
+            let start = Instant::now();
+            let source = Weights::from_file(d, o.model.join("model.safetensors"))?;
+            let weight_load = start.elapsed();
+            let source_bytes = source.bytes();
+            let tensor_count = source.names().count();
+            let parameter_count = source.names().try_fold(0usize, |total, name| {
+                total
+                    .checked_add(source.get(name)?.numel())
+                    .ok_or_else(|| Error::Shape("source parameter count overflow".into()))
+            })?;
+            let before = d.counters();
+            let start = Instant::now();
+            let model = qwen::construct(d, c.clone(), &source)?;
+            let construction = start.elapsed();
+            let construction_bytes =
+                generation::counter_delta(before, d.counters()).allocated_bytes;
+            drop(source);
+            (
+                c,
+                tok,
+                model,
+                source_bytes,
+                tensor_count,
+                parameter_count,
+                0,
+                tokenizer_load,
+                weight_load,
+                construction,
+                construction_bytes,
+                "Qwen2.5-0.5B-Instruct safetensors",
+            )
+        }
     };
     let start = Instant::now();
     let (text, ids) = tok.encode_prompt(&o.prompt, &o.system, o.raw)?;

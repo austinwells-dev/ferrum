@@ -7,3 +7,4 @@ pub mod weights;
 pub use transformer::Transformer;
 pub mod qwen;
 pub mod qwen_gguf;
+pub mod qwen_mlx;

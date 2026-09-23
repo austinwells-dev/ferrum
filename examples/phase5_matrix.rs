@@ -1,8 +1,11 @@
 //! Paired production-generation matrix for the Phase 4 BF16 baseline and GGUF.
+#[path = "support/phase5_common.rs"]
+mod phase5_common;
+
 use ferrum::{
     Error, MetalDevice, Result, generation,
     loader::Weights,
-    model::{Transformer, qwen, qwen_gguf},
+    model::{Transformer, qwen},
     tokenizer::qwen::{DEFAULT_SYSTEM, QwenTokenizer},
 };
 
@@ -10,6 +13,7 @@ struct GenerationCase<'a> {
     model: &'a Transformer,
     label: &'static str,
     model_kind: &'a str,
+    kernel_path: &'static str,
     pair: usize,
     order: usize,
     prompt: &'a [u32],
@@ -40,6 +44,7 @@ fn run_case(device: &MetalDevice, case: GenerationCase<'_>) -> Result<()> {
         serde_json::json!({
             "case": case.label,
             "model": case.model_kind,
+            "kernel_path": case.kernel_path,
             "pair": case.pair,
             "pair_order": case.order,
             "generation_ms": elapsed.as_secs_f64() * 1000.0,
@@ -71,11 +76,12 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if !(3..=4).contains(&args.len()) {
         return Err(Error::Parameter(
-            "usage: phase5_matrix BF16_CHECKPOINT_DIR QUANTIZED_GGUF [PAIRED_REPEATS]".into(),
+            "usage: phase5_matrix BF16_CHECKPOINT_DIR QUANTIZED_GGUF_OR_MLX_DIR [PAIRED_REPEATS]"
+                .into(),
         ));
     }
     let bf16_dir = std::path::Path::new(&args[1]);
-    let gguf_path = std::path::Path::new(&args[2]);
+    let quantized_path = std::path::Path::new(&args[2]);
     let repeats = args
         .get(3)
         .map(|value| value.parse::<usize>())
@@ -95,6 +101,12 @@ fn main() -> Result<()> {
         )?;
     }
     device.set_profiling(std::env::var_os("FERRUM_MATRIX_PROFILE").is_some());
+    let compare_mpp_direct = std::env::var_os("FERRUM_PHASE5_KERNEL_AB").is_some();
+    if compare_mpp_direct && device.capabilities()?["mpp_available"].as_bool() != Some(true) {
+        return Err(Error::Parameter(
+            "FERRUM_PHASE5_KERNEL_AB requires Metal 4 MPP support".into(),
+        ));
+    }
 
     let bf16_config = qwen::QwenConfig::from_file(bf16_dir.join("config.json"))?;
     let bf16_tokenizer = QwenTokenizer::load(bf16_dir, &bf16_config)?;
@@ -102,7 +114,7 @@ fn main() -> Result<()> {
     let bf16_model = qwen::construct(&device, bf16_config.convert()?, &bf16_source)?;
     drop(bf16_source);
 
-    let quantized = qwen_gguf::load(&device, gguf_path)?;
+    let quantized = phase5_common::load(&device, quantized_path)?;
     let reference_config = bf16_model.config();
     let quantized_config = &quantized.config;
     if quantized_config.vocab_size != reference_config.vocab_size
@@ -115,7 +127,7 @@ fn main() -> Result<()> {
         || quantized_config.max_context_length != reference_config.max_context_length
     {
         return Err(Error::Config(format!(
-            "Qwen GGUF dimensions {:?} differ from BF16 reference {:?}",
+            "quantized dimensions {:?} differ from BF16 reference {:?}",
             quantized_config, reference_config
         )));
     }
@@ -132,10 +144,10 @@ fn main() -> Result<()> {
     if quantized_short != short || quantized_prose != prose {
         return Err(Error::Tokenizer("BF16/GGUF prompt token IDs differ".into()));
     }
-    let quantized_label = gguf_path
+    let quantized_label = quantized_path
         .file_stem()
         .and_then(|value| value.to_str())
-        .unwrap_or("quantized-gguf");
+        .unwrap_or("quantized-model");
     let cases = [
         ("short", short.clone(), 17),
         ("128", prose[..128].to_vec(), 17),
@@ -146,11 +158,15 @@ fn main() -> Result<()> {
     ];
     let selected = std::env::var("FERRUM_PHASE5_CASE").ok();
     eprintln!(
-        "Phase 5 paired matrix: device={}; BF16 retained={} bytes; GGUF source={} bytes; quantized retained={} bytes; tensors={}; parameters={}; repeats={}",
+        "Phase 5 paired matrix: device={}; BF16 retained={} bytes; {} {}@{} source={} bytes; quantized retained={} bytes; packed={} bytes; tensors={}; parameters={}; repeats={}",
         device.name(),
         bf16_model.weight_bytes(),
+        quantized.format,
+        quantized.repository,
+        quantized.revision,
         quantized.source_tensor_bytes,
         quantized.model.weight_bytes(),
+        quantized.quantized_tensor_bytes,
         quantized.tensor_count,
         quantized.parameter_count,
         repeats,
@@ -162,6 +178,47 @@ fn main() -> Result<()> {
         }
         if prompt.len() + generated > bf16_model.config().max_context_length {
             return Err(Error::Config(format!("case {label} exceeds model context")));
+        }
+        if compare_mpp_direct {
+            // Compile both projection pipelines and warm both paths before timing.
+            for enabled in [true, false] {
+                device.set_native_matmul(enabled)?;
+                generation::generate(
+                    &device,
+                    &quantized.model,
+                    &prompt,
+                    2,
+                    &[],
+                    generation::argmax,
+                    |_| Ok(()),
+                )?;
+            }
+            device.set_native_matmul(true)?;
+            for pair in 0..repeats {
+                let order = if pair % 2 == 0 {
+                    [("mpp", true), ("direct", false)]
+                } else {
+                    [("direct", false), ("mpp", true)]
+                };
+                for (position, (kernel_path, enabled)) in order.into_iter().enumerate() {
+                    device.set_native_matmul(enabled)?;
+                    run_case(
+                        &device,
+                        GenerationCase {
+                            model: &quantized.model,
+                            label,
+                            model_kind: quantized_label,
+                            kernel_path,
+                            pair,
+                            order: position,
+                            prompt: &prompt,
+                            generated,
+                        },
+                    )?;
+                }
+            }
+            device.set_native_matmul(true)?;
+            continue;
         }
         for model in [&bf16_model, &quantized.model] {
             generation::generate(
@@ -187,6 +244,7 @@ fn main() -> Result<()> {
                         model,
                         label,
                         model_kind: kind,
+                        kernel_path: "production-default",
                         pair,
                         order: position,
                         prompt: &prompt,

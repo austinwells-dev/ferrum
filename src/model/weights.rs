@@ -231,6 +231,7 @@ pub(crate) fn construct_mixed(
                         | QuantizationFormat::Q5_K
                         | QuantizationFormat::Q8_0
                         | QuantizationFormat::Q6_K
+                        | QuantizationFormat::MlxAffine4Group64
                 ) {
                     return Err(Error::Weight {
                         name,
