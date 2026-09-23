@@ -95,11 +95,13 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
         ArchitecturePolicy {
             qk_norm_epsilon: Some(rms_norm_epsilon),
             qkv_bias: ProjectionBias::Forbidden,
+            ..ArchitecturePolicy::default()
         }
     } else {
         ArchitecturePolicy {
             qk_norm_epsilon: None,
             qkv_bias: ProjectionBias::Required,
+            ..ArchitecturePolicy::default()
         }
     };
     let config = ModelConfig {

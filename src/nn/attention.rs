@@ -1,4 +1,5 @@
 use super::{Linear, RmsNorm, kv_cache::KvCache};
+use crate::model::architecture::QkNormLayout;
 use crate::{Error, MetalDevice, Result, Tensor};
 /// Optional diagnostic snapshots; retaining them is explicitly opt-in.
 pub type Trace = std::collections::BTreeMap<String, Tensor>;
@@ -18,6 +19,8 @@ pub struct Attention {
     pub kv_heads: usize,
     pub head_dim: usize,
     pub theta: f32,
+    pub qk_norm_layout: QkNormLayout,
+    pub scale: f32,
 }
 impl Attention {
     pub fn forward(
@@ -40,20 +43,28 @@ impl Attention {
             return Err(Error::Shape("attention needs [S,hidden]".into()));
         }
         let offset = cache.layer_len(layer)?;
-        let mut q = d
-            .profile_projection("q_proj", || self.q.forward(d, x))?
-            .reshape([s, self.q_heads, self.head_dim])?;
-        let mut k = d
-            .profile_projection("k_proj", || self.k.forward(d, x))?
-            .reshape([s, self.kv_heads, self.head_dim])?;
+        let mut q = d.profile_projection("q_proj", || self.q.forward(d, x))?;
+        let mut k = d.profile_projection("k_proj", || self.k.forward(d, x))?;
+        if self.qk_norm_layout == QkNormLayout::Projection {
+            if let Some(norm) = &self.q_norm {
+                q = norm.forward(d, &q)?;
+            }
+            if let Some(norm) = &self.k_norm {
+                k = norm.forward(d, &k)?;
+            }
+        }
+        let mut q = q.reshape([s, self.q_heads, self.head_dim])?;
+        let mut k = k.reshape([s, self.kv_heads, self.head_dim])?;
         let v = d
             .profile_projection("v_proj", || self.v.forward(d, x))?
             .reshape([s, self.kv_heads, self.head_dim])?;
-        if let Some(norm) = &self.q_norm {
-            q = norm.forward(d, &q)?;
-        }
-        if let Some(norm) = &self.k_norm {
-            k = norm.forward(d, &k)?;
+        if self.qk_norm_layout == QkNormLayout::PerHead {
+            if let Some(norm) = &self.q_norm {
+                q = norm.forward(d, &q)?;
+            }
+            if let Some(norm) = &self.k_norm {
+                k = norm.forward(d, &k)?;
+            }
         }
         let prefix = format!("layer.{layer}");
         for (name, t) in [("q", &q), ("k", &k), ("v", &v)] {
@@ -69,7 +80,7 @@ impl Attention {
             .ok_or_else(|| Error::Cache("missing active K/V".into()))?;
         let scores = d.attention_scores(&q, k)?.tensor;
         let t = k.shape().dimensions()[0];
-        let scale = (self.head_dim as f32).sqrt().recip();
+        let scale = self.scale;
         let probs = if trace.is_none() && !d.reference_math() {
             d.attention_softmax(&scores, offset, scale)?.tensor
         } else {

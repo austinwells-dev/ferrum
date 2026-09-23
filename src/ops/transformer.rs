@@ -521,7 +521,17 @@ impl MetalDevice {
         p[1] = index(ad[0])?;
         p[2] = index(ad[1])?;
         p[3] = index(bd[0])?;
-        let name = if ad[0] > 1 && self.native_matmul() && a.dtype() != DType::F32 {
+        let f32_batched_gemv = a.dtype() == DType::F32
+            && ad[0] > 1
+            && ad[0] <= 32
+            && ad[1] >= 512
+            && bd[0] >= 512
+            && ad[1].is_multiple_of(4)
+            && a.storage_info().alignment >= 8
+            && weight.storage_info().alignment >= 8;
+        let name = if f32_batched_gemv {
+            "gemv_wide"
+        } else if ad[0] > 1 && self.native_matmul() && a.dtype() != DType::F32 {
             if ad[0] >= 32
                 && ad[1] > 0
                 && a.numel() <= i32::MAX as usize
@@ -547,9 +557,9 @@ impl MetalDevice {
             } else {
                 "project_f16"
             }
-        } else if ad[0] == 1 && a.dtype() != DType::F32 {
+        } else if ad[0] == 1 {
             if self.split_k_gemv()
-                && a.dtype() == DType::BF16
+                && matches!(a.dtype(), DType::BF16 | DType::F32)
                 && ad[1] >= 512
                 && bd[0] >= 512
                 && ad[1].is_multiple_of(4)

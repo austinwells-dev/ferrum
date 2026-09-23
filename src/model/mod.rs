@@ -6,6 +6,8 @@ pub mod tiny;
 pub mod transformer;
 pub mod weights;
 pub use transformer::Transformer;
+pub mod granite;
+pub mod olmo2;
 pub mod qwen;
 pub mod qwen3;
 pub mod qwen_gguf;

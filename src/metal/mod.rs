@@ -1072,7 +1072,7 @@ impl MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
                         width: grid[0],
-                        height: 1,
+                        height: grid[1],
                         depth: 1,
                     },
                     MTLSize {

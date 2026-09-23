@@ -133,6 +133,15 @@ impl Weights {
         }
         Ok(Self { tensors })
     }
+    pub(crate) fn insert(&mut self, name: String, tensor: Tensor) -> Result<()> {
+        if self.tensors.insert(name.clone(), tensor).is_some() {
+            return Err(Error::Weight {
+                name,
+                message: "duplicate mapped tensor".into(),
+            });
+        }
+        Ok(())
+    }
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }

@@ -106,6 +106,7 @@ impl Qwen3Config {
         let policy = ArchitecturePolicy {
             qk_norm_epsilon: Some(self.rms_norm_eps),
             qkv_bias: ProjectionBias::Forbidden,
+            ..ArchitecturePolicy::default()
         };
         policy.validate()?;
         Ok((config, policy))

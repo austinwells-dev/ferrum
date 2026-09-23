@@ -1,6 +1,6 @@
 use super::{
     ModelConfig,
-    architecture::ArchitecturePolicy,
+    architecture::{ArchitecturePolicy, ResidualTopology},
     weights::{self, DecoderLayer},
 };
 use crate::{
@@ -19,19 +19,46 @@ impl DecoderLayer {
         x: &Tensor,
         cache: &mut KvCache,
         layer: usize,
+        policy: ArchitecturePolicy,
         mut trace: Option<&mut Trace>,
     ) -> Result<Tensor> {
-        let norm = self.input_norm.forward(d, x)?;
-        record(&mut trace, format!("layer.{layer}.norm"), &norm);
-        let attn = self
-            .attention
-            .forward(d, &norm, cache, layer, trace.as_deref_mut())?;
-        let residual = d.add(x, &attn)?.tensor;
-        let norm = self.post_norm.forward(d, &residual)?;
-        record(&mut trace, format!("layer.{layer}.post_norm"), &norm);
-        let mlp = self.mlp.forward(d, &norm)?;
-        record(&mut trace, format!("layer.{layer}.mlp"), &mlp);
-        let output = d.add(&residual, &mlp)?.tensor;
+        let output = match policy.residual_topology {
+            ResidualTopology::PreNorm => {
+                let norm = self.input_norm.forward(d, x)?;
+                record(&mut trace, format!("layer.{layer}.norm"), &norm);
+                let attn = self
+                    .attention
+                    .forward(d, &norm, cache, layer, trace.as_deref_mut())?;
+                let attn = if policy.residual_multiplier == 1. {
+                    attn
+                } else {
+                    d.scale(&attn, policy.residual_multiplier)?.tensor
+                };
+                let residual = d.add(x, &attn)?.tensor;
+                let norm = self.post_norm.forward(d, &residual)?;
+                record(&mut trace, format!("layer.{layer}.post_norm"), &norm);
+                let mlp = self.mlp.forward(d, &norm)?;
+                record(&mut trace, format!("layer.{layer}.mlp"), &mlp);
+                let mlp = if policy.residual_multiplier == 1. {
+                    mlp
+                } else {
+                    d.scale(&mlp, policy.residual_multiplier)?.tensor
+                };
+                d.add(&residual, &mlp)?.tensor
+            }
+            ResidualTopology::PostNorm => {
+                let attn = self
+                    .attention
+                    .forward(d, x, cache, layer, trace.as_deref_mut())?;
+                let attn = self.input_norm.forward(d, &attn)?;
+                record(&mut trace, format!("layer.{layer}.norm"), &attn);
+                let residual = d.add(x, &attn)?.tensor;
+                let mlp = self.mlp.forward(d, &residual)?;
+                let mlp = self.post_norm.forward(d, &mlp)?;
+                record(&mut trace, format!("layer.{layer}.mlp"), &mlp);
+                d.add(&residual, &mlp)?.tensor
+            }
+        };
         record(&mut trace, format!("layer.{layer}.output"), &output);
         Ok(output)
     }
@@ -209,9 +236,12 @@ impl Transformer {
         let execution = d.execution()?;
         let mut staged = cache.clone();
         let mut x = self.embedding.forward(d, tokens)?;
+        if self.policy.embedding_multiplier != 1. {
+            x = d.scale(&x, self.policy.embedding_multiplier)?.tensor;
+        }
         record(&mut trace, "embedding", &x);
         for (l, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(d, &x, &mut staged, l, trace.as_deref_mut())?;
+            x = layer.forward(d, &x, &mut staged, l, self.policy, trace.as_deref_mut())?;
         }
         let x = self.final_norm.forward(d, &x)?;
         record(&mut trace, "final_hidden", &x);
@@ -224,6 +254,11 @@ impl Transformer {
             x
         };
         let logits = d.profile_projection("lm_head", || self.lm_head.forward(d, &head_input))?;
+        let logits = if self.policy.logits_divisor == 1. {
+            logits
+        } else {
+            d.scale(&logits, self.policy.logits_divisor.recip())?.tensor
+        };
         record(&mut trace, "logits", &logits);
         execution.finish()?;
         *cache = staged;

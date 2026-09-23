@@ -3,12 +3,59 @@ use ferrum::{
     generation::{self, Generation},
     loader::Weights,
     model::{
+        granite, olmo2,
         qwen::{self, QwenConfig},
         qwen_gguf, qwen_mlx, qwen3,
     },
     sampling::{Sampler, SamplingConfig},
-    tokenizer::qwen::{DEFAULT_SYSTEM, QwenTokenizer},
+    tokenizer::{
+        Tokenizer,
+        qwen::{DEFAULT_SYSTEM, QwenTokenizer, chat_prompt},
+    },
 };
+enum PromptFormat {
+    Qwen,
+    Granite,
+    Plain,
+}
+struct RuntimeTokenizer {
+    tokenizer: Tokenizer,
+    eos_ids: Vec<u32>,
+    format: PromptFormat,
+}
+impl From<QwenTokenizer> for RuntimeTokenizer {
+    fn from(value: QwenTokenizer) -> Self {
+        Self {
+            tokenizer: value.tokenizer,
+            eos_ids: value.eos_ids,
+            format: PromptFormat::Qwen,
+        }
+    }
+}
+impl RuntimeTokenizer {
+    fn encode_prompt(&self, prompt: &str, system: &str, raw: bool) -> Result<(String, Vec<u32>)> {
+        let text = if raw {
+            prompt.to_owned()
+        } else {
+            match self.format {
+                PromptFormat::Qwen => chat_prompt(system, prompt),
+                PromptFormat::Granite => format!(
+                    "<|start_of_role|>system<|end_of_role|>{system}<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>{prompt}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+                ),
+                PromptFormat::Plain => {
+                    if system != DEFAULT_SYSTEM {
+                        return Err(Error::Tokenizer(
+                            "this model has no chat template; use --raw for custom prompts".into(),
+                        ));
+                    }
+                    prompt.to_owned()
+                }
+            }
+        };
+        let ids = self.tokenizer.encode(&text)?;
+        Ok((text, ids))
+    }
+}
 use std::{
     io::{self, Write},
     path::PathBuf,
@@ -164,7 +211,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
         (
             loaded.config,
-            loaded.tokenizer,
+            loaded.tokenizer.into(),
             loaded.model,
             loaded.source_tensor_bytes,
             loaded.tensor_count,
@@ -193,7 +240,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
             (
                 loaded.config,
-                loaded.tokenizer,
+                loaded.tokenizer.into(),
                 loaded.model,
                 loaded.source_tensor_bytes,
                 loaded.tensor_count,
@@ -205,6 +252,50 @@ pub fn run(d: &MetalDevice) -> Result<()> {
                 allocated,
                 "Qwen3 safetensors",
             )
+        } else if metadata["model_type"] == "granitemoehybrid" {
+            let before = d.counters();
+            let loaded = granite::load(d, &o.model)?;
+            let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
+            (
+                loaded.config,
+                RuntimeTokenizer {
+                    tokenizer: loaded.tokenizer,
+                    eos_ids: loaded.eos_ids,
+                    format: PromptFormat::Granite,
+                },
+                loaded.model,
+                loaded.source_tensor_bytes,
+                loaded.tensor_count,
+                loaded.parameter_count,
+                0,
+                loaded.config_tokenizer_load,
+                loaded.weight_load,
+                loaded.construction,
+                allocated,
+                "Granite 4 dense safetensors",
+            )
+        } else if metadata["model_type"] == "olmo2" {
+            let before = d.counters();
+            let loaded = olmo2::load(d, &o.model)?;
+            let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
+            (
+                loaded.config,
+                RuntimeTokenizer {
+                    tokenizer: loaded.tokenizer,
+                    eos_ids: loaded.eos_ids,
+                    format: PromptFormat::Plain,
+                },
+                loaded.model,
+                loaded.source_tensor_bytes,
+                loaded.tensor_count,
+                loaded.parameter_count,
+                0,
+                loaded.config_tokenizer_load,
+                loaded.weight_load,
+                loaded.construction,
+                allocated,
+                "OLMo 2 safetensors",
+            )
         } else if metadata["model_type"] == "qwen2" {
             let qc = QwenConfig::from_file(&config_path)?;
             if qc.extra.contains_key("quantization") {
@@ -213,7 +304,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
                 let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
                 (
                     loaded.config,
-                    loaded.tokenizer,
+                    loaded.tokenizer.into(),
                     loaded.model,
                     loaded.source_tensor_bytes,
                     loaded.tensor_count,
@@ -249,7 +340,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
                 drop(source);
                 (
                     c,
-                    tok,
+                    tok.into(),
                     model,
                     source_bytes,
                     tensor_count,

@@ -1,6 +1,6 @@
 use super::{
     ModelConfig,
-    architecture::{ArchitecturePolicy, ProjectionBias},
+    architecture::{ArchitecturePolicy, ProjectionBias, QkNormLayout},
 };
 use crate::{
     Error, MetalDevice, Result, Tensor,
@@ -84,8 +84,15 @@ pub(crate) fn specifications_with_policy(
             specs.push((format!("layers.{l}.{name}"), shape));
         }
         if policy.qk_norm_epsilon.is_some() {
-            for name in ["q_norm.weight", "k_norm.weight"] {
-                specs.push((format!("layers.{l}.{name}"), vec![c.head_dim]));
+            for (name, heads) in [
+                ("q_norm.weight", c.num_attention_heads),
+                ("k_norm.weight", c.num_key_value_heads),
+            ] {
+                let width = match policy.qk_norm_layout {
+                    QkNormLayout::PerHead => c.head_dim,
+                    QkNormLayout::Projection => heads * c.head_dim,
+                };
+                specs.push((format!("layers.{l}.{name}"), vec![width]));
             }
         }
     }
@@ -211,6 +218,10 @@ pub(crate) fn construct(
                 kv_heads: c.num_key_value_heads,
                 head_dim: c.head_dim,
                 theta: c.rope_theta,
+                qk_norm_layout: policy.qk_norm_layout,
+                scale: policy
+                    .attention_scale
+                    .unwrap_or_else(|| (c.head_dim as f32).sqrt().recip()),
             },
             mlp: Mlp {
                 gate: linear(&format!("{p}.gate"))?,
@@ -371,6 +382,10 @@ pub(crate) fn construct_mixed(
                 kv_heads: c.num_key_value_heads,
                 head_dim: c.head_dim,
                 theta: c.rope_theta,
+                qk_norm_layout: policy.qk_norm_layout,
+                scale: policy
+                    .attention_scale
+                    .unwrap_or_else(|| (c.head_dim as f32).sqrt().recip()),
             },
             mlp: Mlp {
                 gate: linear(&format!("{prefix}.gate"))?,

@@ -16,6 +16,9 @@ def main() -> None:
     prompt.add_argument("--prompt-text", help="Raw text to tokenize without a chat template")
     parser.add_argument("--repeat", type=int, default=1, help="Repeat raw prompt text")
     parser.add_argument("--steps", type=int, default=8)
+    parser.add_argument(
+        "--full-context", action="store_true", help="Recompute the whole prefix each step"
+    )
     args = parser.parse_args()
     if args.prompt_ids:
         ids = json.loads(args.prompt_ids)
@@ -38,8 +41,13 @@ def main() -> None:
     with torch.inference_mode():
         for step in range(args.steps):
             start = time.perf_counter()
-            output = model(input_ids=input_ids, past_key_values=cache, use_cache=True)
-            cache = output.past_key_values
+            output = model(
+                input_ids=input_ids,
+                past_key_values=None if args.full_context else cache,
+                use_cache=not args.full_context,
+            )
+            if not args.full_context:
+                cache = output.past_key_values
             logits = output.logits[0, -1].float()
             token = int(torch.argmax(logits))
             top_values, top_ids = torch.topk(logits, 10)
@@ -53,7 +61,10 @@ def main() -> None:
                 }
             )
             generated.append(token)
-            input_ids = torch.tensor([[token]], dtype=torch.long)
+            if args.full_context:
+                input_ids = torch.cat((input_ids, torch.tensor([[token]], dtype=torch.long)), dim=1)
+            else:
+                input_ids = torch.tensor([[token]], dtype=torch.long)
     print(
         json.dumps(
             {
@@ -64,6 +75,7 @@ def main() -> None:
                 "prompt_ids": ids,
                 "prompt_text": args.prompt_text,
                 "repeat": args.repeat,
+                "full_context": args.full_context,
                 "generated_ids": generated,
                 "load_s": load_s,
                 "rows": rows,

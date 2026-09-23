@@ -31,7 +31,7 @@ fn growing_cache_copies_only_at_geometric_boundaries() {
 #[test]
 fn vector_projection_tail_and_misaligned_views() {
     let d = MetalDevice::new().unwrap();
-    for ty in [DType::BF16, DType::F16] {
+    for ty in [DType::F32, DType::BF16, DType::F16] {
         for offset in [0, 1] {
             let (k, n) = (128, 17);
             let x = Tensor::from_f32(&d, [k + offset], ty, &reference::deterministic(k + offset))
@@ -54,26 +54,52 @@ fn vector_projection_tail_and_misaligned_views() {
                 .map(|v| ty.round(v))
                 .collect();
             let y = Linear::new(&d, w, None).unwrap().forward(&d, &x).unwrap();
-            let tolerance = if ty == DType::BF16 { 1.6e-2 } else { 2e-3 };
+            let tolerance = match ty {
+                DType::F32 => 2e-4,
+                DType::BF16 => 1.6e-2,
+                DType::F16 => 2e-3,
+            };
             reference::check(&y.to_f32(), &expected, tolerance, tolerance).unwrap();
         }
     }
 }
 
 #[test]
-fn split_k_bf16_gemv_matches_reference_for_large_rows() {
+fn split_k_dense_gemv_matches_reference_for_large_rows() {
     let d = MetalDevice::new().unwrap();
     let (k, n) = (896, 513);
-    let x = Tensor::from_f32(&d, [1, k], DType::BF16, &reference::deterministic(k)).unwrap();
-    let w = Tensor::from_f32(&d, [n, k], DType::BF16, &reference::deterministic(n * k)).unwrap();
-    let values = w.to_f32();
-    let wt: Vec<_> = (0..n * k).map(|i| values[(i % n) * k + i / n]).collect();
-    let expected: Vec<_> = reference::matmul(&x.to_f32(), &wt, 1, k, n)
-        .into_iter()
-        .map(|v| DType::BF16.round(v))
-        .collect();
-    let y = Linear::new(&d, w, None).unwrap().forward(&d, &x).unwrap();
-    reference::check(&y.to_f32(), &expected, 1.6e-2, 1e-2).unwrap();
+    for ty in [DType::BF16, DType::F32] {
+        let x = Tensor::from_f32(&d, [1, k], ty, &reference::deterministic(k)).unwrap();
+        let w = Tensor::from_f32(&d, [n, k], ty, &reference::deterministic(n * k)).unwrap();
+        let values = w.to_f32();
+        let wt: Vec<_> = (0..n * k).map(|i| values[(i % n) * k + i / n]).collect();
+        let expected: Vec<_> = reference::matmul(&x.to_f32(), &wt, 1, k, n)
+            .into_iter()
+            .map(|v| ty.round(v))
+            .collect();
+        let y = Linear::new(&d, w, None).unwrap().forward(&d, &x).unwrap();
+        let (atol, rtol) = if ty == DType::F32 {
+            (2e-4, 2e-4)
+        } else {
+            (1.6e-2, 1e-2)
+        };
+        reference::check(&y.to_f32(), &expected, atol, rtol).unwrap();
+    }
+}
+
+#[test]
+fn batched_f32_gemv_covers_small_prefill_and_output_tail() {
+    let d = MetalDevice::new().unwrap();
+    for m in [2, 8, 21] {
+        let (k, n) = (896, 513);
+        let x = Tensor::from_f32(&d, [m, k], DType::F32, &reference::deterministic(m * k)).unwrap();
+        let w = Tensor::from_f32(&d, [n, k], DType::F32, &reference::deterministic(n * k)).unwrap();
+        let values = w.to_f32();
+        let wt: Vec<_> = (0..n * k).map(|i| values[(i % n) * k + i / n]).collect();
+        let expected = reference::matmul(&x.to_f32(), &wt, m, k, n);
+        let actual = Linear::new(&d, w, None).unwrap().forward(&d, &x).unwrap();
+        reference::check(&actual.to_f32(), &expected, 2e-4, 2e-4).unwrap();
+    }
 }
 
 #[test]
