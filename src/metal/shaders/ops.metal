@@ -28,6 +28,7 @@ inline float round_storage(float x, uint dtype) {
     return x;
 }
 #define ARGS device const uchar* a [[buffer(0)]], device const uchar* b [[buffer(1)]], device uchar* c [[buffer(2)]], constant uint* p [[buffer(3)]]
+#define EXPERT_PROJECT_ARGS device const uchar* a [[buffer(0)]], device const uchar* b [[buffer(1)]], device const uchar* m [[buffer(2)]], device uchar* c [[buffer(3)]], constant uint* p [[buffer(4)]]
 kernel void add(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) store(c,i,p[4],load(a,i,p[4])+load(b,i,p[4])); }
 kernel void mul(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) store(c,i,p[4],load(a,i,p[4])*load(b,i,p[4])); }
 kernel void silu(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) { float x=load(a,i,p[4]); float s=x>=0 ? 1.f/(1.f+exp(-x)) : exp(x)/(1.f+exp(x)); store(c,i,p[4],x*s); } }
@@ -1052,6 +1053,61 @@ kernel void gemv_wide(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 grou
     if(p[4]==0) gemv_wide_impl<float>((device const float4*)a,(device const float4*)b,c,p,tid,row,batch,partial);
     else if(p[4]==2) gemv_wide_impl<bfloat>((device const bfloat4*)a,(device const bfloat4*)b,c,p,tid,row,batch,partial);
     else gemv_wide_impl<half>((device const half4*)a,(device const half4*)b,c,p,tid,row,batch,partial);
+}
+
+kernel void expert_assign(ARGS, uint i [[thread_position_in_grid]]) {
+    uint tokens=p[1], hidden=p[2], top_k=p[3];
+    uint assignments=tokens*top_k;
+    if(i<assignments*hidden) {
+        uint assignment=i/hidden, column=i%hidden;
+        uint token=as_type<uint>(load(b,assignment*3+1,p[5]));
+        store(c,i,p[4],load(a,token*hidden+column,p[4]));
+    }
+}
+
+void expert_project_impl(device const uchar* input, device const uchar* weights,
+                         device const uchar* metadata, device uchar* output,
+                         constant uint* p, uint tid, uint2 group) {
+    uint assignment=group.y, row=group.x*4+tid/32, lane=tid%32;
+    uint k=p[2], n=p[3], experts=p[5];
+    uint expert=as_type<uint>(load(metadata,assignment*3,p[6]));
+    float sum=0.f;
+    if(assignment<p[1] && row<n && expert<experts) {
+        uint weight_base=(expert*n+row)*k;
+        for(uint j=lane;j<k;j+=32)
+            sum+=load(input,assignment*k+j,p[4])*load(weights,weight_base+j,p[4]);
+    }
+    sum=simd_sum(sum);
+    if(lane==0 && assignment<p[1] && row<n && expert<experts)
+        store(output,assignment*n+row,p[4],sum);
+}
+kernel void expert_project(EXPERT_PROJECT_ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    expert_project_impl(a,b,m,c,p,tid,group);
+}
+
+kernel void expert_silu_mul(ARGS, uint i [[thread_position_in_grid]]) {
+    uint assignments=p[1], intermediate=p[2];
+    if(i<assignments*intermediate) {
+        uint assignment=i/intermediate, column=i%intermediate;
+        uint base=assignment*2*intermediate;
+        float gate=load(a,base+column,p[4]);
+        float activated=round_storage(gate*(gate>=0.f?1.f/(1.f+exp(-gate)):exp(gate)/(1.f+exp(gate))),p[4]);
+        store(c,i,p[4],activated*load(a,base+intermediate+column,p[4]));
+    }
+}
+
+kernel void expert_combine(ARGS, uint i [[thread_position_in_grid]]) {
+    uint tokens=p[1], hidden=p[2], top_k=p[3], token=i/hidden, column=i%hidden;
+    if(i<tokens*hidden) {
+        float total=0.f;
+        for(uint rank=0;rank<top_k;rank++) {
+            uint assignment=token*top_k+rank;
+            float gate=round_storage(load(b,assignment*3+2,p[5]),p[4]);
+            float value=load(a,assignment*hidden+column,p[4]);
+            total+=round_storage(gate*value,p[4]);
+        }
+        store(c,i,p[4],total);
+    }
 }
 
 // Grouped attention products: retain explicit score/probability storage boundaries.

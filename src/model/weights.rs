@@ -5,7 +5,7 @@ use super::{
 use crate::{
     Error, MetalDevice, Result, Tensor,
     loader::Weights,
-    nn::{Embedding, Linear, Mlp, RmsNorm, attention::Attention},
+    nn::{Embedding, Linear, Mlp, RmsNorm, attention::Attention, moe::SparseMoe},
     quantization::{QuantizationFormat, QuantizedMatrix},
 };
 use std::collections::BTreeMap;
@@ -13,7 +13,38 @@ pub struct DecoderLayer {
     pub input_norm: RmsNorm,
     pub attention: Attention,
     pub post_norm: RmsNorm,
-    pub mlp: Mlp,
+    pub(crate) feed_forward: FeedForward,
+}
+
+pub(crate) enum FeedForward {
+    Dense(Mlp),
+    Sparse(SparseMoe),
+}
+
+impl FeedForward {
+    pub(crate) fn forward(&self, d: &MetalDevice, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(mlp) => mlp.forward(d, x),
+            Self::Sparse(moe) => moe.forward(d, x),
+        }
+    }
+
+    pub(crate) fn weight_bytes(&self) -> usize {
+        match self {
+            Self::Dense(mlp) => [&mlp.gate, &mlp.up, &mlp.down]
+                .iter()
+                .map(|linear| linear.weight_bytes())
+                .sum(),
+            Self::Sparse(moe) => moe.weight_bytes(),
+        }
+    }
+
+    pub(crate) fn take_moe_stats(&self) -> Option<crate::nn::moe::MoeStats> {
+        match self {
+            Self::Dense(_) => None,
+            Self::Sparse(moe) => Some(moe.take_stats()),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -77,11 +108,30 @@ pub(crate) fn specifications_with_policy(
             ("k.weight", vec![k, h]),
             ("v.weight", vec![k, h]),
             ("o.weight", vec![h, q]),
-            ("gate.weight", vec![i, h]),
-            ("up.weight", vec![i, h]),
-            ("down.weight", vec![h, i]),
         ] {
             specs.push((format!("layers.{l}.{name}"), shape));
+        }
+        if let Some(moe) = policy.moe {
+            specs.extend([
+                (
+                    format!("layers.{l}.moe.router.weight"),
+                    vec![moe.experts, h],
+                ),
+                (
+                    format!("layers.{l}.moe.input.weight"),
+                    vec![moe.experts, 2 * i, h],
+                ),
+                (
+                    format!("layers.{l}.moe.output.weight"),
+                    vec![moe.experts, h, i],
+                ),
+            ]);
+        } else {
+            specs.extend([
+                (format!("layers.{l}.gate.weight"), vec![i, h]),
+                (format!("layers.{l}.up.weight"), vec![i, h]),
+                (format!("layers.{l}.down.weight"), vec![h, i]),
+            ]);
         }
         if policy.qk_norm_epsilon.is_some() {
             for (name, heads) in [
@@ -151,6 +201,11 @@ pub(crate) fn construct(
     policy: ArchitecturePolicy,
     w: &Weights,
 ) -> Result<(Embedding, Vec<DecoderLayer>, RmsNorm, Linear)> {
+    if policy.moe.is_some() {
+        return Err(Error::Config(
+            "sparse models must be constructed from mixed model weights".into(),
+        ));
+    }
     // Complete validation precedes any preprocessing dispatch.
     for (name, shape) in specifications_with_policy(c, policy) {
         checked(w, &name, &shape, c, d)?;
@@ -223,11 +278,11 @@ pub(crate) fn construct(
                     .attention_scale
                     .unwrap_or_else(|| (c.head_dim as f32).sqrt().recip()),
             },
-            mlp: Mlp {
+            feed_forward: FeedForward::Dense(Mlp {
                 gate: linear(&format!("{p}.gate"))?,
                 up: linear(&format!("{p}.up"))?,
                 down: linear(&format!("{p}.down"))?,
-            },
+            }),
         });
     }
     let embedding = Embedding::new(w.get("embedding.weight")?.clone())?;
@@ -368,6 +423,27 @@ pub(crate) fn construct_mixed(
     let mut layers = Vec::with_capacity(c.num_layers);
     for layer in 0..c.num_layers {
         let prefix = format!("layers.{layer}");
+        let feed_forward = if policy.moe.is_some() {
+            let router = dense(&format!("{prefix}.moe.router.weight"))?;
+            let input_experts = dense(&format!("{prefix}.moe.input.weight"))?;
+            let output_experts = dense(&format!("{prefix}.moe.output.weight"))?;
+            let routing = policy
+                .moe
+                .ok_or_else(|| Error::Config("missing MoE routing policy".into()))?;
+            FeedForward::Sparse(SparseMoe::new(
+                d,
+                router,
+                input_experts,
+                output_experts,
+                routing.top_k,
+            )?)
+        } else {
+            FeedForward::Dense(Mlp {
+                gate: linear(&format!("{prefix}.gate"))?,
+                up: linear(&format!("{prefix}.up"))?,
+                down: linear(&format!("{prefix}.down"))?,
+            })
+        };
         layers.push(DecoderLayer {
             input_norm: norm(&format!("{prefix}.input_norm.weight"))?,
             post_norm: norm(&format!("{prefix}.post_norm.weight"))?,
@@ -387,11 +463,7 @@ pub(crate) fn construct_mixed(
                     .attention_scale
                     .unwrap_or_else(|| (c.head_dim as f32).sqrt().recip()),
             },
-            mlp: Mlp {
-                gate: linear(&format!("{prefix}.gate"))?,
-                up: linear(&format!("{prefix}.up"))?,
-                down: linear(&format!("{prefix}.down"))?,
-            },
+            feed_forward,
         });
     }
     let embedding = match w.get("embedding.weight")? {

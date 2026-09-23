@@ -3,7 +3,7 @@ use ferrum::{
     generation::{self, Generation},
     loader::Weights,
     model::{
-        granite, olmo2,
+        granite, granite_moe, olmo2,
         qwen::{self, QwenConfig},
         qwen_gguf, qwen_mlx, qwen3,
     },
@@ -274,6 +274,28 @@ pub fn run(d: &MetalDevice) -> Result<()> {
                 allocated,
                 "Granite 4 dense safetensors",
             )
+        } else if metadata["model_type"] == "granitemoe" {
+            let before = d.counters();
+            let loaded = granite_moe::load(d, &o.model)?;
+            let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
+            (
+                loaded.config,
+                RuntimeTokenizer {
+                    tokenizer: loaded.tokenizer,
+                    eos_ids: loaded.eos_ids,
+                    format: PromptFormat::Granite,
+                },
+                loaded.model,
+                loaded.source_tensor_bytes,
+                loaded.tensor_count,
+                loaded.parameter_count,
+                0,
+                loaded.config_tokenizer_load,
+                loaded.weight_load,
+                loaded.construction,
+                allocated,
+                "Granite 3.1 1B-A400M MoE safetensors",
+            )
         } else if metadata["model_type"] == "olmo2" {
             let before = d.counters();
             let loaded = olmo2::load(d, &o.model)?;
@@ -411,6 +433,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             generation::argmax,
             |_| Ok(()),
         )?;
+        let _ = model.take_moe_stats();
     }
     d.set_profiling(o.profile);
     let mut sampler = Sampler::new(o.sampling)?;
@@ -442,6 +465,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             Ok(())
         },
     )?;
+    let moe_stats = model.take_moe_stats();
     // Flush any final incomplete byte sequence using the tokenizer's documented
     // replacement policy; completed Unicode was already streamed intact.
     let visible: Vec<_> = r
@@ -463,7 +487,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         let median = sorted.get(sorted.len() / 2).copied().unwrap_or_default();
         eprintln!(
             "SUMMARY {}",
-            serde_json::json!({"prompt_tokens":ids.len(),"generated_ids":r.tokens,"prefill_ms":ms(r.prefill),"prefill_tps":ids.len() as f64/r.prefill.as_secs_f64(),"first_token_ms":ms(r.first_token),"decode_median_ms":ms(median),"decode_tps":if median.is_zero(){0.}else{1./median.as_secs_f64()},"decode_ms":r.decode.iter().map(|x|ms(*x)).collect::<Vec<_>>(),"prefill_counters":r.prefill_counters,"decode_counters":r.decode_counters,"sampling_ms":ms(r.sampling),"retained_weight_bytes":model.weight_bytes(),"kv_active_bytes":r.kv_bytes,"kv_reserved_bytes":r.kv_reserved_bytes})
+            serde_json::json!({"prompt_tokens":ids.len(),"generated_ids":r.tokens,"prefill_ms":ms(r.prefill),"prefill_tps":ids.len() as f64/r.prefill.as_secs_f64(),"first_token_ms":ms(r.first_token),"decode_median_ms":ms(median),"decode_tps":if median.is_zero(){0.}else{1./median.as_secs_f64()},"decode_ms":r.decode.iter().map(|x|ms(*x)).collect::<Vec<_>>(),"prefill_counters":r.prefill_counters,"decode_counters":r.decode_counters,"sampling_ms":ms(r.sampling),"retained_weight_bytes":model.weight_bytes(),"kv_active_bytes":r.kv_bytes,"kv_reserved_bytes":r.kv_reserved_bytes,"moe":if moe_stats.assignments==0 {serde_json::Value::Null} else {serde_json::json!({"router_projection_enqueue_ms":ms(moe_stats.router_projection_enqueue),"route_selection_wall_ms":ms(moe_stats.routing),"routing_boundary_wait_ms":ms(moe_stats.routing_boundary_wait),"expert_dispatch_enqueue_ms":ms(moe_stats.expert_dispatch),"combine_enqueue_ms":ms(moe_stats.combine_dispatch),"active_expert_visits":moe_stats.active_experts,"assignments":moe_stats.assignments,"peak_temporary_bytes":moe_stats.peak_temporary_bytes})}})
         );
         eprintln!(
             "PROFILE prefill: {}",

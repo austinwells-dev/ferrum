@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 pub mod attention;
 pub mod kv_cache;
+pub mod moe;
 use crate::{DType, Error, MetalDevice, Result, Tensor, quantization::QuantizedMatrix};
 
 enum MatrixWeight {

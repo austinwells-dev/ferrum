@@ -21,6 +21,7 @@ pub struct ArchitecturePolicy {
     pub embedding_multiplier: f32,
     pub residual_multiplier: f32,
     pub logits_divisor: f32,
+    pub moe: Option<MoeRoutingPolicy>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -37,6 +38,12 @@ pub enum ResidualTopology {
     PostNorm,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeRoutingPolicy {
+    pub experts: usize,
+    pub top_k: usize,
+}
+
 impl Default for ArchitecturePolicy {
     fn default() -> Self {
         Self {
@@ -48,6 +55,7 @@ impl Default for ArchitecturePolicy {
             embedding_multiplier: 1.,
             residual_multiplier: 1.,
             logits_divisor: 1.,
+            moe: None,
         }
     }
 }
@@ -65,6 +73,13 @@ impl ArchitecturePolicy {
         if self.residual_topology == ResidualTopology::PostNorm && self.residual_multiplier != 1. {
             return Err(Error::Config(
                 "post-normalized residual multiplier is unsupported".into(),
+            ));
+        }
+        if self.moe.is_some_and(|routing| {
+            routing.experts == 0 || routing.top_k == 0 || routing.top_k > routing.experts
+        }) {
+            return Err(Error::Config(
+                "MoE requires positive expert count and top-k within expert count".into(),
             ));
         }
         if self

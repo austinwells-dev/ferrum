@@ -473,6 +473,11 @@ impl MetalDevice {
         // submission.resources drops only after the wait and status check.
         Ok(())
     }
+    /// Complete the current encoding epoch before safe host readback. Model
+    /// code uses this at CPU routing boundaries inside an active transaction.
+    pub(crate) fn synchronize(&self) -> Result<()> {
+        self.flush()
+    }
     pub(crate) fn profile_projection<T>(
         &self,
         stage: &'static str,
@@ -722,6 +727,14 @@ impl MetalDevice {
         grid: [usize; 2],
         tiled: bool,
     ) -> Result<DispatchTiming> {
+        let (input_count, output_count) = match name {
+            "expert_project" => (3, 1),
+            "lfm2_short_conv" => (4, 2),
+            _ => (2, 1),
+        };
+        if buffers.len() != input_count + output_count {
+            return Err(Error::Dispatch(format!("invalid buffer count for {name}")));
+        }
         #[cfg(test)]
         if self
             .fail_after
@@ -741,7 +754,7 @@ impl MetalDevice {
                 return Err(Error::DeviceMismatch);
             }
         }
-        for (buffer, offset, length) in &buffers[..buffers.len().min(2)] {
+        for (buffer, offset, length) in &buffers[..input_count] {
             if buffer.writes.borrow().iter().any(|(start, end, state)| {
                 *offset < *end && offset + length > *start && state.get() == Completion::Failed
             }) {
@@ -753,7 +766,28 @@ impl MetalDevice {
         if grid.contains(&0) {
             return Ok(DispatchTiming::default());
         }
-        debug_assert_eq!(buffers.len(), 3);
+        for (output_index, (output, output_offset, output_length)) in
+            buffers[input_count..].iter().enumerate()
+        {
+            for (input, input_offset, input_length) in &buffers[..input_count] {
+                if std::ptr::eq(*input, *output)
+                    && *input_offset < *output_offset + *output_length
+                    && *output_offset < *input_offset + *input_length
+                {
+                    return Err(Error::Dispatch(format!("input/output alias for {name}")));
+                }
+            }
+            for (other, other_offset, other_length) in
+                buffers[input_count..input_count + output_index].iter()
+            {
+                if std::ptr::eq(*other, *output)
+                    && *other_offset < *output_offset + *output_length
+                    && *output_offset < *other_offset + *other_length
+                {
+                    return Err(Error::Dispatch(format!("output/output alias for {name}")));
+                }
+            }
+        }
         debug_assert!(params[4] <= 2);
         let p = self.builtin(name)?;
         let required = if tiled
@@ -767,6 +801,7 @@ impl MetalDevice {
             "gemv"
                 | "gemv_vector"
                 | "gemv_wide"
+                | "expert_project"
                 | "project_wide_bf16"
                 | "project_wide_f16"
                 | "project_mpp"
@@ -843,7 +878,7 @@ impl MetalDevice {
                 encoder.setBytes_length_atIndex(
                     NonNull::from(params).cast(),
                     size_of_val(params),
-                    3,
+                    buffers.len(),
                 );
             }
             if matches!(
@@ -1062,6 +1097,25 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
+            } else if name == "expert_project" {
+                if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
+                {
+                    return Err(Error::Dispatch(
+                        "expert projection requires 32-wide SIMD and 128-thread groups".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0].div_ceil(4),
+                        height: grid[1],
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
             } else if name == "gemv_wide" {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
@@ -1116,12 +1170,12 @@ impl MetalDevice {
             submission
                 .resources
                 .extend(buffers.iter().map(|(b, _, _)| b.raw.clone()));
-            *buffers[2].0.ready.borrow_mut() = Some(submission.ready.clone());
-            let (output, offset, length) = buffers[2];
-            let mut writes = output.writes.borrow_mut();
-            writes.retain(|(_, _, state)| state.get() != Completion::Completed);
-            writes.push((offset, offset + length, submission.ready.clone()));
-            drop(writes);
+            for (output, offset, length) in &buffers[input_count..] {
+                *output.ready.borrow_mut() = Some(submission.ready.clone());
+                let mut writes = output.writes.borrow_mut();
+                writes.retain(|(_, _, state)| state.get() != Completion::Completed);
+                writes.push((*offset, offset + length, submission.ready.clone()));
+            }
             submission.dispatches += 1;
             let flush = !self.batching.get() || submission.dispatches >= self.batch_limit.get();
             let mut counters = self.counters.get();
@@ -1336,5 +1390,33 @@ mod failed_completion_tests {
         assert!(after.command_buffers - before.command_buffers >= 2);
         assert!(after.transient_peak_bytes <= 256 * 1024 * 1024);
         assert!(x.to_f32().iter().all(|&v| v == 0.01f32 * 2f32.powi(40)));
+    }
+}
+
+#[cfg(test)]
+mod custom_output_tests {
+    use super::*;
+    use crate::{DType, Tensor};
+
+    #[test]
+    fn expert_projection_tracks_its_real_output_range() {
+        let d = MetalDevice::new().unwrap();
+        let input = Tensor::from_f32(&d, [1, 2], DType::F32, &[5., 7.]).unwrap();
+        let metadata = Tensor::from_f32(&d, [1, 3], DType::F32, &[0., 0., 1.]).unwrap();
+        let weights = Tensor::from_f32(&d, [1, 1, 2], DType::F32, &[2., 3.]).unwrap();
+
+        let execution = d.execution().unwrap();
+        let output = d.expert_project(&input, &metadata, &weights, 2, 1).unwrap();
+        execution.finish().unwrap();
+        assert_eq!(output.to_f32(), vec![31.]);
+
+        let execution = d.execution().unwrap();
+        let failed_output = d.expert_project(&input, &metadata, &weights, 2, 1).unwrap();
+        d.fail_completion.set(true);
+        assert!(execution.finish().is_err());
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { failed_output.to_f32() }))
+                .is_err()
+        );
     }
 }

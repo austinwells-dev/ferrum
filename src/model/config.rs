@@ -52,7 +52,6 @@ impl ModelConfig {
             vec![c.intermediate_size, c.hidden_size],
             vec![c.num_attention_heads, c.head_dim, c.hidden_size],
             vec![c.max_context_length, c.num_attention_heads, c.head_dim],
-            vec![c.max_context_length, c.max_context_length],
             vec![c.num_layers],
         ] {
             let shape = Shape::new(dims).map_err(|e| Error::Config(e.to_string()))?;

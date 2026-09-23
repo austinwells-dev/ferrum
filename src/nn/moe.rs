@@ -1,0 +1,426 @@
+//! Shared sparse top-k expert routing and grouped expert projection runtime.
+#![forbid(unsafe_code)]
+
+use crate::{Error, MetalDevice, Result, Tensor};
+use std::{
+    cell::Cell,
+    time::{Duration, Instant},
+};
+
+const ROUTING_TEMPORARY_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MoeStats {
+    pub router_projection_enqueue: Duration,
+    pub routing: Duration,
+    pub routing_boundary_wait: Duration,
+    pub expert_dispatch: Duration,
+    pub combine_dispatch: Duration,
+    pub active_experts: usize,
+    pub assignments: usize,
+    pub peak_temporary_bytes: usize,
+}
+
+impl MoeStats {
+    fn merge(&mut self, other: Self) {
+        self.router_projection_enqueue += other.router_projection_enqueue;
+        self.routing += other.routing;
+        self.routing_boundary_wait += other.routing_boundary_wait;
+        self.expert_dispatch += other.expert_dispatch;
+        self.combine_dispatch += other.combine_dispatch;
+        self.active_experts += other.active_experts;
+        self.assignments += other.assignments;
+        self.peak_temporary_bytes = self.peak_temporary_bytes.max(other.peak_temporary_bytes);
+    }
+}
+
+pub struct SparseMoe {
+    router: crate::nn::Linear,
+    input_experts: Tensor,
+    output_experts: Tensor,
+    expert_count: usize,
+    top_k: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    stats: Cell<MoeStats>,
+}
+
+impl SparseMoe {
+    pub(crate) fn new(
+        device: &MetalDevice,
+        router_weight: Tensor,
+        input_experts: Tensor,
+        output_experts: Tensor,
+        top_k: usize,
+    ) -> Result<Self> {
+        let router_dims = router_weight.shape().dimensions();
+        let input_dims = input_experts.shape().dimensions();
+        let output_dims = output_experts.shape().dimensions();
+        if router_dims.len() != 2
+            || input_dims.len() != 3
+            || output_dims.len() != 3
+            || router_dims[0] != input_dims[0]
+            || router_dims[0] != output_dims[0]
+            || input_dims[1] == 0
+            || !input_dims[1].is_multiple_of(2)
+            || router_dims[1] != input_dims[2]
+            || router_dims[1] != output_dims[1]
+            || output_dims[2].checked_mul(2) != Some(input_dims[1])
+            || top_k == 0
+            || top_k > router_dims[0]
+            || [
+                router_weight.dtype(),
+                input_experts.dtype(),
+                output_experts.dtype(),
+            ]
+            .iter()
+            .any(|&dtype| dtype != input_experts.dtype())
+            || !device.owns(router_weight.buffer())
+            || !device.owns(input_experts.buffer())
+            || !device.owns(output_experts.buffer())
+        {
+            return Err(Error::Config(
+                "invalid sparse expert weight geometry".into(),
+            ));
+        }
+        let expert_count = router_dims[0];
+        let hidden_size = router_dims[1];
+        let intermediate_size = input_dims[1] / 2;
+        let router = crate::nn::Linear::new(device, router_weight, None)?;
+        Ok(Self {
+            router,
+            input_experts,
+            output_experts,
+            expert_count,
+            top_k,
+            hidden_size,
+            intermediate_size,
+            stats: Cell::new(MoeStats::default()),
+        })
+    }
+
+    pub fn weight_bytes(&self) -> usize {
+        self.router.weight_bytes()
+            + self.input_experts.byte_size()
+            + self.output_experts.byte_size()
+    }
+
+    pub fn take_stats(&self) -> MoeStats {
+        self.stats.replace(MoeStats::default())
+    }
+
+    pub fn forward(&self, device: &MetalDevice, hidden: &Tensor) -> Result<Tensor> {
+        let dims = hidden.shape().dimensions();
+        if dims.len() != 2 || dims[1] != self.hidden_size || dims[0] == 0 {
+            return Err(Error::Shape(
+                "sparse expert input requires [tokens,hidden]".into(),
+            ));
+        }
+        if !device.owns(hidden.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
+        let activation_elements_per_assignment = self
+            .hidden_size
+            .checked_mul(2)
+            .and_then(|v| v.checked_add(self.intermediate_size.checked_mul(3)?))
+            .ok_or_else(|| Error::Shape("expert temporary size overflow".into()))?;
+        let bytes_per_assignment = activation_elements_per_assignment
+            .checked_mul(hidden.dtype().size_bytes())
+            .and_then(|v| v.checked_add(3 * std::mem::size_of::<f32>()))
+            .ok_or_else(|| Error::Shape("expert temporary size overflow".into()))?;
+        let bytes_per_token = bytes_per_assignment
+            .checked_mul(self.top_k)
+            .and_then(|v| {
+                v.checked_add(
+                    self.expert_count
+                        .checked_add(self.hidden_size)?
+                        .checked_mul(hidden.dtype().size_bytes())?,
+                )
+            })
+            .ok_or_else(|| Error::Shape("expert temporary size overflow".into()))?;
+        let chunk_tokens = (ROUTING_TEMPORARY_LIMIT / bytes_per_token)
+            .max(1)
+            .min(dims[0]);
+        let chunks = dims[0].div_ceil(chunk_tokens);
+        let output_elements = dims[0]
+            .checked_mul(self.hidden_size)
+            .ok_or_else(|| Error::Shape("expert output size overflow".into()))?;
+        let mut all_outputs = Vec::with_capacity(output_elements);
+        let mut total_stats = MoeStats::default();
+
+        for chunk_start in (0..dims[0]).step_by(chunk_tokens) {
+            let count = chunk_tokens.min(dims[0] - chunk_start);
+            let input = hidden.view(chunk_start * self.hidden_size, [count, self.hidden_size])?;
+            let route_start = Instant::now();
+            let router_logits =
+                device.profile_projection("moe.router", || self.router.forward(device, &input))?;
+            total_stats.router_projection_enqueue += route_start.elapsed();
+            // Router choice is data-dependent. Complete the GPU projection before
+            // reading it; all staged cache changes remain local to the caller.
+            let boundary_start = Instant::now();
+            device.synchronize()?;
+            total_stats.routing_boundary_wait += boundary_start.elapsed();
+            let route_start = Instant::now();
+            let logits = router_logits.to_f32();
+            let metadata = self.select_routes(&logits, count)?;
+            let active = metadata
+                .chunks_exact(3)
+                .map(|item| item[0].to_bits() as usize)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len();
+            total_stats.routing += route_start.elapsed();
+            total_stats.active_experts += active;
+            let assignment_count = count
+                .checked_mul(self.top_k)
+                .ok_or_else(|| Error::Shape("expert assignment count overflow".into()))?;
+            total_stats.assignments += assignment_count;
+
+            let metadata_tensor =
+                Tensor::from_f32(device, [assignment_count, 3], crate::DType::F32, &metadata)?;
+            let temp_bytes = assignment_count
+                .checked_mul(bytes_per_assignment)
+                .and_then(|v| {
+                    v.checked_add(
+                        count
+                            .checked_mul(self.expert_count.checked_add(self.hidden_size)?)?
+                            .checked_mul(hidden.dtype().size_bytes())?,
+                    )
+                })
+                .ok_or_else(|| Error::Shape("expert temporary size overflow".into()))?;
+            total_stats.peak_temporary_bytes = total_stats.peak_temporary_bytes.max(temp_bytes);
+
+            let dispatch_start = Instant::now();
+            let assigned = device.profile_projection("moe.assign", || {
+                device.expert_assign(&input, &metadata_tensor, self.top_k)
+            })?;
+            let projected = device.profile_projection("moe.input_projection", || {
+                device.expert_project(
+                    &assigned,
+                    &metadata_tensor,
+                    &self.input_experts,
+                    self.hidden_size,
+                    self.expert_count,
+                )
+            })?;
+            let activated = device.profile_projection("moe.silu_mul", || {
+                device.expert_silu_mul(&projected, self.intermediate_size)
+            })?;
+            let expert_output = device.profile_projection("moe.output_projection", || {
+                device.expert_project(
+                    &activated,
+                    &metadata_tensor,
+                    &self.output_experts,
+                    self.intermediate_size,
+                    self.expert_count,
+                )
+            })?;
+            total_stats.expert_dispatch += dispatch_start.elapsed();
+            let combine_start = Instant::now();
+            let combined = device.profile_projection("moe.combine", || {
+                device.expert_combine(
+                    &expert_output,
+                    &metadata_tensor,
+                    count,
+                    self.hidden_size,
+                    self.top_k,
+                )
+            })?;
+            total_stats.combine_dispatch += combine_start.elapsed();
+
+            if chunks == 1 {
+                let mut accumulated = self.stats.get();
+                accumulated.merge(total_stats);
+                self.stats.set(accumulated);
+                return Ok(combined);
+            }
+            device.synchronize()?;
+            all_outputs.extend(combined.to_f32());
+        }
+        let mut accumulated = self.stats.get();
+        accumulated.merge(total_stats);
+        self.stats.set(accumulated);
+        Tensor::from_f32(
+            device,
+            [dims[0], self.hidden_size],
+            hidden.dtype(),
+            &all_outputs,
+        )
+    }
+
+    fn select_routes(&self, logits: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        if tokens.checked_mul(self.expert_count) != Some(logits.len())
+            || logits.iter().any(|value| !value.is_finite())
+        {
+            return Err(Error::Validation("router produced invalid logits".into()));
+        }
+        let capacity = tokens
+            .checked_mul(self.top_k)
+            .and_then(|value| value.checked_mul(3))
+            .ok_or_else(|| Error::Shape("expert routing metadata overflow".into()))?;
+        let mut metadata = Vec::with_capacity(capacity);
+        for token in 0..tokens {
+            let row = &logits[token * self.expert_count..(token + 1) * self.expert_count];
+            let mut order: Vec<usize> = (0..self.expert_count).collect();
+            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then_with(|| a.cmp(&b)));
+            order.truncate(self.top_k);
+            let maximum = order
+                .iter()
+                .map(|&expert| row[expert])
+                .fold(f32::NEG_INFINITY, f32::max);
+            let mut selected: Vec<_> = order
+                .into_iter()
+                .map(|expert| (expert, (row[expert] - maximum).exp()))
+                .collect();
+            let normalizer: f32 = selected.iter().map(|(_, weight)| weight).sum();
+            for (_, weight) in &mut selected {
+                *weight /= normalizer;
+            }
+            // Grouped expert execution uses the reference's expert-ID ordering
+            // when combining the selected contributions for each token.
+            selected.sort_by_key(|(expert, _)| *expert);
+            for (expert, weight) in selected {
+                let expert_id = u32::try_from(expert)
+                    .map_err(|_| Error::Shape("expert ID exceeds routing index range".into()))?;
+                let token_id = u32::try_from(token)
+                    .map_err(|_| Error::Shape("token ID exceeds routing index range".into()))?;
+                metadata.extend([f32::from_bits(expert_id), f32::from_bits(token_id), weight]);
+            }
+        }
+        Ok(metadata)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ROUTING_TEMPORARY_LIMIT, SparseMoe};
+    use crate::{DType, MetalDevice, Tensor};
+
+    #[test]
+    fn grouped_experts_preserve_long_token_indices_and_match_cpu() {
+        let device = MetalDevice::new().unwrap();
+        let experts = 3;
+        let hidden = 3;
+        let intermediate = 2;
+        let tokens = 300;
+        let top_k = 2;
+
+        let router_weights = vec![
+            1., 0., 0., // Expert 0 ranks first for positive x[0].
+            0.5, 0., 0., // Expert 1 ranks second.
+            -1., 0., 0., // Expert 2 is not selected.
+        ];
+        let mut input_weights = vec![0.; experts * 2 * intermediate * hidden];
+        let mut set_input = |expert: usize, row: usize, values: [f32; 3]| {
+            let start = (expert * 2 * intermediate + row) * hidden;
+            input_weights[start..start + hidden].copy_from_slice(&values);
+        };
+        set_input(0, 0, [1., 0., 0.]);
+        set_input(0, 1, [0., 1., 0.]);
+        set_input(0, 2, [1., 0., 0.]);
+        set_input(0, 3, [0., 1., 0.]);
+        set_input(1, 0, [1., 1., 0.]);
+        set_input(1, 1, [0.5, -1., 0.]);
+        set_input(1, 2, [0., 0., 1.]);
+        set_input(1, 3, [0., 1., 0.]);
+
+        let mut output_weights = vec![0.; experts * hidden * intermediate];
+        let mut set_output = |expert: usize, row: usize, values: [f32; 2]| {
+            let start = (expert * hidden + row) * intermediate;
+            output_weights[start..start + intermediate].copy_from_slice(&values);
+        };
+        set_output(0, 0, [1., 0.]);
+        set_output(0, 1, [0., 1.]);
+        set_output(0, 2, [0.5, 0.5]);
+        set_output(1, 0, [0., 1.]);
+        set_output(1, 1, [1., 0.]);
+        set_output(1, 2, [0.25, 0.5]);
+
+        let router =
+            Tensor::from_f32(&device, [experts, hidden], DType::F32, &router_weights).unwrap();
+        let input_experts = Tensor::from_f32(
+            &device,
+            [experts, 2 * intermediate, hidden],
+            DType::F32,
+            &input_weights,
+        )
+        .unwrap();
+        let output_experts = Tensor::from_f32(
+            &device,
+            [experts, hidden, intermediate],
+            DType::F32,
+            &output_weights,
+        )
+        .unwrap();
+        let moe = SparseMoe::new(&device, router, input_experts, output_experts, top_k).unwrap();
+
+        let mut input_values = Vec::with_capacity(tokens * hidden);
+        for token in 0..tokens {
+            input_values.extend([token as f32 + 1., 1., 2.]);
+        }
+        let input = Tensor::from_f32(&device, [tokens, hidden], DType::F32, &input_values).unwrap();
+        let actual = moe.forward(&device, &input).unwrap().to_f32();
+
+        let mut expected = Vec::with_capacity(tokens * hidden);
+        for token in 0..tokens {
+            let x = [token as f32 + 1., 1., 2.];
+            let mut logits: Vec<_> = (0..experts)
+                .map(|expert| {
+                    let row = &router_weights[expert * hidden..(expert + 1) * hidden];
+                    (expert, row.iter().zip(x).map(|(a, b)| a * b).sum::<f32>())
+                })
+                .collect();
+            logits.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            logits.truncate(top_k);
+            let max = logits[0].1;
+            let mut gates: Vec<_> = logits
+                .iter()
+                .map(|(_, value)| (value - max).exp())
+                .collect();
+            let denominator: f32 = gates.iter().sum();
+            for gate in &mut gates {
+                *gate /= denominator;
+            }
+            let mut y = [0.; 3];
+            for ((expert, _), gate) in logits.iter().zip(gates) {
+                let base = expert * 2 * intermediate * hidden;
+                let projected: Vec<f32> = (0..2 * intermediate)
+                    .map(|row| {
+                        input_weights[base + row * hidden..base + (row + 1) * hidden]
+                            .iter()
+                            .zip(x)
+                            .map(|(a, b)| a * b)
+                            .sum()
+                    })
+                    .collect();
+                let activation: Vec<f32> = (0..intermediate)
+                    .map(|j| {
+                        let value = projected[j];
+                        (value / (1. + (-value).exp())) * projected[intermediate + j]
+                    })
+                    .collect();
+                for (row, total) in y.iter_mut().enumerate() {
+                    let start = (expert * hidden + row) * intermediate;
+                    let value = output_weights[start..start + intermediate]
+                        .iter()
+                        .zip(&activation)
+                        .map(|(a, b)| a * b)
+                        .sum::<f32>();
+                    *total += gate * value;
+                }
+            }
+            expected.extend(y);
+        }
+
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            let tolerance = expected.abs().max(1.) * 2e-5;
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "element {index}: {actual} vs {expected}, tolerance {tolerance}"
+            );
+        }
+        let stats = moe.take_stats();
+        assert_eq!(stats.assignments, tokens * top_k);
+        assert_eq!(stats.active_experts, 2);
+        assert!(stats.peak_temporary_bytes < ROUTING_TEMPORARY_LIMIT);
+    }
+}

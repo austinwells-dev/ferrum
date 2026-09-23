@@ -37,7 +37,7 @@ impl DecoderLayer {
                 let residual = d.add(x, &attn)?.tensor;
                 let norm = self.post_norm.forward(d, &residual)?;
                 record(&mut trace, format!("layer.{layer}.post_norm"), &norm);
-                let mlp = self.mlp.forward(d, &norm)?;
+                let mlp = self.feed_forward.forward(d, &norm)?;
                 record(&mut trace, format!("layer.{layer}.mlp"), &mlp);
                 let mlp = if policy.residual_multiplier == 1. {
                     mlp
@@ -53,7 +53,7 @@ impl DecoderLayer {
                 let attn = self.input_norm.forward(d, &attn)?;
                 record(&mut trace, format!("layer.{layer}.norm"), &attn);
                 let residual = d.add(x, &attn)?.tensor;
-                let mlp = self.mlp.forward(d, &residual)?;
+                let mlp = self.feed_forward.forward(d, &residual)?;
                 let mlp = self.post_norm.forward(d, &mlp)?;
                 record(&mut trace, format!("layer.{layer}.mlp"), &mlp);
                 d.add(&residual, &mlp)?.tensor
@@ -138,12 +138,10 @@ impl Transformer {
                 &layer.attention.k,
                 &layer.attention.v,
                 &layer.attention.output,
-                &layer.mlp.gate,
-                &layer.mlp.up,
-                &layer.mlp.down,
             ] {
                 weight_bytes += linear.weight_bytes();
             }
+            weight_bytes += layer.feed_forward.weight_bytes();
         }
 
         Ok(Self {
@@ -164,6 +162,24 @@ impl Transformer {
     }
     pub fn weight_bytes(&self) -> usize {
         self.weight_bytes
+    }
+    pub fn take_moe_stats(&self) -> crate::nn::moe::MoeStats {
+        self.layers
+            .iter()
+            .fold(Default::default(), |mut total, layer| {
+                if let Some(stats) = layer.feed_forward.take_moe_stats() {
+                    total.router_projection_enqueue += stats.router_projection_enqueue;
+                    total.routing += stats.routing;
+                    total.routing_boundary_wait += stats.routing_boundary_wait;
+                    total.expert_dispatch += stats.expert_dispatch;
+                    total.combine_dispatch += stats.combine_dispatch;
+                    total.active_experts += stats.active_experts;
+                    total.assignments += stats.assignments;
+                    total.peak_temporary_bytes =
+                        total.peak_temporary_bytes.max(stats.peak_temporary_bytes);
+                }
+                total
+            })
     }
     pub fn new_cache(&self) -> Result<KvCache> {
         let c = &self.config;
