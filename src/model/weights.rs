@@ -224,7 +224,13 @@ pub(crate) fn construct_mixed(
             ModelWeight::Quantized(tensor) => {
                 if !matches!(
                     tensor.format(),
-                    QuantizationFormat::Q4_0 | QuantizationFormat::Q8_0 | QuantizationFormat::Q6_K
+                    QuantizationFormat::Q4_0
+                        | QuantizationFormat::Q5_0
+                        | QuantizationFormat::Q5_1
+                        | QuantizationFormat::Q4_K
+                        | QuantizationFormat::Q5_K
+                        | QuantizationFormat::Q8_0
+                        | QuantizationFormat::Q6_K
                 ) {
                     return Err(Error::Weight {
                         name,

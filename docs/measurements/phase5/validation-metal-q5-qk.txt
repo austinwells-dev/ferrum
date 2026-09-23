@@ -1,0 +1,25 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 4 tests
+2026-09-23 17:21:33.290 ferrum-508026e7fa9bdb9b[93385:5599916] Metal API Validation Enabled
+2026-09-23 17:21:33.290 ferrum-508026e7fa9bdb9b[93385:5599916] Metal GPU Validation Enabled
+test ops::transformer::q5_tests::q5_0_and_q5_1_reject_partial_blocks ... ok
+test ops::transformer::q5_tests::q5_0_and_q5_1_embedding_gather_decode_selected_rows ... ok
+test ops::transformer::q5_tests::q5_0_and_q5_1_gemv_and_gemm_cover_output_and_batch_tails ... ok
+test ops::transformer::q5_tests::q5_0_and_q5_1_mpp_gemm_cover_batch_and_output_tails ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.22s
+
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 4 tests
+2026-09-23 17:21:35.962 ferrum-508026e7fa9bdb9b[93395:5599999] Metal API Validation Enabled
+2026-09-23 17:21:35.963 ferrum-508026e7fa9bdb9b[93395:5599999] Metal GPU Validation Enabled
+test ops::transformer::qk_tests::q4_k_and_q5_k_reject_partial_superblocks ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_embedding_gather_decodes_selected_rows ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_gemv_gemm_cover_blocks_and_batch_tails ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_mpp_gemm_cover_row_output_and_group_tails ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 42 filtered out; finished in 0.58s

@@ -441,12 +441,13 @@ impl MetalDevice {
     ) {
         let name = if self.lm_head_profile.get() {
             match name {
-                "gemv" | "gemv_vector" | "gemv_wide" | "q4_0_gemv" | "q6_k_gemv" | "q8_0_gemv" => {
-                    "lm_head_gemv"
-                }
+                "gemv" | "gemv_vector" | "gemv_wide" | "q4_0_gemv" | "q5_0_gemv" | "q5_1_gemv"
+                | "q4_k_gemv" | "q5_k_gemv" | "q6_k_gemv" | "q8_0_gemv" => "lm_head_gemv",
                 "project_bf16" | "project_f16" | "project_wide_bf16" | "project_wide_f16"
-                | "project_mpp" | "q4_0_gemm_mpp" | "q6_k_gemm_mpp" | "q8_0_gemm_mpp"
-                | "matmul_nt" | "q4_0_gemm" | "q6_k_gemm" | "q8_0_gemm" => "lm_head_matmul",
+                | "project_mpp" | "q4_0_gemm_mpp" | "q5_0_gemm_mpp" | "q5_1_gemm_mpp"
+                | "q4_k_gemm_mpp" | "q5_k_gemm_mpp" | "q6_k_gemm_mpp" | "q8_0_gemm_mpp"
+                | "matmul_nt" | "q4_0_gemm" | "q5_0_gemm" | "q5_1_gemm" | "q4_k_gemm"
+                | "q5_k_gemm" | "q6_k_gemm" | "q8_0_gemm" => "lm_head_matmul",
                 _ => name,
             }
         } else {
@@ -628,6 +629,10 @@ impl MetalDevice {
             name,
             "project_mpp"
                 | "q4_0_gemm_mpp"
+                | "q5_0_gemm_mpp"
+                | "q5_1_gemm_mpp"
+                | "q4_k_gemm_mpp"
+                | "q5_k_gemm_mpp"
                 | "q6_k_gemm_mpp"
                 | "q8_0_gemm_mpp"
                 | "attention_scores_mpp"
@@ -705,13 +710,25 @@ impl MetalDevice {
                 | "project_wide_f16"
                 | "project_mpp"
                 | "q4_0_gemm_mpp"
+                | "q5_0_gemm_mpp"
+                | "q5_1_gemm_mpp"
+                | "q4_k_gemm_mpp"
+                | "q5_k_gemm_mpp"
                 | "q6_k_gemm_mpp"
                 | "q8_0_gemm_mpp"
                 | "attention_scores_mpp"
                 | "attention_context_mpp"
                 | "q8_0_gemv"
                 | "q4_0_gemv"
+                | "q5_0_gemv"
+                | "q5_1_gemv"
+                | "q4_k_gemv"
+                | "q5_k_gemv"
                 | "q4_0_gemm"
+                | "q5_0_gemm"
+                | "q5_1_gemm"
+                | "q4_k_gemm"
+                | "q5_k_gemm"
                 | "q6_k_gemv"
                 | "q6_k_gemm"
                 | "q8_0_gemm"
@@ -764,6 +781,10 @@ impl MetalDevice {
                 name,
                 "project_mpp"
                     | "q4_0_gemm_mpp"
+                    | "q5_0_gemm_mpp"
+                    | "q5_1_gemm_mpp"
+                    | "q4_k_gemm_mpp"
+                    | "q5_k_gemm_mpp"
                     | "q6_k_gemm_mpp"
                     | "q8_0_gemm_mpp"
                     | "attention_scores_mpp"
@@ -778,7 +799,14 @@ impl MetalDevice {
                         height: grid[1].div_ceil(64),
                         depth: if matches!(
                             name,
-                            "project_mpp" | "q4_0_gemm_mpp" | "q6_k_gemm_mpp" | "q8_0_gemm_mpp"
+                            "project_mpp"
+                                | "q4_0_gemm_mpp"
+                                | "q5_0_gemm_mpp"
+                                | "q5_1_gemm_mpp"
+                                | "q4_k_gemm_mpp"
+                                | "q5_k_gemm_mpp"
+                                | "q6_k_gemm_mpp"
+                                | "q8_0_gemm_mpp"
                         ) {
                             1
                         } else {
@@ -874,7 +902,16 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if matches!(name, "q4_0_gemv" | "q6_k_gemv" | "q8_0_gemv") {
+            } else if matches!(
+                name,
+                "q4_0_gemv"
+                    | "q5_0_gemv"
+                    | "q5_1_gemv"
+                    | "q4_k_gemv"
+                    | "q5_k_gemv"
+                    | "q6_k_gemv"
+                    | "q8_0_gemv"
+            ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
                     return Err(Error::Dispatch(
@@ -893,7 +930,16 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if matches!(name, "q4_0_gemm" | "q6_k_gemm" | "q8_0_gemm") {
+            } else if matches!(
+                name,
+                "q4_0_gemm"
+                    | "q5_0_gemm"
+                    | "q5_1_gemm"
+                    | "q4_k_gemm"
+                    | "q5_k_gemm"
+                    | "q6_k_gemm"
+                    | "q8_0_gemm"
+            ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
                     return Err(Error::Dispatch(

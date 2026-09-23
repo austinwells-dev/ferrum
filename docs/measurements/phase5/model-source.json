@@ -18,7 +18,11 @@
       "file": "qwen2.5-0.5b-instruct-q4_0.gguf",
       "bytes": 428730208,
       "sha256": "7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed",
-      "ggml_types": ["F32", "Q4_0", "Q8_0"]
+      "ggml_types": [
+        "F32",
+        "Q4_0",
+        "Q8_0"
+      ]
     },
     {
       "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
@@ -26,7 +30,39 @@
       "file": "qwen2.5-0.5b-instruct-q6_k.gguf",
       "bytes": 650379104,
       "sha256": "2f82233630c349ccf6b8daccf48f9a7865713d9f08a2eadfa456cebe9b97c7f5",
-      "ggml_types": ["F32", "Q6_K", "Q8_0"]
+      "ggml_types": [
+        "F32",
+        "Q6_K",
+        "Q8_0"
+      ]
+    },
+    {
+      "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+      "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      "bytes": 491400032,
+      "sha256": "74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db",
+      "ggml_types": [
+        "F32",
+        "Q5_0",
+        "Q8_0",
+        "Q4_K",
+        "Q6_K"
+      ]
+    },
+    {
+      "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+      "file": "qwen2.5-0.5b-instruct-q5_k_m.gguf",
+      "bytes": 522186592,
+      "sha256": "041474553fcabfc2a2d67903f9d2c2e50bd92528e670da4f33b5d0ce6e59fd55",
+      "ggml_types": [
+        "F32",
+        "Q5_1",
+        "Q8_0",
+        "Q5_K",
+        "Q6_K"
+      ]
     }
   ]
 }

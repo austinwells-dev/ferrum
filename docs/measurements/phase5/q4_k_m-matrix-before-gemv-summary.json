@@ -1,0 +1,2437 @@
+{
+  "source": "docs/measurements/phase5/q4_k_m-matrix-before-gemv.jsonl.gz",
+  "quantized_model": "qwen2.5-0.5b-instruct-q4_k_m",
+  "rows": 36,
+  "workloads": {
+    "short": {
+      "models": {
+        "bf16": {
+          "generation_ms": 203.2205,
+          "generation_tps": 83.65297792299498,
+          "post_first_token_tps": 93.91428120723873,
+          "prefill_ms": 32.010875,
+          "prefill_tps": 656.027053306103,
+          "first_token_ms": 32.310542,
+          "decode_median_ms": 10.41825,
+          "decode_tps": 95.98541021764692,
+          "decode_aggregate_tps": 95.99642413320105,
+          "sampling_ms": 4.046459,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 31.10425,
+            "encode_ms_mean": 0.20609866666666668,
+            "wait_ms_mean": 31.39280533333333,
+            "allocation_time_ms_mean": 0.35659466666666667,
+            "allocations_mean": 49,
+            "allocated_bytes_mean": 3145812,
+            "reused_bytes_mean": 37027840,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 37027840,
+            "arena_capacity_bytes_max": 38094848
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 9.704708291666666,
+            "encode_ms_mean": 0.1797205625,
+            "wait_ms_mean": 9.947238770833334,
+            "allocation_time_ms_mean": 0.003602375,
+            "allocations_mean": 1,
+            "allocated_bytes_mean": 4,
+            "reused_bytes_mean": 2282496,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 2328576,
+            "arena_capacity_bytes_max": 38094848
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 9437184.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.081624,
+              "allocation_ms": 0.013124,
+              "submission_ms": 0.053040000000000004,
+              "synchronized_ms": 0.053040000000000004,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 4718592.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.043495,
+              "allocation_ms": 0.007838999999999999,
+              "submission_ms": 0.027715000000000004,
+              "synchronized_ms": 0.027715000000000004,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 1179648.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.041167999999999996,
+              "allocation_ms": 0.006128,
+              "submission_ms": 0.026417999999999997,
+              "synchronized_ms": 0.026417999999999997,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 1179648.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.036332,
+              "allocation_ms": 0.00492,
+              "submission_ms": 0.023873000000000002,
+              "synchronized_ms": 0.023873000000000002,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 5898240.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.117872,
+              "allocation_ms": 0.017087,
+              "submission_ms": 0.078747,
+              "synchronized_ms": 0.078747,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather": {
+              "calls": 3.0,
+              "allocation_bytes": 196608.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.014833,
+              "allocation_ms": 0.00041600000000000003,
+              "submission_ms": 0.01275,
+              "synchronized_ms": 0.01275,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.079131,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.067331,
+              "synchronized_ms": 0.067331,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.0027500000000000003,
+              "allocation_ms": 0.000168,
+              "submission_ms": 0.002125,
+              "synchronized_ms": 0.002125,
+              "gpu_ms": 0.0
+            },
+            "project_bf16": {
+              "calls": 504.0,
+              "allocation_bytes": 53084160.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.280136,
+              "allocation_ms": 0.040258,
+              "submission_ms": 0.185465,
+              "synchronized_ms": 0.185465,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 9633792.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.088545,
+              "allocation_ms": 0.013086,
+              "submission_ms": 0.05763,
+              "synchronized_ms": 0.05763,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 5308416.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.084166,
+              "allocation_ms": 0.012249,
+              "submission_ms": 0.056581,
+              "synchronized_ms": 0.056581,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 18874368.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.038997000000000004,
+              "allocation_ms": 0.004742,
+              "submission_ms": 0.026621,
+              "synchronized_ms": 0.026621,
+              "gpu_ms": 0.0
+            }
+          }
+        },
+        "qwen2.5-0.5b-instruct-q4_k_m": {
+          "generation_ms": 200.64220799999998,
+          "generation_tps": 84.72793521092034,
+          "post_first_token_tps": 93.59929526282619,
+          "prefill_ms": 29.324666999999998,
+          "prefill_tps": 716.1206638765924,
+          "first_token_ms": 29.658334,
+          "decode_median_ms": 10.435167,
+          "decode_tps": 95.82980320295785,
+          "decode_aggregate_tps": 95.7643476898934,
+          "sampling_ms": 3.996249,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 28.300527666666667,
+            "encode_ms_mean": 0.20269833333333334,
+            "wait_ms_mean": 28.579986,
+            "allocation_time_ms_mean": 0.334735,
+            "allocations_mean": 49,
+            "allocated_bytes_mean": 3145812,
+            "reused_bytes_mean": 37027840,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 37027840,
+            "arena_capacity_bytes_max": 38094848
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 9.765706604166667,
+            "encode_ms_mean": 0.1759734375,
+            "wait_ms_mean": 10.007427958333333,
+            "allocation_time_ms_mean": 0.0035971875,
+            "allocations_mean": 1,
+            "allocated_bytes_mean": 4,
+            "reused_bytes_mean": 2282496,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 2328576,
+            "arena_capacity_bytes_max": 38094848
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 9437184.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.078793,
+              "allocation_ms": 0.012497,
+              "submission_ms": 0.051296,
+              "synchronized_ms": 0.051296,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 4718592.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.04199700000000001,
+              "allocation_ms": 0.0077,
+              "submission_ms": 0.026045,
+              "synchronized_ms": 0.026045,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 1179648.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.039372,
+              "allocation_ms": 0.006377,
+              "submission_ms": 0.025544999999999998,
+              "synchronized_ms": 0.025544999999999998,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 1179648.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.035668,
+              "allocation_ms": 0.0050019999999999995,
+              "submission_ms": 0.023589,
+              "synchronized_ms": 0.023589,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 5898240.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.12062200000000001,
+              "allocation_ms": 0.017292,
+              "submission_ms": 0.079626,
+              "synchronized_ms": 0.079626,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather_q5_0": {
+              "calls": 3.0,
+              "allocation_bytes": 196608.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.013626,
+              "allocation_ms": 0.000333,
+              "submission_ms": 0.011916999999999999,
+              "synchronized_ms": 0.011916999999999999,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.078951,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.066509,
+              "synchronized_ms": 0.066509,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.002666,
+              "allocation_ms": 0.00020899999999999998,
+              "submission_ms": 0.0018340000000000001,
+              "synchronized_ms": 0.0018340000000000001,
+              "gpu_ms": 0.0
+            },
+            "q4_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 2359296.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.021705000000000002,
+              "allocation_ms": 0.003415,
+              "submission_ms": 0.013958,
+              "synchronized_ms": 0.013958,
+              "gpu_ms": 0.0
+            },
+            "q5_0_gemm_mpp": {
+              "calls": 396.0,
+              "allocation_bytes": 48070656.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.223254,
+              "allocation_ms": 0.031545,
+              "submission_ms": 0.148179,
+              "synchronized_ms": 0.148179,
+              "gpu_ms": 0.0
+            },
+            "q6_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 2359296.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.022578,
+              "allocation_ms": 0.0030819999999999997,
+              "submission_ms": 0.015046,
+              "synchronized_ms": 0.015046,
+              "gpu_ms": 0.0
+            },
+            "q8_0_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 294912.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.020628,
+              "allocation_ms": 0.00258,
+              "submission_ms": 0.013454,
+              "synchronized_ms": 0.013454,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 9633792.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.08612700000000001,
+              "allocation_ms": 0.012925000000000002,
+              "submission_ms": 0.056248000000000006,
+              "synchronized_ms": 0.056248000000000006,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 5308416.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.075376,
+              "allocation_ms": 0.011966000000000001,
+              "submission_ms": 0.04909,
+              "synchronized_ms": 0.04909,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 18874368.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.038377,
+              "allocation_ms": 0.0048389999999999996,
+              "submission_ms": 0.025759,
+              "synchronized_ms": 0.025759,
+              "gpu_ms": 0.0
+            }
+          }
+        }
+      },
+      "paired_comparison": {
+        "pairs": [
+          {
+            "pair": 0,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": 9.009763009414584,
+            "cached_decode_tps_delta_percent": -0.2281277993430919,
+            "generation_tps_delta_percent": 1.1584967267517676,
+            "first_token_ms_delta_percent": -8.083084047121492,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 1,
+            "order": [
+              1,
+              0
+            ],
+            "prefill_tps_delta_percent": 9.326139066288075,
+            "cached_decode_tps_delta_percent": -0.5677915839775283,
+            "generation_tps_delta_percent": 0.48616695286214373,
+            "first_token_ms_delta_percent": -8.444742276375305,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 2,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": 10.718588835361253,
+            "cached_decode_tps_delta_percent": -0.011996736887565085,
+            "generation_tps_delta_percent": 1.285019750181382,
+            "first_token_ms_delta_percent": -9.593294244327844,
+            "generated_id_mismatches": 0
+          }
+        ],
+        "median_prefill_tps_delta_percent": 9.326139066288075,
+        "median_cached_decode_tps_delta_percent": -0.2281277993430919,
+        "median_generation_tps_delta_percent": 1.1584967267517676,
+        "median_first_token_ms_delta_percent": -8.444742276375305,
+        "exact_generated_id_pairs": 3
+      }
+    },
+    "128": {
+      "models": {
+        "bf16": {
+          "generation_ms": 188.79808300000002,
+          "generation_tps": 90.0432871450289,
+          "post_first_token_tps": 95.18990987907182,
+          "prefill_ms": 20.753708999999997,
+          "prefill_tps": 6167.572263830047,
+          "first_token_ms": 21.077459,
+          "decode_median_ms": 10.205959,
+          "decode_tps": 97.98197308062868,
+          "decode_aggregate_tps": 97.44075866790054,
+          "sampling_ms": 3.9983329999999997,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 19.559833333333334,
+            "encode_ms_mean": 0.203592,
+            "wait_ms_mean": 19.850902666666666,
+            "allocation_time_ms_mean": 0.41860966666666666,
+            "allocations_mean": 49,
+            "allocated_bytes_mean": 3146240,
+            "reused_bytes_mean": 244056064,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 244056064,
+            "arena_capacity_bytes_max": 262948864
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 9.488079875,
+            "encode_ms_mean": 0.178053,
+            "wait_ms_mean": 9.731197041666666,
+            "allocation_time_ms_mean": 0.003504375,
+            "allocations_mean": 1,
+            "allocated_bytes_mean": 4,
+            "reused_bytes_mean": 2426880,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 2426880,
+            "arena_capacity_bytes_max": 262948864
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.079537,
+              "allocation_ms": 0.012336,
+              "submission_ms": 0.051043,
+              "synchronized_ms": 0.051043,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 18874368.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.041703000000000004,
+              "allocation_ms": 0.007289,
+              "submission_ms": 0.025583,
+              "synchronized_ms": 0.025583,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.043996,
+              "allocation_ms": 0.006082000000000001,
+              "submission_ms": 0.029628,
+              "synchronized_ms": 0.029628,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.038870999999999996,
+              "allocation_ms": 0.004834,
+              "submission_ms": 0.025294,
+              "synchronized_ms": 0.025294,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 23592960.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.118955,
+              "allocation_ms": 0.01721,
+              "submission_ms": 0.080209,
+              "synchronized_ms": 0.080209,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather": {
+              "calls": 3.0,
+              "allocation_bytes": 786432.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.012583,
+              "allocation_ms": 0.000375,
+              "submission_ms": 0.011208000000000001,
+              "synchronized_ms": 0.011208000000000001,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.078248,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.066079,
+              "synchronized_ms": 0.066079,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.002959,
+              "allocation_ms": 0.00025,
+              "submission_ms": 0.002083,
+              "synchronized_ms": 0.002083,
+              "gpu_ms": 0.0
+            },
+            "project_mpp": {
+              "calls": 504.0,
+              "allocation_bytes": 363331584.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.281889,
+              "allocation_ms": 0.040317,
+              "submission_ms": 0.186535,
+              "synchronized_ms": 0.186535,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 38535168.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.085169,
+              "allocation_ms": 0.013042999999999999,
+              "submission_ms": 0.055622000000000005,
+              "synchronized_ms": 0.055622000000000005,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 21233664.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.07663600000000001,
+              "allocation_ms": 0.01213,
+              "submission_ms": 0.049617999999999995,
+              "synchronized_ms": 0.049617999999999995,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 150994944.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.040792,
+              "allocation_ms": 0.005043,
+              "submission_ms": 0.027874,
+              "synchronized_ms": 0.027874,
+              "gpu_ms": 0.0
+            }
+          }
+        },
+        "qwen2.5-0.5b-instruct-q4_k_m": {
+          "generation_ms": 207.10575,
+          "generation_tps": 82.08366981602394,
+          "post_first_token_tps": 94.42185650696302,
+          "prefill_ms": 37.511750000000006,
+          "prefill_tps": 3412.264157230734,
+          "first_token_ms": 37.855790999999996,
+          "decode_median_ms": 10.267916,
+          "decode_tps": 97.390746087132,
+          "decode_aggregate_tps": 96.64797635748877,
+          "sampling_ms": 4.0229159999999995,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 36.475361,
+            "encode_ms_mean": 0.21176633333333333,
+            "wait_ms_mean": 36.76450033333333,
+            "allocation_time_ms_mean": 0.3640683333333333,
+            "allocations_mean": 49,
+            "allocated_bytes_mean": 3146240,
+            "reused_bytes_mean": 244056064,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 244056064,
+            "arena_capacity_bytes_max": 262948864
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 9.536526895833333,
+            "encode_ms_mean": 0.17733833333333332,
+            "wait_ms_mean": 9.766882020833334,
+            "allocation_time_ms_mean": 0.0035711458333333333,
+            "allocations_mean": 1,
+            "allocated_bytes_mean": 4,
+            "reused_bytes_mean": 2426880,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 2426880,
+            "arena_capacity_bytes_max": 262948864
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.078828,
+              "allocation_ms": 0.012292999999999998,
+              "submission_ms": 0.051295999999999994,
+              "synchronized_ms": 0.051295999999999994,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 18874368.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.042876,
+              "allocation_ms": 0.007660999999999999,
+              "submission_ms": 0.026747,
+              "synchronized_ms": 0.026747,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.045749,
+              "allocation_ms": 0.006624,
+              "submission_ms": 0.030753000000000003,
+              "synchronized_ms": 0.030753000000000003,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.039330000000000004,
+              "allocation_ms": 0.005124,
+              "submission_ms": 0.026124,
+              "synchronized_ms": 0.026124,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 23592960.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.12204200000000001,
+              "allocation_ms": 0.016254,
+              "submission_ms": 0.081555,
+              "synchronized_ms": 0.081555,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather_q5_0": {
+              "calls": 3.0,
+              "allocation_bytes": 786432.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.013374,
+              "allocation_ms": 0.00020899999999999998,
+              "submission_ms": 0.011917,
+              "synchronized_ms": 0.011917,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.08162900000000001,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.06883800000000001,
+              "synchronized_ms": 0.06883800000000001,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.002583,
+              "allocation_ms": 0.000291,
+              "submission_ms": 0.0017490000000000001,
+              "synchronized_ms": 0.0017490000000000001,
+              "gpu_ms": 0.0
+            },
+            "q4_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 9437184.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.021253,
+              "allocation_ms": 0.0035399999999999997,
+              "submission_ms": 0.013454,
+              "synchronized_ms": 0.013454,
+              "gpu_ms": 0.0
+            },
+            "q5_0_gemm_mpp": {
+              "calls": 396.0,
+              "allocation_bytes": 343277568.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.23600100000000002,
+              "allocation_ms": 0.032289,
+              "submission_ms": 0.160545,
+              "synchronized_ms": 0.160545,
+              "gpu_ms": 0.0
+            },
+            "q6_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 9437184.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.022164,
+              "allocation_ms": 0.003208,
+              "submission_ms": 0.014873,
+              "synchronized_ms": 0.014873,
+              "gpu_ms": 0.0
+            },
+            "q8_0_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 1179648.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.020836,
+              "allocation_ms": 0.0025399999999999997,
+              "submission_ms": 0.013787999999999998,
+              "synchronized_ms": 0.013787999999999998,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 38535168.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.084375,
+              "allocation_ms": 0.012573,
+              "submission_ms": 0.055283,
+              "synchronized_ms": 0.055283,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 21233664.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.077461,
+              "allocation_ms": 0.012211999999999999,
+              "submission_ms": 0.050710000000000005,
+              "synchronized_ms": 0.050710000000000005,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 150994944.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.040333999999999995,
+              "allocation_ms": 0.004959,
+              "submission_ms": 0.027666999999999997,
+              "synchronized_ms": 0.027666999999999997,
+              "gpu_ms": 0.0
+            }
+          }
+        }
+      },
+      "paired_comparison": {
+        "pairs": [
+          {
+            "pair": 0,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": -45.40486486366344,
+            "cached_decode_tps_delta_percent": -1.9046868429589248,
+            "generation_tps_delta_percent": -8.839767606645388,
+            "first_token_ms_delta_percent": 81.78623795511244,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 1,
+            "order": [
+              1,
+              0
+            ],
+            "prefill_tps_delta_percent": -45.136527078665225,
+            "cached_decode_tps_delta_percent": -1.5018334781858322,
+            "generation_tps_delta_percent": -10.74378225761321,
+            "first_token_ms_delta_percent": 80.97058094146925,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 2,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": -44.28367911387766,
+            "cached_decode_tps_delta_percent": 4.32819680251797,
+            "generation_tps_delta_percent": -5.797835350565506,
+            "first_token_ms_delta_percent": 78.33652036562388,
+            "generated_id_mismatches": 0
+          }
+        ],
+        "median_prefill_tps_delta_percent": -45.136527078665225,
+        "median_cached_decode_tps_delta_percent": -1.5018334781858322,
+        "median_generation_tps_delta_percent": -8.839767606645388,
+        "median_first_token_ms_delta_percent": 80.97058094146925,
+        "exact_generated_id_pairs": 3
+      }
+    },
+    "512": {
+      "models": {
+        "bf16": {
+          "generation_ms": 241.4895,
+          "generation_tps": 70.39643545578586,
+          "post_first_token_tps": 89.17818142312247,
+          "prefill_ms": 61.609041000000005,
+          "prefill_tps": 8310.468588530699,
+          "first_token_ms": 61.930875,
+          "decode_median_ms": 10.900542,
+          "decode_tps": 91.73855758731997,
+          "decode_aggregate_tps": 91.14550058698272,
+          "sampling_ms": 3.9989580000000005,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 57.52411133333334,
+            "encode_ms_mean": 0.30371000000000004,
+            "wait_ms_mean": 58.803708666666665,
+            "allocation_time_ms_mean": 1.326749,
+            "allocations_mean": 58,
+            "allocated_bytes_mean": 18876416,
+            "reused_bytes_mean": 1264058368,
+            "command_buffers_mean": 5,
+            "completion_waits_mean": 5,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 268042240,
+            "arena_capacity_bytes_max": 260571136
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 10.198921854166667,
+            "encode_ms_mean": 0.18396297916666668,
+            "wait_ms_mean": 10.46460075,
+            "allocation_time_ms_mean": 0.09031604166666667,
+            "allocations_mean": 17.0625,
+            "allocated_bytes_mean": 920708,
+            "reused_bytes_mean": 2882432,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 534,
+            "transient_peak_bytes_max": 3016704,
+            "arena_capacity_bytes_max": 262719488
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 150994944.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.576414,
+              "allocation_ms": 0.49174799999999996,
+              "submission_ms": 0.06612,
+              "synchronized_ms": 0.06612,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 75497472.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.055793999999999996,
+              "allocation_ms": 0.007376000000000001,
+              "submission_ms": 0.037585,
+              "synchronized_ms": 0.037585,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 603979776.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.179747,
+              "allocation_ms": 70.784165,
+              "submission_ms": 0.09437899999999999,
+              "synchronized_ms": 0.09437899999999999,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 603979776.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.059962,
+              "allocation_ms": 0.006496999999999999,
+              "submission_ms": 0.043379,
+              "synchronized_ms": 0.043379,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 94371840.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.342576,
+              "allocation_ms": 0.21779800000000002,
+              "submission_ms": 0.09725699999999998,
+              "synchronized_ms": 0.09725699999999998,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather": {
+              "calls": 3.0,
+              "allocation_bytes": 3145728.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.014124999999999999,
+              "allocation_ms": 0.00045799999999999997,
+              "submission_ms": 0.0125,
+              "synchronized_ms": 0.0125,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.092592,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.079085,
+              "synchronized_ms": 0.079085,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.112458,
+              "allocation_ms": 0.109208,
+              "submission_ms": 0.0027089999999999996,
+              "synchronized_ms": 0.0027089999999999996,
+              "gpu_ms": 0.0
+            },
+            "project_mpp": {
+              "calls": 504.0,
+              "allocation_bytes": 1453326336.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.813839,
+              "allocation_ms": 35.940335000000005,
+              "submission_ms": 0.264914,
+              "synchronized_ms": 0.264914,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 154140672.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.730001,
+              "allocation_ms": 0.632372,
+              "submission_ms": 0.07595299999999999,
+              "synchronized_ms": 0.07595299999999999,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 84934656.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.175917,
+              "allocation_ms": 36.189165,
+              "submission_ms": 0.104544,
+              "synchronized_ms": 0.104544,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 603979776.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 1.458251,
+              "allocation_ms": 1.415874,
+              "submission_ms": 0.032705,
+              "synchronized_ms": 0.032705,
+              "gpu_ms": 0.0
+            }
+          }
+        },
+        "qwen2.5-0.5b-instruct-q4_k_m": {
+          "generation_ms": 287.306375,
+          "generation_tps": 59.17028468303218,
+          "post_first_token_tps": 90.02879497858994,
+          "prefill_ms": 109.389,
+          "prefill_tps": 4680.543747543172,
+          "first_token_ms": 109.726125,
+          "decode_median_ms": 10.776166,
+          "decode_tps": 92.79738266838132,
+          "decode_aggregate_tps": 92.06092159104564,
+          "sampling_ms": 4.063416,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 104.82713866666667,
+            "encode_ms_mean": 0.291803,
+            "wait_ms_mean": 106.557389,
+            "allocation_time_ms_mean": 1.3120103333333333,
+            "allocations_mean": 58,
+            "allocated_bytes_mean": 18876416,
+            "reused_bytes_mean": 1264058368,
+            "command_buffers_mean": 5,
+            "completion_waits_mean": 5,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 268042240,
+            "arena_capacity_bytes_max": 260571136
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 10.096282125,
+            "encode_ms_mean": 0.18581708333333333,
+            "wait_ms_mean": 10.362117916666667,
+            "allocation_time_ms_mean": 0.0913221875,
+            "allocations_mean": 17.0625,
+            "allocated_bytes_mean": 920708,
+            "reused_bytes_mean": 2882432,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 534,
+            "transient_peak_bytes_max": 3016704,
+            "arena_capacity_bytes_max": 262719488
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 150994944.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.599963,
+              "allocation_ms": 0.521247,
+              "submission_ms": 0.06246,
+              "synchronized_ms": 0.06246,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 75497472.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.052668999999999994,
+              "allocation_ms": 0.007208000000000001,
+              "submission_ms": 0.034796,
+              "synchronized_ms": 0.034796,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 603979776.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.17175,
+              "allocation_ms": 132.222421,
+              "submission_ms": 0.089414,
+              "synchronized_ms": 0.089414,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 603979776.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.05729,
+              "allocation_ms": 0.006541,
+              "submission_ms": 0.041455000000000006,
+              "synchronized_ms": 0.041455000000000006,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 94371840.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.342507,
+              "allocation_ms": 0.218713,
+              "submission_ms": 0.09704200000000002,
+              "synchronized_ms": 0.09704200000000002,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather_q5_0": {
+              "calls": 3.0,
+              "allocation_bytes": 3145728.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.015625,
+              "allocation_ms": 0.000459,
+              "submission_ms": 0.013918,
+              "synchronized_ms": 0.013918,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.094415,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.079961,
+              "synchronized_ms": 0.079961,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.10724900000000001,
+              "allocation_ms": 0.10366600000000001,
+              "submission_ms": 0.00246,
+              "synchronized_ms": 0.00246,
+              "gpu_ms": 0.0
+            },
+            "q4_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.248129,
+              "allocation_ms": 0.22504200000000002,
+              "submission_ms": 0.017461,
+              "synchronized_ms": 0.017461,
+              "gpu_ms": 0.0
+            },
+            "q5_0_gemm_mpp": {
+              "calls": 396.0,
+              "allocation_bytes": 1373110272.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.403759,
+              "allocation_ms": 65.20354,
+              "submission_ms": 0.204287,
+              "synchronized_ms": 0.204287,
+              "gpu_ms": 0.0
+            },
+            "q6_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.022961000000000002,
+              "allocation_ms": 0.002704,
+              "submission_ms": 0.015956,
+              "synchronized_ms": 0.015956,
+              "gpu_ms": 0.0
+            },
+            "q8_0_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 4718592.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.123577,
+              "allocation_ms": 0.102376,
+              "submission_ms": 0.016249,
+              "synchronized_ms": 0.016249,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 154140672.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.775877,
+              "allocation_ms": 0.684382,
+              "submission_ms": 0.07386899999999999,
+              "synchronized_ms": 0.07386899999999999,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 84934656.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.16546899999999998,
+              "allocation_ms": 65.178584,
+              "submission_ms": 0.093707,
+              "synchronized_ms": 0.093707,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 603979776.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 1.4829979999999998,
+              "allocation_ms": 1.441748,
+              "submission_ms": 0.032374,
+              "synchronized_ms": 0.032374,
+              "gpu_ms": 0.0
+            }
+          }
+        }
+      },
+      "paired_comparison": {
+        "pairs": [
+          {
+            "pair": 0,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": -43.678943038148255,
+            "cached_decode_tps_delta_percent": -0.14865014689380285,
+            "generation_tps_delta_percent": -15.955724030786433,
+            "first_token_ms_delta_percent": 77.17515697945491,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 1,
+            "order": [
+              1,
+              0
+            ],
+            "prefill_tps_delta_percent": -43.56209517856565,
+            "cached_decode_tps_delta_percent": 1.1541767266762593,
+            "generation_tps_delta_percent": -15.947044335511185,
+            "first_token_ms_delta_percent": 76.78025039285335,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 2,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": -44.433270539857375,
+            "cached_decode_tps_delta_percent": -0.2591426043641487,
+            "generation_tps_delta_percent": -16.14031724523087,
+            "first_token_ms_delta_percent": 79.53265934764102,
+            "generated_id_mismatches": 0
+          }
+        ],
+        "median_prefill_tps_delta_percent": -43.678943038148255,
+        "median_cached_decode_tps_delta_percent": -0.14865014689380285,
+        "median_generation_tps_delta_percent": -15.955724030786433,
+        "median_first_token_ms_delta_percent": 77.17515697945491,
+        "exact_generated_id_pairs": 3
+      }
+    },
+    "1024": {
+      "models": {
+        "bf16": {
+          "generation_ms": 342.956792,
+          "generation_tps": 49.5689264553186,
+          "post_first_token_tps": 84.55337512130238,
+          "prefill_ms": 153.401791,
+          "prefill_tps": 6675.28060347092,
+          "first_token_ms": 153.727208,
+          "decode_median_ms": 11.498458,
+          "decode_tps": 86.96818303810825,
+          "decode_aggregate_tps": 86.33167326338673,
+          "sampling_ms": 4.00221,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 134.48740266666667,
+            "encode_ms_mean": 0.4839893333333333,
+            "wait_ms_mean": 140.135583,
+            "allocation_time_ms_mean": 12.082245333333333,
+            "allocations_mean": 80,
+            "allocated_bytes_mean": 242225152,
+            "reused_bytes_mean": 3128426496,
+            "command_buffers_mean": 14,
+            "completion_waits_mean": 14,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 267649024,
+            "arena_capacity_bytes_max": 261867520
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 10.778114625,
+            "encode_ms_mean": 0.18614066666666668,
+            "wait_ms_mean": 11.046407166666667,
+            "allocation_time_ms_mean": 0.12428291666666666,
+            "allocations_mean": 10.75,
+            "allocated_bytes_mean": 1732612,
+            "reused_bytes_mean": 3643392,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 534,
+            "transient_peak_bytes_max": 3803136,
+            "arena_capacity_bytes_max": 264423424
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 301989888.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.8441240000000001,
+              "allocation_ms": 68.038584,
+              "submission_ms": 0.148914,
+              "synchronized_ms": 0.148914,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 150994944.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.697999,
+              "allocation_ms": 0.627291,
+              "submission_ms": 0.057284,
+              "synchronized_ms": 0.057284,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 2415919104.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.17254,
+              "allocation_ms": 66.894539,
+              "submission_ms": 0.098909,
+              "synchronized_ms": 0.098909,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 2415919104.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 19.090086,
+              "allocation_ms": 76.984792,
+              "submission_ms": 0.10741400000000001,
+              "synchronized_ms": 0.10741400000000001,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 188743680.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.40975100000000003,
+              "allocation_ms": 0.223005,
+              "submission_ms": 0.145121,
+              "synchronized_ms": 0.145121,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather": {
+              "calls": 3.0,
+              "allocation_bytes": 6291456.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.010917,
+              "allocation_ms": 0.000457,
+              "submission_ms": 0.00946,
+              "synchronized_ms": 0.00946,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.093301,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.079617,
+              "synchronized_ms": 0.079617,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.115376,
+              "allocation_ms": 0.111333,
+              "submission_ms": 0.003333,
+              "synchronized_ms": 0.003333,
+              "gpu_ms": 0.0
+            },
+            "project_mpp": {
+              "calls": 504.0,
+              "allocation_bytes": 2906652672.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 3.859168,
+              "allocation_ms": 129.52745,
+              "submission_ms": 0.46595000000000003,
+              "synchronized_ms": 0.46595000000000003,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 308281344.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 1.3591229999999999,
+              "allocation_ms": 1.208338,
+              "submission_ms": 0.117423,
+              "synchronized_ms": 0.117423,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 169869312.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.236044,
+              "allocation_ms": 0.134373,
+              "submission_ms": 0.079462,
+              "synchronized_ms": 0.079462,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 1207959552.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 10.366216,
+              "allocation_ms": 100.01004099999999,
+              "submission_ms": 0.139081,
+              "synchronized_ms": 0.139081,
+              "gpu_ms": 0.0
+            }
+          }
+        },
+        "qwen2.5-0.5b-instruct-q4_k_m": {
+          "generation_ms": 414.633042,
+          "generation_tps": 41.0001092001732,
+          "post_first_token_tps": 84.29117566903184,
+          "prefill_ms": 225.149708,
+          "prefill_tps": 4548.084956876782,
+          "first_token_ms": 225.507708,
+          "decode_median_ms": 11.432333,
+          "decode_tps": 87.47120994463685,
+          "decode_aggregate_tps": 86.04049025677757,
+          "sampling_ms": 3.984459,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 207.51959666666667,
+            "encode_ms_mean": 0.5125973333333333,
+            "wait_ms_mean": 213.10494566666665,
+            "allocation_time_ms_mean": 12.158458333333334,
+            "allocations_mean": 80,
+            "allocated_bytes_mean": 242225152,
+            "reused_bytes_mean": 3128426496,
+            "command_buffers_mean": 14,
+            "completion_waits_mean": 14,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 267649024,
+            "arena_capacity_bytes_max": 261867520
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 10.760713520833333,
+            "encode_ms_mean": 0.18716460416666666,
+            "wait_ms_mean": 11.026408875,
+            "allocation_time_ms_mean": 0.121266625,
+            "allocations_mean": 10.75,
+            "allocated_bytes_mean": 1732612,
+            "reused_bytes_mean": 3643392,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 534,
+            "transient_peak_bytes_max": 3803136,
+            "arena_capacity_bytes_max": 264423424
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 301989888.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.871921,
+              "allocation_ms": 101.375835,
+              "submission_ms": 0.15971,
+              "synchronized_ms": 0.15971,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 150994944.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.745252,
+              "allocation_ms": 0.673417,
+              "submission_ms": 0.05783300000000001,
+              "synchronized_ms": 0.05783300000000001,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 2415919104.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.161209,
+              "allocation_ms": 99.644546,
+              "submission_ms": 0.09991900000000001,
+              "synchronized_ms": 0.09991900000000001,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 2415919104.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 19.615203,
+              "allocation_ms": 114.241748,
+              "submission_ms": 0.116834,
+              "synchronized_ms": 0.116834,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 188743680.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.403365,
+              "allocation_ms": 0.213507,
+              "submission_ms": 0.148622,
+              "synchronized_ms": 0.148622,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather_q5_0": {
+              "calls": 3.0,
+              "allocation_bytes": 6291456.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.012125,
+              "allocation_ms": 0.000375,
+              "submission_ms": 0.010708,
+              "synchronized_ms": 0.010708,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.09733,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.08287399999999999,
+              "synchronized_ms": 0.08287399999999999,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.141166,
+              "allocation_ms": 0.137458,
+              "submission_ms": 0.002709,
+              "synchronized_ms": 0.002709,
+              "gpu_ms": 0.0
+            },
+            "q4_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 75497472.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.060999000000000005,
+              "allocation_ms": 0.0055379999999999995,
+              "submission_ms": 0.045375,
+              "synchronized_ms": 0.045375,
+              "gpu_ms": 0.0
+            },
+            "q5_0_gemm_mpp": {
+              "calls": 396.0,
+              "allocation_bytes": 2746220544.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 1.3760869999999998,
+              "allocation_ms": 191.298213,
+              "submission_ms": 0.392745,
+              "synchronized_ms": 0.392745,
+              "gpu_ms": 0.0
+            },
+            "q6_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 75497472.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 1.750416,
+              "allocation_ms": 1.703875,
+              "submission_ms": 0.036085,
+              "synchronized_ms": 0.036085,
+              "gpu_ms": 0.0
+            },
+            "q8_0_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 9437184.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.033835,
+              "allocation_ms": 0.003038,
+              "submission_ms": 0.023337,
+              "synchronized_ms": 0.023337,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 308281344.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 1.3485049999999998,
+              "allocation_ms": 1.1939980000000001,
+              "submission_ms": 0.125249,
+              "synchronized_ms": 0.125249,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 169869312.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.206799,
+              "allocation_ms": 0.107546,
+              "submission_ms": 0.078128,
+              "synchronized_ms": 0.078128,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 1207959552.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 10.368668,
+              "allocation_ms": 149.357126,
+              "submission_ms": 0.157664,
+              "synchronized_ms": 0.157664,
+              "gpu_ms": 0.0
+            }
+          }
+        }
+      },
+      "paired_comparison": {
+        "pairs": [
+          {
+            "pair": 0,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": -31.866759960443737,
+            "cached_decode_tps_delta_percent": 0.8677279199223786,
+            "generation_tps_delta_percent": -17.286671041523014,
+            "first_token_ms_delta_percent": 46.69342592887007,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 1,
+            "order": [
+              1,
+              0
+            ],
+            "prefill_tps_delta_percent": -32.08609578868822,
+            "cached_decode_tps_delta_percent": -0.27407354211952395,
+            "generation_tps_delta_percent": -17.692103975928354,
+            "first_token_ms_delta_percent": 47.10654855274172,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 2,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": -32.6023949891171,
+            "cached_decode_tps_delta_percent": 1.0698100052292103,
+            "generation_tps_delta_percent": -17.23178821088015,
+            "first_token_ms_delta_percent": 48.26559562779207,
+            "generated_id_mismatches": 0
+          }
+        ],
+        "median_prefill_tps_delta_percent": -32.08609578868822,
+        "median_cached_decode_tps_delta_percent": 0.8677279199223786,
+        "median_generation_tps_delta_percent": -17.286671041523014,
+        "median_first_token_ms_delta_percent": 47.10654855274172,
+        "exact_generated_id_pairs": 3
+      }
+    },
+    "sustained-128-decode": {
+      "models": {
+        "bf16": {
+          "generation_ms": 1447.9013750000001,
+          "generation_tps": 89.09446611997312,
+          "post_first_token_tps": 91.34766623604948,
+          "prefill_ms": 46.360958000000004,
+          "prefill_tps": 452.9673437723181,
+          "first_token_ms": 46.661417,
+          "decode_median_ms": 10.726917,
+          "decode_tps": 93.2234303668053,
+          "decode_aggregate_tps": 93.3692059573294,
+          "sampling_ms": 30.551121000000002,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 30.807264,
+            "encode_ms_mean": 0.23327366666666666,
+            "wait_ms_mean": 41.35913866666667,
+            "allocation_time_ms_mean": 0.44682066666666664,
+            "allocations_mean": 49,
+            "allocated_bytes_mean": 3145812,
+            "reused_bytes_mean": 37027840,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 37027840,
+            "arena_capacity_bytes_max": 264259584
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 9.982537739583334,
+            "encode_ms_mean": 0.17939421875,
+            "wait_ms_mean": 10.235346447916667,
+            "allocation_time_ms_mean": 0.003376338541666667,
+            "allocations_mean": 1,
+            "allocated_bytes_mean": 4,
+            "reused_bytes_mean": 2385792,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 2623488,
+            "arena_capacity_bytes_max": 264259584
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 9437184.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.09337000000000001,
+              "allocation_ms": 0.013203,
+              "submission_ms": 0.062575,
+              "synchronized_ms": 0.062575,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 4718592.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.047505000000000006,
+              "allocation_ms": 0.007626000000000001,
+              "submission_ms": 0.030501,
+              "synchronized_ms": 0.030501,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 1179648.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.043623999999999996,
+              "allocation_ms": 0.006129,
+              "submission_ms": 0.028255999999999996,
+              "synchronized_ms": 0.028255999999999996,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 1179648.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.039212,
+              "allocation_ms": 0.0049570000000000005,
+              "submission_ms": 0.025960999999999998,
+              "synchronized_ms": 0.025960999999999998,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 5898240.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.12812600000000002,
+              "allocation_ms": 0.016706,
+              "submission_ms": 0.087074,
+              "synchronized_ms": 0.087074,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather": {
+              "calls": 3.0,
+              "allocation_bytes": 196608.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.015334,
+              "allocation_ms": 0.000459,
+              "submission_ms": 0.013626,
+              "synchronized_ms": 0.013626,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.085259,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.072877,
+              "synchronized_ms": 0.072877,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.003333,
+              "allocation_ms": 0.00020800000000000001,
+              "submission_ms": 0.0025009999999999998,
+              "synchronized_ms": 0.0025009999999999998,
+              "gpu_ms": 0.0
+            },
+            "project_bf16": {
+              "calls": 504.0,
+              "allocation_bytes": 53084160.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.31704,
+              "allocation_ms": 0.041483000000000006,
+              "submission_ms": 0.217624,
+              "synchronized_ms": 0.217624,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 9633792.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.099249,
+              "allocation_ms": 0.017456,
+              "submission_ms": 0.063658,
+              "synchronized_ms": 0.063658,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 5308416.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.08429,
+              "allocation_ms": 0.01246,
+              "submission_ms": 0.056754,
+              "synchronized_ms": 0.056754,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 18874368.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.052211999999999995,
+              "allocation_ms": 0.004958,
+              "submission_ms": 0.038414000000000004,
+              "synchronized_ms": 0.038414000000000004,
+              "gpu_ms": 0.0
+            }
+          }
+        },
+        "qwen2.5-0.5b-instruct-q4_k_m": {
+          "generation_ms": 1433.2183750000002,
+          "generation_tps": 90.00721889293388,
+          "post_first_token_tps": 91.50159022043357,
+          "prefill_ms": 34.03425,
+          "prefill_tps": 617.0254963749752,
+          "first_token_ms": 34.335583,
+          "decode_median_ms": 10.670458,
+          "decode_tps": 93.71668957414948,
+          "decode_aggregate_tps": 93.53689921681693,
+          "sampling_ms": 30.547254,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 28.215222,
+            "encode_ms_mean": 0.24725866666666665,
+            "wait_ms_mean": 32.82691633333334,
+            "allocation_time_ms_mean": 0.46236166666666667,
+            "allocations_mean": 49,
+            "allocated_bytes_mean": 3145812,
+            "reused_bytes_mean": 37027840,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 37027840,
+            "arena_capacity_bytes_max": 264259584
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 10.018707794270833,
+            "encode_ms_mean": 0.177855359375,
+            "wait_ms_mean": 10.255609713541666,
+            "allocation_time_ms_mean": 0.00345540625,
+            "allocations_mean": 1,
+            "allocated_bytes_mean": 4,
+            "reused_bytes_mean": 2385792,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 2623488,
+            "arena_capacity_bytes_max": 264259584
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 9437184.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.09183,
+              "allocation_ms": 0.013461,
+              "submission_ms": 0.062627,
+              "synchronized_ms": 0.062627,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 4718592.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.050416,
+              "allocation_ms": 0.008457000000000001,
+              "submission_ms": 0.033296,
+              "synchronized_ms": 0.033296,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 1179648.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.049465999999999996,
+              "allocation_ms": 0.006751,
+              "submission_ms": 0.033997,
+              "synchronized_ms": 0.033997,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 1179648.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.041788,
+              "allocation_ms": 0.0054659999999999995,
+              "submission_ms": 0.027919,
+              "synchronized_ms": 0.027919,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 5898240.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.135825,
+              "allocation_ms": 0.018416000000000002,
+              "submission_ms": 0.092338,
+              "synchronized_ms": 0.092338,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather_q5_0": {
+              "calls": 3.0,
+              "allocation_bytes": 196608.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.0335,
+              "allocation_ms": 0.000375,
+              "submission_ms": 0.031083,
+              "synchronized_ms": 0.031083,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.095417,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.080958,
+              "synchronized_ms": 0.080958,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.003543,
+              "allocation_ms": 0.000208,
+              "submission_ms": 0.002791,
+              "synchronized_ms": 0.002791,
+              "gpu_ms": 0.0
+            },
+            "q4_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 2359296.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.024413999999999998,
+              "allocation_ms": 0.0035819999999999997,
+              "submission_ms": 0.016048,
+              "synchronized_ms": 0.016048,
+              "gpu_ms": 0.0
+            },
+            "q5_0_gemm_mpp": {
+              "calls": 396.0,
+              "allocation_bytes": 48070656.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.25728300000000004,
+              "allocation_ms": 0.035134,
+              "submission_ms": 0.17117100000000002,
+              "synchronized_ms": 0.17117100000000002,
+              "gpu_ms": 0.0
+            },
+            "q6_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 2359296.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.025753,
+              "allocation_ms": 0.003371,
+              "submission_ms": 0.017664,
+              "synchronized_ms": 0.017664,
+              "gpu_ms": 0.0
+            },
+            "q8_0_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 294912.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.022418,
+              "allocation_ms": 0.002794,
+              "submission_ms": 0.014959,
+              "synchronized_ms": 0.014959,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 9633792.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.103581,
+              "allocation_ms": 0.014335,
+              "submission_ms": 0.067759,
+              "synchronized_ms": 0.067759,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 5308416.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.08641399999999999,
+              "allocation_ms": 0.012920999999999998,
+              "submission_ms": 0.05799900000000001,
+              "synchronized_ms": 0.05799900000000001,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 18874368.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.045704,
+              "allocation_ms": 0.00525,
+              "submission_ms": 0.031167,
+              "synchronized_ms": 0.031167,
+              "gpu_ms": 0.0
+            }
+          }
+        }
+      },
+      "paired_comparison": {
+        "pairs": [
+          {
+            "pair": 0,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": 39.04204441114465,
+            "cached_decode_tps_delta_percent": 0.9117884162048062,
+            "generation_tps_delta_percent": 1.2569933036199021,
+            "first_token_ms_delta_percent": -27.95987767969075,
+            "generated_id_mismatches": 108
+          },
+          {
+            "pair": 1,
+            "order": [
+              1,
+              0
+            ],
+            "prefill_tps_delta_percent": 51.663965657916044,
+            "cached_decode_tps_delta_percent": 0.547961101782457,
+            "generation_tps_delta_percent": 1.2943809620753477,
+            "first_token_ms_delta_percent": -33.83800367657073,
+            "generated_id_mismatches": 108
+          },
+          {
+            "pair": 2,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": -9.884320823273407,
+            "cached_decode_tps_delta_percent": -0.907328651815198,
+            "generation_tps_delta_percent": -1.1997122939335747,
+            "first_token_ms_delta_percent": 10.87088225722983,
+            "generated_id_mismatches": 108
+          }
+        ],
+        "median_prefill_tps_delta_percent": 39.04204441114465,
+        "median_cached_decode_tps_delta_percent": 0.547961101782457,
+        "median_generation_tps_delta_percent": 1.2569933036199021,
+        "median_first_token_ms_delta_percent": -27.95987767969075,
+        "exact_generated_id_pairs": 0
+      }
+    },
+    "long-horizon-1601": {
+      "models": {
+        "bf16": {
+          "generation_ms": 19246.352375000002,
+          "generation_tps": 83.1845935689931,
+          "post_first_token_tps": 83.38237386006672,
+          "prefill_ms": 57.307667,
+          "prefill_tps": 6421.4793458613485,
+          "first_token_ms": 57.644667,
+          "decode_median_ms": 11.689458,
+          "decode_tps": 85.54716565986207,
+          "decode_aggregate_tps": 85.17994709501276,
+          "sampling_ms": 404.28871100000003,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 41.65025,
+            "encode_ms_mean": 0.298097,
+            "wait_ms_mean": 52.703207666666664,
+            "allocation_time_ms_mean": 1.4746803333333334,
+            "allocations_mean": 60,
+            "allocated_bytes_mean": 19006912,
+            "reused_bytes_mean": 760610816,
+            "command_buffers_mean": 3,
+            "completion_waits_mean": 3,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 266993664,
+            "arena_capacity_bytes_max": 264759296
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 10.992062590208333,
+            "encode_ms_mean": 0.19023798875,
+            "wait_ms_mean": 11.248684273125,
+            "allocation_time_ms_mean": 0.0060194947916666665,
+            "allocations_mean": 1.195,
+            "allocated_bytes_mean": 27774.88,
+            "reused_bytes_mean": 4476764.16,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531.06,
+            "transient_peak_bytes_max": 5376000,
+            "arena_capacity_bytes_max": 268298240
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 150994944.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.088209,
+              "allocation_ms": 0.011243999999999999,
+              "submission_ms": 0.060578,
+              "synchronized_ms": 0.060578,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 75497472.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.053793999999999995,
+              "allocation_ms": 0.007541000000000001,
+              "submission_ms": 0.03562,
+              "synchronized_ms": 0.03562,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 301989888.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 4.185246,
+              "allocation_ms": 4.1347059999999995,
+              "submission_ms": 0.040623,
+              "synchronized_ms": 0.040623,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 301989888.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.155835,
+              "allocation_ms": 62.313210999999995,
+              "submission_ms": 0.075044,
+              "synchronized_ms": 0.075044,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 94371840.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.590715,
+              "allocation_ms": 0.467791,
+              "submission_ms": 0.095836,
+              "synchronized_ms": 0.095836,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather": {
+              "calls": 3.0,
+              "allocation_bytes": 3145728.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.03375,
+              "allocation_ms": 0.002417,
+              "submission_ms": 0.028084,
+              "synchronized_ms": 0.028084,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.096297,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.081826,
+              "synchronized_ms": 0.081826,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.133542,
+              "allocation_ms": 0.129833,
+              "submission_ms": 0.003167,
+              "synchronized_ms": 0.003167,
+              "gpu_ms": 0.0
+            },
+            "project_mpp": {
+              "calls": 504.0,
+              "allocation_bytes": 849346560.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.839877,
+              "allocation_ms": 48.227593,
+              "submission_ms": 0.306127,
+              "synchronized_ms": 0.306127,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 154140672.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.103157,
+              "allocation_ms": 0.01134,
+              "submission_ms": 0.072042,
+              "synchronized_ms": 0.072042,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 84934656.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.464458,
+              "allocation_ms": 0.388957,
+              "submission_ms": 0.058295,
+              "synchronized_ms": 0.058295,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 301989888.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.8949179999999999,
+              "allocation_ms": 0.8482500000000001,
+              "submission_ms": 0.037049,
+              "synchronized_ms": 0.037049,
+              "gpu_ms": 0.0
+            }
+          }
+        },
+        "qwen2.5-0.5b-instruct-q4_k_m": {
+          "generation_ms": 19284.011040999998,
+          "generation_tps": 83.02214703134592,
+          "post_first_token_tps": 83.34037766139258,
+          "prefill_ms": 89.960875,
+          "prefill_tps": 4090.667192821324,
+          "first_token_ms": 90.30125,
+          "decode_median_ms": 11.715458,
+          "decode_tps": 85.35731168171147,
+          "decode_aggregate_tps": 85.11914824758234,
+          "sampling_ms": 401.570699,
+          "runs": 3,
+          "prefill_counters": {
+            "gpu_ms_mean": 78.790861,
+            "encode_ms_mean": 0.277886,
+            "wait_ms_mean": 85.01186133333333,
+            "allocation_time_ms_mean": 1.3908896666666666,
+            "allocations_mean": 60,
+            "allocated_bytes_mean": 19006912,
+            "reused_bytes_mean": 760610816,
+            "command_buffers_mean": 3,
+            "completion_waits_mean": 3,
+            "dispatches_mean": 531,
+            "transient_peak_bytes_max": 266993664,
+            "arena_capacity_bytes_max": 264759296
+          },
+          "decode_counters": {
+            "gpu_ms_mean": 11.029782667291666,
+            "encode_ms_mean": 0.18746350020833333,
+            "wait_ms_mean": 11.279666256041667,
+            "allocation_time_ms_mean": 0.006002334791666667,
+            "allocations_mean": 1.195,
+            "allocated_bytes_mean": 27774.88,
+            "reused_bytes_mean": 4476764.16,
+            "command_buffers_mean": 1,
+            "completion_waits_mean": 1,
+            "dispatches_mean": 531.06,
+            "transient_peak_bytes_max": 5376000,
+            "arena_capacity_bytes_max": 268298240
+          },
+          "prefill_profile_sum_over_runs": {
+            "add": {
+              "calls": 144.0,
+              "allocation_bytes": 150994944.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.087548,
+              "allocation_ms": 0.010386,
+              "submission_ms": 0.06026,
+              "synchronized_ms": 0.06026,
+              "gpu_ms": 0.0
+            },
+            "attention_context_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 75497472.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.054502999999999996,
+              "allocation_ms": 0.00813,
+              "submission_ms": 0.035878,
+              "synchronized_ms": 0.035878,
+              "gpu_ms": 0.0
+            },
+            "attention_scores_mpp": {
+              "calls": 72.0,
+              "allocation_bytes": 301989888.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 3.806125,
+              "allocation_ms": 3.756291,
+              "submission_ms": 0.039872000000000005,
+              "synchronized_ms": 0.039872000000000005,
+              "gpu_ms": 0.0
+            },
+            "attention_softmax": {
+              "calls": 72.0,
+              "allocation_bytes": 301989888.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.142501,
+              "allocation_ms": 90.03259,
+              "submission_ms": 0.067916,
+              "synchronized_ms": 0.067916,
+              "gpu_ms": 0.0
+            },
+            "bias_add": {
+              "calls": 216.0,
+              "allocation_bytes": 94371840.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.658121,
+              "allocation_ms": 0.541575,
+              "submission_ms": 0.090739,
+              "synchronized_ms": 0.090739,
+              "gpu_ms": 0.0
+            },
+            "embedding_gather_q5_0": {
+              "calls": 3.0,
+              "allocation_bytes": 3145728.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.044125,
+              "allocation_ms": 0.003292,
+              "submission_ms": 0.036708,
+              "synchronized_ms": 0.036708,
+              "gpu_ms": 0.0
+            },
+            "kv_append": {
+              "calls": 144.0,
+              "allocation_bytes": 0.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.10050300000000001,
+              "allocation_ms": 0.0,
+              "submission_ms": 0.083496,
+              "synchronized_ms": 0.083496,
+              "gpu_ms": 0.0
+            },
+            "lm_head_gemv": {
+              "calls": 3.0,
+              "allocation_bytes": 1572864.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.110125,
+              "allocation_ms": 0.10658300000000001,
+              "submission_ms": 0.002708,
+              "synchronized_ms": 0.002708,
+              "gpu_ms": 0.0
+            },
+            "q4_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.022958,
+              "allocation_ms": 0.0029600000000000004,
+              "submission_ms": 0.015416,
+              "synchronized_ms": 0.015416,
+              "gpu_ms": 0.0
+            },
+            "q5_0_gemm_mpp": {
+              "calls": 396.0,
+              "allocation_bytes": 769130496.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.606256,
+              "allocation_ms": 81.384383,
+              "submission_ms": 0.193292,
+              "synchronized_ms": 0.193292,
+              "gpu_ms": 0.0
+            },
+            "q6_k_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 37748736.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.026545,
+              "allocation_ms": 0.0029620000000000002,
+              "submission_ms": 0.018291,
+              "synchronized_ms": 0.018291,
+              "gpu_ms": 0.0
+            },
+            "q8_0_gemm_mpp": {
+              "calls": 36.0,
+              "allocation_bytes": 4718592.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.086539,
+              "allocation_ms": 0.064956,
+              "submission_ms": 0.016420999999999998,
+              "synchronized_ms": 0.016420999999999998,
+              "gpu_ms": 0.0
+            },
+            "rmsnorm": {
+              "calls": 147.0,
+              "allocation_bytes": 154140672.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.09975,
+              "allocation_ms": 0.011161,
+              "submission_ms": 0.069079,
+              "synchronized_ms": 0.069079,
+              "gpu_ms": 0.0
+            },
+            "rope_split": {
+              "calls": 144.0,
+              "allocation_bytes": 84934656.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.489081,
+              "allocation_ms": 0.406751,
+              "submission_ms": 0.065623,
+              "synchronized_ms": 0.065623,
+              "gpu_ms": 0.0
+            },
+            "silu_mul": {
+              "calls": 72.0,
+              "allocation_bytes": 301989888.0,
+              "gpu_samples": 0.0,
+              "wall_ms": 0.801876,
+              "allocation_ms": 0.7545810000000001,
+              "submission_ms": 0.037959,
+              "synchronized_ms": 0.037959,
+              "gpu_ms": 0.0
+            }
+          }
+        }
+      },
+      "paired_comparison": {
+        "pairs": [
+          {
+            "pair": 0,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": -31.27952457109826,
+            "cached_decode_tps_delta_percent": -0.08610432165307991,
+            "generation_tps_delta_percent": -0.16834844644599833,
+            "first_token_ms_delta_percent": 45.30050900052085,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 1,
+            "order": [
+              1,
+              0
+            ],
+            "prefill_tps_delta_percent": -32.23981649260856,
+            "cached_decode_tps_delta_percent": -0.22192901037244583,
+            "generation_tps_delta_percent": -0.19151907361355525,
+            "first_token_ms_delta_percent": 47.292753031256126,
+            "generated_id_mismatches": 0
+          },
+          {
+            "pair": 2,
+            "order": [
+              0,
+              1
+            ],
+            "prefill_tps_delta_percent": -45.63573074752061,
+            "cached_decode_tps_delta_percent": -1.0472326310006386,
+            "generation_tps_delta_percent": -0.7431302923625815,
+            "first_token_ms_delta_percent": 83.39297821362194,
+            "generated_id_mismatches": 0
+          }
+        ],
+        "median_prefill_tps_delta_percent": -32.23981649260856,
+        "median_cached_decode_tps_delta_percent": -0.22192901037244583,
+        "median_generation_tps_delta_percent": -0.19151907361355525,
+        "median_first_token_ms_delta_percent": 47.292753031256126,
+        "exact_generated_id_pairs": 3
+      }
+    }
+  }
+}

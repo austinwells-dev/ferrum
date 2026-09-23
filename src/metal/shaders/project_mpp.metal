@@ -149,6 +149,264 @@ kernel void q4_0_gemm_mpp(device bfloat* a [[buffer(0)]],
     }
 }
 
+kernel void q5_0_gemm_mpp(device bfloat* a [[buffer(0)]],
+                          device const uchar* packed [[buffer(1)]],
+                          device ushort* c [[buffer(2)]],
+                          constant uint* p [[buffer(3)]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr int TILE_M=64, TILE_N=64, TILE_K=128;
+    threadgroup bfloat dequantized[TILE_N*TILE_K];
+    int m=int(p[1]), k=int(p[2]), n=int(p[3]);
+    int blocks=k/32;
+    tensor<device bfloat, dextents<int,2>, tensor_inline> A(a,dextents<int,2>(k,m));
+    tensor<threadgroup bfloat, dextents<int,2>, tensor_inline> B(
+        dequantized,dextents<int,2>(TILE_K,TILE_N));
+    auto left=A.slice(0,int(group.y)*TILE_M);
+    constexpr auto desc=matmul2d_descriptor(
+        TILE_M,TILE_N,TILE_K,false,true,false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc,execution_simdgroups<4>> op;
+    auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
+    int k_tiles=(k+TILE_K-1)/TILE_K;
+    for(int kt=0;kt<k_tiles;kt++) {
+        if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+            uint out_col=i/(TILE_K/2), packed_index=i%(TILE_K/2);
+            uint block_in_tile=packed_index/16, byte_in_block=packed_index%16;
+            int channel=int(group.x)*TILE_N+int(out_col);
+            int source_k=kt*TILE_K+int(block_in_tile*32+byte_in_block);
+            uint tile_index=out_col*TILE_K+block_in_tile*32+byte_in_block;
+            if(channel<n && source_k<k) {
+                uint block_index=uint(source_k)/32;
+                device const uchar* block=packed+(uint(channel)*uint(blocks)+block_index)*22;
+                float d=float(*((device const half*)block));
+                uchar qs=block[6+byte_in_block];
+                uint qh0=(uint(block[2+(byte_in_block>>3)])>>(byte_in_block&7))&1;
+                uint upper=byte_in_block+16;
+                uint qh1=(uint(block[2+(upper>>3)])>>(upper&7))&1;
+                int q0=int(qs&15)+int(qh0<<4)-16;
+                int q1=int(qs>>4)+int(qh1<<4)-16;
+                dequantized[tile_index]=bfloat(d*float(q0));
+                dequantized[tile_index+16]=bfloat(d*float(q1));
+            } else {
+                dequantized[tile_index]=bfloat(0.0f);
+                dequantized[tile_index+16]=bfloat(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto right=B;
+        auto left_k=A.slice(kt*TILE_K,int(group.y)*TILE_M);
+        op.run(left_k,right,result);
+    }
+    for(uint i=0;i<result.get_capacity();i++) {
+        auto coord=result.get_multidimensional_index(i);
+        uint col=group.x*TILE_N+coord[0], row=group.y*TILE_M+coord[1];
+        if(row<uint(m) && col<uint(n)) {
+            float x=result[i]; uint bits=as_type<uint>(x);
+            c[row*uint(n)+col]=isnan(x)?ushort((bits>>16)|0x40):ushort((bits+0x7fff+((bits>>16)&1))>>16);
+        }
+    }
+}
+
+kernel void q5_1_gemm_mpp(device bfloat* a [[buffer(0)]],
+                          device const uchar* packed [[buffer(1)]],
+                          device ushort* c [[buffer(2)]],
+                          constant uint* p [[buffer(3)]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr int TILE_M=64, TILE_N=64, TILE_K=128;
+    threadgroup bfloat dequantized[TILE_N*TILE_K];
+    int m=int(p[1]), k=int(p[2]), n=int(p[3]);
+    int blocks=k/32;
+    tensor<device bfloat, dextents<int,2>, tensor_inline> A(a,dextents<int,2>(k,m));
+    tensor<threadgroup bfloat, dextents<int,2>, tensor_inline> B(
+        dequantized,dextents<int,2>(TILE_K,TILE_N));
+    auto left=A.slice(0,int(group.y)*TILE_M);
+    constexpr auto desc=matmul2d_descriptor(
+        TILE_M,TILE_N,TILE_K,false,true,false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc,execution_simdgroups<4>> op;
+    auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
+    int k_tiles=(k+TILE_K-1)/TILE_K;
+    for(int kt=0;kt<k_tiles;kt++) {
+        if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+            uint out_col=i/(TILE_K/2), packed_index=i%(TILE_K/2);
+            uint block_in_tile=packed_index/16, byte_in_block=packed_index%16;
+            int channel=int(group.x)*TILE_N+int(out_col);
+            int source_k=kt*TILE_K+int(block_in_tile*32+byte_in_block);
+            uint tile_index=out_col*TILE_K+block_in_tile*32+byte_in_block;
+            if(channel<n && source_k<k) {
+                uint block_index=uint(source_k)/32;
+                device const uchar* block=packed+(uint(channel)*uint(blocks)+block_index)*24;
+                float d=float(*((device const half*)block));
+                float minimum=float(*((device const half*)(block+2)));
+                uchar qs=block[8+byte_in_block];
+                uint qh0=(uint(block[4+(byte_in_block>>3)])>>(byte_in_block&7))&1;
+                uint upper=byte_in_block+16;
+                uint qh1=(uint(block[4+(upper>>3)])>>(upper&7))&1;
+                uint q0=uint(qs&15)+(qh0<<4);
+                uint q1=uint(qs>>4)+(qh1<<4);
+                dequantized[tile_index]=bfloat(d*float(q0)+minimum);
+                dequantized[tile_index+16]=bfloat(d*float(q1)+minimum);
+            } else {
+                dequantized[tile_index]=bfloat(0.0f);
+                dequantized[tile_index+16]=bfloat(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto right=B;
+        auto left_k=A.slice(kt*TILE_K,int(group.y)*TILE_M);
+        op.run(left_k,right,result);
+    }
+    for(uint i=0;i<result.get_capacity();i++) {
+        auto coord=result.get_multidimensional_index(i);
+        uint col=group.x*TILE_N+coord[0], row=group.y*TILE_M+coord[1];
+        if(row<uint(m) && col<uint(n)) {
+            float x=result[i]; uint bits=as_type<uint>(x);
+            c[row*uint(n)+col]=isnan(x)?ushort((bits>>16)|0x40):ushort((bits+0x7fff+((bits>>16)&1))>>16);
+        }
+    }
+}
+
+inline uint qk4_scale_mpp(device const uchar* scales, uint group) {
+    if(group<4) return uint(scales[group]&63);
+    return uint(scales[group+4]&15) | (uint(scales[group-4]>>6)<<4);
+}
+inline uint qk4_min_mpp(device const uchar* scales, uint group) {
+    if(group<4) return uint(scales[group+4]&63);
+    return uint(scales[group+4]>>4) | (uint(scales[group]>>6)<<4);
+}
+
+kernel void q4_k_gemm_mpp(device bfloat* a [[buffer(0)]],
+                          device const uchar* packed [[buffer(1)]],
+                          device ushort* c [[buffer(2)]],
+                          constant uint* p [[buffer(3)]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr int TILE_M=64, TILE_N=64, TILE_K=128;
+    threadgroup bfloat dequantized[TILE_N*TILE_K];
+    int m=int(p[1]), k=int(p[2]), n=int(p[3]);
+    int blocks=k/256;
+    tensor<device bfloat, dextents<int,2>, tensor_inline> A(a,dextents<int,2>(k,m));
+    tensor<threadgroup bfloat, dextents<int,2>, tensor_inline> B(
+        dequantized,dextents<int,2>(TILE_K,TILE_N));
+    auto left=A.slice(0,int(group.y)*TILE_M);
+    constexpr auto desc=matmul2d_descriptor(
+        TILE_M,TILE_N,TILE_K,false,true,false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc,execution_simdgroups<4>> op;
+    auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
+    int k_tiles=(k+TILE_K-1)/TILE_K;
+    for(int kt=0;kt<k_tiles;kt++) {
+        if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+            uint out_col=i/(TILE_K/2), pair_index=i%(TILE_K/2);
+            uint half_tile=pair_index/32, lane=pair_index%32;
+            int channel=int(group.x)*TILE_N+int(out_col);
+            int source_k=kt*TILE_K+int(half_tile*64+lane);
+            uint tile_index=out_col*TILE_K+half_tile*64+lane;
+            if(channel<n && source_k<k) {
+                uint block_index=uint(source_k)>>8, within=uint(source_k)&255;
+                uint group0=within>>5, chunk=within>>6;
+                device const uchar* block=packed+(uint(channel)*uint(blocks)+block_index)*144;
+                float d=float(*((device const half*)block));
+                float dmin=float(*((device const half*)(block+2)));
+                device const uchar* scales=block+4;
+                uchar qs=block[16+chunk*32+lane];
+                uint scale0=qk4_scale_mpp(scales,group0);
+                uint scale1=qk4_scale_mpp(scales,group0+1);
+                uint min0=qk4_min_mpp(scales,group0);
+                uint min1=qk4_min_mpp(scales,group0+1);
+                dequantized[tile_index]=bfloat(d*float(scale0)*float(qs&15)-dmin*float(min0));
+                dequantized[tile_index+32]=bfloat(d*float(scale1)*float(qs>>4)-dmin*float(min1));
+            } else {
+                dequantized[tile_index]=bfloat(0.0f);
+                dequantized[tile_index+32]=bfloat(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto right=B;
+        auto left_k=A.slice(kt*TILE_K,int(group.y)*TILE_M);
+        op.run(left_k,right,result);
+    }
+    for(uint i=0;i<result.get_capacity();i++) {
+        auto coord=result.get_multidimensional_index(i);
+        uint col=group.x*TILE_N+coord[0], row=group.y*TILE_M+coord[1];
+        if(row<uint(m) && col<uint(n)) {
+            float x=result[i]; uint bits=as_type<uint>(x);
+            c[row*uint(n)+col]=isnan(x)?ushort((bits>>16)|0x40):ushort((bits+0x7fff+((bits>>16)&1))>>16);
+        }
+    }
+}
+
+kernel void q5_k_gemm_mpp(device bfloat* a [[buffer(0)]],
+                          device const uchar* packed [[buffer(1)]],
+                          device ushort* c [[buffer(2)]],
+                          constant uint* p [[buffer(3)]],
+                          uint tid [[thread_index_in_threadgroup]],
+                          uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr int TILE_M=64, TILE_N=64, TILE_K=128;
+    threadgroup bfloat dequantized[TILE_N*TILE_K];
+    int m=int(p[1]), k=int(p[2]), n=int(p[3]);
+    int blocks=k/256;
+    tensor<device bfloat, dextents<int,2>, tensor_inline> A(a,dextents<int,2>(k,m));
+    tensor<threadgroup bfloat, dextents<int,2>, tensor_inline> B(
+        dequantized,dextents<int,2>(TILE_K,TILE_N));
+    auto left=A.slice(0,int(group.y)*TILE_M);
+    constexpr auto desc=matmul2d_descriptor(
+        TILE_M,TILE_N,TILE_K,false,true,false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc,execution_simdgroups<4>> op;
+    auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
+    int k_tiles=(k+TILE_K-1)/TILE_K;
+    for(int kt=0;kt<k_tiles;kt++) {
+        if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+            uint out_col=i/(TILE_K/2), pair_index=i%(TILE_K/2);
+            uint half_tile=pair_index/32, lane=pair_index%32;
+            int channel=int(group.x)*TILE_N+int(out_col);
+            int source_k=kt*TILE_K+int(half_tile*64+lane);
+            uint tile_index=out_col*TILE_K+half_tile*64+lane;
+            if(channel<n && source_k<k) {
+                uint block_index=uint(source_k)>>8, within=uint(source_k)&255;
+                uint group0=within>>5, chunk=within>>6;
+                device const uchar* block=packed+(uint(channel)*uint(blocks)+block_index)*176;
+                float d=float(*((device const half*)block));
+                float dmin=float(*((device const half*)(block+2)));
+                device const uchar* scales=block+4;
+                uchar qs=block[48+chunk*32+lane];
+                uchar qh=block[16+lane];
+                uint high0=(uint(qh)>>group0)&1;
+                uint high1=(uint(qh)>>(group0+1))&1;
+                uint scale0=qk4_scale_mpp(scales,group0);
+                uint scale1=qk4_scale_mpp(scales,group0+1);
+                uint min0=qk4_min_mpp(scales,group0);
+                uint min1=qk4_min_mpp(scales,group0+1);
+                uint q0=uint(qs&15)|(high0<<4), q1=uint(qs>>4)|(high1<<4);
+                dequantized[tile_index]=bfloat(d*float(scale0)*float(q0)-dmin*float(min0));
+                dequantized[tile_index+32]=bfloat(d*float(scale1)*float(q1)-dmin*float(min1));
+            } else {
+                dequantized[tile_index]=bfloat(0.0f);
+                dequantized[tile_index+32]=bfloat(0.0f);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto right=B;
+        auto left_k=A.slice(kt*TILE_K,int(group.y)*TILE_M);
+        op.run(left_k,right,result);
+    }
+    for(uint i=0;i<result.get_capacity();i++) {
+        auto coord=result.get_multidimensional_index(i);
+        uint col=group.x*TILE_N+coord[0], row=group.y*TILE_M+coord[1];
+        if(row<uint(m) && col<uint(n)) {
+            float x=result[i]; uint bits=as_type<uint>(x);
+            c[row*uint(n)+col]=isnan(x)?ushort((bits>>16)|0x40):ushort((bits+0x7fff+((bits>>16)&1))>>16);
+        }
+    }
+}
+
 inline float q6_k_weight_mpp(device const uchar* weights, uint row, uint column, uint k) {
     uint block_index=column>>8, within=column&255, blocks=k>>8;
     device const uchar* block=weights+(row*blocks+block_index)*210;

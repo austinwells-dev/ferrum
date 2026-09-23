@@ -28,6 +28,18 @@ impl MetalDevice {
             (QuantizationFormat::Q4_0, true, _) => "q4_0_gemv",
             (QuantizationFormat::Q4_0, false, true) => "q4_0_gemm_mpp",
             (QuantizationFormat::Q4_0, false, false) => "q4_0_gemm",
+            (QuantizationFormat::Q5_0, true, _) => "q5_0_gemv",
+            (QuantizationFormat::Q5_0, false, true) => "q5_0_gemm_mpp",
+            (QuantizationFormat::Q5_0, false, false) => "q5_0_gemm",
+            (QuantizationFormat::Q5_1, true, _) => "q5_1_gemv",
+            (QuantizationFormat::Q5_1, false, true) => "q5_1_gemm_mpp",
+            (QuantizationFormat::Q5_1, false, false) => "q5_1_gemm",
+            (QuantizationFormat::Q4_K, true, _) => "q4_k_gemv",
+            (QuantizationFormat::Q4_K, false, true) => "q4_k_gemm_mpp",
+            (QuantizationFormat::Q4_K, false, false) => "q4_k_gemm",
+            (QuantizationFormat::Q5_K, true, _) => "q5_k_gemv",
+            (QuantizationFormat::Q5_K, false, true) => "q5_k_gemm_mpp",
+            (QuantizationFormat::Q5_K, false, false) => "q5_k_gemm",
             (QuantizationFormat::Q6_K, true, _) => "q6_k_gemv",
             (QuantizationFormat::Q6_K, false, true) => "q6_k_gemm_mpp",
             (QuantizationFormat::Q6_K, false, false) => "q6_k_gemm",
@@ -51,7 +63,13 @@ impl MetalDevice {
         use crate::quantization::QuantizationFormat;
         if !matches!(
             weight.format(),
-            QuantizationFormat::Q4_0 | QuantizationFormat::Q8_0 | QuantizationFormat::Q6_K
+            QuantizationFormat::Q4_0
+                | QuantizationFormat::Q5_0
+                | QuantizationFormat::Q5_1
+                | QuantizationFormat::Q4_K
+                | QuantizationFormat::Q5_K
+                | QuantizationFormat::Q8_0
+                | QuantizationFormat::Q6_K
         ) || weight.columns() > u32::MAX as usize
         {
             return Err(Error::Gguf(format!(
@@ -915,6 +933,441 @@ mod q4_0_tests {
         assert!(
             QuantizedMatrix::from_reader(&d, 3, 31, QuantizationFormat::Q4_0, |_| Ok(())).is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod q5_tests {
+    use super::*;
+    use crate::quantization::{QuantizationFormat, QuantizedMatrix};
+
+    fn block_parameters(format: QuantizationFormat, row: usize, block: usize) -> (f32, f32) {
+        match format {
+            QuantizationFormat::Q5_0 => {
+                let d = if (row + block).is_multiple_of(2) {
+                    0.0625
+                } else {
+                    -0.03125
+                };
+                (d, 0.0)
+            }
+            QuantizationFormat::Q5_1 => (
+                0.03125 + ((row + block) % 3) as f32 * 0.0078125,
+                -0.125 + block as f32 * 0.03125,
+            ),
+            _ => unreachable!(),
+        }
+    }
+
+    fn qh_byte(row: usize, block: usize, byte: usize) -> u8 {
+        ((row * 37 + block * 19 + byte * 53 + 0xa5) & 255) as u8
+    }
+
+    fn qs_byte(row: usize, block: usize, byte: usize) -> u8 {
+        ((row * 11 + block * 7 + byte * 29 + 0x36) & 255) as u8
+    }
+
+    fn packed(
+        device: &MetalDevice,
+        rows: usize,
+        columns: usize,
+        format: QuantizationFormat,
+    ) -> QuantizedMatrix {
+        assert!(matches!(
+            format,
+            QuantizationFormat::Q5_0 | QuantizationFormat::Q5_1
+        ));
+        let block_bytes = format.block_bytes();
+        let mut bytes = Vec::with_capacity(rows * columns / 32 * block_bytes);
+        for row in 0..rows {
+            for block_index in 0..columns / 32 {
+                let (d, minimum) = block_parameters(format, row, block_index);
+                bytes.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+                if format == QuantizationFormat::Q5_1 {
+                    bytes.extend_from_slice(&half::f16::from_f32(minimum).to_bits().to_le_bytes());
+                }
+                let qh_offset = if format == QuantizationFormat::Q5_0 {
+                    2
+                } else {
+                    4
+                };
+                for byte in 0..4 {
+                    bytes.push(qh_byte(row, block_index, byte));
+                }
+                for byte in 0..16 {
+                    bytes.push(qs_byte(row, block_index, byte));
+                }
+                assert_eq!(bytes.len() % block_bytes, 0);
+                assert_eq!(
+                    bytes.len() - (row * (columns / 32) + block_index) * block_bytes,
+                    block_bytes
+                );
+                assert_eq!(qh_offset + 4 + 16, block_bytes);
+            }
+        }
+        QuantizedMatrix::from_reader(device, rows, columns, format, |destination| {
+            destination.copy_from_slice(&bytes);
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    fn q5_value(row: usize, column: usize, format: QuantizationFormat) -> f32 {
+        let block = column / 32;
+        let within = column % 32;
+        let qs = qs_byte(row, block, within & 15);
+        let nibble = if within < 16 { qs & 15 } else { qs >> 4 };
+        let high_bit = (qh_byte(row, block, within >> 3) >> (within & 7)) & 1;
+        let q = u32::from(nibble) + (u32::from(high_bit) << 4);
+        let (d, minimum) = block_parameters(format, row, block);
+        match format {
+            QuantizationFormat::Q5_0 => d * (q as f32 - 16.0),
+            QuantizationFormat::Q5_1 => d * q as f32 + minimum,
+            _ => unreachable!(),
+        }
+    }
+
+    fn input(rows: usize, columns: usize) -> Vec<f32> {
+        (0..rows * columns)
+            .map(|i| ((i * 23 + 5) % 97) as f32 / 89.0 - 0.52)
+            .collect()
+    }
+
+    fn expected(
+        input: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        format: QuantizationFormat,
+    ) -> Vec<f32> {
+        (0..m)
+            .flat_map(|row| {
+                (0..n).map(move |column| {
+                    (0..k)
+                        .map(|index| input[row * k + index] * q5_value(column, index, format))
+                        .sum::<f32>()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn q5_0_and_q5_1_gemv_and_gemm_cover_output_and_batch_tails() {
+        let d = MetalDevice::new().unwrap();
+        for format in [QuantizationFormat::Q5_0, QuantizationFormat::Q5_1] {
+            let (n, k) = (5, 64);
+            let weight = packed(&d, n, k, format);
+            assert_eq!(weight.byte_size(), n * 2 * format.block_bytes());
+            for m in [1, 2, 3, 4, 5, 7] {
+                let values = input(m, k);
+                let x = Tensor::from_f32(&d, [m, k], DType::F32, &values).unwrap();
+                let actual = d.project_quantized(&x, &weight).unwrap().tensor.to_f32();
+                let expected = expected(&values, m, n, k, format);
+                for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        (actual - expected).abs() <= 3.0e-5,
+                        "{format:?} index {index}: actual={actual}, expected={expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q5_0_and_q5_1_mpp_gemm_cover_batch_and_output_tails() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let (m, n, k) = (35, 65, 128);
+        for format in [QuantizationFormat::Q5_0, QuantizationFormat::Q5_1] {
+            let weight = packed(&d, n, k, format);
+            let values = input(m, k);
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
+            let reference_values = expected(&x.to_f32(), m, n, k, format);
+            let reference = Tensor::from_f32(&d, [m, n], DType::BF16, &reference_values).unwrap();
+            let output = d.project_quantized(&x, &weight).unwrap();
+            let expected_kernel = match format {
+                QuantizationFormat::Q5_0 => "q5_0_gemm_mpp",
+                QuantizationFormat::Q5_1 => "q5_1_gemm_mpp",
+                _ => unreachable!(),
+            };
+            assert_eq!(output.metrics.operation, expected_kernel);
+            for (index, (actual, expected)) in output
+                .tensor
+                .to_f32()
+                .iter()
+                .zip(reference.to_f32())
+                .enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 0.08,
+                    "{format:?} index {index}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q5_0_and_q5_1_embedding_gather_decode_selected_rows() {
+        let d = MetalDevice::new().unwrap();
+        for format in [QuantizationFormat::Q5_0, QuantizationFormat::Q5_1] {
+            let (vocab, hidden) = (5, 64);
+            let weight = packed(&d, vocab, hidden, format);
+            let ids = [4, 0, 3];
+            let actual = d
+                .embedding_gather_quantized(&weight, &ids, DType::BF16)
+                .unwrap()
+                .tensor
+                .to_f32();
+            let expected = ids
+                .iter()
+                .flat_map(|&row| {
+                    (0..hidden).map(move |column| {
+                        DType::BF16.round(q5_value(row as usize, column, format))
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn q5_0_and_q5_1_reject_partial_blocks() {
+        let d = MetalDevice::new().unwrap();
+        for format in [QuantizationFormat::Q5_0, QuantizationFormat::Q5_1] {
+            assert!(QuantizedMatrix::from_reader(&d, 3, 31, format, |_| Ok(())).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod qk_tests {
+    use super::*;
+    use crate::quantization::{QuantizationFormat, QuantizedMatrix};
+
+    fn scales(row: usize, block: usize) -> [u8; 12] {
+        std::array::from_fn(|i| ((row * 47 + block * 31 + i * 53 + 0x9d) & 255) as u8)
+    }
+
+    fn qbyte(row: usize, block: usize, index: usize) -> u8 {
+        ((row * 17 + block * 43 + index * 29 + 0x6b) & 255) as u8
+    }
+
+    fn parameters(format: QuantizationFormat, row: usize, block: usize) -> (f32, f32) {
+        match format {
+            QuantizationFormat::Q4_K => (0.00390625 + row as f32 * 0.00048828125, 0.015625),
+            QuantizationFormat::Q5_K => (0.001953125 + block as f32 / 4096.0, 0.0078125),
+            _ => unreachable!(),
+        }
+    }
+
+    fn packed(
+        device: &MetalDevice,
+        rows: usize,
+        columns: usize,
+        format: QuantizationFormat,
+    ) -> QuantizedMatrix {
+        assert!(matches!(
+            format,
+            QuantizationFormat::Q4_K | QuantizationFormat::Q5_K
+        ));
+        let mut bytes = Vec::with_capacity(rows * columns / 256 * format.block_bytes());
+        for row in 0..rows {
+            for block_index in 0..columns / 256 {
+                let block_start = bytes.len();
+                let (d, dmin) = parameters(format, row, block_index);
+                bytes.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+                bytes.extend_from_slice(&half::f16::from_f32(dmin).to_bits().to_le_bytes());
+                bytes.extend_from_slice(&scales(row, block_index));
+                match format {
+                    QuantizationFormat::Q4_K => {}
+                    QuantizationFormat::Q5_K => {
+                        for index in 0..32 {
+                            bytes.push(qbyte(row + 7, block_index, index));
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                for index in 0..128 {
+                    bytes.push(qbyte(row, block_index, index));
+                }
+                assert_eq!(bytes.len() - block_start, format.block_bytes());
+            }
+        }
+        QuantizedMatrix::from_reader(device, rows, columns, format, |destination| {
+            destination.copy_from_slice(&bytes);
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    fn unpack_scale_min(scales: &[u8], group: usize) -> (u32, u32) {
+        if group < 4 {
+            (
+                u32::from(scales[group] & 63),
+                u32::from(scales[group + 4] & 63),
+            )
+        } else {
+            (
+                u32::from(scales[group + 4] & 15) | (u32::from(scales[group - 4] >> 6) << 4),
+                u32::from(scales[group + 4] >> 4) | (u32::from(scales[group] >> 6) << 4),
+            )
+        }
+    }
+
+    fn qk_value(row: usize, column: usize, format: QuantizationFormat) -> f32 {
+        let block = column / 256;
+        let within = column % 256;
+        let group = within / 32;
+        let lane = within % 32;
+        let chunk = within / 64;
+        let packed = qbyte(row, block, chunk * 32 + lane);
+        let nibble = if group.is_multiple_of(2) {
+            packed & 15
+        } else {
+            packed >> 4
+        };
+        let (d, dmin) = parameters(format, row, block);
+        let sc = scales(row, block);
+        let (scale, minimum) = unpack_scale_min(&sc, group);
+        let q = match format {
+            QuantizationFormat::Q4_K => u32::from(nibble),
+            QuantizationFormat::Q5_K => {
+                let high = (qbyte(row + 7, block, lane) >> group) & 1;
+                u32::from(nibble) | (u32::from(high) << 4)
+            }
+            _ => unreachable!(),
+        };
+        d * scale as f32 * q as f32 - dmin * minimum as f32
+    }
+
+    fn input(rows: usize, columns: usize) -> Vec<f32> {
+        (0..rows * columns)
+            .map(|i| ((i * 41 + 11) % 127) as f32 / 113.0 - 0.55)
+            .collect()
+    }
+
+    fn expected(
+        input: &[f32],
+        m: usize,
+        n: usize,
+        k: usize,
+        format: QuantizationFormat,
+    ) -> Vec<f32> {
+        (0..m)
+            .flat_map(|row| {
+                (0..n).map(move |column| {
+                    (0..k)
+                        .map(|index| input[row * k + index] * qk_value(column, index, format))
+                        .sum::<f32>()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn q4_k_and_q5_k_gemv_gemm_cover_blocks_and_batch_tails() {
+        let d = MetalDevice::new().unwrap();
+        for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
+            let (n, k) = (5, 512);
+            let weight = packed(&d, n, k, format);
+            assert_eq!(weight.byte_size(), n * 2 * format.block_bytes());
+            for m in [1, 2, 3, 4, 5, 7] {
+                let values = input(m, k);
+                let x = Tensor::from_f32(&d, [m, k], DType::F32, &values).unwrap();
+                let actual = d.project_quantized(&x, &weight).unwrap().tensor.to_f32();
+                let reference = expected(&values, m, n, k, format);
+                for (index, (actual, reference)) in actual.iter().zip(&reference).enumerate() {
+                    assert!(
+                        (actual - reference).abs() <= 2.0e-4,
+                        "{format:?} index {index}: actual={actual}, expected={reference}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn q4_k_and_q5_k_mpp_gemm_cover_row_output_and_group_tails() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let (m, n, k) = (35, 65, 512);
+        for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
+            let weight = packed(&d, n, k, format);
+            let values = input(m, k);
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
+            let rounded_input = x.to_f32();
+            let rounded_input = &rounded_input;
+            let expected = (0..m)
+                .flat_map(|row| {
+                    (0..n).map(move |column| {
+                        (0..k)
+                            .map(|index| {
+                                rounded_input[row * k + index]
+                                    * DType::BF16.round(qk_value(column, index, format))
+                            })
+                            .sum::<f32>()
+                    })
+                })
+                .collect::<Vec<_>>();
+            let reference = Tensor::from_f32(&d, [m, n], DType::BF16, &expected).unwrap();
+            let output = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(
+                output.metrics.operation,
+                if format == QuantizationFormat::Q4_K {
+                    "q4_k_gemm_mpp"
+                } else {
+                    "q5_k_gemm_mpp"
+                }
+            );
+            for (index, (actual, reference)) in output
+                .tensor
+                .to_f32()
+                .iter()
+                .zip(reference.to_f32())
+                .enumerate()
+            {
+                assert!(
+                    (actual - reference).abs() <= 0.04,
+                    "{format:?} index {index}: actual={actual}, expected={reference}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q4_k_and_q5_k_embedding_gather_decodes_selected_rows() {
+        let d = MetalDevice::new().unwrap();
+        for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
+            let (vocab, hidden) = (5, 512);
+            let weight = packed(&d, vocab, hidden, format);
+            let ids = [4, 0, 3];
+            let actual = d
+                .embedding_gather_quantized(&weight, &ids, DType::BF16)
+                .unwrap()
+                .tensor
+                .to_f32();
+            let expected = ids
+                .iter()
+                .flat_map(|&row| {
+                    (0..hidden).map(move |column| {
+                        DType::BF16.round(qk_value(row as usize, column, format))
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actual, expected, "{format:?}");
+        }
+    }
+
+    #[test]
+    fn q4_k_and_q5_k_reject_partial_superblocks() {
+        let d = MetalDevice::new().unwrap();
+        for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
+            assert!(QuantizedMatrix::from_reader(&d, 3, 255, format, |_| Ok(())).is_err());
+        }
     }
 }
 

@@ -30,6 +30,92 @@ fn nll(values: &[f32], target: u32) -> f64 {
     f64::from(max) + normalizer.ln() - f64::from(values[target as usize])
 }
 
+fn teacher_forced_decode_logits(
+    device: &MetalDevice,
+    model: &ferrum::model::Transformer,
+    ids: &[u32],
+) -> Result<Vec<f32>> {
+    if ids.len() < 2 {
+        return Ok(Vec::new());
+    }
+    let (first_logits, mut cache) = model.forward_prefill_last(device, &ids[..1])?;
+    let mut logits = first_logits.to_f32();
+    for &token in &ids[1..ids.len() - 1] {
+        logits.extend(model.forward_decode(device, token, &mut cache)?.to_f32());
+    }
+    Ok(logits)
+}
+
+fn quality_metrics(
+    reference_logits: &[f32],
+    actual_logits: &[f32],
+    targets: &[u32],
+    vocabulary: usize,
+) -> Result<serde_json::Value> {
+    if vocabulary == 0
+        || !reference_logits.len().is_multiple_of(vocabulary)
+        || actual_logits.len() != reference_logits.len()
+        || targets.len() > reference_logits.len() / vocabulary
+    {
+        return Err(Error::Shape(
+            "quality logits or targets have invalid dimensions".into(),
+        ));
+    }
+    let positions = reference_logits.len() / vocabulary;
+    let mut absolute_sum = 0.0f64;
+    let mut squared_sum = 0.0f64;
+    let mut max_absolute = 0.0f32;
+    let mut dot = 0.0f64;
+    let mut reference_norm = 0.0f64;
+    let mut actual_norm = 0.0f64;
+    let mut top1_matches = 0usize;
+    let mut top5_overlap = 0usize;
+    let mut reference_nll = 0.0f64;
+    let mut actual_nll = 0.0f64;
+    for position in 0..positions {
+        let start = position * vocabulary;
+        let reference = &reference_logits[start..start + vocabulary];
+        let actual = &actual_logits[start..start + vocabulary];
+        for (&left, &right) in reference.iter().zip(actual) {
+            let delta = (left - right).abs();
+            max_absolute = max_absolute.max(delta);
+            absolute_sum += f64::from(delta);
+            squared_sum += f64::from(delta) * f64::from(delta);
+            dot += f64::from(left) * f64::from(right);
+            reference_norm += f64::from(left) * f64::from(left);
+            actual_norm += f64::from(right) * f64::from(right);
+        }
+        let reference_top = top_k(reference, 5);
+        let actual_top = top_k(actual, 5);
+        top1_matches += usize::from(reference_top[0] == actual_top[0]);
+        top5_overlap += reference_top
+            .iter()
+            .filter(|id| actual_top.contains(id))
+            .count();
+        if let Some(&target) = targets.get(position) {
+            reference_nll += nll(reference, target);
+            actual_nll += nll(actual, target);
+        }
+    }
+    let logit_count = (positions * vocabulary) as f64;
+    let reference_perplexity = (reference_nll / targets.len() as f64).exp();
+    let actual_perplexity = (actual_nll / targets.len() as f64).exp();
+    Ok(serde_json::json!({
+        "positions": positions,
+        "teacher_forced_tokens": targets.len(),
+        "vocabulary": vocabulary,
+        "logit_max_abs_error": max_absolute,
+        "logit_mean_abs_error": absolute_sum / logit_count,
+        "logit_rmse": (squared_sum / logit_count).sqrt(),
+        "logit_cosine_similarity": dot / (reference_norm.sqrt() * actual_norm.sqrt()),
+        "top1_position_agreement": top1_matches as f64 / positions as f64,
+        "top5_mean_overlap": top5_overlap as f64 / (positions * 5) as f64,
+        "bf16_perplexity": reference_perplexity,
+        "quantized_perplexity": actual_perplexity,
+        "perplexity_ratio": actual_perplexity / reference_perplexity,
+    }))
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() != 3 {
@@ -72,46 +158,19 @@ fn main() -> Result<()> {
         return Err(Error::Shape("quality probe logits shape mismatch".into()));
     }
 
-    let mut absolute_sum = 0.0f64;
-    let mut squared_sum = 0.0f64;
-    let mut max_absolute = 0.0f32;
-    let mut dot = 0.0f64;
-    let mut bf16_norm = 0.0f64;
-    let mut quantized_norm = 0.0f64;
-    let mut top1_matches = 0usize;
-    let mut top5_overlap = 0usize;
-    let mut bf16_nll_sum = 0.0f64;
-    let mut quantized_nll_sum = 0.0f64;
-    for position in 0..positions {
-        let start = position * vocabulary;
-        let reference = &bf16_logits[start..start + vocabulary];
-        let actual = &quantized_logits[start..start + vocabulary];
-        for (&left, &right) in reference.iter().zip(actual) {
-            let delta = (left - right).abs();
-            max_absolute = max_absolute.max(delta);
-            absolute_sum += f64::from(delta);
-            squared_sum += f64::from(delta) * f64::from(delta);
-            dot += f64::from(left) * f64::from(right);
-            bf16_norm += f64::from(left) * f64::from(left);
-            quantized_norm += f64::from(right) * f64::from(right);
-        }
-        let reference_top = top_k(reference, 5);
-        let quantized_top = top_k(actual, 5);
-        top1_matches += usize::from(reference_top[0] == quantized_top[0]);
-        top5_overlap += reference_top
-            .iter()
-            .filter(|id| quantized_top.contains(id))
-            .count();
-        if position + 1 < positions {
-            let target = bf16_ids[position + 1];
-            bf16_nll_sum += nll(reference, target);
-            quantized_nll_sum += nll(actual, target);
-        }
-    }
-    let logit_count = (positions * vocabulary) as f64;
-    let scored_tokens = positions.saturating_sub(1) as f64;
-    let bf16_perplexity = (bf16_nll_sum / scored_tokens).exp();
-    let quantized_perplexity = (quantized_nll_sum / scored_tokens).exp();
+    let prefill_quality =
+        quality_metrics(&bf16_logits, &quantized_logits, &bf16_ids[1..], vocabulary)?;
+    // Feed the same ground-truth stream through one-token decode calls so this
+    // report also measures the M=1 kernels used after the initial prompt.
+    let bf16_decode_logits = teacher_forced_decode_logits(&device, &bf16_model, &bf16_ids)?;
+    let quantized_decode_logits =
+        teacher_forced_decode_logits(&device, &quantized.model, &quantized_ids)?;
+    let decode_quality = quality_metrics(
+        &bf16_decode_logits,
+        &quantized_decode_logits,
+        &bf16_ids[1..],
+        vocabulary,
+    )?;
     println!(
         "{}",
         serde_json::json!({
@@ -131,16 +190,18 @@ fn main() -> Result<()> {
             "token_ids": bf16_ids,
             "positions": positions,
             "vocabulary": vocabulary,
-            "logit_max_abs_error": max_absolute,
-            "logit_mean_abs_error": absolute_sum / logit_count,
-            "logit_rmse": (squared_sum / logit_count).sqrt(),
-            "logit_cosine_similarity": dot / (bf16_norm.sqrt() * quantized_norm.sqrt()),
-            "top1_position_agreement": top1_matches as f64 / positions as f64,
-            "top5_mean_overlap": top5_overlap as f64 / (positions * 5) as f64,
-            "teacher_forced_tokens": positions.saturating_sub(1),
-            "bf16_perplexity": bf16_perplexity,
-            "quantized_perplexity": quantized_perplexity,
-            "perplexity_ratio": quantized_perplexity / bf16_perplexity,
+            "logit_max_abs_error": prefill_quality["logit_max_abs_error"],
+            "logit_mean_abs_error": prefill_quality["logit_mean_abs_error"],
+            "logit_rmse": prefill_quality["logit_rmse"],
+            "logit_cosine_similarity": prefill_quality["logit_cosine_similarity"],
+            "top1_position_agreement": prefill_quality["top1_position_agreement"],
+            "top5_mean_overlap": prefill_quality["top5_mean_overlap"],
+            "teacher_forced_tokens": prefill_quality["teacher_forced_tokens"],
+            "bf16_perplexity": prefill_quality["bf16_perplexity"],
+            "quantized_perplexity": prefill_quality["quantized_perplexity"],
+            "perplexity_ratio": prefill_quality["perplexity_ratio"],
+            "prefill_quality": prefill_quality,
+            "cached_decode_quality": decode_quality,
         })
     );
     Ok(())
