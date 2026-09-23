@@ -131,6 +131,18 @@ fn main() -> Result<()> {
         };
         device.set_q4_0_gemv_8rows(enabled)?;
     }
+    if let Ok(value) = std::env::var("FERRUM_MLX_AFFINE4_GEMV_QUAD") {
+        let enabled = match value.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => {
+                return Err(Error::Parameter(
+                    "invalid FERRUM_MLX_AFFINE4_GEMV_QUAD".into(),
+                ));
+            }
+        };
+        device.set_mlx_affine4_gemv_quad(enabled)?;
+    }
     if let Ok(value) = std::env::var("FERRUM_BATCH_LIMIT") {
         let limit = value
             .parse::<usize>()

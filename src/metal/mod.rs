@@ -267,6 +267,7 @@ pub struct MetalDevice {
     arena: Rc<RefCell<Arena>>,
     native_matmul: Cell<bool>,
     mlx_affine4_mpp_tile_k64: Cell<Option<bool>>,
+    mlx_affine4_gemv_quad: Cell<bool>,
     split_k_gemv: Cell<bool>,
     q4_0_gemv_8rows: Cell<bool>,
     reference_math: Cell<bool>,
@@ -303,6 +304,7 @@ impl MetalDevice {
             arena: Rc::new(RefCell::new(Arena::default())),
             native_matmul: Cell::new(raw.supportsFamily(MTLGPUFamily::Apple7)),
             mlx_affine4_mpp_tile_k64: Cell::new(None),
+            mlx_affine4_gemv_quad: Cell::new(true),
             split_k_gemv: Cell::new(true),
             q4_0_gemv_8rows: Cell::new(true),
             reference_math: Cell::new(false),
@@ -346,6 +348,26 @@ impl MetalDevice {
         self.mlx_affine4_mpp_tile_k64
             .get()
             .unwrap_or((512..=1024).contains(&batch_rows))
+    }
+    /// Select the four-lane, eight-row affine-Q4 M=1 GEMV candidate for wide outputs.
+    pub fn set_mlx_affine4_gemv_quad(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() || (enabled && !self.mpp_projection()) {
+            return Err(Error::Parameter(
+                "affine-Q4 quad GEMV requires an idle compatible device".into(),
+            ));
+        }
+        self.mlx_affine4_gemv_quad.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_mlx_affine4_gemv_quad(
+        &self,
+        output_rows: usize,
+        input_columns: usize,
+    ) -> bool {
+        self.mlx_affine4_gemv_quad.get()
+            && self.mpp_projection()
+            && output_rows >= 2048
+            && input_columns <= 2048
     }
     pub(crate) fn q8_0_gemv_8rows(&self, output_rows: usize) -> bool {
         output_rows >= 128 && output_rows.is_multiple_of(8)
@@ -868,6 +890,25 @@ impl MetalDevice {
                     },
                     MTLSize {
                         width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if name == "mlx_affine4_gemv_quad" {
+                if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 32
+                {
+                    return Err(Error::Dispatch(
+                        "affine-Q4 quad GEMV requires 32-wide SIMD".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0].div_ceil(64),
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 32,
                         height: 1,
                         depth: 1,
                     },

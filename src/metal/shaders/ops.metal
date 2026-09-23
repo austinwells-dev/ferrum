@@ -1,4 +1,5 @@
 #include <metal_stdlib>
+#include <metal_simdgroup>
 using namespace metal;
 // ABI: length, row width, K, N, dtype (0 f32 / 1 f16 / 2 bf16), position,
 // head dimension, epsilon bits, theta bits. All indexing validated to fit uint.
@@ -628,6 +629,39 @@ kernel void mlx_affine4_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uin
     }
     float sum=simd_sum((sum0+sum1)+(sum2+sum3));
     if(lane==0 && row<p[3]) store(c,row,p[4],sum);
+}
+// Four lanes cooperate on K while reusing each activation fragment for eight rows.
+kernel void mlx_affine4_gemv_quad(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint quad=tid/4, quad_lane=tid%4;
+    uint first_row=group*64+quad;
+    uint groups=p[2]/64;
+    float result[8]={0.f};
+    float x[16];
+    for(uint group_index=0;group_index<groups;group_index++) {
+        uint column=group_index*64+quad_lane*16;
+        for(uint i=0;i<16;i++) x[i]=load(a,column+i,p[4]);
+        for(uint output=0;output<8;output++) {
+            uint row=first_row+output*8;
+            if(row<p[3]) {
+                device const uchar* block=b+(row*groups+group_index)*36;
+                float scale=float(*((device const half*)block));
+                float bias=float(*((device const half*)(block+2)));
+                float partial=0.f;
+                for(uint byte=0;byte<8;byte++) {
+                    uchar packed=block[4+quad_lane*8+byte];
+                    float w0=scale*float(packed&15)+bias;
+                    float w1=scale*float(packed>>4)+bias;
+                    partial+=w0*x[byte*2]+w1*x[byte*2+1];
+                }
+                result[output]+=partial;
+            }
+        }
+    }
+    for(uint output=0;output<8;output++) {
+        uint row=first_row+output*8;
+        float sum=quad_sum(result[output]);
+        if(quad_lane==0 && row<p[3]) store(c,row,p[4],sum);
+    }
 }
 kernel void mlx_affine4_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
     uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;

@@ -58,7 +58,13 @@ impl MetalDevice {
             (QuantizationFormat::Q6_K, true, _) => "q6_k_gemv",
             (QuantizationFormat::Q6_K, false, true) => "q6_k_gemm_mpp",
             (QuantizationFormat::Q6_K, false, false) => "q6_k_gemm",
-            (QuantizationFormat::MlxAffine4Group64, true, _) => "mlx_affine4_gemv",
+            (QuantizationFormat::MlxAffine4Group64, true, _) => {
+                if self.use_mlx_affine4_gemv_quad(weight.rows(), weight.columns()) {
+                    "mlx_affine4_gemv_quad"
+                } else {
+                    "mlx_affine4_gemv"
+                }
+            }
             (QuantizationFormat::MlxAffine4Group64, false, true) => {
                 if self.mlx_affine4_mpp_tile_k64(ad[0]) {
                     "mlx_affine4_gemm_mpp_k64"
@@ -1716,6 +1722,45 @@ mod mlx_affine4_tests {
                     "M={m}, index {index}: actual={actual}, expected={expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn affine4_quad_gemv_reuses_activations_across_rows_and_covers_tails() {
+        let device = MetalDevice::new().unwrap();
+        let (n, k) = (2051, 192);
+        let weight = packed(&device, n, k);
+        let values = input(1, k);
+        let x = Tensor::from_f32(&device, [1, k], DType::F16, &values).unwrap();
+        assert!(device.use_mlx_affine4_gemv_quad(n, k));
+        assert!(!device.use_mlx_affine4_gemv_quad(896, 896));
+        assert!(!device.use_mlx_affine4_gemv_quad(896, 4864));
+        let rounded_input = x.to_f32();
+        let expected = (0..n)
+            .map(|row| {
+                (0..k)
+                    .map(|column| rounded_input[column] * value(row, column))
+                    .sum::<f32>()
+            })
+            .map(|value| DType::F16.round(value))
+            .collect::<Vec<_>>();
+        let candidate = device.project_quantized(&x, &weight).unwrap();
+        assert_eq!(candidate.metrics.operation, "mlx_affine4_gemv_quad");
+        device.set_mlx_affine4_gemv_quad(false).unwrap();
+        let baseline = device.project_quantized(&x, &weight).unwrap();
+        assert_eq!(baseline.metrics.operation, "mlx_affine4_gemv");
+        for (index, ((actual, baseline), expected)) in candidate
+            .tensor
+            .to_f32()
+            .iter()
+            .zip(baseline.tensor.to_f32())
+            .zip(expected)
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 0.015 && (actual - baseline).abs() <= 0.015,
+                "index {index}: candidate={actual}, baseline={baseline}, expected={expected}"
+            );
         }
     }
 

@@ -320,6 +320,7 @@ def main() -> None:
                             result["ferrum_options"] = {
                                 "batch_limit_dispatches": int(os.environ.get("FERRUM_BATCH_LIMIT", "1024")),
                                 "q4_0_gemv_8rows": os.environ.get("FERRUM_Q4_0_GEMV_8ROWS", "true").lower() in ("1", "true"),
+                                "mlx_affine4_gemv_quad": os.environ.get("FERRUM_MLX_AFFINE4_GEMV_QUAD", "true").lower() in ("1", "true"),
                             }
                         result["engine_order"] = order
                         result["case_index"] = case_index

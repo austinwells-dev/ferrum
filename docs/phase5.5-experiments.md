@@ -4,7 +4,7 @@
 
 Phase 5.5 compares Ferrum’s supported GGUF quantized and MLX affine-Q4 paths with current llama.cpp Metal and native MLX/MLX-LM on the same Apple M5. This phase starts from clean Phase 5 commit `b47f03367672b62b2b5208242dc467c902dc9ff7`. No Phase 6 work is included.
 
-Current status: three-pair matched baseline matrices are complete for Q4_0, Q4_K_M, Q5_K_M, Q6_K, Q8_0, and native MLX affine Q4. F16 MPP attention improves affine-Q4 prefill while preserving exact native token IDs. The two-row-per-SIMD Q4_0 M=1 GEMV is retained as the default for wide outputs after a full paired matrix showed 10–15% higher decode throughput with identical Ferrum token IDs. Q5_0, Q5_1, Q6_K, Q8_0, and affine-Q4 M=1 projections remain optimization targets. Short smoke numbers are sanity checks only and are not reported as benchmark results.
+Current status: Phase 5.5 is suspended at a clean performance checkpoint and is not declared performance-complete. The three-pair matched matrices cover Q4_0, Q4_K_M, Q5_K_M, Q6_K, Q8_0, and native MLX affine Q4. F16 MPP attention, the wide-output Q4_0 two-row M=1 GEMV, and the guarded wide/short-K affine-Q4 quad GEMV are retained. The attempted Q5_0/Q5_1 row-sharing candidate was rejected and removed after synchronized GPU profiles showed regressions. The major remaining deficit is quantized M=1 projection/GEMV performance; prefill also remains behind mature reference runtimes. This checkpoint makes no parity claim. Short smoke numbers are sanity checks only and are not reported as benchmark results.
 
 ## Host and pinned artifacts
 
@@ -38,21 +38,21 @@ The matched prompt IDs make input work comparable; they do not guarantee identic
 
 ## Results
 
-### GGUF baseline across formats
+### GGUF cross-format summary
 
 These are medians of the paired Ferrum-to-llama.cpp throughput ratios over the six workloads and three pairs per workload. Each workload contributes one value per pair, so the summary weights cases equally. Exact output matches compare complete generated ID sequences within a pair.
 
 | GGUF format | Prefill ratio | Decode ratio | Full generation ratio | Exact output matches |
 | --- | ---: | ---: | ---: | ---: |
-| Q4_0 | 0.501 | 0.409 | 0.449 | 15 / 18 |
+| Q4_0 | 0.494 | 0.470 | 0.493 | 15 / 18 |
 | Q4_K_M | 0.513 | 0.485 | 0.505 | 12 / 18 |
 | Q5_K_M | 0.495 | 0.488 | 0.501 | 12 / 18 |
 | Q6_K | 0.429 | 0.603 | 0.571 | 15 / 18 |
 | Q8_0 | 0.378 | 0.636 | 0.595 | 12 / 18 |
 
-Raw matrices are `q4_0-ferrum-vs-llama-current.jsonl`, `q4_k_m-ferrum-vs-llama-current.jsonl`, `q5_k_m-ferrum-vs-llama-current.jsonl`, `q6_k-ferrum-vs-llama-current.jsonl`, and `q8_0-ferrum-vs-llama-current.jsonl` under `docs/measurements/phase5.5/`.
+Raw matrices are `q4_0-ferrum-vs-llama-current-after-8rows.jsonl`, `q4_k_m-ferrum-vs-llama-current.jsonl`, `q5_k_m-ferrum-vs-llama-current.jsonl`, `q6_k-ferrum-vs-llama-current.jsonl`, and `q8_0-ferrum-vs-llama-current.jsonl` under `docs/measurements/phase5.5/`.
 
-### MLX affine Q4 vs native MLX-LM
+### MLX affine Q4 vs native MLX-LM baseline
 
 Ferrum and native MLX-LM used the same pinned group-size-64 affine-Q4 model directory. The table shows median throughput in tokens per second as Ferrum / native MLX-LM; output lengths and prompt IDs were identical. Native MLX-LM and the saved artifacts report `mlx==0.32.2` and `mlx-lm==0.31.3`.
 
@@ -65,7 +65,7 @@ Ferrum and native MLX-LM used the same pinned group-size-64 affine-Q4 model dire
 | `sustained-128-decode` | 825 / 1,868 | 117 / 311 | 112.4 / 302.0 | 0.373 |
 | `long-horizon-1601` | 1,892 / 12,198 | 102 / 266 | 98.8 / 264.0 | 0.374 |
 
-Across all 18 paired samples, the median Ferrum/native throughput ratios are 0.251 for prefill, 0.381 for aggregate decode, and 0.374 for full generation. All 18 pairs produced exactly the same token IDs. The long-prompt prefill gap is the most severe: Ferrum reaches 12.5% of native MLX-LM at 512 tokens and 7.1% at 1,024 tokens. Native decode aggregate rates are derived from the recorded output-token intervals; the runner now emits this derived field for future runs. Raw rows are in `docs/measurements/phase5.5/mlx-affine4-ferrum-vs-native-mlx-lm.jsonl`.
+This is the pre-optimization reference matrix. Across all 18 paired samples, the median Ferrum/native throughput ratios are 0.251 for prefill, 0.381 for aggregate decode, and 0.374 for full generation. All 18 pairs produced exactly the same token IDs. The long-prompt prefill gap is the most severe: Ferrum reaches 12.5% of native MLX-LM at 512 tokens and 7.1% at 1,024 tokens. Native decode aggregate rates are derived from the recorded output-token intervals; the runner now emits this derived field for future runs. Raw rows are in `docs/measurements/phase5.5/mlx-affine4-ferrum-vs-native-mlx-lm.jsonl`.
 
 ### F16 attention MPP result
 
@@ -80,15 +80,41 @@ After adding F16 grouped MPP score and context kernels, the full three-pair matr
 | `sustained-128-decode` | 797 / 1,570 | -3% | 111.1 / 272.1 | 0.390 (0.365–0.408) |
 | `long-horizon-1601` | 4,284 / 11,258 | +126% | 97.0 / 240.2 | 0.396 (0.360–0.404) |
 
-The paired median full-generation ratio over all cases rose from 0.374 to 0.401. Aggregate decode remains about 0.38 of native MLX-LM, so M=1 quantized projections are the next target. The post-change raw matrix is `docs/measurements/phase5.5/mlx-affine4-ferrum-vs-native-mlx-lm-after-f16-attention-mpp.jsonl`.
+The paired median full-generation ratio over all cases rose from 0.374 to 0.401. Aggregate decode remained about 0.38 of native MLX-LM, so M=1 quantized projections were the next target. The post-change raw matrix is `docs/measurements/phase5.5/mlx-affine4-ferrum-vs-native-mlx-lm-after-f16-attention-mpp.jsonl`.
+
+### Affine-Q4 eight-row M=1 GEMV
+
+The new kernel maps each four-lane quad to eight output rows. Each lane loads a 16-value activation fragment once and reuses it across those rows, following the shape of MLX's affine `qmv_quad` path. The first broad experiment showed regressions for small-output Q/K/V and long-K down projections, so the retained policy selects the kernel only when `N >= 2048` and `K <= 2048`. For the pinned Qwen model, that selects the wide gate/up projections and LM head, and leaves Q/K/V/down on the existing kernel.
+
+| Case | Prefill tok/s Ferrum / native | Decode tok/s Ferrum / native | Full generation tok/s Ferrum / native | Paired generation ratio | Ferrum generation change vs F16 attention matrix |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `short` | 825 / 1,806 | 126 / 294 | 108.7 / 239.8 | 0.455 (0.423–0.455) | +5.0% |
+| `128` | 3,926 / 5,836 | 127 / 292 | 102.2 / 206.7 | 0.491 (0.455–0.506) | +1.9% |
+| `512` | 5,608 / 13,646 | 120 / 282 | 74.9 / 167.1 | 0.434 (0.423–0.449) | +2.5% |
+| `1024` | 5,184 / 13,762 | 110 / 292 | 48.9 / 123.6 | 0.393 (0.367–0.400) | +0.7% |
+| `sustained-128-decode` | 861 / 1,814 | 126 / 311 | 119.6 / 300.2 | 0.404 (0.387–0.413) | +7.7% |
+| `long-horizon-1601` | 4,694 / 12,296 | 112 / 279 | 108.8 / 277.9 | 0.392 (0.388–0.415) | +12.2% |
+
+Across all 18 paired samples, the final median Ferrum/native ratios are 0.411 for prefill, 0.415 for aggregate decode, and 0.419 for full generation. Ferrum produced exactly the same IDs as the post-F16 baseline and native MLX-LM in all 18 pairs. In a synchronized short-prompt profile, the guarded candidate stages recorded 6.10 ms for up, 5.13 ms for gate, and 0.99 ms for the LM head, versus 6.90 ms, 5.87 ms, and 4.70 ms on the original path; Q/K/V/down used the original path. Profile values are diagnostic samples; the matched matrix is the latency evidence. Raw results are `docs/measurements/phase5.5/mlx-affine4-ferrum-vs-native-mlx-lm-after-affine-quad-policy.jsonl`, and the guarded profile is `docs/measurements/phase5.5/profiles/mlx-affine4-stage-profile-after-quad-policy.jsonl`.
 
 ### Upstream kernel survey
 
-At the pinned llama.cpp revision, `ggml/src/ggml-metal/kernels/mul_mv.metal` implements Q4_0, Q5_0, and Q5_1 through `mul_vec_q_n_f32_impl`; `ggml-metal-impl.h` sets four output rows per SIMD group for these formats. The generic kernel loads and rearranges an activation fragment once, then reuses it while accumulating several weight rows. The Q5_K and Q6_K implementations also keep per-row accumulators while reusing activation fragments across rows. This informed the Q4_0 two-row candidate and is the next idea to evaluate for Ferrum Q5.
+At the pinned llama.cpp revision, `ggml/src/ggml-metal/kernels/mul_mv.metal` implements Q4_0, Q5_0, and Q5_1 through `mul_vec_q_n_f32_impl`; `ggml-metal-impl.h` sets four output rows per SIMD group for these formats. The generic kernel loads and rearranges an activation fragment once, then reuses it while accumulating several weight rows. The Q5_K and Q6_K implementations also keep per-row accumulators while reusing activation fragments across rows. These ideas informed the retained Q4_0 candidate and the rejected Q5 candidate documented below.
 
 At the pinned MLX revision, `mlx/backend/metal/quantized.cpp` chooses quantized matrix/vector paths using M, K, N, transpose state, and Apple GPU generation. The `dispatch_qmv` path selects `qmv_quad` for K=64 or 128, and `mlx/backend/metal/kernels/quantized.h`'s affine `qmv_quad_impl` loads an activation fragment once and accumulates up to eight output rows per quadgroup. This is directly relevant to the pinned group-size-64 affine-Q4 decode path. The MLX-LM generation loop uses MLX's lazy evaluation and cache policy; the comparison harness calls its native `generate_step` path and measures that runtime separately.
 
-Ferrum's retained F16 attention kernels and Q4_0 two-row kernel are native implementations using Ferrum's existing Metal and Rust interfaces. The work reuses dataflow ideas from upstream; it does not copy upstream source code. No new third-party runtime dependency was added.
+Ferrum's retained F16 attention, Q4_0 two-row, and affine-Q4 quad kernels are native implementations using Ferrum's existing Metal and Rust interfaces. The work reuses dataflow ideas from upstream; it does not copy upstream source code. No new third-party runtime dependency was added.
+
+### Rejected Q5_0/Q5_1 two-row-per-SIMD candidate
+
+A two-row-per-SIMD M=1 candidate for Q5_0 and Q5_1 passed deterministic numerical checks for both formats, a 131-row output tail, and a five-block K dimension. The synchronized real-model stage profiles showed the candidate was substantially slower in the Q4_K_M and Q5_K_M models, so it was removed before a full latency matrix:
+
+| Model | Baseline Q5 GEMV GPU time across profiled projections | Candidate time | Change |
+| --- | ---: | ---: | ---: |
+| Q4_K_M (Q5_0) | 5.18 ms | 8.16 ms | +58% |
+| Q5_K_M (Q5_1) | 5.27 ms | 8.73 ms | +66% |
+
+These are one-token diagnostic profiles with a synchronized dispatch limit of one, not production throughput measurements. The candidate doubled per-thread accumulators and still decoded a separate weight row; the extra Q5 decode work appears to outweigh the activation-load reuse. Register pressure is a possible contributor but was not measured directly. The candidate tests and production kernels were removed; the four raw before/after profiles are retained in `docs/measurements/phase5.5/profiles/` for traceability.
 
 ### Stage profile diagnosis
 
@@ -129,3 +155,33 @@ The baseline Q4_0 M=1 kernel assigned one SIMD group to one output row, repeatin
 | `long-horizon-1601` | 4,372 → 4,385 | 96.0 → 108 | 0.441 (0.439–0.442) | 93.5 → 104.2 | 0.457 (0.454–0.457) |
 
 Decode improved 10.7–14.7% across all six cases; full-generation throughput improved 4.1–12.1%. Prefill remained within measurement variation except for the sustained case, whose prefill rate fell 17% in the candidate run while decode improved 13%; this diagnostic run does not change the prefill implementation. The candidate produced the same Ferrum output IDs as the original kernel in all 18 pairs, including all 129 tokens of each sustained-decode output. Its full output matched llama.cpp in 15/18 pairs, the same agreement count as the baseline. This supports retaining it for M=1 decode. The raw candidate matrix is `docs/measurements/phase5.5/q4_0-ferrum-vs-llama-current-after-8rows.jsonl`; the before/after synchronized profiles are in `docs/measurements/phase5.5/profiles/`.
+
+## Final checkpoint matrices and remaining work
+
+The following are the final paired-median throughput ratios after retaining the validated candidates. Each value is Ferrum / reference; GGUF rows compare against the pinned llama.cpp Metal build and affine-Q4 compares against native MLX-LM. Overall values take the median of paired ratios across six workloads, with workloads weighted equally. Exact matches count complete generated sequences.
+
+| Format | Prefill ratio | Decode ratio | Full generation ratio | Exact output matches |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_0 | 0.494 | 0.470 | 0.493 | 15 / 18 |
+| Q4_K_M | 0.513 | 0.485 | 0.505 | 12 / 18 |
+| Q5_K_M | 0.495 | 0.488 | 0.501 | 12 / 18 |
+| Q6_K | 0.429 | 0.603 | 0.571 | 15 / 18 |
+| Q8_0 | 0.378 | 0.636 | 0.595 | 12 / 18 |
+| MLX affine-Q4 | 0.411 | 0.415 | 0.419 | 18 / 18 |
+
+Per-workload matrix, with each cell listing paired-median `prefill / decode / full-generation` ratios:
+
+| Workload | Q4_0 | Q4_K_M | Q5_K_M | Q6_K | Q8_0 | MLX affine-Q4 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| short | 0.490 / 0.498 / 0.507 | 0.514 / 0.496 / 0.510 | 0.515 / 0.504 / 0.518 | 0.423 / 0.621 / 0.587 | 0.378 / 0.658 / 0.603 | 0.457 / 0.431 / 0.455 |
+| 128 | 0.518 / 0.496 / 0.497 | 0.515 / 0.512 / 0.527 | 0.499 / 0.514 / 0.527 | 0.408 / 0.628 / 0.588 | 0.389 / 0.670 / 0.607 | 0.636 / 0.433 / 0.491 |
+| 512 | 0.531 / 0.468 / 0.505 | 0.539 / 0.482 / 0.512 | 0.520 / 0.490 / 0.511 | 0.458 / 0.608 / 0.538 | 0.429 / 0.631 / 0.539 | 0.410 / 0.427 / 0.434 |
+| 1024 | 0.534 / 0.439 / 0.501 | 0.537 / 0.452 / 0.507 | 0.526 / 0.465 / 0.502 | 0.469 / 0.561 / 0.509 | 0.437 / 0.588 / 0.493 | 0.372 / 0.375 / 0.393 |
+| sustained-128-decode | 0.433 / 0.471 / 0.485 | 0.474 / 0.489 / 0.503 | 0.451 / 0.485 / 0.500 | 0.389 / 0.604 / 0.609 | 0.379 / 0.649 / 0.648 | 0.463 / 0.412 / 0.404 |
+| long-horizon-1601 | 0.450 / 0.441 / 0.457 | 0.467 / 0.456 / 0.471 | 0.460 / 0.459 / 0.473 | 0.427 / 0.560 / 0.572 | 0.353 / 0.585 / 0.596 | 0.358 / 0.403 / 0.392 |
+
+Raw, per-pair rows remain in the JSONL matrices listed above and in the affine-Q4 final matrix `docs/measurements/phase5.5/mlx-affine4-ferrum-vs-native-mlx-lm-after-affine-quad-policy.jsonl`. The benchmark runners, pinned revisions, matched prompts, logs, diagnostic profiles, and upstream kernel survey remain in this checkpoint so later work can reproduce the comparisons without rebuilding the setup.
+
+Phase 5.5 is paused, not performance-complete. The central remaining deficit is quantized M=1 projection/GEMV throughput: final overall decode ratios range from 0.470 to 0.636 against llama.cpp across GGUF formats, and 0.415 against native MLX-LM for affine-Q4. Prefill also remains behind mature references: the final overall ratios range from 0.378 to 0.513 for GGUF and are 0.411 for affine-Q4. The long affine-Q4 cases are lower still (0.372 at 1,024 prompt tokens and 0.358 for the long-horizon workload). These results are far from parity and are recorded as remaining gaps, not completion criteria met.
+
+Recommended continuation point: resume at `src/ops/transformer.rs::project_quantized` and the Metal M=1 quantized GEMV implementations. First profile synchronized per-projection M=1 time for Q6_K and Q8_0 against the retained baseline profiles, then select and validate a format-specific dataflow; their final decode ratios (0.603 and 0.636) are the strongest GGUF results but still leave a substantial gap. Continue with Q4_K_M and Q5_K_M after that, designing a different Q5 unpack/reuse strategy from the rejected Q5_0/Q5_1 two-row candidate. Keep the matched matrix harness as the acceptance measurement. Address prefill in a later, separately measured batch/projection tiling pass. No Phase 6 work is started by this checkpoint.
