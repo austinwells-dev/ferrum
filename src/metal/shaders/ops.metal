@@ -229,6 +229,45 @@ kernel void q4_0_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group
     float sum=simd_sum((sum0+sum1)+(sum2+sum3));
     if(lane==0 && row<p[3]) store(c,row,p[4],sum);
 }
+// Two output rows share the same activation loads in each SIMD group.
+kernel void q4_0_gemv_8rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32;
+    uint row0=group*8+simd*2, row1=row0+1;
+    uint k=p[2], blocks=k/32;
+    float sum00=0.f, sum01=0.f, sum02=0.f, sum03=0.f;
+    float sum10=0.f, sum11=0.f, sum12=0.f, sum13=0.f;
+    if(row0<p[3]) {
+        uint groups=blocks/4;
+        for(uint tile=0;tile<groups;tile++) {
+            uint block=tile*4;
+            uint column=block*32+lane;
+            float x0=load(a,column+0*32,p[4]);
+            float x1=load(a,column+1*32,p[4]);
+            float x2=load(a,column+2*32,p[4]);
+            float x3=load(a,column+3*32,p[4]);
+            sum00+=q4_0_weight(b,row0,column+0*32,k)*x0;
+            sum01+=q4_0_weight(b,row0,column+1*32,k)*x1;
+            sum02+=q4_0_weight(b,row0,column+2*32,k)*x2;
+            sum03+=q4_0_weight(b,row0,column+3*32,k)*x3;
+            if(row1<p[3]) {
+                sum10+=q4_0_weight(b,row1,column+0*32,k)*x0;
+                sum11+=q4_0_weight(b,row1,column+1*32,k)*x1;
+                sum12+=q4_0_weight(b,row1,column+2*32,k)*x2;
+                sum13+=q4_0_weight(b,row1,column+3*32,k)*x3;
+            }
+        }
+        for(uint block=groups*4;block<blocks;block++) {
+            uint column=block*32+lane;
+            float x=load(a,column,p[4]);
+            sum00+=q4_0_weight(b,row0,column,k)*x;
+            if(row1<p[3]) sum10+=q4_0_weight(b,row1,column,k)*x;
+        }
+    }
+    float sum0=simd_sum((sum00+sum01)+(sum02+sum03));
+    float sum1=simd_sum((sum10+sum11)+(sum12+sum13));
+    if(lane==0 && row0<p[3]) store(c,row0,p[4],sum0);
+    if(lane==0 && row1<p[3]) store(c,row1,p[4],sum1);
+}
 kernel void q4_0_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
     uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;
     uint k=p[2], blocks=k/32;

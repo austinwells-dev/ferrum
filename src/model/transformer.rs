@@ -187,7 +187,7 @@ impl Transformer {
         } else {
             x
         };
-        let logits = d.profile_lm_head(|| self.lm_head.forward(d, &head_input))?;
+        let logits = d.profile_projection("lm_head", || self.lm_head.forward(d, &head_input))?;
         record(&mut trace, "logits", &logits);
         execution.finish()?;
         *cache = staged;

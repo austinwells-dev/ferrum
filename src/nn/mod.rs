@@ -173,9 +173,9 @@ pub struct Mlp {
 }
 impl Mlp {
     pub fn forward(&self, d: &MetalDevice, x: &Tensor) -> Result<Tensor> {
-        let gate = self.gate.forward(d, x)?;
-        let up = self.up.forward(d, x)?;
+        let gate = d.profile_projection("gate_proj", || self.gate.forward(d, x))?;
+        let up = d.profile_projection("up_proj", || self.up.forward(d, x))?;
         let hidden = d.silu_mul(&gate, &up)?.tensor;
-        self.down.forward(d, &hidden)
+        d.profile_projection("down_proj", || self.down.forward(d, &hidden))
     }
 }

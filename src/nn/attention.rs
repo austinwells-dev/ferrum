@@ -38,17 +38,14 @@ impl Attention {
             return Err(Error::Shape("attention needs [S,hidden]".into()));
         }
         let offset = cache.layer_len(layer)?;
-        let q = self
-            .q
-            .forward(d, x)?
+        let q = d
+            .profile_projection("q_proj", || self.q.forward(d, x))?
             .reshape([s, self.q_heads, self.head_dim])?;
-        let k = self
-            .k
-            .forward(d, x)?
+        let k = d
+            .profile_projection("k_proj", || self.k.forward(d, x))?
             .reshape([s, self.kv_heads, self.head_dim])?;
-        let v = self
-            .v
-            .forward(d, x)?
+        let v = d
+            .profile_projection("v_proj", || self.v.forward(d, x))?
             .reshape([s, self.kv_heads, self.head_dim])?;
         let prefix = format!("layer.{layer}");
         for (name, t) in [("q", &q), ("k", &k), ("v", &v)] {
@@ -95,7 +92,7 @@ impl Attention {
             .tensor
             .reshape([s, self.q_heads * self.head_dim])?;
         record(&mut trace, format!("{prefix}.context"), &merged);
-        let output = self.output.forward(d, &merged)?;
+        let output = d.profile_projection("o_proj", || self.output.forward(d, &merged))?;
         record(&mut trace, format!("{prefix}.attention"), &output);
         Ok(output)
     }

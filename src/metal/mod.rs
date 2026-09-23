@@ -224,7 +224,7 @@ pub struct ProfileEntry {
     pub gpu_samples: usize,
     pub allocation_bytes: usize,
 }
-pub type Profile = std::collections::BTreeMap<&'static str, ProfileEntry>;
+pub type Profile = std::collections::BTreeMap<String, ProfileEntry>;
 /// An encoding epoch owns every referenced Metal resource through completion.
 /// No tensor carrying this epoch may be mapped until successful completion.
 struct Submission {
@@ -249,17 +249,17 @@ impl Drop for Execution<'_> {
         self.device.batching.set(false);
     }
 }
-struct ProfileScope<'a> {
-    flag: &'a Cell<bool>,
-    previous: bool,
+struct ProfileStageScope<'a> {
+    stage: &'a Cell<Option<&'static str>>,
+    previous: Option<&'static str>,
 }
-impl Drop for ProfileScope<'_> {
+impl Drop for ProfileStageScope<'_> {
     fn drop(&mut self) {
-        self.flag.set(self.previous);
+        self.stage.set(self.previous);
     }
 }
 pub struct MetalDevice {
-    lm_head_profile: Cell<bool>,
+    profile_stage: Cell<Option<&'static str>>,
     #[cfg(test)]
     fail_after: Cell<Option<usize>>,
     #[cfg(test)]
@@ -268,6 +268,7 @@ pub struct MetalDevice {
     native_matmul: Cell<bool>,
     mlx_affine4_mpp_tile_k64: Cell<Option<bool>>,
     split_k_gemv: Cell<bool>,
+    q4_0_gemv_8rows: Cell<bool>,
     reference_math: Cell<bool>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
@@ -294,7 +295,7 @@ impl MetalDevice {
             .newCommandQueue()
             .ok_or_else(|| Error::Initialization("command queue creation failed".into()))?;
         Ok(Self {
-            lm_head_profile: Cell::new(false),
+            profile_stage: Cell::new(None),
             #[cfg(test)]
             fail_after: Cell::new(None),
             #[cfg(test)]
@@ -303,6 +304,7 @@ impl MetalDevice {
             native_matmul: Cell::new(raw.supportsFamily(MTLGPUFamily::Apple7)),
             mlx_affine4_mpp_tile_k64: Cell::new(None),
             split_k_gemv: Cell::new(true),
+            q4_0_gemv_8rows: Cell::new(true),
             reference_math: Cell::new(false),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
@@ -347,6 +349,19 @@ impl MetalDevice {
     }
     pub(crate) fn q8_0_gemv_8rows(&self, output_rows: usize) -> bool {
         output_rows >= 128 && output_rows.is_multiple_of(8)
+    }
+    /// Select the two-output-row-per-SIMD Q4_0 M=1 kernel for wide projections.
+    pub fn set_q4_0_gemv_8rows(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q4_0 GEMV during execution".into(),
+            ));
+        }
+        self.q4_0_gemv_8rows.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q4_0_gemv_8rows(&self, output_rows: usize) -> bool {
+        self.q4_0_gemv_8rows.get() && output_rows >= 128
     }
     /// Select the multi-SIMD split-K BF16 GEMV for large aligned rows.
     pub fn set_split_k_gemv(&self, enabled: bool) -> Result<()> {
@@ -436,10 +451,17 @@ impl MetalDevice {
         // submission.resources drops only after the wait and status check.
         Ok(())
     }
-    pub(crate) fn profile_lm_head<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
-        let _scope = ProfileScope {
-            flag: &self.lm_head_profile,
-            previous: self.lm_head_profile.replace(true),
+    pub(crate) fn profile_projection<T>(
+        &self,
+        stage: &'static str,
+        f: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        if !self.profiling.get() {
+            return f();
+        }
+        let _scope = ProfileStageScope {
+            stage: &self.profile_stage,
+            previous: self.profile_stage.replace(Some(stage)),
         };
         f()
     }
@@ -461,38 +483,10 @@ impl MetalDevice {
         bytes: usize,
         timing: &DispatchTiming,
     ) {
-        let name = if self.lm_head_profile.get() {
-            match name {
-                "gemv" | "gemv_vector" | "gemv_wide" | "q4_0_gemv" | "q5_0_gemv" | "q5_1_gemv"
-                | "q4_k_gemv" | "q5_k_gemv" | "q6_k_gemv" | "q8_0_gemv" | "q8_0_gemv_8rows"
-                | "mlx_affine4_gemv" => "lm_head_gemv",
-                "project_bf16"
-                | "project_f16"
-                | "project_wide_bf16"
-                | "project_wide_f16"
-                | "project_mpp"
-                | "q4_0_gemm_mpp"
-                | "q5_0_gemm_mpp"
-                | "q5_1_gemm_mpp"
-                | "q4_k_gemm_mpp"
-                | "q5_k_gemm_mpp"
-                | "q6_k_gemm_mpp"
-                | "q8_0_gemm_mpp"
-                | "matmul_nt"
-                | "q4_0_gemm"
-                | "q5_0_gemm"
-                | "q5_1_gemm"
-                | "q4_k_gemm"
-                | "q5_k_gemm"
-                | "q6_k_gemm"
-                | "q8_0_gemm"
-                | "mlx_affine4_gemm"
-                | "mlx_affine4_gemm_mpp"
-                | "mlx_affine4_gemm_mpp_k64" => "lm_head_matmul",
-                _ => name,
-            }
+        let name = if let Some(stage) = self.profile_stage.get() {
+            format!("{stage}.{name}")
         } else {
-            name
+            name.to_owned()
         };
         let mut profile = self.profile.borrow_mut();
         let entry = profile.entry(name).or_default();
@@ -680,6 +674,8 @@ impl MetalDevice {
                 | "q8_0_gemm_mpp"
                 | "attention_scores_mpp"
                 | "attention_context_mpp"
+                | "attention_scores_mpp_f16"
+                | "attention_context_mpp_f16"
         ) {
             self.compile_kernel_version(
                 include_str!("shaders/project_mpp.metal"),
@@ -763,8 +759,11 @@ impl MetalDevice {
                 | "q8_0_gemm_mpp"
                 | "attention_scores_mpp"
                 | "attention_context_mpp"
+                | "attention_scores_mpp_f16"
+                | "attention_context_mpp_f16"
                 | "q8_0_gemv"
                 | "q8_0_gemv_8rows"
+                | "q4_0_gemv_8rows"
                 | "q4_0_gemv"
                 | "q5_0_gemv"
                 | "q5_1_gemv"
@@ -839,6 +838,8 @@ impl MetalDevice {
                     | "q8_0_gemm_mpp"
                     | "attention_scores_mpp"
                     | "attention_context_mpp"
+                    | "attention_scores_mpp_f16"
+                    | "attention_context_mpp_f16"
             ) {
                 if p.raw.threadExecutionWidth() != 32 {
                     return Err(Error::Dispatch("MPP requires 32-wide SIMD".into()));
@@ -964,6 +965,7 @@ impl MetalDevice {
                     | "q6_k_gemv"
                     | "q8_0_gemv"
                     | "q8_0_gemv_8rows"
+                    | "q4_0_gemv_8rows"
                     | "mlx_affine4_gemv"
             ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
@@ -974,7 +976,13 @@ impl MetalDevice {
                 }
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: grid[0].div_ceil(if name == "q8_0_gemv_8rows" { 8 } else { 4 }),
+                        width: grid[0].div_ceil(
+                            if matches!(name, "q8_0_gemv_8rows" | "q4_0_gemv_8rows") {
+                                8
+                            } else {
+                                4
+                            },
+                        ),
                         height: 1,
                         depth: 1,
                     },

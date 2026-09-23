@@ -34,7 +34,13 @@ impl MetalDevice {
             }
             (QuantizationFormat::Q8_0, false, true) => "q8_0_gemm_mpp",
             (QuantizationFormat::Q8_0, false, false) => "q8_0_gemm",
-            (QuantizationFormat::Q4_0, true, _) => "q4_0_gemv",
+            (QuantizationFormat::Q4_0, true, _) => {
+                if self.use_q4_0_gemv_8rows(weight.rows()) {
+                    "q4_0_gemv_8rows"
+                } else {
+                    "q4_0_gemv"
+                }
+            }
             (QuantizationFormat::Q4_0, false, true) => "q4_0_gemm_mpp",
             (QuantizationFormat::Q4_0, false, false) => "q4_0_gemm",
             (QuantizationFormat::Q5_0, true, _) => "q5_0_gemv",
@@ -348,13 +354,18 @@ impl MetalDevice {
         let dims = [a[1], a[0], b[0]];
         let n = crate::tensor::Shape::new(dims)?.numel();
         if self.mpp_projection()
-            && q.dtype() == DType::BF16
+            && matches!(q.dtype(), DType::BF16 | DType::F16)
             && a[0] > 1
             && [q.numel(), k.numel(), n]
                 .iter()
                 .all(|&x| x <= i32::MAX as usize)
         {
-            self.run("attention_scores_mpp", q, Some(k), &dims, p, [b[0], a[0]])
+            let name = if q.dtype() == DType::F16 {
+                "attention_scores_mpp_f16"
+            } else {
+                "attention_scores_mpp"
+            };
+            self.run(name, q, Some(k), &dims, p, [b[0], a[0]])
         } else if self.native_matmul()
             && q.dtype() == DType::BF16
             && a[0] > 1
@@ -455,20 +466,18 @@ impl MetalDevice {
                 [groups, 1],
             )
         } else if self.mpp_projection()
-            && probs.dtype() == DType::BF16
+            && matches!(probs.dtype(), DType::BF16 | DType::F16)
             && a[1] > 1
             && [probs.numel(), v.numel(), n]
                 .iter()
                 .all(|&x| x <= i32::MAX as usize)
         {
-            self.run(
-                "attention_context_mpp",
-                probs,
-                Some(v),
-                &dims,
-                p,
-                [b[2], a[1]],
-            )
+            let name = if probs.dtype() == DType::F16 {
+                "attention_context_mpp_f16"
+            } else {
+                "attention_context_mpp"
+            };
+            self.run(name, probs, Some(v), &dims, p, [b[2], a[1]])
         } else if self.native_matmul()
             && probs.dtype() == DType::BF16
             && a[1] > 1
@@ -623,34 +632,41 @@ mod fusion_tests {
     #[test]
     fn tiled_attention_products_match_scalar_for_grouping_and_tails() {
         let d = MetalDevice::new().unwrap();
-        for (s, t, width) in [(3, 5, 12), (17, 33, 64), (3, 1027, 64)] {
-            let q = Tensor::from_f32(
-                &d,
-                [s, 6, width],
-                DType::BF16,
-                &crate::reference::deterministic(s * 6 * width),
-            )
-            .unwrap();
-            let k = Tensor::from_f32(
-                &d,
-                [t, 2, width],
-                DType::BF16,
-                &crate::reference::deterministic(t * 2 * width),
-            )
-            .unwrap();
-            d.set_native_matmul(true).unwrap();
-            let fast = d.attention_scores(&q, &k).unwrap().tensor;
-            d.set_native_matmul(false).unwrap();
-            let slow = d.attention_scores(&q, &k).unwrap().tensor;
-            crate::reference::check(&fast.to_f32(), &slow.to_f32(), 1.6e-2, 1e-2).unwrap();
-            let probs = d
-                .attention_softmax(&slow, t - s, (width as f32).sqrt().recip())
-                .unwrap()
-                .tensor;
-            let slow = d.attention_context(&probs, &k).unwrap().tensor;
-            d.set_native_matmul(true).unwrap();
-            let fast = d.attention_context(&probs, &k).unwrap().tensor;
-            crate::reference::check(&fast.to_f32(), &slow.to_f32(), 1.6e-2, 1e-2).unwrap();
+        for dtype in [DType::BF16, DType::F16] {
+            let (atol, rtol) = if dtype == DType::F16 {
+                (2e-3, 2e-3)
+            } else {
+                (1.6e-2, 1e-2)
+            };
+            for (s, t, width) in [(3, 5, 12), (17, 33, 64), (3, 1027, 64)] {
+                let q = Tensor::from_f32(
+                    &d,
+                    [s, 6, width],
+                    dtype,
+                    &crate::reference::deterministic(s * 6 * width),
+                )
+                .unwrap();
+                let k = Tensor::from_f32(
+                    &d,
+                    [t, 2, width],
+                    dtype,
+                    &crate::reference::deterministic(t * 2 * width),
+                )
+                .unwrap();
+                d.set_native_matmul(true).unwrap();
+                let fast = d.attention_scores(&q, &k).unwrap().tensor;
+                d.set_native_matmul(false).unwrap();
+                let slow = d.attention_scores(&q, &k).unwrap().tensor;
+                crate::reference::check(&fast.to_f32(), &slow.to_f32(), atol, rtol).unwrap();
+                let probs = d
+                    .attention_softmax(&slow, t - s, (width as f32).sqrt().recip())
+                    .unwrap()
+                    .tensor;
+                let slow = d.attention_context(&probs, &k).unwrap().tensor;
+                d.set_native_matmul(true).unwrap();
+                let fast = d.attention_context(&probs, &k).unwrap().tensor;
+                crate::reference::check(&fast.to_f32(), &slow.to_f32(), atol, rtol).unwrap();
+            }
         }
     }
     #[test]
@@ -896,6 +912,25 @@ mod q4_0_tests {
                     "index {index}: actual={actual}, expected={expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn q4_0_gemv_8rows_reuses_inputs_and_covers_output_tail() {
+        let d = MetalDevice::new().unwrap();
+        let (n, k) = (131, 64);
+        let weight = packed(&d, n, k);
+        let values = input(1, k);
+        let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+        assert!(d.use_q4_0_gemv_8rows(n));
+        let output = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(output.metrics.operation, "q4_0_gemv_8rows");
+        let expected = expected(&values, 1, n, k);
+        for (index, (actual, expected)) in output.tensor.to_f32().iter().zip(expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 2.0e-5,
+                "index {index}: actual={actual}, expected={expected}"
+            );
         }
     }
 
