@@ -200,6 +200,61 @@ kernel void gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[th
     sum=simd_sum(sum);
     if(lane==0 && row<p[3]) store(c,row,p[4],sum);
 }
+inline float q4_0_weight(device const uchar* weights, uint row, uint column, uint k) {
+    uint block_index=column>>5, within=column&31, blocks=k>>5;
+    device const uchar* block=weights+(row*blocks+block_index)*18;
+    float scale=float(*((device const half*)block));
+    uchar packed=block[2+(within&15)];
+    int q=within<16 ? int(packed&15)-8 : int(packed>>4)-8;
+    return scale*float(q);
+}
+// GGML Q4_0 uses { f16 d, 16 bytes of paired low/high nibbles } per 32 values.
+kernel void q4_0_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32, row=group*4+simd;
+    uint k=p[2], blocks=k/32;
+    float sum0=0.f, sum1=0.f, sum2=0.f, sum3=0.f;
+    if(row<p[3]) {
+        for(uint tile=0;tile<blocks/4;tile++) {
+            uint base=tile*4*32+lane;
+            sum0+=q4_0_weight(b,row,base+0*32,k)*load(a,base+0*32,p[4]);
+            sum1+=q4_0_weight(b,row,base+1*32,k)*load(a,base+1*32,p[4]);
+            sum2+=q4_0_weight(b,row,base+2*32,k)*load(a,base+2*32,p[4]);
+            sum3+=q4_0_weight(b,row,base+3*32,k)*load(a,base+3*32,p[4]);
+        }
+        for(uint block=blocks/4*4;block<blocks;block++) {
+            uint column=block*32+lane;
+            sum0+=q4_0_weight(b,row,column,k)*load(a,column,p[4]);
+        }
+    }
+    float sum=simd_sum((sum0+sum1)+(sum2+sum3));
+    if(lane==0 && row<p[3]) store(c,row,p[4],sum);
+}
+kernel void q4_0_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;
+    uint k=p[2], blocks=k/32;
+    float sum0=0.f, sum1=0.f, sum2=0.f, sum3=0.f;
+    if(row<p[3]) for(uint block=0;block<blocks;block++) {
+        uint column=block*32+lane;
+        float w=q4_0_weight(b,row,column,k);
+        if(batch+0<p[1]) sum0+=w*load(a,(batch+0)*k+column,p[4]);
+        if(batch+1<p[1]) sum1+=w*load(a,(batch+1)*k+column,p[4]);
+        if(batch+2<p[1]) sum2+=w*load(a,(batch+2)*k+column,p[4]);
+        if(batch+3<p[1]) sum3+=w*load(a,(batch+3)*k+column,p[4]);
+    }
+    sum0=simd_sum(sum0); sum1=simd_sum(sum1); sum2=simd_sum(sum2); sum3=simd_sum(sum3);
+    if(lane==0 && row<p[3]) {
+        if(batch+0<p[1]) store(c,(batch+0)*p[3]+row,p[4],sum0);
+        if(batch+1<p[1]) store(c,(batch+1)*p[3]+row,p[4],sum1);
+        if(batch+2<p[1]) store(c,(batch+2)*p[3]+row,p[4],sum2);
+        if(batch+3<p[1]) store(c,(batch+3)*p[3]+row,p[4],sum3);
+    }
+}
+kernel void embedding_gather_q4_0(ARGS, uint i [[thread_position_in_grid]]) {
+    if(i>=p[0]) return;
+    uint width=p[1], token=i/width, column=i%width;
+    uint id=((device const uint*)b)[token];
+    store(c,i,p[4],q4_0_weight(a,id,column,width));
+}
 // GGML Q8_0 rows are packed as repeated { half scale, 32 signed bytes } blocks.
 // One SIMD group reduces one output row; four rows share a 128-thread group.
 kernel void q8_0_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {

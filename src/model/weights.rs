@@ -222,7 +222,10 @@ pub(crate) fn construct_mixed(
                 }
             }
             ModelWeight::Quantized(tensor) => {
-                if tensor.format() != QuantizationFormat::Q8_0 {
+                if !matches!(
+                    tensor.format(),
+                    QuantizationFormat::Q4_0 | QuantizationFormat::Q8_0
+                ) {
                     return Err(Error::Weight {
                         name,
                         message: format!("unsupported execution format {:?}", tensor.format()),

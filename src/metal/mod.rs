@@ -441,9 +441,10 @@ impl MetalDevice {
     ) {
         let name = if self.lm_head_profile.get() {
             match name {
-                "gemv" | "gemv_vector" | "gemv_wide" | "q8_0_gemv" => "lm_head_gemv",
+                "gemv" | "gemv_vector" | "gemv_wide" | "q4_0_gemv" | "q8_0_gemv" => "lm_head_gemv",
                 "project_bf16" | "project_f16" | "project_wide_bf16" | "project_wide_f16"
-                | "project_mpp" | "q8_0_gemm_mpp" | "matmul_nt" | "q8_0_gemm" => "lm_head_matmul",
+                | "project_mpp" | "q4_0_gemm_mpp" | "q8_0_gemm_mpp" | "matmul_nt" | "q4_0_gemm"
+                | "q8_0_gemm" => "lm_head_matmul",
                 _ => name,
             }
         } else {
@@ -623,7 +624,11 @@ impl MetalDevice {
         }
         let p = if matches!(
             name,
-            "project_mpp" | "q8_0_gemm_mpp" | "attention_scores_mpp" | "attention_context_mpp"
+            "project_mpp"
+                | "q4_0_gemm_mpp"
+                | "q8_0_gemm_mpp"
+                | "attention_scores_mpp"
+                | "attention_context_mpp"
         ) {
             self.compile_kernel_version(
                 include_str!("shaders/project_mpp.metal"),
@@ -696,10 +701,13 @@ impl MetalDevice {
                 | "project_wide_bf16"
                 | "project_wide_f16"
                 | "project_mpp"
+                | "q4_0_gemm_mpp"
                 | "q8_0_gemm_mpp"
                 | "attention_scores_mpp"
                 | "attention_context_mpp"
                 | "q8_0_gemv"
+                | "q4_0_gemv"
+                | "q4_0_gemm"
                 | "q8_0_gemm"
         ) {
             128
@@ -748,7 +756,11 @@ impl MetalDevice {
             }
             if matches!(
                 name,
-                "project_mpp" | "q8_0_gemm_mpp" | "attention_scores_mpp" | "attention_context_mpp"
+                "project_mpp"
+                    | "q4_0_gemm_mpp"
+                    | "q8_0_gemm_mpp"
+                    | "attention_scores_mpp"
+                    | "attention_context_mpp"
             ) {
                 if p.raw.threadExecutionWidth() != 32 {
                     return Err(Error::Dispatch("MPP requires 32-wide SIMD".into()));
@@ -757,7 +769,8 @@ impl MetalDevice {
                     MTLSize {
                         width: grid[0].div_ceil(64),
                         height: grid[1].div_ceil(64),
-                        depth: if matches!(name, "project_mpp" | "q8_0_gemm_mpp") {
+                        depth: if matches!(name, "project_mpp" | "q4_0_gemm_mpp" | "q8_0_gemm_mpp")
+                        {
                             1
                         } else {
                             params[3] as usize
@@ -852,11 +865,11 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if name == "q8_0_gemv" {
+            } else if matches!(name, "q4_0_gemv" | "q8_0_gemv") {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
                     return Err(Error::Dispatch(
-                        "Q8_0 GEMV requires 32-wide SIMD and 128-thread groups".into(),
+                        "quantized GEMV requires 32-wide SIMD and 128-thread groups".into(),
                     ));
                 }
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
@@ -871,11 +884,11 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if name == "q8_0_gemm" {
+            } else if matches!(name, "q4_0_gemm" | "q8_0_gemm") {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
                     return Err(Error::Dispatch(
-                        "Q8_0 GEMM requires 32-wide SIMD and 128-thread groups".into(),
+                        "quantized GEMM requires 32-wide SIMD and 128-thread groups".into(),
                     ));
                 }
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(

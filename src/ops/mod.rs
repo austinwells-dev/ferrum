@@ -83,6 +83,10 @@ impl MetalDevice {
         output_dtype: DType,
         mut p: [u32; 9],
     ) -> Result<Output> {
+        let name = match weight.format() {
+            crate::quantization::QuantizationFormat::Q4_0 => "embedding_gather_q4_0",
+            crate::quantization::QuantizationFormat::Q8_0 => "embedding_gather_q8_0",
+        };
         let profile_start = self.profiling().then(std::time::Instant::now);
         let wait_before = profile_start
             .map(|_| self.counters().wait)
@@ -102,14 +106,14 @@ impl MetalDevice {
         p[0] = index(shape.numel())?;
         p[4] = output_dtype as u32;
         let timing = self.dispatch(
-            "embedding_gather_q8_0",
+            name,
             &[weight.binding(), ids.binding(), tensor.binding()],
             &p,
             [shape.numel(), 1],
             false,
         )?;
         let metrics = Metrics {
-            operation: "embedding_gather_q8_0",
+            operation: name,
             shape,
             dtype: output_dtype,
             bytes_read: ids.byte_size() + weight.byte_size(),
@@ -119,7 +123,7 @@ impl MetalDevice {
         };
         if let Some(start) = profile_start {
             self.record_profile(
-                "embedding_gather_q8_0",
+                name,
                 start
                     .elapsed()
                     .saturating_sub(self.counters().wait - wait_before),
@@ -328,8 +332,11 @@ impl MetalDevice {
             "softmax",
             "rope",
             "matmul",
+            "q4_0_gemv",
+            "q4_0_gemm",
             "q8_0_gemv",
             "q8_0_gemm",
+            "embedding_gather_q4_0",
             "embedding_gather_q8_0",
         ] {
             self.builtin(name)?;

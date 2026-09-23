@@ -34,7 +34,7 @@ fn main() -> Result<()> {
     let args: Vec<_> = std::env::args().collect();
     if args.len() != 3 {
         return Err(Error::Parameter(
-            "usage: qwen_quant_quality BF16_CHECKPOINT_DIR Q8_0_GGUF".into(),
+            "usage: qwen_quant_quality BF16_CHECKPOINT_DIR QUANTIZED_GGUF".into(),
         ));
     }
     let bf16_dir = std::path::Path::new(&args[1]);
@@ -115,17 +115,17 @@ fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::json!({
-            "format": "GGUF Q8_0",
+            "format": "GGUF",
             "quantized_repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
             "quantized_revision": "9217f5db79a29953eb74d5343926648285ec7e67",
-            "quantized_file": "qwen2.5-0.5b-instruct-q8_0.gguf",
+            "quantized_file": gguf_path.file_name().and_then(|name| name.to_str()).unwrap_or("unknown"),
             "reference": format!("Qwen2.5-0.5B-Instruct BF16 safetensors revision {}", qwen::REVISION),
             "device": device.name(),
             "parameter_count": quantized.parameter_count,
             "bf16_retained_weight_bytes": bf16_model.weight_bytes(),
             "gguf_source_tensor_bytes": quantized.source_tensor_bytes,
-            "q8_0_retained_weight_bytes": quantized.model.weight_bytes(),
-            "q8_0_retained_packed_bytes": quantized.quantized_tensor_bytes,
+            "quantized_retained_weight_bytes": quantized.model.weight_bytes(),
+            "quantized_retained_packed_bytes": quantized.quantized_tensor_bytes,
             "corpus": corpus,
             "corpus_repetitions": 16,
             "token_ids": bf16_ids,
@@ -139,7 +139,7 @@ fn main() -> Result<()> {
             "top5_mean_overlap": top5_overlap as f64 / (positions * 5) as f64,
             "teacher_forced_tokens": positions.saturating_sub(1),
             "bf16_perplexity": bf16_perplexity,
-            "q8_0_perplexity": quantized_perplexity,
+            "quantized_perplexity": quantized_perplexity,
             "perplexity_ratio": quantized_perplexity / bf16_perplexity,
         })
     );

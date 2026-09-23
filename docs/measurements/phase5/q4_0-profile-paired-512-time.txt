@@ -1,0 +1,22 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 3.57s
+     Running `target/release/examples/phase5_matrix /tmp/ferrum-phase5-qwen-bf16 /tmp/ferrum-phase5-qwen-gguf-lower/qwen2.5-0.5b-instruct-q4_0.gguf 3`
+Phase 5 paired matrix: device=Apple M5; BF16 retained=988065536 bytes; GGUF source=422782464 bytes; quantized retained=422639360 bytes; tensors=291; parameters=630167424; repeats=3
+        7.01 real         0.59 user         0.55 sys
+          2247573504  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              208750  page reclaims
+                  24  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                1913  involuntary context switches
+         14697223904  instructions retired
+          4836923963  cycles elapsed
+          2220214480  peak memory footprint

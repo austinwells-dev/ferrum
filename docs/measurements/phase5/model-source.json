@@ -10,5 +10,15 @@
     "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
     "file": "qwen2.5-0.5b-instruct-q8_0.gguf",
     "sha256": "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e"
-  }
+  },
+  "lower_bit_files": [
+    {
+      "repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      "revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+      "file": "qwen2.5-0.5b-instruct-q4_0.gguf",
+      "bytes": 428730208,
+      "sha256": "7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed",
+      "ggml_types": ["F32", "Q4_0", "Q8_0"]
+    }
+  ]
 }

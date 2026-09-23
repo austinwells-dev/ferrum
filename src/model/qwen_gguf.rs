@@ -193,23 +193,20 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
     let mut quantized_tensor_bytes = 0usize;
     for (source, canonical, shape) in expected.into_iter().chain(biases) {
         let info = reader.tensor(&source)?.clone();
-        if info.type_id == QuantizationFormat::Q8_0.ggml_type() {
+        if matches!(info.type_id, 2 | 8) {
             if shape.len() != 2 {
                 return Err(Error::Weight {
                     name: source,
-                    message: "Q8_0 is only accepted for matrix weights".into(),
+                    message: "quantized GGUF types are only accepted for matrix weights".into(),
                 });
             }
             let [rows, columns] = [shape[0], shape[1]];
-            let tensor = QuantizedMatrix::from_reader(
-                device,
-                rows,
-                columns,
-                QuantizationFormat::Q8_0,
-                |destination| {
+            let format = QuantizationFormat::from_ggml_type(info.type_id)?;
+            let tensor =
+                QuantizedMatrix::from_reader(device, rows, columns, format, |destination| {
                     let mut written = 0usize;
-                    reader.stream_tensor(&source, 34 * 4096, |chunk| {
-                        validate_q8_0_payload(&source, chunk)?;
+                    reader.stream_tensor(&source, format.block_bytes() * 4096, |chunk| {
+                        validate_quantized_payload(&source, format, chunk)?;
                         let end = written + chunk.len();
                         destination[written..end].copy_from_slice(chunk);
                         written = end;
@@ -222,8 +219,7 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
                         )));
                     }
                     Ok(())
-                },
-            )?;
+                })?;
             quantized_tensor_bytes = quantized_tensor_bytes
                 .checked_add(tensor.byte_size())
                 .ok_or_else(|| Error::Gguf("quantized byte count overflow".into()))?;
@@ -261,28 +257,56 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
     })
 }
 
-fn validate_q8_0_payload(name: &str, payload: &[u8]) -> Result<()> {
-    if !payload.len().is_multiple_of(34) {
+fn validate_quantized_payload(
+    name: &str,
+    format: QuantizationFormat,
+    payload: &[u8],
+) -> Result<()> {
+    if !payload.len().is_multiple_of(format.block_bytes()) {
         return Err(Error::Gguf(format!(
-            "tensor {name} Q8_0 stream ended inside a block"
+            "tensor {name} {} stream ended inside a block",
+            format_name(format)
         )));
     }
-    for block in payload.chunks_exact(34) {
-        let scale = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32();
-        if !scale.is_finite() || scale < 0.0 {
-            return Err(Error::Weight {
-                name: name.into(),
-                message: "Q8_0 scale must be finite and nonnegative".into(),
-            });
-        }
-        if block[2..].contains(&0x80) {
-            return Err(Error::Weight {
-                name: name.into(),
-                message: "Q8_0 value -128 is outside the GGML range".into(),
-            });
+    for block in payload.chunks_exact(format.block_bytes()) {
+        let half_at = |offset| {
+            half::f16::from_bits(u16::from_le_bytes([block[offset], block[offset + 1]])).to_f32()
+        };
+        match format {
+            QuantizationFormat::Q4_0 => {
+                if !half_at(0).is_finite() {
+                    return Err(invalid_quantized_scale(name, format));
+                }
+            }
+            QuantizationFormat::Q8_0 => {
+                let scale = half_at(0);
+                if !scale.is_finite() || scale < 0.0 {
+                    return Err(invalid_quantized_scale(name, format));
+                }
+                if block[2..].contains(&0x80) {
+                    return Err(Error::Weight {
+                        name: name.into(),
+                        message: "Q8_0 value -128 is outside the GGML range".into(),
+                    });
+                }
+            }
         }
     }
     Ok(())
+}
+
+fn invalid_quantized_scale(name: &str, format: QuantizationFormat) -> Error {
+    Error::Weight {
+        name: name.into(),
+        message: format!("{} scale must be finite", format_name(format)),
+    }
+}
+
+fn format_name(format: QuantizationFormat) -> &'static str {
+    match format {
+        QuantizationFormat::Q4_0 => "Q4_0",
+        QuantizationFormat::Q8_0 => "Q8_0",
+    }
 }
 
 fn gguf_weight_name(canonical: &str) -> Result<String> {
@@ -337,7 +361,7 @@ fn source_shape(info: &TensorInfo) -> Result<Vec<usize>> {
 fn validate_tensor_type(info: &TensorInfo, rank: usize, name: &str) -> Result<()> {
     match info.type_id {
         0 | 1 | 30 => Ok(()),
-        8 if rank == 2 => Ok(()),
+        2 | 8 if rank == 2 => Ok(()),
         type_id => Err(Error::Weight {
             name: name.into(),
             message: format!("unsupported GGML type {type_id} for Qwen2 tensor"),
@@ -505,11 +529,42 @@ mod tests {
 
     #[test]
     fn q8_0_loader_checks_scale_range_and_block_boundary() {
-        assert!(validate_q8_0_payload("weight", &q8_block(0.25, 127)).is_ok());
-        assert!(validate_q8_0_payload("weight", &q8_block(0.0, 0)).is_ok());
-        assert!(validate_q8_0_payload("weight", &q8_block(f32::INFINITY, 0)).is_err());
-        assert!(validate_q8_0_payload("weight", &q8_block(-0.25, 0)).is_err());
-        assert!(validate_q8_0_payload("weight", &q8_block(0.25, 0x80)).is_err());
-        assert!(validate_q8_0_payload("weight", &[0; 33]).is_err());
+        assert!(
+            validate_quantized_payload("weight", QuantizationFormat::Q8_0, &q8_block(0.25, 127))
+                .is_ok()
+        );
+        assert!(
+            validate_quantized_payload("weight", QuantizationFormat::Q8_0, &q8_block(0.0, 0))
+                .is_ok()
+        );
+        assert!(
+            validate_quantized_payload(
+                "weight",
+                QuantizationFormat::Q8_0,
+                &q8_block(f32::INFINITY, 0)
+            )
+            .is_err()
+        );
+        assert!(
+            validate_quantized_payload("weight", QuantizationFormat::Q8_0, &q8_block(-0.25, 0))
+                .is_err()
+        );
+        assert!(
+            validate_quantized_payload("weight", QuantizationFormat::Q8_0, &q8_block(0.25, 0x80))
+                .is_err()
+        );
+        assert!(validate_quantized_payload("weight", QuantizationFormat::Q8_0, &[0; 33]).is_err());
+    }
+
+    #[test]
+    fn q4_0_loader_checks_scale_and_block_boundary() {
+        let mut block = vec![0u8; 18];
+        block[..2].copy_from_slice(&half::f16::from_f32(0.125).to_bits().to_le_bytes());
+        assert!(validate_quantized_payload("weight", QuantizationFormat::Q4_0, &block).is_ok());
+        block[..2].copy_from_slice(&half::f16::from_f32(-0.125).to_bits().to_le_bytes());
+        assert!(validate_quantized_payload("weight", QuantizationFormat::Q4_0, &block).is_ok());
+        block[..2].copy_from_slice(&half::f16::from_f32(f32::INFINITY).to_bits().to_le_bytes());
+        assert!(validate_quantized_payload("weight", QuantizationFormat::Q4_0, &block).is_err());
+        assert!(validate_quantized_payload("weight", QuantizationFormat::Q4_0, &[0; 17]).is_err());
     }
 }

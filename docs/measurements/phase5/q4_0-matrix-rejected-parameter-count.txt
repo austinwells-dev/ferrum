@@ -1,0 +1,22 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 3.12s
+     Running `target/release/examples/phase5_matrix /tmp/ferrum-phase5-qwen-bf16 /tmp/ferrum-phase5-qwen-gguf-lower/qwen2.5-0.5b-instruct-q4_0.gguf 3`
+Error: Config("Qwen GGUF parameter count 630167424 differs from pinned model count")
+        4.23 real         0.44 user         0.42 sys
+          2244280320  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              175993  page reclaims
+                  26  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+                 546  involuntary context switches
+         11980253101  instructions retired
+          3782705904  cycles elapsed
+          2216528128  peak memory footprint

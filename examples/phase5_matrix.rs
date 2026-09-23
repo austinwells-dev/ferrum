@@ -9,7 +9,7 @@ use ferrum::{
 struct GenerationCase<'a> {
     model: &'a Transformer,
     label: &'static str,
-    model_kind: &'static str,
+    model_kind: &'a str,
     pair: usize,
     order: usize,
     prompt: &'a [u32],
@@ -103,10 +103,20 @@ fn main() -> Result<()> {
     drop(bf16_source);
 
     let quantized = qwen_gguf::load(&device, gguf_path)?;
-    if quantized.parameter_count != 494_032_768 {
+    let reference_config = bf16_model.config();
+    let quantized_config = &quantized.config;
+    if quantized_config.vocab_size != reference_config.vocab_size
+        || quantized_config.hidden_size != reference_config.hidden_size
+        || quantized_config.intermediate_size != reference_config.intermediate_size
+        || quantized_config.num_layers != reference_config.num_layers
+        || quantized_config.num_attention_heads != reference_config.num_attention_heads
+        || quantized_config.num_key_value_heads != reference_config.num_key_value_heads
+        || quantized_config.head_dim != reference_config.head_dim
+        || quantized_config.max_context_length != reference_config.max_context_length
+    {
         return Err(Error::Config(format!(
-            "Qwen GGUF parameter count {} differs from pinned model count",
-            quantized.parameter_count
+            "Qwen GGUF dimensions {:?} differ from BF16 reference {:?}",
+            quantized_config, reference_config
         )));
     }
     let short = bf16_tokenizer
@@ -122,6 +132,10 @@ fn main() -> Result<()> {
     if quantized_short != short || quantized_prose != prose {
         return Err(Error::Tokenizer("BF16/GGUF prompt token IDs differ".into()));
     }
+    let quantized_label = gguf_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("quantized-gguf");
     let cases = [
         ("short", short.clone(), 17),
         ("128", prose[..128].to_vec(), 17),
@@ -132,7 +146,7 @@ fn main() -> Result<()> {
     ];
     let selected = std::env::var("FERRUM_PHASE5_CASE").ok();
     eprintln!(
-        "Phase 5 paired matrix: device={}; BF16 retained={} bytes; GGUF source={} bytes; Q8_0 retained={} bytes; tensors={}; parameters={}; repeats={}",
+        "Phase 5 paired matrix: device={}; BF16 retained={} bytes; GGUF source={} bytes; quantized retained={} bytes; tensors={}; parameters={}; repeats={}",
         device.name(),
         bf16_model.weight_bytes(),
         quantized.source_tensor_bytes,
@@ -162,9 +176,9 @@ fn main() -> Result<()> {
         }
         for pair in 0..repeats {
             let order = if pair % 2 == 0 {
-                [("bf16", &bf16_model), ("q8_0", &quantized.model)]
+                [("bf16", &bf16_model), (quantized_label, &quantized.model)]
             } else {
-                [("q8_0", &quantized.model), ("bf16", &bf16_model)]
+                [(quantized_label, &quantized.model), ("bf16", &bf16_model)]
             };
             for (position, (kind, model)) in order.into_iter().enumerate() {
                 run_case(

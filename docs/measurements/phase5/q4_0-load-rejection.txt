@@ -1,0 +1,22 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 3.34s
+     Running `target/release/examples/phase5_matrix /tmp/ferrum-phase5-qwen-bf16 /tmp/ferrum-phase5-qwen-gguf-lower/qwen2.5-0.5b-instruct-q4_0.gguf 3`
+Error: Weight { name: "embedding.weight", message: "unsupported execution format Q4_0" }
+        4.57 real         0.43 user         0.45 sys
+          2243739648  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              176262  page reclaims
+                  18  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                 133  voluntary context switches
+                2618  involuntary context switches
+         12319274493  instructions retired
+          3864413039  cycles elapsed
+          2216118528  peak memory footprint
