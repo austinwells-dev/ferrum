@@ -1,0 +1,12 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 4 tests
+2026-09-23 16:37:38.091 ferrum-508026e7fa9bdb9b[89796:5541971] Metal API Validation Enabled
+2026-09-23 16:37:38.091 ferrum-508026e7fa9bdb9b[89796:5541971] Metal GPU Validation Enabled
+test ops::transformer::q6_k_tests::q6_k_rejects_columns_that_do_not_form_ggml_superblocks ... ok
+test ops::transformer::q6_k_tests::q6_k_embedding_gather_decodes_only_requested_rows ... ok
+test ops::transformer::q6_k_tests::q6_k_gemv_and_gemm_cover_superblock_and_batch_tails ... ok
+test ops::transformer::q6_k_tests::q6_k_mpp_gemm_decodes_bounded_tiles_with_row_and_k_tails ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 28 filtered out; finished in 0.58s

@@ -7,12 +7,15 @@ use crate::{Error, MetalDevice, Result, tensor::PackedStorage};
 pub enum QuantizationFormat {
     Q4_0,
     Q8_0,
+    #[allow(non_camel_case_types)]
+    Q6_K,
 }
 impl QuantizationFormat {
     pub fn from_ggml_type(type_id: u32) -> Result<Self> {
         match type_id {
             2 => Ok(Self::Q4_0),
             8 => Ok(Self::Q8_0),
+            14 => Ok(Self::Q6_K),
             _ => Err(Error::Gguf(format!(
                 "unsupported quantized weight type {type_id}"
             ))),
@@ -22,18 +25,21 @@ impl QuantizationFormat {
         match self {
             Self::Q4_0 => 2,
             Self::Q8_0 => 8,
+            Self::Q6_K => 14,
         }
     }
     pub const fn block_elements(self) -> usize {
         match self {
             Self::Q4_0 => 32,
             Self::Q8_0 => 32,
+            Self::Q6_K => 256,
         }
     }
     pub const fn block_bytes(self) -> usize {
         match self {
             Self::Q4_0 => 18,
             Self::Q8_0 => 34,
+            Self::Q6_K => 210,
         }
     }
 }
@@ -102,5 +108,6 @@ fn format_name(format: QuantizationFormat) -> &'static str {
     match format {
         QuantizationFormat::Q4_0 => "Q4_0",
         QuantizationFormat::Q8_0 => "Q8_0",
+        QuantizationFormat::Q6_K => "Q6_K",
     }
 }

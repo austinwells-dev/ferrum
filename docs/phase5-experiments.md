@@ -4,7 +4,7 @@ This journal starts from the finalized Phase 4 checkpoint. Phase 4 reports and r
 
 ## Status
 
-Phase 5 is active. The strict GGUF/Qwen2 adapter, packed Q8_0 and Q4_0 storage, direct decode GEMV, tiled prefill GEMM, and real-model generation paths are implemented. Q8_0 has a three-pair production matrix and 448-target quality probe; Q4_0's full matrix and quality probe are recorded below. Q5/Q6 formats, MLX interchange, broader quality data, and remaining optimization are still outstanding.
+Phase 5 is active. The strict GGUF/Qwen2 adapter, packed Q8_0, Q4_0, and Q6_K storage, direct decode GEMV, tiled prefill GEMM, and real-model generation paths are implemented. Q8_0, Q4_0, and Q6_K have paired production matrices and 448-target quality probes; Q5 formats, Q4_K, MLX interchange, broader quality data, and remaining optimization are still outstanding.
 
 ## Baseline
 
@@ -31,16 +31,16 @@ Keep the packed storage abstraction separate from ordinary tensor arithmetic. It
 
 Parse GGUF independently of Qwen naming. Read the versioned header, typed metadata, tensor descriptors, alignment and relative tensor offsets with checked arithmetic and explicit size bounds. Index dimensions in GGUF order; expose a runtime `[out,in]` matrix by reversing the descriptor dimensions while preserving row-major payload order. Validate required tensor byte lengths from the exact GGML type and block geometry, file bounds, duplicate names, duplicate/overlapping tensor ranges, dimensions, metadata types, and required architecture fields before allocating runtime weights. Unknown or unsupported types fail with the tensor name and type code rather than being interpreted as another format.
 
-Initially accept GGUF v2/v3 little-endian indices and Qwen2 architecture metadata, with dense F32/F16/BF16 plus Q8_0 and Q4_0 tensor loading. Stream tensor payloads into packed or dense Metal storage one tensor at a time so a complete second CPU copy of a large model is not retained. The Qwen adapter maps standard GGUF names and metadata into the current strict model contract. Tokenizer metadata is checked against Ferrum's Qwen tokenizer behavior; BF16 and GGUF prompt token IDs match on both benchmark prompts and the quality corpus.
+Initially accept GGUF v2/v3 little-endian indices and Qwen2 architecture metadata, with dense F32/F16/BF16 plus Q8_0, Q4_0, and Q6_K tensor loading. Stream tensor payloads into packed or dense Metal storage one tensor at a time so a complete second CPU copy of a large model is not retained. The Qwen adapter maps standard GGUF names and metadata into the current strict model contract. Tokenizer metadata is checked against Ferrum's Qwen tokenizer behavior; BF16 and GGUF prompt token IDs match on both benchmark prompts and the quality corpus.
 
 The parser follows the upstream [GGUF specification](https://github.com/ggml-org/ggml/blob/master/docs/gguf.md) and [ggml block declarations](https://github.com/ggml-org/llama.cpp/blob/master/ggml/src/ggml-common.h). Quantization type IDs and layouts come from GGML; Ferrum will not define private on-disk variants.
 
 ### Execution split
 
-- M=1 decode: dedicated Q8_0 and Q4_0 Metal GEMVs read packed rows, use four independent reduction chains per SIMD lane, and write output directly without a whole-weight intermediate. The tied vocabulary projection and transformer projections are both exercised by production generation.
-- M>1 prefill: use the Q8_0 or Q4_0 MPP GEMM for BF16 activation batches of at least 16 rows when K is a multiple of 128 and Metal 4 is available. It decodes packed blocks directly into a bounded threadgroup tile, then accumulates 64x64 output tiles over K. The Q4_0 tile loader expands both values from each packed byte together. Keep direct SIMD GEMM for unsupported shapes and devices. Apple's [Metal 4 TensorOps guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf) documents threadgroup-backed tensor operands and multiply-accumulate cooperative tensors.
-- Direct packed embedding gather keeps quantized Q8_0 embeddings from forcing a whole-model dense copy.
-- Q8_0 is the first correctness bridge. After it is correct and measured, evaluate upstream `Q6_K`, `Q5_K`, and `Q4_K` (and common legacy `Q4_0`/`Q4_1` where useful), preserving each format's real block geometry and metadata. Do not collapse distinct GGML schemes into one decoder when that costs correctness or speed.
+- M=1 decode: dedicated Q8_0, Q4_0, and Q6_K Metal GEMVs read packed rows, use four independent reduction chains per SIMD lane, and write output directly without a whole-weight intermediate. The tied vocabulary projection and transformer projections are both exercised by production generation.
+- M>1 prefill: use Q8_0, Q4_0, or Q6_K MPP GEMM for BF16 activation batches of at least 16 rows when K is a multiple of 128 and Metal 4 is available. It decodes packed blocks directly into a bounded threadgroup tile, then accumulates 64x64 output tiles over K. Q4_0 expands both nibbles from one byte together; Q6_K expands both values represented by a low-plane byte together. Keep direct SIMD GEMM for unsupported shapes and devices. Apple's [Metal 4 TensorOps guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf) documents threadgroup-backed tensor operands and multiply-accumulate cooperative tensors.
+- Direct packed embedding gather keeps quantized Q8_0, Q4_0, and Q6_K embeddings from forcing a whole-model dense copy.
+- Q8_0 was the first correctness bridge; Q4_0 and Q6_K now execute through official real-model files. Next evaluate Q5_0/Q5_1, Q4_K, and Q5_K, preserving each format's exact GGML block geometry and metadata. Do not collapse distinct GGML schemes into one decoder when that costs correctness or speed.
 - MLX `quantized` weights use their own group-size/scale representation. Interoperability will use an explicit importer/repacker and must not add MLX as a runtime dependency.
 
 ## Measurement definitions and acceptance gates
@@ -53,7 +53,7 @@ Do not attribute traffic estimates to DRAM bandwidth without hardware counters. 
 
 ## Format support, experiments, quality, and memory
 
-The journal began before Phase 5 runtime changes; current checkpoint status is below. Q8_0 and Q4_0 are implemented and validated end-to-end. Q5/Q6 and MLX compatibility remain planned, not yet implemented.
+The journal began before Phase 5 runtime changes; current checkpoint status is below. Q8_0, Q4_0, and Q6_K are implemented and validated end-to-end. Q5 formats, Q4_K, and MLX compatibility remain planned, not yet implemented.
 
 | Experiment | Status | Evidence / decision |
 |---|---|---|
@@ -65,6 +65,9 @@ The journal began before Phase 5 runtime changes; current checkpoint status is b
 | Q8_0 MPP prefill with on-the-fly 64x128 tile decode | Accepted for supported shapes | `q8-matrix-after-mpp.jsonl`; 2,392 / 3,675 / 3,510 tok/s at 128 / 512 / 1,024 prompts. The direct SIMD path remains the fallback |
 | Q4_0 MPP scalar-per-value tile expansion | Rejected optimization | `q4_0-matrix-before-nibble.jsonl`; 512-token median prefill was 4,044 tok/s |
 | Q4_0 paired-nibble MPP tile expansion | Accepted optimization | `q4_0-profile-paired-512.jsonl` and final `q4_0-matrix.jsonl`; 512-token prefill rose to 5,087 tok/s (+25.8%) and first-token median fell from 127.3 to 101.0 ms. Generated IDs matched the earlier kernel for all 36 runs |
+| Q6_K direct GEMV/GEMM and bounded MPP tiles | Accepted | Official Q6_K GGUF generation, 448-target quality, multi-superblock and signed-scale tests, and Metal validation passed |
+| Q6_K MPP scalar-per-value tile expansion | Rejected optimization | `q6_k-matrix-before-pair.jsonl`; 512-token median prefill was 3,887 tok/s and phase GPU time 128.3 ms |
+| Q6_K paired low-plane tile expansion | Accepted optimization | `q6_k-paired-512.jsonl` and final `q6_k-matrix.jsonl`; 512-token prefill rose to 4,214 tok/s (+8.4%) and first-token median fell from 132.0 to 121.8 ms. All 36 generated sequences matched the pre-optimization Q6_K kernel |
 | Dispatch threshold 16 prompt rows | Accepted provisionally | On the 21-token short prompt, Q8_0 first-token median improved from 113.0 ms (direct path) to 42.6 ms (MPP), versus 36.0 ms BF16; `q8-mpp-short.jsonl` |
 | Q8_0 four-chain GEMV reduction | Accepted provisionally | Cached decode in the full paired matrix is 19–24% faster than BF16 for this model/run; individual before/after result is in `q8-matrix-after-tile4.jsonl`. Keep measuring by shape |
 
@@ -104,6 +107,25 @@ All throughput values are tok/s medians across three alternating pairs; raw rows
 
 The 449-position / 448-target teacher-forced quality probe produced mean absolute logit error 0.7074, RMSE 0.9037, cosine similarity 0.96486, top-1 agreement 98.22%, top-5 overlap 74.12%, and perplexity 1.52762 vs BF16 1.50983 (ratio 1.01178). BF16 and GGUF tokenizers returned identical IDs. The repeated short corpus is a reproducible smoke test rather than broad quality validation; a held-out evaluation remains required.
 
-The five Q4_0 MPP/GEMV/embedding and signed-scale tests passed with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`. `cargo test --all-targets` passed 63 tests; the two existing real-model tests remain ignored behind their existing environment gate. `cargo clippy --all-targets -- -D warnings`, formatting, diff check, and all-target check passed. The generation matrix used the official local BF16 and Q4_0 models.
+The five Q4_0 MPP/GEMV/embedding and signed-scale tests passed with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`. `cargo test --all-targets` passed 63 tests at the Q4_0 checkpoint; the two existing real-model tests remain ignored behind their existing environment gate. `cargo clippy --all-targets -- -D warnings`, formatting, diff check, and all-target check passed. The generation matrix used the official local BF16 and Q4_0 models.
 
-Remaining limits: GGUF Q8_0 and Q4_0 execute quantized; Q5/Q6 and MLX interoperability are not implemented. MPP Q8_0 and Q4_0 prefill remain slower than BF16 for most long prompts, while cached decode is faster on these workloads. The vocabulary GEMV and transformer projection GEMVs need per-shape tuning. MLX and llama.cpp comparisons, a standard held-out quality corpus, and final real-model validation for every retained format remain outstanding.
+### Q6_K real-model milestone
+
+The pinned Qwen Q6_K source, file size, and SHA-256 are recorded in [`model-source.json`](measurements/phase5/model-source.json). The official file mixes Q6_K down-projection matrices with Q8_0 tensors. Q6_K blocks keep 256 weights as `ql[128]`, `qh[64]`, signed `scales[16]`, and `f16 d` (210 bytes). Ferrum stores that layout in packed GPU storage; the MPP tile decodes paired values sharing each ql byte. The original and optimized three-pair matrices are retained.
+
+| Workload | BF16 prefill | Q6_K prefill | BF16 cached decode | Q6_K cached decode | BF16 complete generation | Q6_K complete generation | BF16 / Q6_K first token |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| short (21 prompt, 17 generated) | 656 | 608 | 97 | 114 | 84 | 95 | 32 / 35 ms |
+| 128 prompt, 17 generated | 6,168 | 2,884 | 97 | 114 | 90 | 90 | 21 / 45 ms |
+| 512 prompt, 17 generated | 8,377 | 4,214 | 92 | 109 | 71 | 62 | 61 / 122 ms |
+| 1,024 prompt, 17 generated | 6,645 | 4,114 | 86 | 99 | 49 | 41 | 154 / 249 ms |
+| short prompt, 129 generated | 500 | 524 | 94 | 110 | 90 | 105 | 42 / 40 ms |
+| 368 prompt, 1,601 generated | 6,438 | 3,600 | 86 | 97 | 84 | 94 | 58 / 103 ms |
+
+Medians are tok/s across three alternating pairs; the raw matrix includes token IDs, per-token decode times, KV use, and counters. Q6_K retained 499,645,184 weight bytes, of which 499,502,080 were packed, versus 988,065,536 BF16 bytes. The process peak RSS was 2,242,265,088 bytes with both models loaded. At the 512-token prompt, the optimized run used 117.98 ms phase GPU time vs 57.83 ms BF16, 531 dispatches, five command buffers, 58 allocations, 1.37 ms allocation time, and a 268,042,240-byte transient peak. The paired-plane change reduced Q6_K GPU time from 128.32 to 116.55 ms on the focused three-pair run, with unchanged dispatch and memory counters.
+
+The 449-position / 448-target teacher-forced probe measured mean absolute logit error 0.3181, RMSE 0.4067, cosine similarity 0.99265, top-1 agreement 99.55%, top-5 overlap 85.92%, and perplexity 1.51473 vs BF16 1.50983 (ratio 1.00324). Token IDs matched BF16 on the short, 128, 512, 1,024, and 1,601-token cases. The sustained 129-token decode diverged on 106 generated positions, showing autoregressive drift despite the strong teacher-forced score. Generated IDs matched exactly between the original and paired-plane Q6_K kernels across all 36 runs.
+
+All four Q6_K Metal kernel tests passed with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`, including signed per-group scales, multi-superblock decode, embedding gather, and MPP tails. `cargo test --all-targets` passed 68 tests; two pre-existing real-model tests remain environment-gated and ignored. `cargo clippy --all-targets -- -D warnings`, formatting, diff check, and all-target check passed.
+
+Remaining limits: GGUF Q8_0, Q4_0, and Q6_K execute quantized; Q5_0/Q5_1, Q4_K/Q5_K, and MLX interoperability are not implemented. Prefill remains slower than BF16 for most long prompts, while cached decode is faster on these workloads. The vocabulary GEMV and transformer projection GEMVs need per-shape tuning. MLX and llama.cpp comparisons, a standard held-out quality corpus, and final real-model validation for every retained format remain outstanding.

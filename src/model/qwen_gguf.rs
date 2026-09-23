@@ -193,7 +193,7 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
     let mut quantized_tensor_bytes = 0usize;
     for (source, canonical, shape) in expected.into_iter().chain(biases) {
         let info = reader.tensor(&source)?.clone();
-        if matches!(info.type_id, 2 | 8) {
+        if matches!(info.type_id, 2 | 8 | 14) {
             if shape.len() != 2 {
                 return Err(Error::Weight {
                     name: source,
@@ -290,6 +290,11 @@ fn validate_quantized_payload(
                     });
                 }
             }
+            QuantizationFormat::Q6_K => {
+                if !half_at(208).is_finite() {
+                    return Err(invalid_quantized_scale(name, format));
+                }
+            }
         }
     }
     Ok(())
@@ -306,6 +311,7 @@ fn format_name(format: QuantizationFormat) -> &'static str {
     match format {
         QuantizationFormat::Q4_0 => "Q4_0",
         QuantizationFormat::Q8_0 => "Q8_0",
+        QuantizationFormat::Q6_K => "Q6_K",
     }
 }
 
@@ -361,7 +367,7 @@ fn source_shape(info: &TensorInfo) -> Result<Vec<usize>> {
 fn validate_tensor_type(info: &TensorInfo, rank: usize, name: &str) -> Result<()> {
     match info.type_id {
         0 | 1 | 30 => Ok(()),
-        2 | 8 if rank == 2 => Ok(()),
+        2 | 8 | 14 if rank == 2 => Ok(()),
         type_id => Err(Error::Weight {
             name: name.into(),
             message: format!("unsupported GGML type {type_id} for Qwen2 tensor"),
@@ -566,5 +572,16 @@ mod tests {
         block[..2].copy_from_slice(&half::f16::from_f32(f32::INFINITY).to_bits().to_le_bytes());
         assert!(validate_quantized_payload("weight", QuantizationFormat::Q4_0, &block).is_err());
         assert!(validate_quantized_payload("weight", QuantizationFormat::Q4_0, &[0; 17]).is_err());
+    }
+
+    #[test]
+    fn q6_k_loader_checks_superblock_scale_and_boundary() {
+        let mut block = vec![0u8; 210];
+        block[208..210].copy_from_slice(&half::f16::from_f32(0.125).to_bits().to_le_bytes());
+        assert!(validate_quantized_payload("weight", QuantizationFormat::Q6_K, &block).is_ok());
+        block[208..210]
+            .copy_from_slice(&half::f16::from_f32(f32::INFINITY).to_bits().to_le_bytes());
+        assert!(validate_quantized_payload("weight", QuantizationFormat::Q6_K, &block).is_err());
+        assert!(validate_quantized_payload("weight", QuantizationFormat::Q6_K, &[0; 209]).is_err());
     }
 }

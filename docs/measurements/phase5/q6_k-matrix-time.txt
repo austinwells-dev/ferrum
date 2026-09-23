@@ -1,0 +1,21 @@
+    Finished `release` profile [optimized] target(s) in 0.04s
+     Running `target/release/examples/phase5_matrix /tmp/ferrum-phase5-qwen-bf16 /tmp/ferrum-phase5-qwen-gguf-lower/qwen2.5-0.5b-instruct-q6_k.gguf 3`
+Phase 5 paired matrix: device=Apple M5; BF16 retained=988065536 bytes; GGUF source=644431360 bytes; quantized retained=499645184 bytes; tensors=291; parameters=494032768; repeats=3
+      164.75 real        10.99 user         2.68 sys
+          2242265088  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              430212  page reclaims
+                  18  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                   0  voluntary context switches
+               65153  involuntary context switches
+        197282356003  instructions retired
+         55309568352  cycles elapsed
+          2214594792  peak memory footprint

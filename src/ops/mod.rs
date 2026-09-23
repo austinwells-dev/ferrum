@@ -86,6 +86,7 @@ impl MetalDevice {
         let name = match weight.format() {
             crate::quantization::QuantizationFormat::Q4_0 => "embedding_gather_q4_0",
             crate::quantization::QuantizationFormat::Q8_0 => "embedding_gather_q8_0",
+            crate::quantization::QuantizationFormat::Q6_K => "embedding_gather_q6_k",
         };
         let profile_start = self.profiling().then(std::time::Instant::now);
         let wait_before = profile_start
@@ -334,9 +335,13 @@ impl MetalDevice {
             "matmul",
             "q4_0_gemv",
             "q4_0_gemm",
+            "q6_k_gemm_mpp",
+            "q6_k_gemv",
+            "q6_k_gemm",
             "q8_0_gemv",
             "q8_0_gemm",
             "embedding_gather_q4_0",
+            "embedding_gather_q6_k",
             "embedding_gather_q8_0",
         ] {
             self.builtin(name)?;

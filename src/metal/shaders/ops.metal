@@ -255,6 +255,67 @@ kernel void embedding_gather_q4_0(ARGS, uint i [[thread_position_in_grid]]) {
     uint id=((device const uint*)b)[token];
     store(c,i,p[4],q4_0_weight(a,id,column,width));
 }
+inline float q6_k_weight(device const uchar* weights, uint row, uint column, uint k) {
+    uint block_index=column>>8, within=column&255, blocks=k>>8;
+    device const uchar* block=weights+(row*blocks+block_index)*210;
+    uint group=within>>5, lane=within&31, half_block=group>>2, slice=group&3;
+    uint ql_index=half_block*64+((slice&1)*32)+lane;
+    uchar packed=block[ql_index];
+    uint low=slice<2 ? uint(packed&15) : uint(packed>>4);
+    uint high=(uint(block[128+half_block*32+lane])>>(slice*2))&3;
+    int q=int(low|(high<<4))-32;
+    uint scale_index=192+half_block*8+slice*2+(lane>>4);
+    char scale=((device const char*)block)[scale_index];
+    float d=float(*((device const half*)(block+208)));
+    return d*float(scale)*float(q);
+}
+// GGML Q6_K: 256 values, ql[128], qh[64], signed scales[16], f16 d.
+kernel void q6_k_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32, row=group*4+simd;
+    uint k=p[2], chunks=k/32;
+    float sum0=0.f, sum1=0.f, sum2=0.f, sum3=0.f;
+    if(row<p[3]) {
+        for(uint tile=0;tile<chunks/4;tile++) {
+            uint base=tile*4*32+lane;
+            sum0+=q6_k_weight(b,row,base+0*32,k)*load(a,base+0*32,p[4]);
+            sum1+=q6_k_weight(b,row,base+1*32,k)*load(a,base+1*32,p[4]);
+            sum2+=q6_k_weight(b,row,base+2*32,k)*load(a,base+2*32,p[4]);
+            sum3+=q6_k_weight(b,row,base+3*32,k)*load(a,base+3*32,p[4]);
+        }
+        for(uint chunk=chunks/4*4;chunk<chunks;chunk++) {
+            uint column=chunk*32+lane;
+            sum0+=q6_k_weight(b,row,column,k)*load(a,column,p[4]);
+        }
+    }
+    float sum=simd_sum((sum0+sum1)+(sum2+sum3));
+    if(lane==0 && row<p[3]) store(c,row,p[4],sum);
+}
+kernel void q6_k_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;
+    uint k=p[2], chunks=k/32;
+    float sum0=0.f, sum1=0.f, sum2=0.f, sum3=0.f;
+    if(row<p[3]) for(uint chunk=0;chunk<chunks;chunk++) {
+        uint column=chunk*32+lane;
+        float w=q6_k_weight(b,row,column,k);
+        if(batch+0<p[1]) sum0+=w*load(a,(batch+0)*k+column,p[4]);
+        if(batch+1<p[1]) sum1+=w*load(a,(batch+1)*k+column,p[4]);
+        if(batch+2<p[1]) sum2+=w*load(a,(batch+2)*k+column,p[4]);
+        if(batch+3<p[1]) sum3+=w*load(a,(batch+3)*k+column,p[4]);
+    }
+    sum0=simd_sum(sum0); sum1=simd_sum(sum1); sum2=simd_sum(sum2); sum3=simd_sum(sum3);
+    if(lane==0 && row<p[3]) {
+        if(batch+0<p[1]) store(c,(batch+0)*p[3]+row,p[4],sum0);
+        if(batch+1<p[1]) store(c,(batch+1)*p[3]+row,p[4],sum1);
+        if(batch+2<p[1]) store(c,(batch+2)*p[3]+row,p[4],sum2);
+        if(batch+3<p[1]) store(c,(batch+3)*p[3]+row,p[4],sum3);
+    }
+}
+kernel void embedding_gather_q6_k(ARGS, uint i [[thread_position_in_grid]]) {
+    if(i>=p[0]) return;
+    uint width=p[1], token=i/width, column=i%width;
+    uint id=((device const uint*)b)[token];
+    store(c,i,p[4],q6_k_weight(a,id,column,width));
+}
 // GGML Q8_0 rows are packed as repeated { half scale, 32 signed bytes } blocks.
 // One SIMD group reduces one output row; four rows share a 128-thread group.
 kernel void q8_0_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
