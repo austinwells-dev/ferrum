@@ -159,13 +159,26 @@ impl Tensor {
         dtype: DType,
         data: &[u8],
     ) -> Result<Self> {
+        Self::from_reader(device, dims, dtype, |dst| {
+            if dst.len() != data.len() {
+                return Err(Error::Shape("byte length differs from shape/dtype".into()));
+            }
+            dst.copy_from_slice(data);
+            Ok(())
+        })
+    }
+    /// Fill fresh shared storage directly from a validated source reader.
+    /// The closure must initialize the complete allocation before returning.
+    pub(crate) fn from_reader(
+        device: &MetalDevice,
+        dims: impl AsRef<[usize]>,
+        dtype: DType,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<Self> {
         let shape = Shape::new(dims)?;
         let layout = Layout::contiguous(&shape)?;
-        if shape.byte_size(dtype)? != data.len() {
-            return Err(Error::Shape("byte length differs from shape/dtype".into()));
-        }
-        let mut storage = device.allocate(data.len())?;
-        storage.with_bytes_mut(|dst| dst.copy_from_slice(data)); // Apple Silicon is little-endian.
+        let mut storage = device.allocate(shape.byte_size(dtype)?)?;
+        storage.with_bytes_mut(fill)?;
         Ok(Self {
             storage: Rc::new(storage),
             offset: 0,
@@ -269,5 +282,43 @@ impl Tensor {
     }
     pub(crate) fn buffer(&self) -> &MetalBuffer {
         &self.storage
+    }
+}
+
+/// Byte-exact owned Metal storage for packed weights. It deliberately has no
+/// dense dtype or element-count interpretation.
+#[derive(Clone)]
+pub(crate) struct PackedStorage {
+    storage: Rc<MetalBuffer>,
+    byte_len: usize,
+}
+impl PackedStorage {
+    pub(crate) fn from_reader(
+        device: &MetalDevice,
+        byte_len: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<Self> {
+        if byte_len == 0 {
+            return Err(Error::Shape("packed storage must be nonempty".into()));
+        }
+        let mut storage = device.allocate(byte_len)?;
+        storage.with_bytes_mut(fill)?;
+        Ok(Self {
+            storage: Rc::new(storage),
+            byte_len,
+        })
+    }
+    pub(crate) fn binding(&self) -> (&MetalBuffer, usize, usize) {
+        (&self.storage, 0, self.byte_len)
+    }
+    pub(crate) fn buffer(&self) -> &MetalBuffer {
+        &self.storage
+    }
+    pub(crate) fn byte_len(&self) -> usize {
+        self.byte_len
+    }
+    #[cfg(test)]
+    pub(crate) fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+        self.storage.with_bytes(0, self.byte_len, f)
     }
 }

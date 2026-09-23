@@ -1,10 +1,24 @@
 #![forbid(unsafe_code)]
 pub mod attention;
 pub mod kv_cache;
-use crate::{Error, MetalDevice, Result, Tensor};
+use crate::{DType, Error, MetalDevice, Result, Tensor, quantization::QuantizedMatrix};
+
+enum MatrixWeight {
+    Dense(Tensor),
+    Quantized(QuantizedMatrix),
+}
+impl MatrixWeight {
+    fn byte_size(&self) -> usize {
+        match self {
+            Self::Dense(t) => t.byte_size(),
+            Self::Quantized(t) => t.byte_size(),
+        }
+    }
+}
 
 pub struct Embedding {
-    weight: Tensor,
+    weight: MatrixWeight,
+    output_dtype: DType,
 }
 impl Embedding {
     pub fn new(weight: Tensor) -> Result<Self> {
@@ -13,17 +27,45 @@ impl Embedding {
                 "embedding requires nonempty [vocab,hidden]".into(),
             ));
         }
-        Ok(Self { weight })
+        let output_dtype = weight.dtype();
+        Ok(Self {
+            weight: MatrixWeight::Dense(weight),
+            output_dtype,
+        })
+    }
+    pub(crate) fn new_quantized(
+        d: &MetalDevice,
+        weight: QuantizedMatrix,
+        output_dtype: DType,
+    ) -> Result<Self> {
+        if weight.rows() == 0 || weight.columns() == 0 {
+            return Err(Error::Shape(
+                "quantized embedding requires nonempty [vocab,hidden]".into(),
+            ));
+        }
+        if !d.owns(weight.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
+        Ok(Self {
+            weight: MatrixWeight::Quantized(weight),
+            output_dtype,
+        })
     }
     pub fn weight_bytes(&self) -> usize {
         self.weight.byte_size()
     }
     pub fn forward(&self, d: &MetalDevice, tokens: &[u32]) -> Result<Tensor> {
-        Ok(d.embedding_gather(&self.weight, tokens)?.tensor)
+        let output = match &self.weight {
+            MatrixWeight::Dense(weight) => d.embedding_gather(weight, tokens)?,
+            MatrixWeight::Quantized(weight) => {
+                d.embedding_gather_quantized(weight, tokens, self.output_dtype)?
+            }
+        };
+        Ok(output.tensor)
     }
 }
 pub struct Linear {
-    weight: Tensor,
+    weight: MatrixWeight,
     bias: Option<Tensor>,
     input: usize,
     output: usize,
@@ -53,7 +95,39 @@ impl Linear {
         Ok(Self {
             input: dims[1],
             output: dims[0],
-            weight,
+            weight: MatrixWeight::Dense(weight),
+            bias,
+        })
+    }
+    pub(crate) fn new_quantized(
+        d: &MetalDevice,
+        weight: QuantizedMatrix,
+        bias: Option<Tensor>,
+        output_dtype: DType,
+    ) -> Result<Self> {
+        if weight.rows() == 0 || weight.columns() == 0 {
+            return Err(Error::Shape(
+                "quantized linear weight requires nonempty [out,in]".into(),
+            ));
+        }
+        if let Some(b) = &bias {
+            if b.shape().dimensions() != [weight.rows()] {
+                return Err(Error::Shape("linear bias requires [out]".into()));
+            }
+            if b.dtype() != output_dtype {
+                return Err(Error::DType);
+            }
+            if !d.owns(b.buffer()) {
+                return Err(Error::DeviceMismatch);
+            }
+        }
+        if !d.owns(weight.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
+        Ok(Self {
+            input: weight.columns(),
+            output: weight.rows(),
+            weight: MatrixWeight::Quantized(weight),
             bias,
         })
     }
@@ -72,7 +146,11 @@ impl Linear {
             .last_mut()
             .ok_or_else(|| Error::Shape("linear rank".into()))? = self.output;
         let x = x.reshape([x.numel() / self.input, self.input])?;
-        let mut y = d.project(&x, &self.weight)?.tensor;
+        let projected = match &self.weight {
+            MatrixWeight::Dense(weight) => d.project(&x, weight)?,
+            MatrixWeight::Quantized(weight) => d.project_quantized(&x, weight)?,
+        };
+        let mut y = projected.tensor;
         if let Some(b) = &self.bias {
             y = d.bias_add(&y, b)?.tensor;
         }

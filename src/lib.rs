@@ -17,5 +17,6 @@ pub mod generation;
 pub mod loader;
 pub mod model;
 pub mod nn;
+pub mod quantization;
 pub mod sampling;
 pub mod tokenizer;

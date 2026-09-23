@@ -1,6 +1,96 @@
 //! Narrow contiguous copies and transformer operations; no strided views.
 use super::*;
 impl MetalDevice {
+    pub(crate) fn project_quantized(
+        &self,
+        a: &Tensor,
+        weight: &crate::quantization::QuantizedMatrix,
+    ) -> Result<Output> {
+        use crate::quantization::QuantizationFormat;
+        if weight.format() != QuantizationFormat::Q8_0 {
+            return Err(Error::Gguf(format!(
+                "no Metal projection for {:?}",
+                weight.format()
+            )));
+        }
+        let ad = a.shape().dimensions();
+        if ad.len() != 2 || ad[1] != weight.columns() || ad[1] > u32::MAX as usize - 32 {
+            return Err(Error::Shape(
+                "quantized projection requires [M,K] matching [N,K]".into(),
+            ));
+        }
+        let mut p = [0; 9];
+        p[1] = index(ad[0])?;
+        p[2] = index(ad[1])?;
+        p[3] = index(weight.rows())?;
+        let name = if ad[0] == 1 {
+            "q8_0_gemv"
+        } else if ad[0] >= 16
+            && a.dtype() == DType::BF16
+            && ad[1].is_multiple_of(128)
+            && self.mpp_projection()
+        {
+            "q8_0_gemm_mpp"
+        } else {
+            "q8_0_gemm"
+        };
+        self.run_quantized(
+            name,
+            a,
+            weight,
+            &[ad[0], weight.rows()],
+            p,
+            [weight.rows(), ad[0]],
+        )
+    }
+
+    pub(crate) fn embedding_gather_quantized(
+        &self,
+        weight: &crate::quantization::QuantizedMatrix,
+        tokens: &[u32],
+        output_dtype: DType,
+    ) -> Result<Output> {
+        use crate::quantization::QuantizationFormat;
+        if weight.format() != QuantizationFormat::Q8_0 || weight.columns() > u32::MAX as usize {
+            return Err(Error::Gguf(format!(
+                "no quantized embedding gather for {:?}",
+                weight.format()
+            )));
+        }
+        for &id in tokens {
+            if id as usize >= weight.rows() {
+                return Err(Error::Token {
+                    id,
+                    vocab: weight.rows(),
+                });
+            }
+        }
+        let ids = Tensor::from_le_bytes(
+            self,
+            [tokens.len()],
+            DType::F32,
+            &tokens
+                .iter()
+                .flat_map(|id| id.to_le_bytes())
+                .collect::<Vec<_>>(),
+        )?;
+        if ids.storage_info().alignment < 4 {
+            return Err(Error::Range(
+                "token ID carrier requires u32 alignment".into(),
+            ));
+        }
+        let mut p = [0; 9];
+        p[1] = index(weight.columns())?;
+        p[2] = index(weight.rows())?;
+        self.run_quantized_embedding(
+            weight,
+            &ids,
+            &[tokens.len(), weight.columns()],
+            output_dtype,
+            p,
+        )
+    }
+
     /// Integer IDs never pass through floating-point conversion.
     pub fn embedding_gather(&self, weight: &Tensor, tokens: &[u32]) -> Result<Output> {
         let dims = weight.shape().dimensions();
@@ -540,5 +630,135 @@ mod fusion_tests {
                 assert_eq!(a.to_f32(), b.to_f32(), "{dtype:?} S={s} P={offset}");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod q8_0_tests {
+    use super::*;
+    use crate::quantization::{QuantizationFormat, QuantizedMatrix};
+
+    fn packed(device: &MetalDevice, rows: usize, columns: usize) -> QuantizedMatrix {
+        let mut bytes = Vec::new();
+        for row in 0..rows {
+            for _ in 0..columns / 32 {
+                bytes.extend_from_slice(&half::f16::from_f32(0.03125).to_bits().to_le_bytes());
+                for column in 0..32 {
+                    let q = ((row * 11 + column * 7) % 25) as i8 - 12;
+                    bytes.push(q as u8);
+                }
+            }
+        }
+        let expected_len = rows * (columns / 32) * 34;
+        assert_eq!(bytes.len(), expected_len);
+        let matrix =
+            QuantizedMatrix::from_reader(device, rows, columns, QuantizationFormat::Q8_0, |dst| {
+                dst.copy_from_slice(&bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(matrix.byte_size(), expected_len);
+        assert_eq!(matrix.with_bytes(|data| data.len()), expected_len);
+        matrix
+    }
+
+    fn q8_value(row: usize, column: usize) -> f32 {
+        let q = ((row * 11 + (column % 32) * 7) % 25) as i8 - 12;
+        0.03125 * f32::from(q)
+    }
+
+    fn input(rows: usize, columns: usize) -> Vec<f32> {
+        (0..rows * columns)
+            .map(|i| ((i * 29 + 3) % 101) as f32 / 73.0 - 0.65)
+            .collect()
+    }
+
+    fn expected(input: &[f32], m: usize, n: usize, k: usize) -> Vec<f32> {
+        (0..m)
+            .flat_map(|row| {
+                (0..n).map(move |column| {
+                    (0..k)
+                        .map(|i| input[row * k + i] * q8_value(column, i))
+                        .sum::<f32>()
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn q8_0_gemv_and_gemm_cover_output_tails_and_odd_batch_sizes() {
+        let d = MetalDevice::new().unwrap();
+        let n = 5;
+        let k = 64;
+        let weight = packed(&d, n, k);
+        for m in [1, 2, 3, 4, 5, 7] {
+            let values = input(m, k);
+            let x = Tensor::from_f32(&d, [m, k], DType::F32, &values).unwrap();
+            let actual = d.project_quantized(&x, &weight).unwrap().tensor.to_f32();
+            let expected = expected(&values, m, n, k);
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 2.0e-5,
+                    "index {index}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q8_0_mpp_gemm_dequantizes_only_a_tiled_weight_block() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let (m, n, k) = (35, 65, 128);
+        let weight = packed(&d, n, k);
+        let values = input(m, k);
+        let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let reference = expected(&rounded_input, m, n, k);
+        let reference = Tensor::from_f32(&d, [m, n], DType::BF16, &reference).unwrap();
+        let output = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(output.metrics.operation, "q8_0_gemm_mpp");
+        for (index, (actual, expected)) in output
+            .tensor
+            .to_f32()
+            .iter()
+            .zip(reference.to_f32())
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 0.06,
+                "index {index}: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn q8_0_embedding_gather_decodes_only_requested_rows() {
+        let d = MetalDevice::new().unwrap();
+        let vocab = 5;
+        let hidden = 64;
+        let weight = packed(&d, vocab, hidden);
+        let ids = [4, 0, 3];
+        let actual = d
+            .embedding_gather_quantized(&weight, &ids, DType::BF16)
+            .unwrap()
+            .tensor
+            .to_f32();
+        let expected = ids
+            .iter()
+            .flat_map(|&row| {
+                (0..hidden).map(move |column| DType::BF16.round(q8_value(row as usize, column)))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn q8_0_rejects_columns_that_cannot_form_upstream_blocks() {
+        let d = MetalDevice::new().unwrap();
+        let result = QuantizedMatrix::from_reader(&d, 3, 31, QuantizationFormat::Q8_0, |_| Ok(()));
+        assert!(result.is_err());
     }
 }

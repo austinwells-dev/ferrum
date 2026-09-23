@@ -2,7 +2,10 @@ use ferrum::{
     Error, MetalDevice, Result,
     generation::{self, Generation},
     loader::Weights,
-    model::qwen::{self, QwenConfig},
+    model::{
+        qwen::{self, QwenConfig},
+        qwen_gguf,
+    },
     sampling::{Sampler, SamplingConfig},
     tokenizer::qwen::{DEFAULT_SYSTEM, QwenTokenizer},
 };
@@ -68,12 +71,12 @@ impl Options {
             }
         }
         if o.model.as_os_str().is_empty() || !supplied_prompt {
-            return Err(Error::Parameter("usage: run --model DIR --prompt TEXT [--raw] [--max-new-tokens 32] [--temperature 0] [--top-k 0] [--top-p 1] [--seed 0] [--warmup] [--profile] [--tokenizer-diagnostic]".into()));
+            return Err(Error::Parameter("usage: run --model DIR_OR_GGUF --prompt TEXT [--raw] [--max-new-tokens 32] [--temperature 0] [--top-k 0] [--top-p 1] [--seed 0] [--warmup] [--profile] [--tokenizer-diagnostic]".into()));
         }
         o.sampling.validate()?;
-        if !o.model.is_dir() {
+        if !o.model.is_dir() && !o.model.is_file() {
             return Err(Error::Config(format!(
-                "missing model directory {}",
+                "missing model path {}",
                 o.model.display()
             )));
         }
@@ -140,11 +143,76 @@ pub fn run(d: &MetalDevice) -> Result<()> {
                 .map_err(|_| Error::Parameter("invalid FERRUM_BATCH_LIMIT".into()))?,
         )?;
     }
-    let start = Instant::now();
-    let qc = QwenConfig::from_file(o.model.join("config.json"))?;
-    let c = qc.convert()?;
-    let tok = QwenTokenizer::load(&o.model, &qc)?;
-    let tokenizer_load = start.elapsed();
+    let (
+        c,
+        tok,
+        model,
+        source_bytes,
+        tensor_count,
+        parameter_count,
+        quantized_bytes,
+        config_tokenizer_load,
+        weight_load,
+        construction,
+        construction_bytes,
+        source_label,
+    ) = if o.model.is_file() {
+        let before = d.counters();
+        let start = Instant::now();
+        let loaded = qwen_gguf::load(d, &o.model)?;
+        let elapsed = start.elapsed();
+        let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
+        (
+            loaded.config,
+            loaded.tokenizer,
+            loaded.model,
+            loaded.source_tensor_bytes,
+            loaded.tensor_count,
+            loaded.parameter_count,
+            loaded.quantized_tensor_bytes,
+            elapsed,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            allocated,
+            "Qwen2 GGUF",
+        )
+    } else {
+        let start = Instant::now();
+        let qc = QwenConfig::from_file(o.model.join("config.json"))?;
+        let c = qc.convert()?;
+        let tok = QwenTokenizer::load(&o.model, &qc)?;
+        let tokenizer_load = start.elapsed();
+        let start = Instant::now();
+        let source = Weights::from_file(d, o.model.join("model.safetensors"))?;
+        let weight_load = start.elapsed();
+        let source_bytes = source.bytes();
+        let tensor_count = source.names().count();
+        let parameter_count = source.names().try_fold(0usize, |total, name| {
+            total
+                .checked_add(source.get(name)?.numel())
+                .ok_or_else(|| Error::Shape("source parameter count overflow".into()))
+        })?;
+        let before = d.counters();
+        let start = Instant::now();
+        let model = qwen::construct(d, c.clone(), &source)?;
+        let construction = start.elapsed();
+        let construction_bytes = generation::counter_delta(before, d.counters()).allocated_bytes;
+        drop(source);
+        (
+            c,
+            tok,
+            model,
+            source_bytes,
+            tensor_count,
+            parameter_count,
+            0,
+            tokenizer_load,
+            weight_load,
+            construction,
+            construction_bytes,
+            "Qwen2.5-0.5B-Instruct safetensors",
+        )
+    };
     let start = Instant::now();
     let (text, ids) = tok.encode_prompt(&o.prompt, &o.system, o.raw)?;
     let tokenization = start.elapsed();
@@ -159,19 +227,8 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             tok.tokenizer.decode(&ids)?
         );
     }
-    let start = Instant::now();
-    let source = Weights::from_file(d, o.model.join("model.safetensors"))?;
-    let load = start.elapsed();
-    let source_bytes = source.bytes();
-    let count = source.names().count();
-    let before = d.counters();
-    let start = Instant::now();
-    let model = qwen::construct(d, c.clone(), &source)?;
-    let construction = start.elapsed();
-    let construction_counters = generation::counter_delta(before, d.counters());
-    drop(source);
     eprintln!(
-        "Ferrum\nModel: Qwen2.5-0.5B-Instruct (local checkpoint)\nDevice: {}\nBackend: Metal\nDtype: {:?}\nLayers: {}; hidden: {}; intermediate: {}; Q heads: {}; KV heads: {}; head dim: {}\nParameters: {}; tensors: {}\nSource weight bytes: {}\nRetained weight bytes: {}\nConstruction/transposition bytes: {}\nRecommended working set: {} bytes",
+        "Ferrum\nModel: {source_label}\nDevice: {}\nBackend: Metal\nDtype: {:?}\nLayers: {}; hidden: {}; intermediate: {}; Q heads: {}; KV heads: {}; head dim: {}\nParameters: {}; tensors: {}\nSource tensor bytes: {}\nRetained weight bytes: {}\nQuantized tensor bytes: {}\nLoader/construction allocations: {}\nRecommended working set: {} bytes",
         d.name(),
         c.dtype,
         c.num_layers,
@@ -180,17 +237,18 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         c.num_attention_heads,
         c.num_key_value_heads,
         c.head_dim,
-        source_bytes / 2,
-        count,
+        parameter_count,
+        tensor_count,
         source_bytes,
         model.weight_bytes(),
-        construction_counters.allocated_bytes,
+        quantized_bytes,
+        construction_bytes,
         d.recommended_max_working_set()
     );
     eprintln!(
-        "config/tokenizer load: {:.3} ms; weight load: {:.3} ms; construction: {:.3} ms; tokenization: {:.3} ms\nPrompt: {} tokens; sampler: {:?}",
-        ms(tokenizer_load),
-        ms(load),
+        "config/tokenizer/model load: {:.3} ms; weight read: {:.3} ms; construction: {:.3} ms; tokenization: {:.3} ms\nPrompt: {} tokens; sampler: {:?}",
+        ms(config_tokenizer_load),
+        ms(weight_load),
         ms(construction),
         ms(tokenization),
         ids.len(),

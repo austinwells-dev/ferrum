@@ -47,6 +47,24 @@ impl Transformer {
     pub fn from_weights(d: &MetalDevice, config: ModelConfig, w: &Weights) -> Result<Self> {
         config.validate()?;
         let (embedding, layers, final_norm, lm_head) = weights::construct(d, &config, w)?;
+        Self::from_parts(config, embedding, layers, final_norm, lm_head)
+    }
+    pub(crate) fn from_model_weights(
+        d: &MetalDevice,
+        config: ModelConfig,
+        w: &weights::ModelWeights,
+    ) -> Result<Self> {
+        config.validate()?;
+        let (embedding, layers, final_norm, lm_head) = weights::construct_mixed(d, &config, w)?;
+        Self::from_parts(config, embedding, layers, final_norm, lm_head)
+    }
+    fn from_parts(
+        config: ModelConfig,
+        embedding: Embedding,
+        layers: Vec<DecoderLayer>,
+        final_norm: RmsNorm,
+        lm_head: Linear,
+    ) -> Result<Self> {
         // Sum actual retained tensor payloads, including the tied LM transpose allocation.
         let mut weight_bytes =
             embedding.weight_bytes() + final_norm.weight.byte_size() + lm_head.weight_bytes();

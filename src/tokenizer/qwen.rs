@@ -21,6 +21,54 @@ fn json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|e| Error::Tokenizer(format!("{}: {e}", path.display())))
 }
 impl QwenTokenizer {
+    pub(crate) fn from_gguf(
+        tokens: &[String],
+        merges: &[String],
+        token_types: &[i32],
+        vocab_size: usize,
+        bos_id: u32,
+        eos_id: u32,
+        pad_id: u32,
+    ) -> Result<Self> {
+        let bad =
+            |message: &str| Error::Tokenizer(format!("GGUF Qwen tokenizer mismatch: {message}"));
+        if tokens.len() > vocab_size {
+            return Err(bad("tokenizer vocabulary exceeds embedding rows"));
+        }
+        for id in [bos_id, eos_id, pad_id] {
+            if id as usize >= tokens.len() {
+                return Err(bad("BOS/EOS/PAD ID is outside tokenizer entries"));
+            }
+        }
+        if tokens.get(bos_id as usize).map(String::as_str) != Some("<|endoftext|>")
+            || tokens.get(eos_id as usize).map(String::as_str) != Some("<|im_end|>")
+        {
+            return Err(bad("unexpected Qwen BOS/EOS token strings"));
+        }
+        let tokenizer = Tokenizer::from_gguf_bpe(tokens, merges, token_types)?;
+        for id in 0..tokens.len() as u32 {
+            if tokenizer.0.id_to_token(id).is_none() {
+                return Err(bad("tokenizer ID hole"));
+            }
+        }
+        for (text, id) in [
+            ("<|endoftext|>", bos_id),
+            ("<|im_start|>", 151644),
+            ("<|im_end|>", eos_id),
+        ] {
+            if tokenizer.0.token_to_id(text) != Some(id) || tokenizer.encode(text)? != [id] {
+                return Err(bad(&format!(
+                    "invalid special token {text}, expected ID {id}"
+                )));
+            }
+        }
+        Ok(Self {
+            tokenizer,
+            eos_ids: vec![eos_id, bos_id],
+            pad_id,
+        })
+    }
+
     pub fn load(dir: &Path, config: &QwenConfig) -> Result<Self> {
         let tc = json(&dir.join("tokenizer_config.json"))?;
         let gc = json(&dir.join("generation_config.json"))?;

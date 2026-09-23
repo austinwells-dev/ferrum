@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
-use crate::{DType, Error, MetalDevice, Result, Tensor, metal::DispatchTiming};
+use crate::{
+    DType, Error, MetalDevice, Result, Tensor, metal::DispatchTiming, quantization::QuantizedMatrix,
+};
 #[derive(Debug, Clone)]
 pub struct Metrics {
     pub operation: &'static str,
@@ -15,6 +17,120 @@ pub struct Output {
     pub metrics: Metrics,
 }
 impl MetalDevice {
+    pub(crate) fn run_quantized(
+        &self,
+        name: &'static str,
+        a: &Tensor,
+        weight: &QuantizedMatrix,
+        dims: &[usize],
+        mut p: [u32; 9],
+        grid: [usize; 2],
+    ) -> Result<Output> {
+        let profile_start = self.profiling().then(std::time::Instant::now);
+        let wait_before = profile_start
+            .map(|_| self.counters().wait)
+            .unwrap_or_default();
+        if !self.owns(a.buffer()) || !self.owns(weight.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
+        index(a.numel())?;
+        let shape = crate::tensor::Shape::new(dims)?;
+        index(shape.numel())?;
+        let allocation_start = profile_start.map(|_| std::time::Instant::now());
+        let tensor = if shape.numel() == 0 {
+            Tensor::zeros(self, dims, a.dtype())?
+        } else {
+            Tensor::output(self, dims, a.dtype())?
+        };
+        let allocation_time = allocation_start.map(|s| s.elapsed()).unwrap_or_default();
+        p[0] = index(a.numel())?;
+        p[4] = a.dtype() as u32;
+        let timing = self.dispatch(
+            name,
+            &[a.binding(), weight.binding(), tensor.binding()],
+            &p,
+            grid,
+            false,
+        )?;
+        let metrics = Metrics {
+            operation: name,
+            shape,
+            dtype: a.dtype(),
+            bytes_read: a.byte_size() + weight.byte_size(),
+            bytes_written: tensor.byte_size(),
+            allocation_bytes: tensor.storage_info().allocation_bytes,
+            timing,
+        };
+        if let Some(start) = profile_start {
+            self.record_profile(
+                name,
+                start
+                    .elapsed()
+                    .saturating_sub(self.counters().wait - wait_before),
+                allocation_time,
+                metrics.allocation_bytes,
+                &metrics.timing,
+            );
+        }
+        Ok(Output { tensor, metrics })
+    }
+
+    pub(crate) fn run_quantized_embedding(
+        &self,
+        weight: &QuantizedMatrix,
+        ids: &Tensor,
+        output_dims: &[usize],
+        output_dtype: DType,
+        mut p: [u32; 9],
+    ) -> Result<Output> {
+        let profile_start = self.profiling().then(std::time::Instant::now);
+        let wait_before = profile_start
+            .map(|_| self.counters().wait)
+            .unwrap_or_default();
+        if !self.owns(ids.buffer()) || !self.owns(weight.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
+        let shape = crate::tensor::Shape::new(output_dims)?;
+        index(shape.numel())?;
+        let allocation_start = profile_start.map(|_| std::time::Instant::now());
+        let tensor = if shape.numel() == 0 {
+            Tensor::zeros(self, output_dims, output_dtype)?
+        } else {
+            Tensor::output(self, output_dims, output_dtype)?
+        };
+        let allocation_time = allocation_start.map(|s| s.elapsed()).unwrap_or_default();
+        p[0] = index(shape.numel())?;
+        p[4] = output_dtype as u32;
+        let timing = self.dispatch(
+            "embedding_gather_q8_0",
+            &[weight.binding(), ids.binding(), tensor.binding()],
+            &p,
+            [shape.numel(), 1],
+            false,
+        )?;
+        let metrics = Metrics {
+            operation: "embedding_gather_q8_0",
+            shape,
+            dtype: output_dtype,
+            bytes_read: ids.byte_size() + weight.byte_size(),
+            bytes_written: tensor.byte_size(),
+            allocation_bytes: tensor.storage_info().allocation_bytes,
+            timing,
+        };
+        if let Some(start) = profile_start {
+            self.record_profile(
+                "embedding_gather_q8_0",
+                start
+                    .elapsed()
+                    .saturating_sub(self.counters().wait - wait_before),
+                allocation_time,
+                metrics.allocation_bytes,
+                &metrics.timing,
+            );
+        }
+        Ok(Output { tensor, metrics })
+    }
+
     fn run(
         &self,
         name: &'static str,
@@ -204,7 +320,18 @@ impl MetalDevice {
         self.run("matmul", a, Some(b), &[ad[0], bd[1]], p, [bd[1], ad[0]])
     }
     pub fn warm_up(&self) -> Result<()> {
-        for name in ["add", "mul", "silu", "rmsnorm", "softmax", "rope", "matmul"] {
+        for name in [
+            "add",
+            "mul",
+            "silu",
+            "rmsnorm",
+            "softmax",
+            "rope",
+            "matmul",
+            "q8_0_gemv",
+            "q8_0_gemm",
+            "embedding_gather_q8_0",
+        ] {
             self.builtin(name)?;
         }
         Ok(())

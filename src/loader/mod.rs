@@ -1,5 +1,6 @@
 //! Local safetensors parsing, independent of model naming.
 #![forbid(unsafe_code)]
+pub mod gguf;
 use crate::{DType, Error, MetalDevice, Result, Tensor};
 use safetensors::SafeTensors;
 use std::{collections::BTreeMap, path::Path};

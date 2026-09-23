@@ -11,6 +11,8 @@ pub enum Error {
     Cache(String),
     #[error("safetensors: {0}")]
     Safetensors(String),
+    #[error("GGUF: {0}")]
+    Gguf(String),
     #[error("tokenizer: {0}")]
     Tokenizer(String),
 

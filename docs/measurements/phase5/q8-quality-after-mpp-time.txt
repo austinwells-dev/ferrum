@@ -1,0 +1,21 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 0.99s
+     Running `target/release/examples/qwen_quant_quality /tmp/ferrum-phase5-qwen-bf16 /tmp/ferrum-phase5-qwen-gguf/qwen2.5-0.5b-instruct-q8_0.gguf`
+        2.75 real         0.55 user         0.58 sys
+          2245328896  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+              189304  page reclaims
+                1013  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+                1332  voluntary context switches
+                4882  involuntary context switches
+         15401601805  instructions retired
+          4690645128  cycles elapsed
+          2217756904  peak memory footprint
