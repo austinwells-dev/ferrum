@@ -275,6 +275,31 @@ kernel void gemv_vector(ARGS, uint tid [[thread_index_in_threadgroup]], uint gro
     else gemv_vector_impl<half>((device const half4*)a,(device const half4*)b,c,p,tid,group);
 }
 
+// Four SIMD groups split K for each output row. This trades additional active
+// lanes and one small cross-SIMD reduction for less serial weight streaming.
+template<typename T>
+void gemv_wide_impl(device const vec<T,4>* a, device const vec<T,4>* b,
+                    device uchar* c, constant uint* p, uint tid, uint row,
+                    threadgroup float* partial) {
+    uint lane=tid%32, simd=tid/32, k4=p[2]/4;
+    float4 sum=0.f;
+    if(row<p[3]) for(uint j=simd*32+lane;j<k4;j+=128)
+        sum+=float4(a[j])*float4(b[row*k4+j]);
+    float chunk=simd_sum((sum.x+sum.y)+(sum.z+sum.w));
+    if(lane==0) partial[simd]=chunk;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(simd==0) {
+        float total=lane<4?partial[lane]:0.f;
+        total=simd_sum(total);
+        if(lane==0 && row<p[3]) store(c,row,p[4],total);
+    }
+}
+kernel void gemv_wide(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[4];
+    if(p[4]==2) gemv_wide_impl<bfloat>((device const bfloat4*)a,(device const bfloat4*)b,c,p,tid,row,partial);
+    else gemv_wide_impl<half>((device const half4*)a,(device const half4*)b,c,p,tid,row,partial);
+}
+
 // Grouped attention products: retain explicit score/probability storage boundaries.
 template<typename T, bool context>
 void attention_matrix(device const uchar* a, device const uchar* b, device uchar* c,

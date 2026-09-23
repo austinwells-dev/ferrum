@@ -50,7 +50,7 @@ A direct unit test verifies exact staged/fused equality for F32/F16/BF16 with mu
 
 The isolated 1k prefill profile (`h-fused-isolated.jsonl`) measures transformer projections 952.16 ms, attention scores 451.30 ms and attention context 447.92 ms. Fused softmax is 27.69 ms, RMSNorm 11.08 ms and LM head GEMV 2.15 ms. Thus the next major experiments must address both GEMM and attention products, unlike the short-prompt case. Isolated timing changes scheduling and is attribution evidence rather than normal production latency.
 
-The current candidate passes Metal API/shader validation for the full backend/correctness/transformer/runtime optimization suites and both official real-model tests. The unchanged F32 diagnostic still passes its existing 8e-5 tolerance. Logs: `h-fused-validation.txt`, `h-fused-real-validation.txt`, `h-fused-f32-check.json`, `h-fused-clippy.txt`. This is an intermediate checkpoint, not goal completion.
+At the h-fused checkpoint, the candidate passed Metal API/shader validation for the full backend/correctness/transformer/runtime optimization suites and both official real-model tests. The unchanged F32 diagnostic still passed its existing 8e-5 tolerance. Logs: `h-fused-validation.txt`, `h-fused-real-validation.txt`, `h-fused-f32-check.json`, `h-fused-clippy.txt`. This was an intermediate checkpoint.
 
 ### Tiled BF16 attention products (i-attention checkpoint)
 
@@ -60,7 +60,7 @@ Three-run medians: short 35.60 ms, 128 tokens 152.34 ms, 512 tokens 577.54 ms, 1
 
 `i-attention-validation.txt` and `i-attention-real-validation.txt` pass Metal API/shader validation, including new direct scalar-versus-tiled comparisons for GQA, awkward widths/tiles and a 1k prefix. No existing numerical tests or tolerances changed. `i-epoch-validation.txt` adds a 40-operation live dependency chain crossing the memory-driven completion boundary and asserts correct values and bounded transient peak.
 
-Next: improve prefill GEMM reuse/staging, then return to long-context decode/GEMV and remaining fusion opportunities. The full expanded goal is still active; neither the target throughput nor the stopping audit has been satisfied.
+At the i-attention checkpoint, prefill GEMM reuse/staging, long-context decode/GEMV, and remaining fusion opportunities were still outstanding; the expanded goal and its stopping audit remained active.
 
 ### Shared projection staging (j-wide checkpoint)
 
@@ -112,4 +112,66 @@ The first specialization is BF16 M>=32 on Apple10 + Metal4, using a 64x64 output
 
 Initial complete matrix including long horizon: prefill 31.90/22.39/87.36/261.61 ms for short/128/512/1024. The short path is unchanged. All generated IDs match the n baseline, including the full 1,600-step run. The unchanged suite and Metal validation pass, along with CPU-reference checks at tile boundaries/awkward K and N and a new unaligned-base view test. F32 diagnostic error remains 7.82012939453125e-5. Compilation experiments exposed SDK/runtime differences in const tensor element support and fragment mask APIs; resolved using the installed API and guarded output coordinates, without changing tolerances.
 
-Re-profiled 1k isolated GPU categories: projection 74.03 ms; attention scores/context 73.30/60.31 ms; causal softmax 26.94 ms; RMSNorm 11.52 ms; SwiGLU 8.13 ms. Thus attention products and their intermediates now collectively dominate prefill. Further hardware-native attention and small-M projection experiments are still reasonable Phase 4 work. GEMV, scheduling and final matched controls remain outstanding; the goal is not complete.
+Re-profiled 1k isolated GPU categories at the o checkpoint: projection 74.03 ms; attention scores/context 73.30/60.31 ms; causal softmax 26.94 ms; RMSNorm 11.52 ms; SwiGLU 8.13 ms. This identified attention products as a large prefill target; the next checkpoint tests MPP attention and decode GEMV.
+
+## MPP attention and split-K decode GEMV (p checkpoint)
+
+For multi-token BF16 score/context products on Apple10 + Metal 4, strided `tensor_inline` views now feed the same 64x64 MPP tile used by projection. GQA head mapping, tails, and sequence-major strides stay generic. Decode and non-BF16 paths keep their existing kernels. The score/probability storage boundaries and fused causal softmax remain intact. No unsafe Rust or model/prompt-specific dimensions were added.
+
+On the 1k prompt, the earlier projection-only MPP candidate measured 261.61 ms prefill; the MPP-attention candidate measured 149.97 ms (42.7% lower, one run each). Isolated operation GPU time for score/context fell from 73.30/60.31 ms to 8.12/8.33 ms. In the updated 1k profile, MPP projection is 72.46 ms, fused attention softmax 24.67 ms, RMSNorm 11.25 ms, and the two MPP attention products total 16.45 ms. The ordinary matrix now measures about 6.7k prompt tokens/s at 1k, above the 2.5k direction. `FERRUM_BATCH_LIMIT=1` deliberately changes synchronization and these category times are attribution evidence, not additive production latency.
+
+Ordinary prefill no longer allocates buffers for the model's full maximum context. `KvCache::new` creates no GPU storage; append grows per-layer K/V storage geometrically to the current prefix, preserving immutable active-prefix views and transactional reservation. At 1k plus the measured decode tail, active KV is 12,779,520 bytes and reserved KV is 25,165,824 bytes. The 1k A/B prefill counters show 242,225,152 bytes of fresh transient allocation volume and a 267,649,024-byte peak; these include model intermediates and are unchanged by the GEMV toggle. In the isolated profile, KV append is 1.74 ms total across 48 writes, while projections, softmax, and attention products take much longer. Allocation/zeroing is not the remaining prefill limiter.
+
+The decode profile separates the tied LM head from transformer projections. The head is one 896-by-151,936 BF16 GEMV (259.7 MiB of weights); the decoder projections account for another 682.5 MiB per token. A paired isolated profile reports about 2.15 ms GPU time for the head and about 11.86 ms across 168 legacy transformer GEMVs. The split-K variant reports about 2.03 ms for the head, 11.75 ms across 120 split-K GEMVs, and 0.76 ms across the 48 small legacy GEMVs. These per-operation numbers vary substantially between identical isolated runs, and the forced one-dispatch command buffers slow the full decode; they are not hardware DRAM counters or a reliable additive decomposition. The stable observation is that transformer projections dominate the head by call count and weight traffic, while paired batched generation shows a smaller net decode improvement.
+
+Each decode step must visit approximately 987,922,432 bytes (942.16 MiB) of BF16 projection weights for this checkpoint, before KV and activation traffic. At 97.0 short-context cached tok/s, that is about 95.9 GB/s of weight traffic. Apple's [M5 tech specs](https://support.apple.com/en-ie/125405) list 153 GB/s memory bandwidth, so 150 tok/s would require roughly 148.2 GB/s for weights alone, before attention, cache traffic, or synchronization. This is a traffic-based roofline estimate, not a measured DRAM counter. Decode is a batch-one GEMV workload: the current MPP matmul path is selected for M>=32 prefill projections, while M=1 decode uses SIMD reduction kernels. That explains why BF16 matrix throughput is not the right decode ceiling and why a materially higher target likely needs a new M=1 GEMV design.
+
+The concrete decode experiment assigns four SIMD groups to each aligned BF16 output row, splits K across them, then combines four partial sums. It is selected only for M=1, K/N>=512, K divisible by four, and aligned views; other cases retain the prior vector/scalar path. `FERRUM_GEMV_AB=1` in `runtime_matrix` alternates and warms both paths in the same process. Three-run paired medians:
+
+| Case | Cached decode, legacy → split-K | Complete generation, legacy → split-K |
+|---|---:|---:|
+| Short | 93.07 → 97.04 tok/s (+4.3%) | 81.14 → 85.06 tok/s (+4.8%) |
+| 128-token prompt | 94.25 → 96.84 tok/s (+2.7%) | 87.15 → 89.28 tok/s (+2.4%) |
+| 512-token prompt | 91.05 → 93.46 tok/s (+2.6%) | 69.96 → 71.28 tok/s (+1.9%) |
+| 1k-token prompt | 85.62 → 88.29 tok/s (+3.1%) | 49.09 → 49.38 tok/s (+0.6%) |
+| 128-step sustained decode | 91.00 → 93.87 tok/s (+3.2%) | 87.52 → 90.24 tok/s (+3.1%) |
+| 1,600-step horizon, one paired run | 83.19 → 85.62 tok/s (+2.9%) | 81.21 → 83.06 tok/s (+2.3%) |
+
+All 1,601 IDs match in the paired long-horizon run. The three 128-step sustained pairs first differ at step 119: under the same teacher-forced history the legacy kernel scores tokens 911 and 15502 at 17.0/17.0, while split-K scores them at 16.875/17.125. The attention MPP change also flips the documented step-six BF16 near-tie between IDs 1492 and 7789 by 0.125 logit. These small reduction-order changes are recorded in `p-gemv-probe-sustained.jsonl` and `p-attention-control-probe-short.jsonl`; no existing expected-token assertion or tolerance changed. The split-K reference check uses the existing BF16 tolerance.
+
+The complete test suite, both official local-Qwen generation/lifetime tests, Metal API/GPU shader validation, `cargo clippy --all-targets -- -D warnings`, formatting, and the F32 diagnostic pass. F32 max error remains 7.82012939453125e-5 against the unchanged 8e-5 bound. Logs: `p-gemv-metal-validation.txt`, `p-gemv-real-shader-validation.txt`, `p-gemv-clippy.txt`, `p-gemv-fmt.txt`, `p-gemv-f32-check.json`, `p-gemv-profile-1024.jsonl`, `p-gemv-ab-profile-short.jsonl`, `p-gemv-probe-sustained.jsonl`, and the raw paired matrices `p-gemv-ab-matrix.jsonl` / `p-gemv-ab-long.jsonl`.
+
+At the p checkpoint, split-K gave a smaller repeatable decode improvement and short cached decode remained below 150 tok/s. M=1 weight streaming, end-to-end timing, and longer-context behavior still needed investigation. The final q closeout below completes that audit. No quantization or GGUF work has started.
+
+### Final MPP decode-GEMV experiment and complete matrix (q closeout)
+
+The final GEMV experiment tested whether the MPP matrix path could accelerate batch-one decode. The installed Metal SDK rejects cooperative MPP matmul tiles unless both M and N are multiples of 8 and at least one is a multiple of 16; the attempted 1x64 tile fails that compile-time assertion. The transposed 16x8 candidate instead computes 16 distinct output rows while broadcasting the input across eight identical columns. This is a valid general GEMV mapping, but it performs redundant products.
+
+Five alternating same-process runs on short decode measured a 10.44 ms median cached step with split-K versus 13.26 ms with the MPP tile. The 128-token sustained case measured 10.68 ms versus 13.66 ms. MPP therefore regressed cached decode by about 27% in both workload classes; complete-generation throughput was 82.63 versus 67.74 tok/s on short and 90.00 versus 70.82 tok/s sustained. The MPP output also changed the first token after five identical generated tokens on the short prompt. The MPP GEMV kernel and runtime switch were removed. Raw results are `p-mpp-gemv-ab-short.jsonl`, `p-mpp-gemv-ab-sustained.jsonl`, and `p-mpp-gemv-smoke.jsonl`.
+
+The production source was rebuilt without the rejected path and the complete paired matrix was rerun with three alternating legacy/split-K pairs. Medians are below; “cached decode” is model-forward throughput and “generation” includes selection and the measured no-op output callback.
+
+| Workload | Prefill tok/s, split-K | Cached decode tok/s, legacy → split-K | Complete generation tok/s, legacy → split-K |
+|---|---:|---:|---:|
+| Short prompt (~21 tokens) | 652.8 | 92.37 → 97.39 | 81.09 → 84.74 |
+| 128-token prompt | 6,136.7 | 93.22 → 96.96 | 86.20 → 89.38 |
+| 512-token prompt | 8,462.4 | 89.09 → 92.15 | 69.43 → 71.20 |
+| 1,024-token prompt | 6,611.0 | 83.94 → 86.57 | 48.84 → 49.43 |
+| 128-token sustained generation | 625.5 | 79.82 → 92.52 | 77.23 → 89.15 |
+
+The short, medium, 512-token, and 1k-token runs each retained identical generated IDs across the three repeats and between legacy/split-K. Sustained split-K first differs at generated index 119, matching the previously investigated same-history BF16 near-tie (legacy scores IDs 911/15502 at 17.0/17.0; split-K scores 16.875/17.125). No tolerance or existing expected output was changed. The three-pair raw matrix is `q-final-matrix.jsonl`. The 1,601-token horizon remains a paired one-run measurement in `p-gemv-ab-long.jsonl`: cached decode 82.96→85.02 tok/s, complete generation 81.21→83.06 tok/s, with all IDs identical. Shorter repeated measurements are less noisy; the long-horizon pair confirms that split-K does not materially regress that workload.
+
+### Phase 4 closeout audit
+
+The expanded objective has been audited against its stopping conditions:
+
+| Requirement | Evidence and decision |
+|---|---|
+| Measure remaining major bottlenecks by workload | 1k prefill profile: MPP projections 72.46 ms GPU, fused causal softmax 24.67 ms, attention products 16.45 ms combined, RMSNorm 11.25 ms. The 1k paired run records 134.6 ms GPU time and 11.3 ms allocation time for prefill; lazy KV append is 1.74 ms across 48 writes in the isolated profile. Short and long decode profiles separate the tied LM head from transformer projections; the latter account for most projection calls and weight traffic. Context-reduction timings were measured at short, 512, 1k and sustained horizons. Existing `n-e2e-baseline.jsonl`, `n-mlx-matrix.jsonl`, and the `p-*` profiles/matrices cover sampling, end-to-end throughput, waits, dispatches, KV, allocation traffic and transient memory. |
+| Try reasonable Phase-4 optimizations | Retained row-major/vector GEMV, split-K BF16 GEMV, multi-SIMD projection tiles, MPP BF16 projections and attention products, growing KV, allocation-pool reclamation, parallel decode context, bounded batching and rounded SwiGLU fusion. Rejected and reverted cases—including output-row GEMV grouping, the earlier wider GEMM tile, and the MPP batch-one GEMV—are documented with measurements above and in `phase4-results.md`. |
+| Show why substantial remaining gains need a larger design | The M5 workload is batch-one GEMV, not a large reusable GEMM. The tied head plus transformer projections stream about 987,922,432 bytes (942.16 MiB) of BF16 weights per decode step. At 97 cached tok/s this is about 95.9 GB/s of logical weight traffic; 150 tok/s would require about 148.2 GB/s for weights alone against Apple's 153 GB/s M5 specification, before KV, activations, attention, or synchronization. This is a traffic estimate, not a measured DRAM counter. Split-K provides a repeatable modest gain, while the public MPP cooperative tile requires padding/reorientation that lost 27% in direct tests. A substantially new M=1 GEMV dataflow is needed to use the remaining bandwidth headroom. |
+| Run the final complete workload matrix | Three alternating pairs cover short, 128, 512, 1k, and sustained generation; the long-horizon case has one same-process pair and 1,601 IDs. Raw output is retained. The 1k prefill direction is exceeded; the 150 tok/s short-decode direction and the user-reported 184.7 tok/s long-generation reference are not reproduced. |
+| Preserve correctness gates | `q-final-metal-validation.txt` passes the full unchanged test suite with Metal API/GPU shader validation. `q-final-real-model-validation.txt` passes both official Qwen tests under the same validation. `q-final-f32-check.json` matches all ordered top-10 lists with max absolute error 7.82012939453125e-5 against the unchanged 8e-5 limit. Cache transaction, snapshot, lifetime, failure, numerical, awkward-shape, and dispatch-boundary tests remain intact. Clippy, formatting, and release build logs are retained. |
+| Document decisions and audit the expanded goal | This report and `phase4-results.md` identify accepted and rejected work, raw evidence, limitations, and why Phase 4 can now stop. No quantization, GGUF, MTP, speculative decoding, or alternate model work began. |
+
+Phase 4 is complete as a BF16 runtime-optimization phase. This is a scope decision based on the completed measurements and rejected tile experiment, not a claim that the decode target or all available hardware bandwidth has been reached. The next substantial decode gains belong to a dedicated GEMV architecture effort; future long-prompt gains may also require online-softmax/fused attention. Phase 5 remains unstarted.

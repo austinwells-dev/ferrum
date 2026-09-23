@@ -404,7 +404,16 @@ impl MetalDevice {
                 "project_f16"
             }
         } else if ad[0] == 1 && a.dtype() != DType::F32 {
-            if ad[1].is_multiple_of(4)
+            if self.split_k_gemv()
+                && a.dtype() == DType::BF16
+                && ad[1] >= 512
+                && bd[0] >= 512
+                && ad[1].is_multiple_of(4)
+                && a.storage_info().alignment >= 8
+                && weight.storage_info().alignment >= 8
+            {
+                "gemv_wide"
+            } else if ad[1].is_multiple_of(4)
                 && a.storage_info().alignment >= 8
                 && weight.storage_info().alignment >= 8
             {

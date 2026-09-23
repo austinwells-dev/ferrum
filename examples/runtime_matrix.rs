@@ -16,6 +16,13 @@ fn main() -> Result<()> {
     if let Ok(limit) = std::env::var("FERRUM_BATCH_LIMIT") {
         d.set_batch_limit(limit.parse().unwrap())?;
     }
+    let gemv_ab = std::env::var_os("FERRUM_GEMV_AB").is_some();
+    let configured_split_k = std::env::var("FERRUM_SPLIT_K_GEMV")
+        .map(|s| s != "0")
+        .unwrap_or(true);
+    if !gemv_ab {
+        d.set_split_k_gemv(configured_split_k)?;
+    }
     d.set_profiling(std::env::var_os("FERRUM_MATRIX_PROFILE").is_some());
     let qc = qwen::QwenConfig::from_file(dir.join("config.json"))?;
     let tok = QwenTokenizer::load(dir, &qc)?;
@@ -40,11 +47,7 @@ fn main() -> Result<()> {
         if filter.as_ref().is_some_and(|x| x != label) {
             continue;
         }
-        // Warm pipelines and allocator through an actual generation, then discard its cache.
-        generation::generate(&d, &model, &prompt, count, &[], generation::argmax, |_| {
-            Ok(())
-        })?;
-        for run in 0..repeats {
+        let measure = |run: usize, gemv_mode: &str| -> Result<()> {
             let generation_start = std::time::Instant::now();
             let r =
                 generation::generate(&d, &model, &prompt, count, &[], generation::argmax, |_| {
@@ -56,8 +59,43 @@ fn main() -> Result<()> {
             dec.sort_by(f64::total_cmp);
             println!(
                 "{}",
-                serde_json::json!({"case":label,"run":run,"generation_ms":generation_seconds*1000.,"generation_tps":r.tokens.len() as f64/generation_seconds,"post_first_token_tps":(r.tokens.len()-1) as f64/post_first_seconds,"sampling_ms":r.sampling.as_secs_f64()*1000.,"decode_aggregate_tps":r.decode.len() as f64/r.decode.iter().sum::<std::time::Duration>().as_secs_f64(),"emit_callback":"noop","prompt_ids":prompt,"prefill_ms":r.prefill.as_secs_f64()*1000.,"prefill_tps":prompt.len() as f64/r.prefill.as_secs_f64(),"first_token_ms":r.first_token.as_secs_f64()*1000.,"decode_median_ms":dec[dec.len()/2],"decode_tps":1000./dec[dec.len()/2],"decode_ms":r.decode.iter().map(|x|x.as_secs_f64()*1000.).collect::<Vec<_>>(),"prefill_counters":r.prefill_counters,"decode_counters":r.decode_counters,"kv_active_bytes":r.kv_bytes,"kv_reserved_bytes":r.kv_reserved_bytes,"generated_ids":r.tokens,"prefill_profile":r.prefill_profile,"decode_profiles":r.decode_profiles})
+                serde_json::json!({"case":label,"run":run,"gemv_mode":gemv_mode,"generation_ms":generation_seconds*1000.,"generation_tps":r.tokens.len() as f64/generation_seconds,"post_first_token_tps":(r.tokens.len()-1) as f64/post_first_seconds,"sampling_ms":r.sampling.as_secs_f64()*1000.,"decode_aggregate_tps":r.decode.len() as f64/r.decode.iter().sum::<std::time::Duration>().as_secs_f64(),"emit_callback":"noop","prompt_ids":prompt,"prefill_ms":r.prefill.as_secs_f64()*1000.,"prefill_tps":prompt.len() as f64/r.prefill.as_secs_f64(),"first_token_ms":r.first_token.as_secs_f64()*1000.,"decode_median_ms":dec[dec.len()/2],"decode_tps":1000./dec[dec.len()/2],"decode_ms":r.decode.iter().map(|x|x.as_secs_f64()*1000.).collect::<Vec<_>>(),"prefill_counters":r.prefill_counters,"decode_counters":r.decode_counters,"kv_active_bytes":r.kv_bytes,"kv_reserved_bytes":r.kv_reserved_bytes,"generated_ids":r.tokens,"prefill_profile":r.prefill_profile,"decode_profiles":r.decode_profiles})
             );
+            Ok(())
+        };
+        if gemv_ab {
+            for run in 0..repeats {
+                let modes = if run % 2 == 0 {
+                    [(false, "legacy"), (true, "split-k")]
+                } else {
+                    [(true, "split-k"), (false, "legacy")]
+                };
+                for (enabled, name) in modes {
+                    d.set_split_k_gemv(enabled)?;
+                    generation::generate(
+                        &d,
+                        &model,
+                        &prompt,
+                        count,
+                        &[],
+                        generation::argmax,
+                        |_| Ok(()),
+                    )?;
+                    measure(run, name)?;
+                }
+            }
+        } else {
+            let mode = if configured_split_k {
+                "split-k"
+            } else {
+                "legacy"
+            };
+            generation::generate(&d, &model, &prompt, count, &[], generation::argmax, |_| {
+                Ok(())
+            })?;
+            for run in 0..repeats {
+                measure(run, mode)?;
+            }
         }
     }
     Ok(())

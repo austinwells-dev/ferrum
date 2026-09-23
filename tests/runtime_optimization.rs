@@ -61,6 +61,22 @@ fn vector_projection_tail_and_misaligned_views() {
 }
 
 #[test]
+fn split_k_bf16_gemv_matches_reference_for_large_rows() {
+    let d = MetalDevice::new().unwrap();
+    let (k, n) = (896, 513);
+    let x = Tensor::from_f32(&d, [1, k], DType::BF16, &reference::deterministic(k)).unwrap();
+    let w = Tensor::from_f32(&d, [n, k], DType::BF16, &reference::deterministic(n * k)).unwrap();
+    let values = w.to_f32();
+    let wt: Vec<_> = (0..n * k).map(|i| values[(i % n) * k + i / n]).collect();
+    let expected: Vec<_> = reference::matmul(&x.to_f32(), &wt, 1, k, n)
+        .into_iter()
+        .map(|v| DType::BF16.round(v))
+        .collect();
+    let y = Linear::new(&d, w, None).unwrap().forward(&d, &x).unwrap();
+    reference::check(&y.to_f32(), &expected, 1.6e-2, 1e-2).unwrap();
+}
+
+#[test]
 fn last_position_prefill_preserves_cache_and_requested_logits() {
     use ferrum::{
         generation::final_logits,

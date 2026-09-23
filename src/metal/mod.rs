@@ -266,6 +266,7 @@ pub struct MetalDevice {
     fail_completion: Cell<bool>,
     arena: Rc<RefCell<Arena>>,
     native_matmul: Cell<bool>,
+    split_k_gemv: Cell<bool>,
     reference_math: Cell<bool>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
@@ -299,6 +300,7 @@ impl MetalDevice {
             fail_completion: Cell::new(false),
             arena: Rc::new(RefCell::new(Arena::default())),
             native_matmul: Cell::new(raw.supportsFamily(MTLGPUFamily::Apple7)),
+            split_k_gemv: Cell::new(true),
             reference_math: Cell::new(false),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
@@ -323,6 +325,19 @@ impl MetalDevice {
         }
         self.native_matmul.set(enabled);
         Ok(())
+    }
+    /// Select the multi-SIMD split-K BF16 GEMV for large aligned rows.
+    pub fn set_split_k_gemv(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change GEMV during execution".into(),
+            ));
+        }
+        self.split_k_gemv.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn split_k_gemv(&self) -> bool {
+        self.split_k_gemv.get()
     }
     pub(crate) fn mpp_projection(&self) -> bool {
         self.native_matmul.get()
@@ -426,7 +441,7 @@ impl MetalDevice {
     ) {
         let name = if self.lm_head_profile.get() {
             match name {
-                "gemv" | "gemv_vector" => "lm_head_gemv",
+                "gemv" | "gemv_vector" | "gemv_wide" => "lm_head_gemv",
                 "project_bf16" | "project_f16" | "project_wide_bf16" | "project_wide_f16"
                 | "project_mpp" | "matmul_nt" => "lm_head_matmul",
                 _ => name,
@@ -677,6 +692,7 @@ impl MetalDevice {
             name,
             "gemv"
                 | "gemv_vector"
+                | "gemv_wide"
                 | "project_wide_bf16"
                 | "project_wide_f16"
                 | "project_mpp"
@@ -824,6 +840,25 @@ impl MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
                         width: grid[0].div_ceil(4),
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if name == "gemv_wide" {
+                if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
+                {
+                    return Err(Error::Dispatch(
+                        "wide GEMV requires 32-wide SIMD and 128-thread groups".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0],
                         height: 1,
                         depth: 1,
                     },
