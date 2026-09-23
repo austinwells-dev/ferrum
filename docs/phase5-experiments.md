@@ -4,7 +4,7 @@ This journal starts from the finalized Phase 4 checkpoint. Phase 4 reports and r
 
 ## Status
 
-Phase 5 is active. The strict GGUF/Qwen2 adapter now retains packed Q8_0, Q4_0, Q5_0, Q5_1, Q4_K, Q5_K, and Q6_K weights and executes direct Metal GEMV, GEMM, MPP prefill, and embedding gather paths. Official Qwen2.5-0.5B GGUF files have completed real generation, repeated paired matrices, and fixed-stream prefill and cached-decode quality probes. MLX interchange, held-out corpus evaluation, broader model coverage, and further optimization remain outstanding.
+Phase 5 is closed as a quantization, model-format, correctness, and interoperability milestone. The strict GGUF/Qwen2 adapter retains packed Q8_0, Q4_0, Q5_0, Q5_1, Q4_K, Q5_K, and Q6_K weights and executes native Metal GEMV, GEMM, MPP prefill, and embedding-gather paths. One pinned MLX affine-Q4/group-64 Qwen2 repository is supported through an explicit importer. Real-model generation, paired performance matrices, quality probes, memory measurements, lifetime/cache checks, and Metal validation are recorded below. Further performance optimization is assigned to Phase 5.5. See the concise [Phase 5 closeout](phase5-closeout.md).
 
 ## Baseline
 
@@ -43,6 +43,25 @@ The parser follows the upstream [GGUF specification](https://github.com/ggml-org
 - Q8_0 was the first correctness bridge; Q4_0, Q5_0/Q5_1, Q4_K/Q5_K, and Q6_K now execute through official real-model files. Keep each format's exact GGML block geometry and metadata. Do not collapse distinct GGML schemes into one decoder when that costs correctness or speed.
 - MLX `quantized` weights use their own group-size/scale representation. Ferrum now has a strict explicit importer/repacker for the pinned Qwen2 affine-Q4, group-64 repository below; it does not add MLX as a runtime dependency. This is a scoped repository contract, not general MLX model support.
 
+## Final interoperability contract
+
+The GGUF reader accepts version 2 and 3 little-endian files and validates the complete index, metadata, alignment, block geometry, offsets, and tensor ranges. The inference adapter currently supports the Qwen2 architecture contract (real-model validation uses Qwen2.5-0.5B-Instruct); GGUF parsing is reusable, but this does not claim support for every GGUF architecture, tokenizer, or multi-file packaging scheme.
+
+| Runtime tensor type | GGML type ID | Block geometry | Runtime paths | Real-model coverage |
+|---|---:|---:|---|---|
+| F32 / F16 / BF16 | 0 / 1 / 30 | dense | Existing dense fallback and mixed GGUF tensors | Qwen2.5-0.5B GGUF variants |
+| Q4_0 | 2 | 32 values / 18 bytes | Direct GEMV, SIMD GEMM, MPP GEMM, packed embedding gather | Official Q4_0 file |
+| Q5_0 | 6 | 32 / 22 | Direct GEMV, SIMD GEMM, MPP GEMM, packed embedding gather | Mixed Q4_K_M file |
+| Q5_1 | 7 | 32 / 24 | Direct GEMV, SIMD GEMM, MPP GEMM, packed embedding gather | Mixed Q5_K_M file |
+| Q8_0 | 8 | 32 / 34 | Direct GEMV, SIMD/MPP GEMM, packed embedding gather | Official Q8_0 and mixed K-quant files |
+| Q4_K | 12 | 256 / 144 | Direct GEMV, SIMD/MPP GEMM, packed embedding gather | Mixed Q4_K_M file |
+| Q5_K | 13 | 256 / 176 | Direct GEMV, SIMD/MPP GEMM, packed embedding gather | Mixed Q5_K_M file |
+| Q6_K | 14 | 256 / 210 | Direct GEMV, SIMD/MPP GEMM, packed embedding gather | Official Q6_K and mixed K-quant files |
+
+The GGUF indexer also knows block geometry for Q4_1 (type 3), Q8_1 (9), Q2_K (10), Q3_K (11), and Q8_K (15) so it can validate their tensor ranges. The Ferrum Qwen2 loader does **not** load those types for execution. Every other quantized or unknown GGML type, including IQ families and removed/private encodings, fails explicitly; no type is reinterpreted as a supported format. Dense F32/F16/BF16 are supported as listed above.
+
+The MLX importer is a separate, explicit safetensors path. Its tested scope is `mlx-community/Qwen2.5-0.5B-Instruct-4bit`, revision `a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3`: Qwen2, affine 4-bit weights, group size 64, tied embeddings, and one `model.safetensors` file. It repacks to a 64-value/36-byte Ferrum packed block. Other MLX quantization modes, group sizes, architectures, untied embeddings, and sharded layouts are unsupported and rejected. MLX is not a Ferrum runtime or build dependency.
+
 ## Measurement definitions and acceptance gates
 
 Use the production Ferrum generation path and the existing Phase 4 workload/matrix conventions. Retain raw JSONL and logs for each run. Record model/load time separately from timed generation. Report prefill tok/s, cached decode tok/s, complete-generation tok/s, first-token latency, GPU/encode/wait time, dispatches, command buffers, allocations and allocation time, active/retained KV, transient peak, retained model bytes, and process memory where available.
@@ -53,12 +72,12 @@ Do not attribute traffic estimates to DRAM bandwidth without hardware counters. 
 
 ## Format support, experiments, quality, and memory
 
-The journal began before Phase 5 runtime changes; the current checkpoint status is below. Q8_0, Q4_0, Q5_0, Q5_1, Q4_K, Q5_K, and Q6_K are implemented and validated on official GGUF model files. A narrowly scoped MLX affine-Q4 Qwen2 importer and Metal path are now implemented and measured; see the MLX milestone below.
+The experiment table preserves accepted and rejected decisions across Phase 5. Q8_0, Q4_0, Q5_0, Q5_1, Q4_K, Q5_K, and Q6_K are implemented and validated on official GGUF model files. A narrowly scoped MLX affine-Q4 Qwen2 importer and Metal path are also implemented and measured; see the MLX milestone below.
 
 | Experiment | Status | Evidence / decision |
 |---|---|---|
 | Phase 4 BF16 baseline | Accepted reference | `q-final-matrix.jsonl`, `phase4-results.md`, `phase4-matrix-progress.md` |
-| GGUF v2/v3 reader and Qwen2 adapter | Accepted for Q8_0 checkpoint | Full suite passes; official tokenizer IDs match; malformed/unknown/overlap cases reject explicitly |
+| GGUF v2/v3 reader and Qwen2 adapter | Accepted for the documented Qwen2 contract | Full suite passes; official tokenizer IDs match; malformed/unknown/overlap cases reject explicitly |
 | Q8_0 direct M=1 GEMV | Accepted | `q8_0_gemv`, official Qwen generation matrix; 168 quantized GEMV calls per decode step; Metal API/GPU validation passed |
 | Q4_0 direct M=1 GEMV and packed embedding gather | Accepted | Official Qwen Q4_0 generation exercises transformer GEMVs and Q4_0 embedding; the upstream output matrix is Q8_0 |
 | Q8_0 direct M>1 GEMM, one SIMD group per channel and four prompt rows | Rejected for primary prefill | `q8-matrix-after-tile4.jsonl`: 512-token median was 206 tok/s versus 7,318 BF16; the raw run remains for comparison. Four independent K chains raised the 128-token result to 253 tok/s, still far behind |
@@ -76,26 +95,27 @@ The journal began before Phase 5 runtime changes; the current checkpoint status 
 | MLX Q4 MPP K=64 tile for 512<=M<=1,024 | Accepted provisionally | Paired MPP K=128/K=64 A/B was neutral at M=128, +2.0% at M=512, and +0.5% at M=1,024; all measured greedy sequences matched. Keep K=128 outside the measured interval |
 | Phase 5 paired matrix summarizer | Accepted | `tools/summarize_phase5_matrix.py` reports each model separately and paired A/B deltas; it avoids the old cross-model aggregation in the Phase 4 helper |
 | Dispatch threshold 16 prompt rows | Accepted provisionally | On the 21-token short prompt, Q8_0 first-token median improved from 113.0 ms (direct path) to 42.6 ms (MPP), versus 36.0 ms BF16; `q8-mpp-short.jsonl` |
-| Q8_0 four-chain GEMV reduction | Accepted provisionally | Cached decode in the full paired matrix is 19–24% faster than BF16 for this model/run; individual before/after result is in `q8-matrix-after-tile4.jsonl`. Keep measuring by shape |
+| Q8_0 four-chain GEMV reduction | Accepted provisionally | Cached decode in the full paired matrix is 19–24% faster than BF16 for this model/run; individual before/after result is in `q8-matrix-after-tile4.jsonl`. Further shape-specific work belongs to Phase 5.5 |
+| Q8_0 8-output-row M=1 GEMV with shared activation loads | Accepted for aligned `N>=128` shapes | Three alternating 129-token pairs measured median cached decode at 111.35 → 120.28 tok/s (+7.92%) versus the original 4-row tile; generated IDs matched exactly in every pair. Full post-change matrix matches the prior Q8 IDs in all 18 workload/pair runs. Raw A/B and matrix: [`q8_0-129decode-gemv-4rows-vs-8rows.jsonl`](measurements/phase5/q8_0-129decode-gemv-4rows-vs-8rows.jsonl), [`q8-matrix-after-8row-gemv.jsonl`](measurements/phase5/q8-matrix-after-8row-gemv.jsonl) |
 
 ## Validation status and remaining bottlenecks
 
-Phase 4 validation remains recorded in its own journal. For this Q8_0 checkpoint, `cargo test --all-targets` passed (57 tests, two official-model tests remain ignored by their existing environment gate), `cargo clippy --all-targets -- -D warnings` passed, and `cargo fmt --all` passed. With `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`, all Q8-specific Metal tests passed, including Q8_0 GEMV/GEMM tails, embedding gather, and the tiled MPP GEMM. The full paired matrix also exercised official Qwen Q8_0 generation through 1,601 generated tokens.
+Phase 4 validation remains recorded in its own journal. At the initial Q8_0 checkpoint, `cargo test --all-targets` passed (57 tests); the two existing official-model tests were then environment-gated. The final Phase 5 validation below reruns the full suite, enables those real-model tests, and validates the final Q8 kernel with Metal API and GPU shader validation. The full Q8 matrix exercises official Qwen generation through 1,601 generated tokens.
 
-The teacher-forced fixed corpus repeated 16 times produced 449 positions / 448 targets: mean absolute logit error 0.3048, RMSE 0.3903, cosine similarity 0.99323, top-1 agreement 99.55%, top-5 overlap 86.01%, and perplexity 1.50838 versus BF16 1.50983 (ratio 0.99904). This repeated short text is a reproducible smoke corpus, not a broad language-quality evaluation; a standard held-out corpus is still required before accepting lower-bit formats.
+The teacher-forced fixed corpus repeated 16 times produced 449 positions / 448 targets: mean absolute logit error 0.3048, RMSE 0.3903, cosine similarity 0.99323, top-1 agreement 99.55%, top-5 overlap 86.01%, and perplexity 1.50838 versus BF16 1.50983 (ratio 0.99904). This repeated short text is a reproducible smoke corpus, not a broad language-quality evaluation; this evidence limit is explicit in the closeout.
 
-The full matrix used three alternating model pairs per workload and the same tokenizer IDs. Medians are tok/s; first-token values are milliseconds. Raw rows retain exact token IDs, command/counter data, and model revisions in [`q8-matrix-after-mpp.jsonl`](measurements/phase5/q8-matrix-after-mpp.jsonl).
+The original Q8 matrix used three alternating model pairs per workload and the same tokenizer IDs; it remains in [`q8-matrix-after-mpp.jsonl`](measurements/phase5/q8-matrix-after-mpp.jsonl). The final matrix reran all workloads after enabling the accepted 8-row M=1 kernel for aligned output dimensions of at least 128. Medians are tok/s; first-token values are milliseconds. Raw rows retain exact token IDs, command/counter data, and model revisions in [`q8-matrix-after-8row-gemv.jsonl`](measurements/phase5/q8-matrix-after-8row-gemv.jsonl).
 
 | Workload | BF16 prefill | Q8_0 prefill | BF16 cached decode | Q8_0 cached decode | BF16 complete generation | Q8_0 complete generation | BF16 / Q8_0 first token |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| short (21 prompt, 17 generated) | 588 | 496 | 87 | 104 | 76 | 85 | 36 / 43 ms |
-| 128 prompt, 17 generated | 5,745 | 2,392 | 89 | 107 | 82 | 81 | 23 / 54 ms |
-| 512 prompt, 17 generated | 7,591 | 3,675 | 83 | 101 | 64 | 56 | 68 / 140 ms |
-| 1,024 prompt, 17 generated | 5,653 | 3,510 | 73 | 88 | 41 | 35 | 182 / 292 ms |
-| short prompt, 129 generated | 442 | 445 | 81 | 100 | 78 | 95 | 48 / 48 ms |
-| 368 prompt, 1,601 generated | 6,301 | 3,031 | 77 | 91 | 75 | 88 | 59 / 122 ms |
+| short (21 prompt, 17 generated) | 656 | 541 | 95 | 123 | 83 | 99 | 32 / 39 ms |
+| 128 prompt, 17 generated | 6,089 | 2,632 | 97 | 125 | 90 | 96 | 21 / 49 ms |
+| 512 prompt, 17 generated | 8,406 | 4,047 | 92 | 118 | 70 | 64 | 61 / 127 ms |
+| 1,024 prompt, 17 generated | 6,602 | 3,885 | 87 | 109 | 49 | 41 | 155 / 264 ms |
+| short prompt, 129 generated | 492 | 453 | 93 | 121 | 89 | 114 | 43 / 47 ms |
+| 368 prompt, 1,601 generated | 6,468 | 3,284 | 79 | 105 | 76 | 102 | 57 / 112 ms |
 
-The 128-token profiled run records 168 `q8_0_gemm_mpp` calls for prefill and 168 `q8_0_gemv` calls per cached decode step. Per-operation Metal GPU counter samples were unavailable in that profile; whole-phase GPU, encode, wait, dispatch, command-buffer, allocation, and allocation-time counters are recorded in the matrix JSONL. The process peak in the paired run was 2,248,605,696 bytes while both BF16 and Q8 models were loaded. Q8 retained weights were 524,976,896 bytes (524,833,792 packed); BF16 retained weights were 988,065,536 bytes. Q8's measured transient peaks matched BF16 at each workload (about 37 MB short and 244–268 MB for the longer prefills). No DRAM-bandwidth claim is made from logical traffic.
+The profiled runs record 168 Q8 quantized projection calls per cached decode step; the focused 8-row test reduced whole-decode phase GPU time from 8.305 to 7.619 ms with unchanged 531 dispatches and one command buffer. Per-operation Metal GPU counter samples were unavailable; whole-phase GPU, encode, wait, dispatch, command-buffer, allocation, and allocation-time counters are retained in the raw matrices. The process peak in the earlier paired run was 2,248,605,696 bytes while both BF16 and Q8 models were loaded. Q8 retained weights were 524,976,896 bytes (524,833,792 packed); BF16 retained weights were 988,065,536 bytes. Q8's measured transient peaks matched BF16 at each workload (about 37 MB short and 244–268 MB for the longer prefills). No DRAM-bandwidth claim is made from logical traffic.
 
 ### Q4_0 real-model milestone
 
@@ -112,7 +132,7 @@ The pinned official Qwen GGUF Q4_0 file, size, and SHA-256 are recorded in [`mod
 
 All throughput values are tok/s medians across three alternating pairs; raw rows contain per-token decode timings, prompt/generated IDs, KV use, and phase counters. The final matrix process peak RSS was 2,243,559,424 bytes with both BF16 and Q4_0 models loaded. Q4_0 retained 422,639,360 weight bytes, of which 422,496,256 were packed, versus 988,065,536 BF16 bytes. At 512 prompt tokens, the optimized paired-nibble run recorded 97.8 ms phase GPU time vs 57.6 ms BF16, with the same 531 dispatches, five command buffers, 58 allocations, 18.9 MB allocated in 1.39 ms, and 268,042,240-byte transient peak. This lowers Q4_0 prefill time but does not yet match dense BF16 latency.
 
-The 449-position / 448-target teacher-forced quality probe produced mean absolute logit error 0.7074, RMSE 0.9037, cosine similarity 0.96486, top-1 agreement 98.22%, top-5 overlap 74.12%, and perplexity 1.52762 vs BF16 1.50983 (ratio 1.01178). BF16 and GGUF tokenizers returned identical IDs. The repeated short corpus is a reproducible smoke test rather than broad quality validation; a held-out evaluation remains required.
+The 449-position / 448-target teacher-forced quality probe produced mean absolute logit error 0.7074, RMSE 0.9037, cosine similarity 0.96486, top-1 agreement 98.22%, top-5 overlap 74.12%, and perplexity 1.52762 vs BF16 1.50983 (ratio 1.01178). BF16 and GGUF tokenizers returned identical IDs. The repeated short corpus is a reproducible smoke test rather than broad quality validation; see the closeout for this limitation.
 
 The five Q4_0 MPP/GEMV/embedding and signed-scale tests passed with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`. `cargo test --all-targets` passed 63 tests at the Q4_0 checkpoint; the two existing real-model tests remain ignored behind their existing environment gate. `cargo clippy --all-targets -- -D warnings`, formatting, diff check, and all-target check passed. The generation matrix used the official local BF16 and Q4_0 models.
 
@@ -133,7 +153,7 @@ Medians are tok/s across three alternating pairs; the raw matrix includes token 
 
 The 449-position / 448-target teacher-forced probe measured mean absolute logit error 0.3181, RMSE 0.4067, cosine similarity 0.99265, top-1 agreement 99.55%, top-5 overlap 85.92%, and perplexity 1.51473 vs BF16 1.50983 (ratio 1.00324). Token IDs matched BF16 on the short, 128, 512, 1,024, and 1,601-token cases. The sustained 129-token decode diverged on 106 generated positions, showing autoregressive drift despite the strong teacher-forced score. Generated IDs matched exactly between the original and paired-plane Q6_K kernels across all 36 runs.
 
-All four Q6_K Metal kernel tests passed with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`, including signed per-group scales, multi-superblock decode, embedding gather, and MPP tails. `cargo test --all-targets` passed 68 tests; two pre-existing real-model tests remain environment-gated and ignored. `cargo clippy --all-targets -- -D warnings`, formatting, diff check, and all-target check passed.
+At the Q6_K checkpoint all four Q6_K Metal kernel tests passed with `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1`, including signed per-group scales, multi-superblock decode, embedding gather, and MPP tails. The then-current `cargo test --all-targets` run passed 68 tests; the two existing real-model tests are now explicitly run and recorded in final validation below. Clippy, formatting, diff check, and all-target check passed at that checkpoint as well.
 
 ### Q5_0/Q5_1 and Q4_K/Q5_K real-model milestone
 
@@ -191,8 +211,85 @@ The MPP tile-width experiment was motivated by MLX's quantized NAX path using K=
 
 Raw artifacts include the [Ferrum/BF16 matrix](measurements/phase5/mlx-affine4-vs-bf16-matrix.jsonl), [native MLX matrix](measurements/phase5/mlx-affine4-native-matrix.jsonl), [BF16 quality probe](measurements/phase5/mlx-affine4-quality.json), [native MLX logit parity](measurements/phase5/mlx-affine4-vs-native-mlx.json), corrected [MPP/direct kernel A/B](measurements/phase5/mlx-affine4-512-mpp-direct-ab.jsonl), [MPP K-tile A/B matrices](measurements/phase5/mlx-affine4-128-mpp-k128-k64-ab.jsonl), post-policy production matrices for [512](measurements/phase5/mlx-affine4-512-shape-k64-matrix.jsonl) and [1,024](measurements/phase5/mlx-affine4-1024-shape-k64-matrix.jsonl), and the retained but invalidated earlier [no-MPP-labelled run](measurements/phase5/mlx-affine4-vs-bf16-512-no-mpp.jsonl). The native MLX script and logit comparison script are in `tools/phase5_mlx_matrix.py` and `tools/compare_mlx_quant_logits.py`.
 
-## Validation status and remaining work
+## Phase 5 closeout
 
-Phase 4 remains frozen and its reports/history remain untouched. On the current Phase 5 checkpoint, `cargo test --all-targets` passed 90 tests with 0 failures; the two pre-existing official-model lifetime tests remain ignored behind their existing environment gate. `cargo clippy --all-targets -- -D warnings`, `cargo fmt --all -- --check`, `cargo check --all-targets`, and `git diff --check` passed. Q5_0/Q5_1, Q4_K/Q5_K, and MLX affine-Q4 kernels have passed Metal API/GPU shader validation; the three MLX tests cover direct GEMV/GEMM, embedding gather, signed scales, tails, and both MPP K tiles with batch/output tails. The pinned MLX model generated through Ferrum's CLI under Metal validation, and the 512-token production matrix exercised the automatic K=64 path with both validation layers enabled. Current raw logs are `validation-cargo-test-all-targets-mlx.txt`, `validation-cargo-clippy-mlx.txt`, `validation-metal-mlx-affine4.txt`, `validation-mlx-real-generation.txt`, and `validation-mlx-real-k64-generation.txt` under [`measurements/phase5`](measurements/phase5).
+Phase 5 is complete as a feature, correctness, and interoperability milestone. Phase 4 remains unchanged and is still the dense BF16 reference/fallback. Quantized tensors use owned packed storage for the model lifetime; direct GEMV and embedding kernels consume the packed representation, while GEMM paths decode only bounded threadgroup tiles. No complete quantized model or persistent dequantized matrix copy is created. GPU resources remain retained through command completion, and the final validation includes cache staging/publication, failures, branches, snapshots, and the 128-step lifetime stress.
 
-Remaining Phase 5 work: evaluate a held-out quality corpus; broaden the narrowly scoped MLX importer only where a concrete repository and format contract warrants it; optimize long-prompt quantized prefill, vocabulary LM-head execution, and projection GEMVs by shape; investigate output-token drift after paired GEMV reductions; extend real-model validation beyond this Qwen family; and retain further accepted/rejected experiments. Ferrum remains slower than llama.cpp on the existing Q4_K_M/Q5_K_M decode comparison. Current shader profiling does not expose per-operation GPU timestamps, so use whole-phase GPU timing and validated Metal profiling tools instead of treating encode wall time as kernel time.
+### Final quality measurements
+
+These are teacher-forced comparisons against the Phase 4 BF16 checkpoint on the repeated fixed smoke corpus (449 logits positions / 448 target tokens). They measure approximation error; they are not a held-out language benchmark. Q4_K_M and Q5_K_M are mixed-quantization GGUFs, so their whole-model scores do not isolate one tensor type. Perplexity ratios use the corresponding BF16 result.
+
+| Loaded variant | Mean abs. logit error | RMSE | Cosine | Top-1 agreement | Top-5 overlap | Perplexity ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| GGUF Q8_0 | 0.30484 | 0.39034 | 0.99323 | 99.55% | 86.01% | 0.99904 |
+| GGUF Q4_0 | 0.70736 | 0.90369 | 0.96486 | 98.22% | 74.12% | 1.01178 |
+| GGUF Q6_K | 0.31811 | 0.40665 | 0.99265 | 99.55% | 85.92% | 1.00324 |
+| GGUF Q4_K_M | 0.42993 | 0.54726 | 0.98682 | 99.11% | 81.25% | 1.00086 |
+| GGUF Q5_K_M | 0.38387 | 0.49211 | 0.98939 | 99.33% | 82.32% | 1.00389 |
+| Pinned MLX affine-Q4 | 0.89448 | 1.14641 | 0.94003 | 97.55% | 71.14% | 1.00995 |
+
+The BF16 corpus perplexity is 1.50983. Cached-decode probes are also retained for Q4_K_M, Q5_K_M, and MLX affine-Q4. MLX-versus-BF16 cached-decode cosine is 0.93953 with 97.54% top-1 agreement and a 1.01250 perplexity ratio. The complete JSON artifacts retain max error, token IDs, exact corpus, and both prefill/decode metrics. Quantization can change autoregressive output: for example, Q8 differs from BF16 on the short and sustained-decode samples, and the paired-byte Q4_K_M/Q5_K_M reduction kernels have additional measured sequence drift recorded above. No token expectation or numerical tolerance was weakened.
+
+### Retained weights and memory
+
+The following retained sizes are measured from Ferrum model storage. “Packed” excludes the small dense norms and other non-quantized tensors. Process peaks were captured with both the BF16 reference and quantized model resident; these include the runtime and allocator and are not the quantized model size alone.
+
+| Variant | Retained weights | Packed quantized bytes | Paired-process peak RSS |
+|---|---:|---:|---:|
+| BF16 reference | 988,065,536 | — | — |
+| GGUF Q8_0 | 524,976,896 | 524,833,792 | 2,248,605,696 |
+| GGUF Q4_0 | 422,639,360 | 422,496,256 | 2,243,559,424 |
+| GGUF Q6_K | 499,645,184 | 499,502,080 | 2,242,265,088 |
+| GGUF Q4_K_M | 485,309,184 | 485,166,080 | 2,219,854,032 |
+| GGUF Q5_K_M | 516,095,744 | 515,952,640 | 2,216,888,528 |
+| Pinned MLX affine-Q4 | 277,996,288 | 277,853,184 | 2,505,965,568 |
+
+The Qwen 512-token prefill transient peak is 268,042,240 bytes for the Q4_0, Q6_K, Q4_K_M, Q5_K_M, and MLX runs, and 244–268 MB across Q8 workloads. Short-run transients are about 37 MB; decode phases report roughly 2.3–5.4 MB. Streaming loaders retain tensor data one tensor at a time. Runtime measurements and storage accounting show the expected packed model sizes and bounded temporary tiles; they show no whole-model BF16/F16 expansion. No bandwidth saturation is inferred from logical byte counts.
+
+### Final production performance matrix
+
+The full six-workload matrices earlier in this journal contain paired BF16 baselines, first-token latency, complete-generation rates, per-token decode time, counters, KV use, and exact IDs. The compact view below gives the most useful cross-variant checkpoints: 512-token prefill, the 129-token sustained decode case, and the 1,601-token generation horizon. Rates are medians in tok/s from each variant's three-pair production matrix. MLX's 512-token value is from the post-policy K=64 matrix; its sustained/long values are from the paired production matrix. Compare against each matrix's paired BF16 rows, since clock conditions varied between separate variant runs.
+
+| Variant | Prefill at M=512 | Cached decode, 129 generated | Complete generation, 129 generated | Complete generation, 1,601 generated |
+|---|---:|---:|---:|---:|
+| GGUF Q8_0 (final 8-row GEMV) | 4,047 | 121 | 114 | 102 |
+| GGUF Q4_0 | 5,087 | 93 | 90 | 90 |
+| GGUF Q6_K | 4,214 | 110 | 105 | 94 |
+| GGUF Q4_K_M | 4,697 | 108 | 103 | 95 |
+| GGUF Q5_K_M | 4,553 | 103 | 99 | 92 |
+| Pinned MLX affine-Q4 | 1,749 | 117 | 112 | 95 |
+
+The completed Q8 4-row/8-row A/B measured 111.35 → 120.28 cached decode tok/s over three alternating 129-token pairs (+7.92% median); all three pairs generated identical IDs. The full final matrix retained exact Q8 IDs relative to the previous kernel in all 18 workload/pair comparisons. The 8-row route is the retained shape policy for aligned output counts `N>=128`; smaller and irregular rows use the original kernel. The raw A/B, post-change full matrix, and Metal-validation real-generation output are linked in the Q8 section and [`measurements/phase5`](measurements/phase5).
+
+Across the paired per-variant matrices, quantized cached decode improves over BF16 on most measured shapes, while quantized prefill and first-token latency trail BF16 for longer prompts; full-generation impact depends on how much decode offsets prefill. Ferrum also trails llama.cpp on the measured Q4_K_M/Q5_K_M runs. These are recorded performance limits, not blockers for this closeout.
+
+### External interoperability and comparison limits
+
+For the pinned MLX repository, Ferrum and native MLX used the same weights revision, prompt token IDs, F16 activations, and F16 KV cache. Prefill/decode logit cosine was 0.9999895/0.9999842, greedy IDs matched, top-5 overlap was 99.51%, and the six generation cases matched. Timing was run sequentially, not interleaved, so it is directional rather than a matched performance comparison. Ferrum has no MLX runtime dependency.
+
+`llama-bench` 0.19.0 measured Q4_K_M and Q5_K_M with full Metal offload, BF16 KV, and flash attention. It reports synthetic `pp512`/`tg128` inputs and llama.cpp's own scheduling, so its throughput cannot be directly paired with Ferrum's tokenizer prompts and production generation loop. These runs establish a useful external reference and show remaining headroom; Phase 5 does not require Ferrum to match either engine. The exact commands, rates, and raw logs remain linked in the Q5/K-quant section.
+
+### Final validation
+
+| Gate | Result | Evidence |
+|---|---|---|
+| Full tests with Metal API and GPU shader validation | 90 passed, 0 failed; two pre-existing local-checkpoint tests were explicitly enabled and run separately | [`validation-final-cargo-test-all-targets.txt`](measurements/phase5/validation-final-cargo-test-all-targets.txt) |
+| Phase 4 BF16 cached-generation and 128-step lifetime/cache stress | Both real-model tests passed; snapshot re-forward equality, bounded waits, and cache byte counts checked | [`validation-final-real-model-lifetime.txt`](measurements/phase5/validation-final-real-model-lifetime.txt) |
+| Q8 final kernel correctness and real generation | Odd output tails, MPP/GEMM paths, aligned 8-row route, and official Qwen short generation passed with both Metal validation layers enabled | [`validation-metal-q8-gemv-8rows.txt`](measurements/phase5/validation-metal-q8-gemv-8rows.txt), [`validation-metal-q8-real-short.jsonl`](measurements/phase5/validation-metal-q8-real-short.jsonl) |
+| Q4/Q5/Q6_K and MLX Metal kernels | Direct GEMV/GEMM, MPP, metadata/scales, embedding, tails, malformed inputs and real pinned-model generation have retained validation logs | [`validation-metal-q5-qk.txt`](measurements/phase5/validation-metal-q5-qk.txt), [`validation-metal-mlx-affine4.txt`](measurements/phase5/validation-metal-mlx-affine4.txt), [`validation-mlx-real-generation.txt`](measurements/phase5/validation-mlx-real-generation.txt) |
+| Formatting, all-target check, Clippy, release build | All passed | [`validation-final-format.txt`](measurements/phase5/validation-final-format.txt), [`validation-final-cargo-check-all-targets.txt`](measurements/phase5/validation-final-cargo-check-all-targets.txt), [`validation-final-cargo-clippy.txt`](measurements/phase5/validation-final-cargo-clippy.txt), [`validation-final-cargo-build-release-all-targets.txt`](measurements/phase5/validation-final-cargo-build-release-all-targets.txt) |
+| Phase 4 history and fallback | Preserved; no Phase 4 report or baseline was rewritten | Phase 4 reports and `q-final-matrix.jsonl` unchanged |
+
+### Phase 5.5 performance handoff
+
+Phase 5.5 owns the following work. Phase 5 performs no further optimization experiments.
+
+- Optimize quantized M=1 GEMV and the large vocabulary LM head.
+- Develop shape-specific Q/K/V and MLP decode kernels, with representative shape measurements.
+- Improve quantized MPP/GEMM prefill and fuse dequantization with matrix multiplication where it helps.
+- Revisit tile geometry, dispatch policy, scale/metadata locality, and activation/weight reuse.
+- Run genuinely matched MLX and llama.cpp performance comparisons with identical prompts, cache precision, sampling, and timed-region definitions where possible.
+- Tune Q8, Q6, Q5, and Q4 formats broadly; retain accepted and rejected results and quality checks for each change.
+- Add a held-out language corpus and broaden architecture/repository coverage only when a concrete model-format contract is selected.
+
+Shader profiling currently lacks per-operation GPU timestamps. Phase 5.5 should use validated GPU profiling/counters for kernel attribution; encode wall time is not GPU execution time, and logical traffic is not a DRAM counter.

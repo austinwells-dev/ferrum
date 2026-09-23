@@ -109,7 +109,9 @@ fn main() -> Result<()> {
             "FERRUM_PHASE5_KERNEL_AB must be mpp-direct or mpp-k64".into(),
         ));
     }
-    if kernel_ab.is_some() && device.capabilities()?["mpp_available"].as_bool() != Some(true) {
+    if (compare_mpp_direct || compare_mpp_k64)
+        && device.capabilities()?["mpp_available"].as_bool() != Some(true)
+    {
         return Err(Error::Parameter(
             "FERRUM_PHASE5_KERNEL_AB requires Metal 4 MPP support".into(),
         ));

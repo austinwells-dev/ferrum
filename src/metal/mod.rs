@@ -345,6 +345,9 @@ impl MetalDevice {
             .get()
             .unwrap_or((512..=1024).contains(&batch_rows))
     }
+    pub(crate) fn q8_0_gemv_8rows(&self, output_rows: usize) -> bool {
+        output_rows >= 128 && output_rows.is_multiple_of(8)
+    }
     /// Select the multi-SIMD split-K BF16 GEMV for large aligned rows.
     pub fn set_split_k_gemv(&self, enabled: bool) -> Result<()> {
         if self.batching.get() {
@@ -461,9 +464,8 @@ impl MetalDevice {
         let name = if self.lm_head_profile.get() {
             match name {
                 "gemv" | "gemv_vector" | "gemv_wide" | "q4_0_gemv" | "q5_0_gemv" | "q5_1_gemv"
-                | "q4_k_gemv" | "q5_k_gemv" | "q6_k_gemv" | "q8_0_gemv" | "mlx_affine4_gemv" => {
-                    "lm_head_gemv"
-                }
+                | "q4_k_gemv" | "q5_k_gemv" | "q6_k_gemv" | "q8_0_gemv" | "q8_0_gemv_8rows"
+                | "mlx_affine4_gemv" => "lm_head_gemv",
                 "project_bf16"
                 | "project_f16"
                 | "project_wide_bf16"
@@ -762,6 +764,7 @@ impl MetalDevice {
                 | "attention_scores_mpp"
                 | "attention_context_mpp"
                 | "q8_0_gemv"
+                | "q8_0_gemv_8rows"
                 | "q4_0_gemv"
                 | "q5_0_gemv"
                 | "q5_1_gemv"
@@ -960,6 +963,7 @@ impl MetalDevice {
                     | "q5_k_gemv"
                     | "q6_k_gemv"
                     | "q8_0_gemv"
+                    | "q8_0_gemv_8rows"
                     | "mlx_affine4_gemv"
             ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
@@ -970,7 +974,7 @@ impl MetalDevice {
                 }
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: grid[0].div_ceil(4),
+                        width: grid[0].div_ceil(if name == "q8_0_gemv_8rows" { 8 } else { 4 }),
                         height: 1,
                         depth: 1,
                     },

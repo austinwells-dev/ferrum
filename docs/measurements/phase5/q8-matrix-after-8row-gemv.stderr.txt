@@ -1,0 +1,4 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 3.36s
+     Running `target/release/examples/phase5_matrix /tmp/ferrum-phase5-qwen-bf16 /tmp/ferrum-phase5-qwen-gguf/qwen2.5-0.5b-instruct-q8_0.gguf 3`
+Phase 5 paired matrix: device=Apple M5; BF16 retained=988065536 bytes; GGUF Qwen/Qwen2.5-0.5B-Instruct-GGUF@9217f5db79a29953eb74d5343926648285ec7e67 source=669763072 bytes; quantized retained=524976896 bytes; packed=524833792 bytes; tensors=291; parameters=494032768; repeats=3

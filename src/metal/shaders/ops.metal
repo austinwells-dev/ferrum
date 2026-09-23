@@ -720,6 +720,82 @@ kernel void q8_0_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group
     float sum=simd_sum((sum0+sum1)+(sum2+sum3));
     if(lane==0 && row<p[3]) store(c,row,p[4],sum);
 }
+// Two output rows share each SIMD group's activation loads. Four simdgroups
+// therefore cover eight adjacent output rows per threadgroup, reducing the
+// amount of repeated M=1 activation work for wide projections and LM heads.
+kernel void q8_0_gemv_8rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32;
+    uint row0=group*8+simd*2, row1=row0+1;
+    uint k=p[2], blocks=k/32;
+    float sum00=0.f, sum01=0.f, sum02=0.f, sum03=0.f;
+    float sum10=0.f, sum11=0.f, sum12=0.f, sum13=0.f;
+    if(row0<p[3]) {
+        device const uchar* row0_weights=b+row0*blocks*34;
+        device const uchar* row1_weights=row1<p[3] ? b+row1*blocks*34 : row0_weights;
+        uint groups=blocks/4;
+        for(uint tile=0;tile<groups;tile++) {
+            uint block=tile*4;
+            device const uchar* packed00=row0_weights+(block+0)*34;
+            device const uchar* packed01=row0_weights+(block+1)*34;
+            device const uchar* packed02=row0_weights+(block+2)*34;
+            device const uchar* packed03=row0_weights+(block+3)*34;
+            device const uchar* packed10=row1_weights+(block+0)*34;
+            device const uchar* packed11=row1_weights+(block+1)*34;
+            device const uchar* packed12=row1_weights+(block+2)*34;
+            device const uchar* packed13=row1_weights+(block+3)*34;
+            float scale00=float(*((device const half*)packed00));
+            float scale01=float(*((device const half*)packed01));
+            float scale02=float(*((device const half*)packed02));
+            float scale03=float(*((device const half*)packed03));
+            float scale10=row1<p[3] ? float(*((device const half*)packed10)) : 0.f;
+            float scale11=row1<p[3] ? float(*((device const half*)packed11)) : 0.f;
+            float scale12=row1<p[3] ? float(*((device const half*)packed12)) : 0.f;
+            float scale13=row1<p[3] ? float(*((device const half*)packed13)) : 0.f;
+            char q00=((device const char*)(packed00+2))[lane];
+            char q01=((device const char*)(packed01+2))[lane];
+            char q02=((device const char*)(packed02+2))[lane];
+            char q03=((device const char*)(packed03+2))[lane];
+            char q10=row1<p[3] ? ((device const char*)(packed10+2))[lane] : 0;
+            char q11=row1<p[3] ? ((device const char*)(packed11+2))[lane] : 0;
+            char q12=row1<p[3] ? ((device const char*)(packed12+2))[lane] : 0;
+            char q13=row1<p[3] ? ((device const char*)(packed13+2))[lane] : 0;
+            uint column=block*32+lane;
+            float x0=load(a,column+0*32,p[4]);
+            float x1=load(a,column+1*32,p[4]);
+            float x2=load(a,column+2*32,p[4]);
+            float x3=load(a,column+3*32,p[4]);
+            sum00+=(scale00*float(q00))*x0;
+            sum01+=(scale01*float(q01))*x1;
+            sum02+=(scale02*float(q02))*x2;
+            sum03+=(scale03*float(q03))*x3;
+            if(row1<p[3]) {
+                sum10+=(scale10*float(q10))*x0;
+                sum11+=(scale11*float(q11))*x1;
+                sum12+=(scale12*float(q12))*x2;
+                sum13+=(scale13*float(q13))*x3;
+            }
+        }
+        for(uint tail=groups*4;tail<blocks;tail++) {
+            device const uchar* packed0=row0_weights+tail*34;
+            float scale0=float(*((device const half*)packed0));
+            char q0=((device const char*)(packed0+2))[lane];
+            float x=load(a,tail*32+lane,p[4]);
+            sum00+=(scale0*float(q0))*x;
+            if(row1<p[3]) {
+                device const uchar* packed1=row1_weights+tail*34;
+                float scale1=float(*((device const half*)packed1));
+                char q1=((device const char*)(packed1+2))[lane];
+                sum10+=(scale1*float(q1))*x;
+            }
+        }
+    }
+    float total0=simd_sum((sum00+sum01)+(sum02+sum03));
+    float total1=simd_sum((sum10+sum11)+(sum12+sum13));
+    if(lane==0) {
+        if(row0<p[3]) store(c,row0,p[4],total0);
+        if(row1<p[3]) store(c,row1,p[4],total1);
+    }
+}
 // One SIMD group handles one output channel across four independent sequence
 // rows. The packed weight and its scale are loaded once for four outputs.
 kernel void q8_0_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
