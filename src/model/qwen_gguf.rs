@@ -145,7 +145,7 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
 
     let mut source_names = HashSet::new();
     let mut expected = Vec::new();
-    for (canonical, shape) in weights::specifications_with_policy(&config, policy) {
+    for (canonical, shape) in weights::specifications_with_policy(&config, &policy) {
         let source = gguf_weight_name(&canonical)?;
         source_names.insert(source.clone());
         expected.push((source, canonical, shape));

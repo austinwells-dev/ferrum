@@ -3,7 +3,7 @@ use ferrum::{
     generation::{self, Generation},
     loader::Weights,
     model::{
-        granite, granite_moe, olmo2,
+        granite, granite_moe, lfm2, olmo2,
         qwen::{self, QwenConfig},
         qwen_gguf, qwen_mlx, qwen3,
     },
@@ -16,6 +16,7 @@ use ferrum::{
 enum PromptFormat {
     Qwen,
     Granite,
+    Lfm2,
     Plain,
 }
 struct RuntimeTokenizer {
@@ -42,6 +43,16 @@ impl RuntimeTokenizer {
                 PromptFormat::Granite => format!(
                     "<|start_of_role|>system<|end_of_role|>{system}<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>{prompt}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
                 ),
+                PromptFormat::Lfm2 => {
+                    let system_message = if system == DEFAULT_SYSTEM {
+                        String::new()
+                    } else {
+                        format!("<|im_start|>system\n{system}<|im_end|>\n")
+                    };
+                    format!(
+                        "<|startoftext|>{system_message}<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                    )
+                }
                 PromptFormat::Plain => {
                     if system != DEFAULT_SYSTEM {
                         return Err(Error::Tokenizer(
@@ -172,9 +183,10 @@ fn report(r: &Generation, prompt: usize, profile: bool) {
         }
     }
     eprintln!(
-        "sampling: {:.3} ms total; active KV: {} bytes; generated IDs: {:?}",
+        "sampling: {:.3} ms total; active KV: {} bytes; convolution/state: {} bytes; generated IDs: {:?}",
         ms(r.sampling),
         r.kv_bytes,
+        r.state_bytes,
         r.tokens
     );
 }
@@ -234,7 +246,29 @@ pub fn run(d: &MetalDevice) -> Result<()> {
                 .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))?,
         )
         .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))?;
-        if metadata["model_type"] == "qwen3" {
+        if metadata["model_type"] == "lfm2" {
+            let before = d.counters();
+            let loaded = lfm2::load(d, &o.model)?;
+            let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
+            (
+                loaded.config,
+                RuntimeTokenizer {
+                    tokenizer: loaded.tokenizer,
+                    eos_ids: loaded.eos_ids,
+                    format: PromptFormat::Lfm2,
+                },
+                loaded.model,
+                loaded.source_tensor_bytes,
+                loaded.tensor_count,
+                loaded.parameter_count,
+                0,
+                loaded.config_tokenizer_load,
+                loaded.weight_load,
+                loaded.construction,
+                allocated,
+                "LFM2.5-230M hybrid safetensors",
+            )
+        } else if metadata["model_type"] == "qwen3" {
             let before = d.counters();
             let loaded = qwen3::load(d, &o.model)?;
             let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
@@ -487,7 +521,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         let median = sorted.get(sorted.len() / 2).copied().unwrap_or_default();
         eprintln!(
             "SUMMARY {}",
-            serde_json::json!({"prompt_tokens":ids.len(),"generated_ids":r.tokens,"prefill_ms":ms(r.prefill),"prefill_tps":ids.len() as f64/r.prefill.as_secs_f64(),"first_token_ms":ms(r.first_token),"decode_median_ms":ms(median),"decode_tps":if median.is_zero(){0.}else{1./median.as_secs_f64()},"decode_ms":r.decode.iter().map(|x|ms(*x)).collect::<Vec<_>>(),"prefill_counters":r.prefill_counters,"decode_counters":r.decode_counters,"sampling_ms":ms(r.sampling),"retained_weight_bytes":model.weight_bytes(),"kv_active_bytes":r.kv_bytes,"kv_reserved_bytes":r.kv_reserved_bytes,"moe":if moe_stats.assignments==0 {serde_json::Value::Null} else {serde_json::json!({"router_projection_enqueue_ms":ms(moe_stats.router_projection_enqueue),"route_selection_wall_ms":ms(moe_stats.routing),"routing_boundary_wait_ms":ms(moe_stats.routing_boundary_wait),"expert_dispatch_enqueue_ms":ms(moe_stats.expert_dispatch),"combine_enqueue_ms":ms(moe_stats.combine_dispatch),"active_expert_visits":moe_stats.active_experts,"assignments":moe_stats.assignments,"peak_temporary_bytes":moe_stats.peak_temporary_bytes})}})
+            serde_json::json!({"prompt_tokens":ids.len(),"generated_ids":r.tokens,"prefill_ms":ms(r.prefill),"prefill_tps":ids.len() as f64/r.prefill.as_secs_f64(),"first_token_ms":ms(r.first_token),"decode_median_ms":ms(median),"decode_tps":if median.is_zero(){0.}else{1./median.as_secs_f64()},"decode_ms":r.decode.iter().map(|x|ms(*x)).collect::<Vec<_>>(),"prefill_counters":r.prefill_counters,"decode_counters":r.decode_counters,"sampling_ms":ms(r.sampling),"retained_weight_bytes":model.weight_bytes(),"kv_active_bytes":r.kv_bytes,"kv_reserved_bytes":r.kv_reserved_bytes,"state_bytes":r.state_bytes,"moe":if moe_stats.assignments==0 {serde_json::Value::Null} else {serde_json::json!({"router_projection_enqueue_ms":ms(moe_stats.router_projection_enqueue),"route_selection_wall_ms":ms(moe_stats.routing),"routing_boundary_wait_ms":ms(moe_stats.routing_boundary_wait),"expert_dispatch_enqueue_ms":ms(moe_stats.expert_dispatch),"combine_enqueue_ms":ms(moe_stats.combine_dispatch),"active_expert_visits":moe_stats.active_experts,"assignments":moe_stats.assignments,"peak_temporary_bytes":moe_stats.peak_temporary_bytes})}})
         );
         eprintln!(
             "PROFILE prefill: {}",

@@ -1,19 +1,94 @@
 use super::{
     ModelConfig,
-    architecture::{ArchitecturePolicy, ProjectionBias, QkNormLayout},
+    architecture::{
+        ArchitecturePolicy, LayerFeedForwardPolicy, LayerOperatorPolicy, ProjectionBias,
+        QkNormLayout,
+    },
 };
 use crate::{
     Error, MetalDevice, Result, Tensor,
     loader::Weights,
-    nn::{Embedding, Linear, Mlp, RmsNorm, attention::Attention, moe::SparseMoe},
+    nn::{
+        Embedding, Linear, Mlp, RmsNorm, attention::Attention, kv_cache::KvCache, moe::SparseMoe,
+    },
     quantization::{QuantizationFormat, QuantizedMatrix},
 };
 use std::collections::BTreeMap;
 pub struct DecoderLayer {
     pub input_norm: RmsNorm,
-    pub attention: Attention,
+    pub operator: LayerOperator,
     pub post_norm: RmsNorm,
     pub(crate) feed_forward: FeedForward,
+}
+
+pub enum LayerOperator {
+    Attention(Box<Attention>),
+    ShortConv(Box<ShortConv>),
+}
+
+pub struct ShortConv {
+    pub input_projection: Linear,
+    pub depthwise_weight: Tensor,
+    pub output_projection: Linear,
+    pub kernel_size: usize,
+}
+
+impl ShortConv {
+    pub(crate) fn forward(
+        &self,
+        d: &MetalDevice,
+        x: &Tensor,
+        cache: &mut KvCache,
+        layer: usize,
+    ) -> Result<Tensor> {
+        let dims = x.shape().dimensions();
+        if dims.len() != 2 || self.depthwise_weight.shape().dimensions().first() != Some(&dims[1]) {
+            return Err(Error::Shape(
+                "short convolution input must be [S,hidden]".into(),
+            ));
+        }
+        let hidden = dims[1];
+        let projected = self.input_projection.forward(d, x)?;
+        let (b, c, value) = d.lfm2_split3(&projected)?;
+        let bx = d.mul(&b, &value)?.tensor;
+        let previous = match cache.conv_state(layer)? {
+            Some(state) => state.clone(),
+            None => Tensor::zeros(d, [self.kernel_size, hidden], x.dtype())?,
+        };
+        let (convolved, next_state) =
+            d.lfm2_short_conv(&bx, &c, &self.depthwise_weight, &previous, self.kernel_size)?;
+        cache.set_conv_state(d, layer, next_state)?;
+        self.output_projection.forward(d, &convolved)
+    }
+
+    pub(crate) fn weight_bytes(&self) -> usize {
+        self.input_projection.weight_bytes()
+            + self.depthwise_weight.byte_size()
+            + self.output_projection.weight_bytes()
+    }
+}
+
+impl LayerOperator {
+    pub(crate) fn weight_bytes(&self) -> usize {
+        match self {
+            Self::Attention(attention) => {
+                let mut bytes = 0;
+                for linear in [&attention.q, &attention.k, &attention.v, &attention.output] {
+                    bytes += linear.weight_bytes();
+                }
+                bytes
+                    + attention
+                        .q_norm
+                        .as_ref()
+                        .map_or(0, |norm| norm.weight.byte_size())
+                    + attention
+                        .k_norm
+                        .as_ref()
+                        .map_or(0, |norm| norm.weight.byte_size())
+            }
+            Self::ShortConv(convolution) => convolution.weight_bytes(),
+        }
+    }
 }
 
 pub(crate) enum FeedForward {
@@ -83,11 +158,11 @@ impl ModelWeights {
     }
 }
 pub(crate) fn specifications(c: &ModelConfig) -> Vec<(String, Vec<usize>)> {
-    specifications_with_policy(c, ArchitecturePolicy::default())
+    specifications_with_policy(c, &ArchitecturePolicy::default())
 }
 pub(crate) fn specifications_with_policy(
     c: &ModelConfig,
-    policy: ArchitecturePolicy,
+    policy: &ArchitecturePolicy,
 ) -> Vec<(String, Vec<usize>)> {
     let h = c.hidden_size;
     let q = c.num_attention_heads * c.head_dim;
@@ -101,39 +176,68 @@ pub(crate) fn specifications_with_policy(
         specs.push(("lm_head.weight".into(), vec![c.vocab_size, h]));
     }
     for l in 0..c.num_layers {
-        for (name, shape) in [
-            ("input_norm.weight", vec![h]),
-            ("post_norm.weight", vec![h]),
-            ("q.weight", vec![q, h]),
-            ("k.weight", vec![k, h]),
-            ("v.weight", vec![k, h]),
-            ("o.weight", vec![h, q]),
-        ] {
-            specs.push((format!("layers.{l}.{name}"), shape));
+        specs.extend([
+            (format!("layers.{l}.input_norm.weight"), vec![h]),
+            (format!("layers.{l}.post_norm.weight"), vec![h]),
+        ]);
+        let Ok(layer) = policy.layer(l, i) else {
+            continue;
+        };
+        match layer.operator {
+            LayerOperatorPolicy::Attention => {
+                specs.extend([
+                    (format!("layers.{l}.q.weight"), vec![q, h]),
+                    (format!("layers.{l}.k.weight"), vec![k, h]),
+                    (format!("layers.{l}.v.weight"), vec![k, h]),
+                    (format!("layers.{l}.o.weight"), vec![h, q]),
+                ]);
+            }
+            LayerOperatorPolicy::ShortConv { kernel_size } => {
+                specs.extend([
+                    (format!("layers.{l}.conv.in_proj.weight"), vec![3 * h, h]),
+                    (
+                        format!("layers.{l}.conv.depthwise.weight"),
+                        vec![h, 1, kernel_size],
+                    ),
+                    (format!("layers.{l}.conv.out_proj.weight"), vec![h, h]),
+                ]);
+            }
         }
-        if let Some(moe) = policy.moe {
-            specs.extend([
+        match layer.feed_forward {
+            LayerFeedForwardPolicy::Dense { intermediate_size } => {
+                specs.extend([
+                    (
+                        format!("layers.{l}.gate.weight"),
+                        vec![intermediate_size, h],
+                    ),
+                    (format!("layers.{l}.up.weight"), vec![intermediate_size, h]),
+                    (
+                        format!("layers.{l}.down.weight"),
+                        vec![h, intermediate_size],
+                    ),
+                ]);
+            }
+            LayerFeedForwardPolicy::Sparse {
+                routing,
+                intermediate_size,
+            } => specs.extend([
                 (
                     format!("layers.{l}.moe.router.weight"),
-                    vec![moe.experts, h],
+                    vec![routing.experts, h],
                 ),
                 (
                     format!("layers.{l}.moe.input.weight"),
-                    vec![moe.experts, 2 * i, h],
+                    vec![routing.experts, 2 * intermediate_size, h],
                 ),
                 (
                     format!("layers.{l}.moe.output.weight"),
-                    vec![moe.experts, h, i],
+                    vec![routing.experts, h, intermediate_size],
                 ),
-            ]);
-        } else {
-            specs.extend([
-                (format!("layers.{l}.gate.weight"), vec![i, h]),
-                (format!("layers.{l}.up.weight"), vec![i, h]),
-                (format!("layers.{l}.down.weight"), vec![h, i]),
-            ]);
+            ]),
         }
-        if policy.qk_norm_epsilon.is_some() {
+        if matches!(layer.operator, LayerOperatorPolicy::Attention)
+            && policy.qk_norm_epsilon.is_some()
+        {
             for (name, heads) in [
                 ("q_norm.weight", c.num_attention_heads),
                 ("k_norm.weight", c.num_key_value_heads),
@@ -148,7 +252,7 @@ pub(crate) fn specifications_with_policy(
     }
     specs
 }
-fn check_qkv_bias(policy: ArchitecturePolicy, present: bool, name: &str) -> Result<()> {
+fn check_qkv_bias(policy: &ArchitecturePolicy, present: bool, name: &str) -> Result<()> {
     match (policy.qkv_bias, present) {
         (ProjectionBias::Required, false) => Err(Error::Weight {
             name: name.into(),
@@ -198,10 +302,18 @@ pub(crate) fn checked(
 pub(crate) fn construct(
     d: &MetalDevice,
     c: &ModelConfig,
-    policy: ArchitecturePolicy,
+    policy: &ArchitecturePolicy,
     w: &Weights,
 ) -> Result<(Embedding, Vec<DecoderLayer>, RmsNorm, Linear)> {
-    if policy.moe.is_some() {
+    policy.validate_for(c)?;
+    if policy.moe.is_some()
+        || policy.layer_policies.as_ref().is_some_and(|layers| {
+            layers.iter().any(|layer| {
+                !matches!(layer.operator, LayerOperatorPolicy::Attention)
+                    || !matches!(layer.feed_forward, LayerFeedForwardPolicy::Dense { .. })
+            })
+        })
+    {
         return Err(Error::Config(
             "sparse models must be constructed from mixed model weights".into(),
         ));
@@ -211,15 +323,24 @@ pub(crate) fn construct(
         checked(w, &name, &shape, c, d)?;
     }
     for l in 0..c.num_layers {
-        for (component, out) in [
-            ("q", c.num_attention_heads * c.head_dim),
-            ("k", c.num_key_value_heads * c.head_dim),
-            ("v", c.num_key_value_heads * c.head_dim),
-            ("o", c.hidden_size),
-            ("gate", c.intermediate_size),
-            ("up", c.intermediate_size),
-            ("down", c.hidden_size),
-        ] {
+        let layer = policy.layer(l, c.intermediate_size)?;
+        let mut components = Vec::new();
+        if matches!(layer.operator, LayerOperatorPolicy::Attention) {
+            components.extend([
+                ("q", c.num_attention_heads * c.head_dim),
+                ("k", c.num_key_value_heads * c.head_dim),
+                ("v", c.num_key_value_heads * c.head_dim),
+                ("o", c.hidden_size),
+            ]);
+        }
+        if let LayerFeedForwardPolicy::Dense { intermediate_size } = layer.feed_forward {
+            components.extend([
+                ("gate", intermediate_size),
+                ("up", intermediate_size),
+                ("down", c.hidden_size),
+            ]);
+        }
+        for (component, out) in components {
             let name = format!("layers.{l}.{component}.bias");
             if matches!(component, "q" | "k" | "v") {
                 check_qkv_bias(policy, w.optional(&name).is_some(), &name)?;
@@ -259,10 +380,9 @@ pub(crate) fn construct(
     let mut layers = Vec::new();
     for l in 0..c.num_layers {
         let p = format!("layers.{l}");
-        layers.push(DecoderLayer {
-            input_norm: norm(&format!("{p}.input_norm.weight"))?,
-            post_norm: norm(&format!("{p}.post_norm.weight"))?,
-            attention: Attention {
+        let layer_policy = policy.layer(l, c.intermediate_size)?;
+        let operator = match layer_policy.operator {
+            LayerOperatorPolicy::Attention => LayerOperator::Attention(Box::new(Attention {
                 q: linear(&format!("{p}.q"))?,
                 k: linear(&format!("{p}.k"))?,
                 v: linear(&format!("{p}.v"))?,
@@ -277,7 +397,25 @@ pub(crate) fn construct(
                 scale: policy
                     .attention_scale
                     .unwrap_or_else(|| (c.head_dim as f32).sqrt().recip()),
-            },
+            })),
+            LayerOperatorPolicy::ShortConv { kernel_size } => {
+                LayerOperator::ShortConv(Box::new(ShortConv {
+                    input_projection: linear(&format!("{p}.conv.in_proj"))?,
+                    depthwise_weight: w.get(&format!("{p}.conv.depthwise.weight"))?.clone(),
+                    output_projection: linear(&format!("{p}.conv.out_proj"))?,
+                    kernel_size,
+                }))
+            }
+        };
+        let LayerFeedForwardPolicy::Dense { .. } = layer_policy.feed_forward else {
+            return Err(Error::Config(
+                "direct weight construction supports dense feed-forward layers only".into(),
+            ));
+        };
+        layers.push(DecoderLayer {
+            input_norm: norm(&format!("{p}.input_norm.weight"))?,
+            post_norm: norm(&format!("{p}.post_norm.weight"))?,
+            operator,
             feed_forward: FeedForward::Dense(Mlp {
                 gate: linear(&format!("{p}.gate"))?,
                 up: linear(&format!("{p}.up"))?,
@@ -304,10 +442,11 @@ pub(crate) fn construct(
 pub(crate) fn construct_mixed(
     d: &MetalDevice,
     c: &ModelConfig,
-    policy: ArchitecturePolicy,
+    policy: &ArchitecturePolicy,
     w: &ModelWeights,
 ) -> Result<(Embedding, Vec<DecoderLayer>, RmsNorm, Linear)> {
     c.validate()?;
+    policy.validate_for(c)?;
     for (name, shape) in specifications_with_policy(c, policy) {
         let weight = w.get(&name)?;
         if weight.dimensions() != shape {
@@ -356,15 +495,20 @@ pub(crate) fn construct_mixed(
         }
     }
     for l in 0..c.num_layers {
-        for (name, out) in [
-            ("q", c.num_attention_heads * c.head_dim),
-            ("k", c.num_key_value_heads * c.head_dim),
-            ("v", c.num_key_value_heads * c.head_dim),
-        ] {
-            let name = format!("layers.{l}.{name}.bias");
-            check_qkv_bias(policy, w.tensors.contains_key(&name), &name)?;
-            if let Some(weight) = w.tensors.get(&name) {
-                check_dense_vector(d, &name, weight, out, c.dtype)?;
+        if matches!(
+            policy.layer(l, c.intermediate_size)?.operator,
+            LayerOperatorPolicy::Attention
+        ) {
+            for (name, out) in [
+                ("q", c.num_attention_heads * c.head_dim),
+                ("k", c.num_key_value_heads * c.head_dim),
+                ("v", c.num_key_value_heads * c.head_dim),
+            ] {
+                let name = format!("layers.{l}.{name}.bias");
+                check_qkv_bias(policy, w.tensors.contains_key(&name), &name)?;
+                if let Some(weight) = w.tensors.get(&name) {
+                    check_dense_vector(d, &name, weight, out, c.dtype)?;
+                }
             }
         }
     }
@@ -423,31 +567,31 @@ pub(crate) fn construct_mixed(
     let mut layers = Vec::with_capacity(c.num_layers);
     for layer in 0..c.num_layers {
         let prefix = format!("layers.{layer}");
-        let feed_forward = if policy.moe.is_some() {
-            let router = dense(&format!("{prefix}.moe.router.weight"))?;
-            let input_experts = dense(&format!("{prefix}.moe.input.weight"))?;
-            let output_experts = dense(&format!("{prefix}.moe.output.weight"))?;
-            let routing = policy
-                .moe
-                .ok_or_else(|| Error::Config("missing MoE routing policy".into()))?;
-            FeedForward::Sparse(SparseMoe::new(
-                d,
-                router,
-                input_experts,
-                output_experts,
-                routing.top_k,
-            )?)
-        } else {
-            FeedForward::Dense(Mlp {
+        let layer_policy = policy.layer(layer, c.intermediate_size)?;
+        let feed_forward = match layer_policy.feed_forward {
+            LayerFeedForwardPolicy::Sparse {
+                routing,
+                intermediate_size: _,
+            } => {
+                let router = dense(&format!("{prefix}.moe.router.weight"))?;
+                let input_experts = dense(&format!("{prefix}.moe.input.weight"))?;
+                let output_experts = dense(&format!("{prefix}.moe.output.weight"))?;
+                FeedForward::Sparse(SparseMoe::new(
+                    d,
+                    router,
+                    input_experts,
+                    output_experts,
+                    routing.top_k,
+                )?)
+            }
+            LayerFeedForwardPolicy::Dense { .. } => FeedForward::Dense(Mlp {
                 gate: linear(&format!("{prefix}.gate"))?,
                 up: linear(&format!("{prefix}.up"))?,
                 down: linear(&format!("{prefix}.down"))?,
-            })
+            }),
         };
-        layers.push(DecoderLayer {
-            input_norm: norm(&format!("{prefix}.input_norm.weight"))?,
-            post_norm: norm(&format!("{prefix}.post_norm.weight"))?,
-            attention: Attention {
+        let operator = match layer_policy.operator {
+            LayerOperatorPolicy::Attention => LayerOperator::Attention(Box::new(Attention {
                 q: linear(&format!("{prefix}.q"))?,
                 k: linear(&format!("{prefix}.k"))?,
                 v: linear(&format!("{prefix}.v"))?,
@@ -462,7 +606,20 @@ pub(crate) fn construct_mixed(
                 scale: policy
                     .attention_scale
                     .unwrap_or_else(|| (c.head_dim as f32).sqrt().recip()),
-            },
+            })),
+            LayerOperatorPolicy::ShortConv { kernel_size } => {
+                LayerOperator::ShortConv(Box::new(ShortConv {
+                    input_projection: linear(&format!("{prefix}.conv.in_proj"))?,
+                    depthwise_weight: dense(&format!("{prefix}.conv.depthwise.weight"))?,
+                    output_projection: linear(&format!("{prefix}.conv.out_proj"))?,
+                    kernel_size,
+                }))
+            }
+        };
+        layers.push(DecoderLayer {
+            input_norm: norm(&format!("{prefix}.input_norm.weight"))?,
+            post_norm: norm(&format!("{prefix}.post_norm.weight"))?,
+            operator,
             feed_forward,
         });
     }

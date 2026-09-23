@@ -10,7 +10,30 @@ pub enum ProjectionBias {
     Forbidden,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerOperatorPolicy {
+    Attention,
+    ShortConv { kernel_size: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerFeedForwardPolicy {
+    Dense {
+        intermediate_size: usize,
+    },
+    Sparse {
+        routing: MoeRoutingPolicy,
+        intermediate_size: usize,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LayerPolicy {
+    pub operator: LayerOperatorPolicy,
+    pub feed_forward: LayerFeedForwardPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct ArchitecturePolicy {
     /// Normalize each Q and K head after projection and before RoPE.
     pub qk_norm_epsilon: Option<f32>,
@@ -21,6 +44,10 @@ pub struct ArchitecturePolicy {
     pub embedding_multiplier: f32,
     pub residual_multiplier: f32,
     pub logits_divisor: f32,
+    /// Optional layer-by-layer block composition. When absent, every layer is
+    /// attention plus a dense MLP, or sparse MLP when `moe` is selected.
+    pub layer_policies: Option<Vec<LayerPolicy>>,
+    /// Compatibility shorthand for architectures using sparse experts in every layer.
     pub moe: Option<MoeRoutingPolicy>,
 }
 
@@ -55,13 +82,14 @@ impl Default for ArchitecturePolicy {
             embedding_multiplier: 1.,
             residual_multiplier: 1.,
             logits_divisor: 1.,
+            layer_policies: None,
             moe: None,
         }
     }
 }
 
 impl ArchitecturePolicy {
-    pub fn validate(self) -> Result<()> {
+    pub fn validate(&self) -> Result<()> {
         if self
             .qk_norm_epsilon
             .is_some_and(|epsilon| !epsilon.is_finite() || epsilon <= 0.)
@@ -82,6 +110,34 @@ impl ArchitecturePolicy {
                 "MoE requires positive expert count and top-k within expert count".into(),
             ));
         }
+        if self.moe.is_some() && self.layer_policies.is_some() {
+            return Err(Error::Config(
+                "global MoE routing cannot be combined with per-layer policies".into(),
+            ));
+        }
+        if self.layer_policies.as_ref().is_some_and(|layers| {
+            layers.iter().any(|layer| {
+                matches!(
+                    layer.operator,
+                    LayerOperatorPolicy::ShortConv { kernel_size: 0 }
+                ) || match layer.feed_forward {
+                    LayerFeedForwardPolicy::Dense { intermediate_size } => intermediate_size == 0,
+                    LayerFeedForwardPolicy::Sparse {
+                        routing,
+                        intermediate_size,
+                    } => {
+                        routing.experts == 0
+                            || routing.top_k == 0
+                            || routing.top_k > routing.experts
+                            || intermediate_size == 0
+                    }
+                }
+            })
+        }) {
+            return Err(Error::Config(
+                "per-layer policies require positive dimensions and valid expert routing".into(),
+            ));
+        }
         if self
             .attention_scale
             .is_some_and(|scale| !scale.is_finite() || scale <= 0.)
@@ -98,5 +154,44 @@ impl ArchitecturePolicy {
             ));
         }
         Ok(())
+    }
+
+    pub fn validate_for(&self, config: &super::ModelConfig) -> Result<()> {
+        self.validate()?;
+        if self
+            .layer_policies
+            .as_ref()
+            .is_some_and(|layers| layers.len() != config.num_layers)
+        {
+            return Err(Error::Config(format!(
+                "architecture policy has {} layer entries for a {}-layer model",
+                self.layer_policies.as_ref().map_or(0, Vec::len),
+                config.num_layers
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn layer(&self, index: usize, default_intermediate_size: usize) -> Result<LayerPolicy> {
+        if let Some(layers) = &self.layer_policies {
+            return layers
+                .get(index)
+                .copied()
+                .ok_or_else(|| Error::Config("layer policy index out of range".into()));
+        }
+        let feed_forward = if let Some(routing) = self.moe {
+            LayerFeedForwardPolicy::Sparse {
+                routing,
+                intermediate_size: default_intermediate_size,
+            }
+        } else {
+            LayerFeedForwardPolicy::Dense {
+                intermediate_size: default_intermediate_size,
+            }
+        };
+        Ok(LayerPolicy {
+            operator: LayerOperatorPolicy::Attention,
+            feed_forward,
+        })
     }
 }

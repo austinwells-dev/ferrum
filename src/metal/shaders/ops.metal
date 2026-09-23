@@ -32,6 +32,53 @@ inline float round_storage(float x, uint dtype) {
 kernel void add(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) store(c,i,p[4],load(a,i,p[4])+load(b,i,p[4])); }
 kernel void mul(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) store(c,i,p[4],load(a,i,p[4])*load(b,i,p[4])); }
 kernel void silu(ARGS, uint i [[thread_position_in_grid]]) { if(i<p[0]) { float x=load(a,i,p[4]); float s=x>=0 ? 1.f/(1.f+exp(-x)) : exp(x)/(1.f+exp(x)); store(c,i,p[4],x*s); } }
+kernel void lfm2_short_conv(
+    device const uchar* bx [[buffer(0)]],
+    device const uchar* gate [[buffer(1)]],
+    device const uchar* weight [[buffer(2)]],
+    device const uchar* previous_state [[buffer(3)]],
+    device uchar* output [[buffer(4)]],
+    device uchar* next_state [[buffer(5)]],
+    constant uint* p [[buffer(6)]],
+    uint i [[thread_position_in_grid]]) {
+    uint sequence=p[3], hidden=p[1], kernel_size=p[2], dtype=p[4];
+    if(i<p[0]) {
+        uint token=i/hidden, channel=i%hidden;
+        float sum=0.f;
+        for(uint tap=0;tap<kernel_size;tap++) {
+            uint joined_position=token+1+tap;
+            float value=joined_position<kernel_size
+                ? load(previous_state,joined_position*hidden+channel,dtype)
+                : load(bx,(joined_position-kernel_size)*hidden+channel,dtype);
+            sum+=value*load(weight,channel*kernel_size+tap,dtype);
+        }
+        float conv_value=round_storage(sum,dtype);
+        store(output,i,dtype,conv_value*load(gate,i,dtype));
+    }
+    uint state_elements=kernel_size*hidden;
+    if(i<state_elements) {
+        uint position=sequence+i/hidden, channel=i%hidden;
+        float value=position<kernel_size
+            ? load(previous_state,position*hidden+channel,dtype)
+            : load(bx,(position-kernel_size)*hidden+channel,dtype);
+        store(next_state,i,dtype,value);
+    }
+}
+kernel void lfm2_split3(
+    device const uchar* input [[buffer(0)]],
+    device uchar* first [[buffer(1)]],
+    device uchar* second [[buffer(2)]],
+    device uchar* third [[buffer(3)]],
+    constant uint* p [[buffer(4)]],
+    uint i [[thread_position_in_grid]]) {
+    if(i<p[0]) {
+        uint hidden=p[1], token=i/hidden, channel=i%hidden;
+        uint source=token*3*hidden+channel;
+        store(first,i,p[4],load(input,source,p[4]));
+        store(second,i,p[4],load(input,source+hidden,p[4]));
+        store(third,i,p[4],load(input,source+2*hidden,p[4]));
+    }
+}
 kernel void rmsnorm(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
     threadgroup float partial[8];
     uint w=p[1], base=row*w, lane=tid%32, simd=tid/32;

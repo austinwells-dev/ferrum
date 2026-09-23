@@ -153,7 +153,7 @@ fn official_name(canonical: &str) -> Result<String> {
 pub fn map_weights(
     device: &MetalDevice,
     config: &ModelConfig,
-    policy: ArchitecturePolicy,
+    policy: &ArchitecturePolicy,
     source: &Weights,
 ) -> Result<Weights> {
     let specs = weights::specifications_with_policy(config, policy)
@@ -233,7 +233,7 @@ pub fn load(device: &MetalDevice, dir: impl AsRef<Path>) -> Result<LoadedOlmo2> 
     let tensor_count = source.names().count();
     let weight_load = started.elapsed();
     let started = Instant::now();
-    let mapped = map_weights(device, &config, policy, &source)?;
+    let mapped = map_weights(device, &config, &policy, &source)?;
     let model = Transformer::from_weights_with_policy(device, config.clone(), policy, &mapped)?;
     let construction = started.elapsed();
     let parameter_count = source_tensor_bytes / DType::F32.size_bytes();

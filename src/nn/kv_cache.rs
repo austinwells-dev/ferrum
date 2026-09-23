@@ -8,13 +8,24 @@ struct LayerCache {
     // storage if it would overwrite any previously published/reserved suffix.
     reserved: Rc<Cell<usize>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheLayerKind {
+    KeyValue,
+    Convolution { kernel_size: usize },
+}
+
 /// Immutable active prefix views over append-only, capacity-backed K/V storage.
 #[derive(Clone)]
 pub struct KvCache {
     layers: Vec<Option<LayerCache>>,
+    conv_states: Vec<Option<Tensor>>,
+    kinds: Vec<CacheLayerKind>,
     capacity: usize,
     heads: usize,
     dim: usize,
+    state_width: usize,
+    sequence_len: usize,
     dtype: DType,
 }
 impl KvCache {
@@ -25,8 +36,32 @@ impl KvCache {
         dim: usize,
         dtype: DType,
     ) -> Result<Self> {
+        let kinds = vec![CacheLayerKind::KeyValue; layers];
+        Self::with_layout(layers, capacity, heads, dim, heads * dim, dtype, kinds)
+    }
+
+    pub fn with_layout(
+        layers: usize,
+        capacity: usize,
+        heads: usize,
+        dim: usize,
+        state_width: usize,
+        dtype: DType,
+        kinds: Vec<CacheLayerKind>,
+    ) -> Result<Self> {
         if [layers, capacity, heads, dim].contains(&0) {
             return Err(Error::Cache("dimensions must be positive".into()));
+        }
+        if state_width == 0 || kinds.len() != layers {
+            return Err(Error::Cache("invalid per-layer state layout".into()));
+        }
+        if kinds
+            .iter()
+            .any(|kind| matches!(kind, CacheLayerKind::Convolution { kernel_size: 0 }))
+        {
+            return Err(Error::Cache(
+                "convolution state length must be positive".into(),
+            ));
         }
         let shape = crate::tensor::Shape::new([capacity, heads, dim])?;
         if shape.numel() > u32::MAX as usize {
@@ -34,9 +69,13 @@ impl KvCache {
         }
         Ok(Self {
             layers: vec![None; layers],
+            conv_states: vec![None; layers],
+            kinds,
             capacity,
             heads,
             dim,
+            state_width,
+            sequence_len: 0,
             dtype,
         })
     }
@@ -44,32 +83,119 @@ impl KvCache {
         self.layers.len()
     }
     pub fn len(&self) -> Result<usize> {
-        let first = self.layer_len(0)?;
-        for i in 1..self.layers.len() {
-            if self.layer_len(i)? != first {
-                return Err(Error::Cache("layer length mismatch".into()));
+        let mut attention_len = None;
+        for (index, kind) in self.kinds.iter().enumerate() {
+            if *kind == CacheLayerKind::KeyValue {
+                let length = self.layers[index]
+                    .as_ref()
+                    .map_or(0, |entry| entry.active.0.shape().dimensions()[0]);
+                if attention_len.is_some_and(|first| first != length) {
+                    return Err(Error::Cache("layer length mismatch".into()));
+                }
+                attention_len = Some(length);
             }
         }
-        Ok(first)
+        let length = attention_len.unwrap_or(self.sequence_len);
+        if self
+            .kinds
+            .iter()
+            .any(|kind| matches!(kind, CacheLayerKind::Convolution { .. }))
+            && length != self.sequence_len
+        {
+            return Err(Error::Cache("hybrid state length mismatch".into()));
+        }
+        Ok(length)
     }
     pub fn is_empty(&self) -> Result<bool> {
         Ok(self.len()? == 0)
     }
     pub fn layer_len(&self, layer: usize) -> Result<usize> {
-        Ok(self
-            .layers
+        let kind = *self
+            .kinds
             .get(layer)
-            .ok_or_else(|| Error::Cache("layer index out of range".into()))?
-            .as_ref()
-            .map_or(0, |entry| entry.active.0.shape().dimensions()[0]))
+            .ok_or_else(|| Error::Cache("layer index out of range".into()))?;
+        Ok(match kind {
+            CacheLayerKind::KeyValue => self.layers[layer]
+                .as_ref()
+                .map_or(0, |entry| entry.active.0.shape().dimensions()[0]),
+            CacheLayerKind::Convolution { .. } => self.sequence_len,
+        })
     }
     pub fn active(&self, layer: usize) -> Result<Option<(&Tensor, &Tensor)>> {
+        if self.kinds.get(layer) != Some(&CacheLayerKind::KeyValue) {
+            return Err(Error::Cache(
+                "K/V requested for a non-attention layer".into(),
+            ));
+        }
         Ok(self
             .layers
             .get(layer)
             .ok_or_else(|| Error::Cache("layer index out of range".into()))?
             .as_ref()
             .map(|entry| (&entry.active.0, &entry.active.1)))
+    }
+
+    pub fn conv_state(&self, layer: usize) -> Result<Option<&Tensor>> {
+        if !matches!(
+            self.kinds.get(layer),
+            Some(CacheLayerKind::Convolution { .. })
+        ) {
+            return Err(Error::Cache(
+                "convolution state requested for a non-conv layer".into(),
+            ));
+        }
+        Ok(self.conv_states[layer].as_ref())
+    }
+
+    pub fn set_conv_state(&mut self, d: &MetalDevice, layer: usize, state: Tensor) -> Result<()> {
+        let kind = *self
+            .kinds
+            .get(layer)
+            .ok_or_else(|| Error::Cache("layer index out of range".into()))?;
+        let CacheLayerKind::Convolution { kernel_size } = kind else {
+            return Err(Error::Cache("state update targets a non-conv layer".into()));
+        };
+        if state.shape().dimensions() != [kernel_size, self.state_width]
+            || state.dtype() != self.dtype
+        {
+            return Err(Error::Cache(
+                "convolution state shape/dtype mismatch".into(),
+            ));
+        }
+        if !d.owns(state.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
+        self.conv_states[layer] = Some(state);
+        Ok(())
+    }
+
+    pub fn validate_layout(&self, expected: &[CacheLayerKind]) -> Result<()> {
+        if self.kinds != expected {
+            return Err(Error::Cache(
+                "model/cache layer-state layout mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn set_sequence_len(&mut self, sequence_len: usize) -> Result<()> {
+        if sequence_len > self.capacity {
+            return Err(Error::Cache("sequence length exceeds capacity".into()));
+        }
+        self.sequence_len = sequence_len;
+        self.len()?;
+        if sequence_len > 0 {
+            for (index, kind) in self.kinds.iter().enumerate() {
+                if matches!(kind, CacheLayerKind::Convolution { .. })
+                    && self.conv_states[index].is_none()
+                {
+                    return Err(Error::Cache(
+                        "missing convolution state after update".into(),
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
     pub fn validate_for(&self, c: &crate::model::ModelConfig, extra: usize) -> Result<usize> {
         if self.layers.len() != c.num_layers
@@ -89,6 +215,11 @@ impl KvCache {
         Ok(offset)
     }
     pub fn append(&mut self, d: &MetalDevice, layer: usize, k: &Tensor, v: &Tensor) -> Result<()> {
+        if self.kinds.get(layer) != Some(&CacheLayerKind::KeyValue) {
+            return Err(Error::Cache(
+                "K/V append targets a non-attention layer".into(),
+            ));
+        }
         let offset = self.layer_len(layer)?;
         let dims = k.shape().dimensions();
         if dims.len() != 3 || dims[1..] != [self.heads, self.dim] || k.shape() != v.shape() {
@@ -159,6 +290,8 @@ impl KvCache {
     }
     pub fn reset(&mut self) {
         self.layers.fill(None);
+        self.conv_states.fill(None);
+        self.sequence_len = 0;
     }
     pub fn reserved_bytes(&self) -> usize {
         self.layers
@@ -172,6 +305,14 @@ impl KvCache {
             .iter()
             .flatten()
             .map(|entry| entry.active.0.byte_size() + entry.active.1.byte_size())
+            .sum()
+    }
+
+    pub fn state_bytes(&self) -> usize {
+        self.conv_states
+            .iter()
+            .flatten()
+            .map(Tensor::byte_size)
             .sum()
     }
 }

@@ -115,7 +115,7 @@ impl Qwen3Config {
 
 pub fn specifications(
     config: &ModelConfig,
-    policy: ArchitecturePolicy,
+    policy: &ArchitecturePolicy,
 ) -> Vec<(String, String, Vec<usize>)> {
     weights::specifications_with_policy(config, policy)
         .into_iter()
@@ -126,11 +126,11 @@ pub fn specifications(
 pub fn map_weights(
     device: &MetalDevice,
     config: &ModelConfig,
-    policy: ArchitecturePolicy,
+    policy: &ArchitecturePolicy,
     source: &Weights,
 ) -> Result<Weights> {
     config.validate()?;
-    policy.validate()?;
+    policy.validate_for(config)?;
     let specs = specifications(config, policy);
     for (official, _, shape) in &specs {
         weights::checked(source, official, shape, config, device)?;
@@ -175,7 +175,7 @@ pub fn construct(
     policy: ArchitecturePolicy,
     source: &Weights,
 ) -> Result<Transformer> {
-    let mapped = map_weights(device, &config, policy, source)?;
+    let mapped = map_weights(device, &config, &policy, source)?;
     Transformer::from_weights_with_policy(device, config, policy, &mapped)
 }
 

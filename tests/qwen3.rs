@@ -16,7 +16,7 @@ fn official_qwen3_config_selects_head_norm_and_config_driven_shapes() {
     assert_eq!(c.num_attention_heads * c.head_dim, 2048);
     assert_eq!(policy.qk_norm_epsilon, Some(1e-6));
     assert_eq!(policy.qkv_bias, ProjectionBias::Forbidden);
-    let specs = qwen3::specifications(&c, policy);
+    let specs = qwen3::specifications(&c, &policy);
     assert_eq!(specs.len(), 310);
     assert!(specs.iter().any(|(source, _, shape)| {
         source == "model.layers.0.self_attn.q_proj.weight" && shape == &[2048, 1024]

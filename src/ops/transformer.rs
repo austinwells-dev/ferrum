@@ -303,6 +303,138 @@ impl MetalDevice {
         p[8] = theta.to_bits();
         self.run("rope_split", a, None, d, p, [a.numel() / 2, 1])
     }
+
+    /// Causal depthwise convolution used by LFM2 short-convolution blocks.
+    /// `bx` is the projected B*X activation, while `gate` is C. The convolution
+    /// result is rounded to the activation dtype before multiplying C, matching
+    /// the two storage boundaries in the upstream implementation. State output
+    /// is a fresh immutable tensor so cache snapshots remain branchable.
+    pub(crate) fn lfm2_short_conv(
+        &self,
+        bx: &Tensor,
+        gate: &Tensor,
+        weight: &Tensor,
+        previous_state: &Tensor,
+        kernel_size: usize,
+    ) -> Result<(Tensor, Tensor)> {
+        let input_dims = bx.shape().dimensions();
+        if input_dims.len() != 2 || input_dims.contains(&0) {
+            return Err(Error::Shape("short convolution requires [S,H]".into()));
+        }
+        let (sequence, hidden) = (input_dims[0], input_dims[1]);
+        if gate.shape() != bx.shape()
+            || weight.shape().dimensions() != [hidden, 1, kernel_size]
+            || previous_state.shape().dimensions() != [kernel_size, hidden]
+            || kernel_size == 0
+        {
+            return Err(Error::Shape(
+                "short convolution weight, gate, or state shape mismatch".into(),
+            ));
+        }
+        if [gate, weight, previous_state]
+            .iter()
+            .any(|tensor| tensor.dtype() != bx.dtype())
+        {
+            return Err(Error::DType);
+        }
+        if [bx, gate, weight, previous_state]
+            .iter()
+            .any(|tensor| !self.owns(tensor.buffer()))
+        {
+            return Err(Error::DeviceMismatch);
+        }
+
+        let output = Tensor::output(self, &[sequence, hidden], bx.dtype())?;
+        let next_state = Tensor::output(self, &[kernel_size, hidden], bx.dtype())?;
+        let output_elements = sequence
+            .checked_mul(hidden)
+            .ok_or_else(|| Error::Shape("short convolution output size overflow".into()))?;
+        let state_elements = kernel_size
+            .checked_mul(hidden)
+            .ok_or_else(|| Error::Shape("short convolution state size overflow".into()))?;
+        let mut p = [0; 9];
+        p[0] = index(output_elements)?;
+        p[1] = index(hidden)?;
+        p[2] = index(kernel_size)?;
+        p[3] = index(sequence)?;
+        p[4] = bx.dtype() as u32;
+        let start = self.profiling().then(std::time::Instant::now);
+        let timing = self.dispatch(
+            "lfm2_short_conv",
+            &[
+                bx.binding(),
+                gate.binding(),
+                weight.binding(),
+                previous_state.binding(),
+                output.binding(),
+                next_state.binding(),
+            ],
+            &p,
+            [output_elements.max(state_elements), 1],
+            false,
+        )?;
+        if let Some(start) = start {
+            self.record_profile(
+                "short_conv",
+                start
+                    .elapsed()
+                    .saturating_sub(timing.synchronized.saturating_sub(timing.submission)),
+                std::time::Duration::ZERO,
+                output.byte_size() + next_state.byte_size(),
+                &timing,
+            );
+        }
+        Ok((output, next_state))
+    }
+
+    /// Split a row-major `[S,3H]` LFM2 input projection into contiguous B, C,
+    /// and X tensors. The three channel groups are adjacent within each token
+    /// row, so they cannot be represented as three contiguous tensor views.
+    pub(crate) fn lfm2_split3(&self, projected: &Tensor) -> Result<(Tensor, Tensor, Tensor)> {
+        let dims = projected.shape().dimensions();
+        if dims.len() != 2 || dims.contains(&0) || !dims[1].is_multiple_of(3) {
+            return Err(Error::Shape("LFM2 projection must be [S,3H]".into()));
+        }
+        if !self.owns(projected.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
+        let (sequence, hidden) = (dims[0], dims[1] / 3);
+        let elements = sequence
+            .checked_mul(hidden)
+            .ok_or_else(|| Error::Shape("LFM2 split size overflow".into()))?;
+        let first = Tensor::output(self, &[sequence, hidden], projected.dtype())?;
+        let second = Tensor::output(self, &[sequence, hidden], projected.dtype())?;
+        let third = Tensor::output(self, &[sequence, hidden], projected.dtype())?;
+        let mut p = [0; 9];
+        p[0] = index(elements)?;
+        p[1] = index(hidden)?;
+        p[4] = projected.dtype() as u32;
+        let start = self.profiling().then(std::time::Instant::now);
+        let timing = self.dispatch(
+            "lfm2_split3",
+            &[
+                projected.binding(),
+                first.binding(),
+                second.binding(),
+                third.binding(),
+            ],
+            &p,
+            [elements, 1],
+            false,
+        )?;
+        if let Some(start) = start {
+            self.record_profile(
+                "short_conv_split",
+                start
+                    .elapsed()
+                    .saturating_sub(timing.synchronized.saturating_sub(timing.submission)),
+                std::time::Duration::ZERO,
+                first.byte_size() + second.byte_size() + third.byte_size(),
+                &timing,
+            );
+        }
+        Ok((first, second, third))
+    }
 }
 
 impl MetalDevice {
@@ -1839,5 +1971,105 @@ mod mlx_affine4_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+}
+
+#[cfg(test)]
+mod lfm2_short_conv_tests {
+    use crate::{DType, MetalDevice, Tensor};
+
+    fn exercise_short_conv(dtype: DType, sequence: usize, hidden: usize, kernel: usize) {
+        let device = MetalDevice::new().unwrap();
+        let bx_values = (0..sequence * hidden)
+            .map(|i| (i as i32 % 11 - 5) as f32 / 8.)
+            .collect::<Vec<_>>();
+        let gate_values = (0..sequence * hidden)
+            .map(|i| (i % 7 + 1) as f32 / 4.)
+            .collect::<Vec<_>>();
+        let weight_values = (0..hidden * kernel)
+            .map(|i| (i as i32 % 5 - 2) as f32 / 8.)
+            .collect::<Vec<_>>();
+        let state_values = (0..kernel * hidden)
+            .map(|i| (i as i32 % 9 - 4) as f32 / 8.)
+            .collect::<Vec<_>>();
+        let bx = Tensor::from_f32(&device, [sequence, hidden], dtype, &bx_values).unwrap();
+        let gate = Tensor::from_f32(&device, [sequence, hidden], dtype, &gate_values).unwrap();
+        let weight = Tensor::from_f32(&device, [hidden, 1, kernel], dtype, &weight_values).unwrap();
+        let previous = Tensor::from_f32(&device, [kernel, hidden], dtype, &state_values).unwrap();
+        let bx_values = bx.to_f32();
+        let gate_values = gate.to_f32();
+        let weight_values = weight.to_f32();
+        let state_values = previous.to_f32();
+
+        let mut expected_output = vec![0.; sequence * hidden];
+        for token in 0..sequence {
+            for channel in 0..hidden {
+                let mut sum = 0.;
+                for tap in 0..kernel {
+                    let joined = token + 1 + tap;
+                    let value = if joined < kernel {
+                        state_values[joined * hidden + channel]
+                    } else {
+                        bx_values[(joined - kernel) * hidden + channel]
+                    };
+                    sum += value * weight_values[channel * kernel + tap];
+                }
+                let conv_value = dtype.round(sum);
+                expected_output[token * hidden + channel] =
+                    dtype.round(conv_value * gate_values[token * hidden + channel]);
+            }
+        }
+        let mut expected_state = vec![0.; kernel * hidden];
+        for position in 0..kernel {
+            for channel in 0..hidden {
+                let joined = sequence + position;
+                expected_state[position * hidden + channel] = if joined < kernel {
+                    state_values[joined * hidden + channel]
+                } else {
+                    bx_values[(joined - kernel) * hidden + channel]
+                };
+            }
+        }
+
+        let (actual_output, actual_state) = device
+            .lfm2_short_conv(&bx, &gate, &weight, &previous, kernel)
+            .unwrap();
+        assert_eq!(actual_output.to_f32(), expected_output);
+        assert_eq!(actual_state.to_f32(), expected_state);
+    }
+
+    #[test]
+    fn lfm2_short_conv_matches_causal_reference_and_updates_fresh_state() {
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for (sequence, hidden, kernel) in [(1, 3, 3), (4, 7, 3), (2, 5, 1)] {
+                exercise_short_conv(dtype, sequence, hidden, kernel);
+            }
+        }
+    }
+
+    #[test]
+    fn lfm2_split3_deinterleaves_each_token_row() {
+        let device = MetalDevice::new().unwrap();
+        for dtype in [DType::F16, DType::BF16] {
+            let (sequence, hidden) = (3, 5);
+            let source = (0..sequence * hidden * 3)
+                .map(|index| (index as f32 - 13.) / 16.)
+                .collect::<Vec<_>>();
+            let projected =
+                Tensor::from_f32(&device, [sequence, 3 * hidden], dtype, &source).unwrap();
+            let rounded = projected.to_f32();
+            let (b, c, x) = device.lfm2_split3(&projected).unwrap();
+            for (part, actual) in [(0, b), (1, c), (2, x)] {
+                let expected = (0..sequence)
+                    .flat_map(|token| {
+                        let rounded = &rounded;
+                        (0..hidden).map(move |channel| {
+                            rounded[token * 3 * hidden + part * hidden + channel]
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(actual.to_f32(), expected);
+            }
+        }
     }
 }

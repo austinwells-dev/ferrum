@@ -73,6 +73,7 @@ pub struct Generation {
     pub decode_counters: Vec<crate::metal::Counters>,
     pub kv_bytes: usize,
     pub kv_reserved_bytes: usize,
+    pub state_bytes: usize,
     pub prefill_profile: crate::metal::Profile,
     pub decode_profiles: Vec<crate::metal::Profile>,
 }
@@ -126,6 +127,7 @@ pub fn generate(
         decode_counters: Vec::new(),
         kv_bytes: 0,
         kv_reserved_bytes: 0,
+        state_bytes: 0,
         prefill_profile: Default::default(),
         decode_profiles: Vec::new(),
     };
@@ -176,5 +178,6 @@ pub fn generate(
     }
     result.kv_bytes = cache.bytes();
     result.kv_reserved_bytes = cache.reserved_bytes();
+    result.state_bytes = cache.state_bytes();
     Ok(result)
 }

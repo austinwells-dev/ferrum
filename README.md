@@ -1,6 +1,6 @@
 # Ferrum
 
-Ferrum is an independent Rust + Metal LLM runtime for Apple Silicon. Its validated model families include dense Qwen2.5, Qwen3, IBM Granite 4, and AllenAI OLMo 2, plus sparse IBM Granite MoE 3.1. MLX, llama.cpp, PyTorch, Python, and MPSGraph are not runtime dependencies.
+Ferrum is an independent Rust + Metal LLM runtime for Apple Silicon. Its validated model families include dense Qwen2.5, Qwen3, IBM Granite 4, and AllenAI OLMo 2, sparse IBM Granite MoE 3.1, and hybrid LiquidAI LFM2.5-230M. MLX, llama.cpp, PyTorch, Python, and MPSGraph are not runtime dependencies.
 
 Phase 4 adds completion-owned command batching, completion-safe storage reuse, checked contiguous views, growing KV storage, direct grouped attention layouts, vectorized decode GEMV, native SIMD-group prefill GEMM, and parallel reductions. On the tested Apple M5, three warm runs measured **511–514 prefill tok/s and 84–88 decode tok/s** for the pinned 21-token Hello workload. See [Phase 4 results](docs/phase4-results.md) for controls, numerical qualifications, memory, external comparisons and remaining bottlenecks.
 
@@ -21,7 +21,7 @@ cargo run --release -- profile --model /path/to/Qwen2.5-0.5B-Instruct \
   --prompt 'Hello!' --max-new-tokens 8 --temperature 0 --warmup
 ```
 
-Supply an official local checkpoint with its config, tokenizer, and weight files. Validated checkpoints are Qwen2.5-0.5B-Instruct BF16, Qwen3-0.6B and 1.7B BF16, Granite 4.0 350M BF16, OLMo 2 0425 1B F32, and Granite 3.1 1B-A400M BF16 MoE. The official Qwen3-0.6B Q8_0 GGUF also runs through the packed Q8 path. The exact revisions and reference results are in the [Phase 6 journal](docs/phase6-architecture-journal.md); earlier Qwen2 quantized variants remain documented in [Phase 5](docs/phase5-closeout.md). Use `--raw` for plain completion prompts; OLMo 2 has no official chat template. No runtime downloads occur. `run` streams text and a short timing summary; `profile` additionally emits machine-readable `SUMMARY` and per-operation records. `FERRUM_BATCH_LIMIT=1` isolates kernel timestamps but changes execution; use default batching for throughput. `FERRUM_NATIVE_MATMUL=0` selects the diagnostic matrix fallback.
+Supply an official local checkpoint with its config, tokenizer, and weight files. Validated checkpoints are Qwen2.5-0.5B-Instruct BF16, Qwen3-0.6B and 1.7B BF16, Granite 4.0 350M BF16, OLMo 2 0425 1B F32, Granite 3.1 1B-A400M BF16 MoE, and LFM2.5-230M BF16 hybrid. The official Qwen3-0.6B Q8_0 GGUF also runs through the packed Q8 path. The exact revisions and reference results are in the [Phase 6 journal](docs/phase6-architecture-journal.md); earlier Qwen2 quantized variants remain documented in [Phase 5](docs/phase5-closeout.md). Use `--raw` for plain completion prompts; OLMo 2 has no official chat template. No runtime downloads occur. `run` streams text and a short timing summary; `profile` additionally emits machine-readable `SUMMARY` and per-operation records. `FERRUM_BATCH_LIMIT=1` isolates kernel timestamps but changes execution; use default batching for throughput. `FERRUM_NATIVE_MATMUL=0` selects the diagnostic matrix fallback.
 
 ## Validation
 

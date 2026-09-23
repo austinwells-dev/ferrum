@@ -496,6 +496,10 @@ impl MetalDevice {
         self.profiling.set(enabled);
         self.profile.borrow_mut().clear();
     }
+    #[cfg(test)]
+    pub(crate) fn inject_dispatch_failure_after(&self, dispatch_count: Option<usize>) {
+        self.fail_after.set(dispatch_count);
+    }
     pub(crate) fn profiling(&self) -> bool {
         self.profiling.get()
     }
@@ -730,6 +734,7 @@ impl MetalDevice {
         let (input_count, output_count) = match name {
             "expert_project" => (3, 1),
             "lfm2_short_conv" => (4, 2),
+            "lfm2_split3" => (1, 3),
             _ => (2, 1),
         };
         if buffers.len() != input_count + output_count {
