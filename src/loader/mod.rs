@@ -2,11 +2,24 @@
 #![forbid(unsafe_code)]
 pub mod gguf;
 use crate::{DType, Error, MetalDevice, Result, Tensor};
-use safetensors::SafeTensors;
+use safetensors::{SafeTensors, tensor::Metadata};
+use serde::Deserialize;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashMap},
+    fs::File,
+    io::Read,
     path::{Component, Path},
 };
+
+const SAFETENSORS_MAX_HEADER_SIZE: usize = 100_000_000;
+
+#[derive(Deserialize)]
+struct SafetensorsHeader {
+    #[serde(default, rename = "__metadata__")]
+    metadata: Option<HashMap<String, String>>,
+    #[serde(flatten)]
+    tensors: BTreeMap<String, safetensors::tensor::TensorInfo>,
+}
 
 pub struct Weights {
     tensors: BTreeMap<String, Tensor>,
@@ -86,9 +99,72 @@ impl Weights {
     }
 
     pub fn from_file(device: &MetalDevice, path: impl AsRef<Path>) -> Result<Self> {
-        let bytes = std::fs::read(path.as_ref())
-            .map_err(|e| Error::Safetensors(format!("{}: {e}", path.as_ref().display())))?;
-        Self::from_bytes(device, &bytes)
+        let path = path.as_ref();
+        let mut file =
+            File::open(path).map_err(|e| Error::Safetensors(format!("{}: {e}", path.display())))?;
+        let file_len = file
+            .metadata()
+            .map_err(|e| Error::Safetensors(format!("{}: {e}", path.display())))?
+            .len();
+        let mut header_len_bytes = [0; 8];
+        file.read_exact(&mut header_len_bytes)
+            .map_err(|e| Error::Safetensors(format!("{}: {e}", path.display())))?;
+        let header_len_u64 = u64::from_le_bytes(header_len_bytes);
+        let header_len = usize::try_from(header_len_u64)
+            .ok()
+            .filter(|len| *len <= SAFETENSORS_MAX_HEADER_SIZE)
+            .ok_or_else(|| Error::Safetensors("invalid or oversized header length".into()))?;
+        let data_offset = 8u64
+            .checked_add(header_len_u64)
+            .ok_or_else(|| Error::Safetensors("header length overflow".into()))?;
+        if file_len < data_offset {
+            return Err(Error::Safetensors("truncated safetensors header".into()));
+        }
+        let mut header_bytes = vec![0; header_len];
+        file.read_exact(&mut header_bytes)
+            .map_err(|e| Error::Safetensors(format!("{}: {e}", path.display())))?;
+        let header: SafetensorsHeader = serde_json::from_slice(&header_bytes)
+            .map_err(|e| Error::Safetensors(format!("invalid safetensors header: {e}")))?;
+        let mut infos: Vec<_> = header.tensors.into_iter().collect();
+        infos.sort_by_key(|(_, info)| info.data_offsets);
+        let metadata =
+            Metadata::new(header.metadata, infos).map_err(|e| Error::Safetensors(e.to_string()))?;
+        let expected_len = data_offset
+            .checked_add(metadata.data_len() as u64)
+            .ok_or_else(|| Error::Safetensors("safetensors file size overflow".into()))?;
+        if expected_len != file_len {
+            return Err(Error::Safetensors(format!(
+                "safetensors payload length mismatch: expected {expected_len}, found {file_len}"
+            )));
+        }
+
+        let mut tensors = BTreeMap::new();
+        for name in metadata.offset_keys() {
+            let info = metadata
+                .info(&name)
+                .ok_or_else(|| Error::Safetensors(format!("missing metadata for {name}")))?;
+            let dtype = match info.dtype {
+                safetensors::Dtype::F32 => DType::F32,
+                safetensors::Dtype::F16 => DType::F16,
+                safetensors::Dtype::BF16 => DType::BF16,
+                other => {
+                    return Err(Error::Weight {
+                        name,
+                        message: format!("unsupported dtype {other:?}"),
+                    });
+                }
+            };
+            let tensor = Tensor::from_reader(device, &info.shape, dtype, |dst| {
+                file.read_exact(dst)
+                    .map_err(|e| Error::Safetensors(format!("{}: {e}", path.display())))
+            })
+            .map_err(|e| Error::Weight {
+                name: name.clone(),
+                message: e.to_string(),
+            })?;
+            tensors.insert(name, tensor);
+        }
+        Ok(Self { tensors })
     }
     pub fn from_bytes(device: &MetalDevice, bytes: &[u8]) -> Result<Self> {
         let file =

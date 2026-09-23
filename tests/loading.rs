@@ -32,6 +32,8 @@ fn safetensors_dtypes_metadata_and_malformed_files() {
             std::env::temp_dir().join(format!("ferrum-{}-{ty:?}.safetensors", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         let file = Weights::from_file(&d, &path).unwrap();
+        std::fs::write(&path, &bytes[..bytes.len() - 1]).unwrap();
+        assert!(Weights::from_file(&d, &path).is_err());
         std::fs::remove_file(path).unwrap();
         assert_eq!(file.bytes(), loaded.bytes());
     }

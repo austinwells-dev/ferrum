@@ -29,6 +29,8 @@ Official [Qwen model listings](https://huggingface.co/Qwen/models) currently sho
 
 Ferrum already shares embedding, linear, SwiGLU, RMSNorm, RoPE, attention, KV storage, generation, sampling, and packed quantized math. `src/model/qwen.rs`, `qwen_gguf.rs`, and `qwen_mlx.rs` are strict Qwen2-specific adapters. The current `ModelConfig` captures common dimensions, while `DecoderLayer` and `Attention` assume one pre-attention RMSNorm, one post-attention RMSNorm, full attention, and no per-head Q/K normalization. The first policy extension will cover observed Qwen2/Qwen3 differences only; the existing Qwen2 contract must remain the default for current tests and format adapters.
 
+Safetensors file loading now parses and validates the bounded JSON header, checks the public safetensors `Metadata` range/shape validation and exact file length, then streams tensors in offset order directly into their final Metal shared allocations. This avoids holding a complete checkpoint byte vector alongside the model on the host; malformed and truncated files still reject. `from_bytes` remains available for in-memory fixtures and serialized inputs. The implementation uses safe Rust and does not memory-map model files.
+
 The official Transformers 4.57.6 `modeling_qwen3.py` installed in `.venv-reference` applies `q_norm` and `k_norm` after projection and reshape to `[batch, sequence, heads, head_dim]`, before RoPE. The current Ferrum RMSNorm kernel reduces over the last dimension and can implement that operation without new model-specific math.
 
 ## Dense milestone 1: shared Q/K policy and Qwen3
