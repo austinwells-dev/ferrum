@@ -362,6 +362,7 @@ impl MetalDevice {
             "mlx_affine4_gemv",
             "mlx_affine4_gemm",
             "mlx_affine4_gemm_mpp",
+            "mlx_affine4_gemm_mpp_k64",
             "embedding_gather_q4_0",
             "embedding_gather_q5_0",
             "embedding_gather_q5_1",

@@ -1,0 +1,3 @@
+    Finished `release` profile [optimized] target(s) in 0.05s
+     Running `target/release/examples/phase5_matrix /tmp/ferrum-phase5-qwen-bf16 /tmp/ferrum-phase5-mlx-qwen4 3`
+Phase 5 paired matrix: device=Apple M5; BF16 retained=988065536 bytes; MLX affine Q4 group-64 mlx-community/Qwen2.5-0.5B-Instruct-4bit@a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3 source=277996288 bytes; quantized retained=277996288 bytes; packed=277853184 bytes; tensors=628; parameters=494032768; repeats=3

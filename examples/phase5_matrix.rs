@@ -101,8 +101,15 @@ fn main() -> Result<()> {
         )?;
     }
     device.set_profiling(std::env::var_os("FERRUM_MATRIX_PROFILE").is_some());
-    let compare_mpp_direct = std::env::var_os("FERRUM_PHASE5_KERNEL_AB").is_some();
-    if compare_mpp_direct && device.capabilities()?["mpp_available"].as_bool() != Some(true) {
+    let kernel_ab = std::env::var("FERRUM_PHASE5_KERNEL_AB").ok();
+    let compare_mpp_direct = kernel_ab.as_deref() == Some("mpp-direct");
+    let compare_mpp_k64 = kernel_ab.as_deref() == Some("mpp-k64");
+    if kernel_ab.is_some() && !compare_mpp_direct && !compare_mpp_k64 {
+        return Err(Error::Parameter(
+            "FERRUM_PHASE5_KERNEL_AB must be mpp-direct or mpp-k64".into(),
+        ));
+    }
+    if kernel_ab.is_some() && device.capabilities()?["mpp_available"].as_bool() != Some(true) {
         return Err(Error::Parameter(
             "FERRUM_PHASE5_KERNEL_AB requires Metal 4 MPP support".into(),
         ));
@@ -179,10 +186,16 @@ fn main() -> Result<()> {
         if prompt.len() + generated > bf16_model.config().max_context_length {
             return Err(Error::Config(format!("case {label} exceeds model context")));
         }
-        if compare_mpp_direct {
+        if compare_mpp_direct || compare_mpp_k64 {
             // Compile both projection pipelines and warm both paths before timing.
-            for enabled in [true, false] {
-                device.set_native_matmul(enabled)?;
+            let kernel_modes = if compare_mpp_direct {
+                [("mpp-k128", true, false), ("direct", false, false)]
+            } else {
+                [("mpp-k128", true, false), ("mpp-k64", true, true)]
+            };
+            for (_, native_matmul, tile_k64) in kernel_modes {
+                device.set_native_matmul(native_matmul)?;
+                device.set_mlx_affine4_mpp_tile_k64(Some(tile_k64))?;
                 generation::generate(
                     &device,
                     &quantized.model,
@@ -194,14 +207,18 @@ fn main() -> Result<()> {
                 )?;
             }
             device.set_native_matmul(true)?;
+            device.set_mlx_affine4_mpp_tile_k64(None)?;
             for pair in 0..repeats {
                 let order = if pair % 2 == 0 {
-                    [("mpp", true), ("direct", false)]
+                    kernel_modes
                 } else {
-                    [("direct", false), ("mpp", true)]
+                    [kernel_modes[1], kernel_modes[0]]
                 };
-                for (position, (kernel_path, enabled)) in order.into_iter().enumerate() {
-                    device.set_native_matmul(enabled)?;
+                for (position, (kernel_path, native_matmul, tile_k64)) in
+                    order.into_iter().enumerate()
+                {
+                    device.set_native_matmul(native_matmul)?;
+                    device.set_mlx_affine4_mpp_tile_k64(Some(tile_k64))?;
                     run_case(
                         &device,
                         GenerationCase {
@@ -218,6 +235,7 @@ fn main() -> Result<()> {
                 }
             }
             device.set_native_matmul(true)?;
+            device.set_mlx_affine4_mpp_tile_k64(None)?;
             continue;
         }
         for model in [&bf16_model, &quantized.model] {

@@ -266,6 +266,7 @@ pub struct MetalDevice {
     fail_completion: Cell<bool>,
     arena: Rc<RefCell<Arena>>,
     native_matmul: Cell<bool>,
+    mlx_affine4_mpp_tile_k64: Cell<Option<bool>>,
     split_k_gemv: Cell<bool>,
     reference_math: Cell<bool>,
     batching: Cell<bool>,
@@ -300,6 +301,7 @@ impl MetalDevice {
             fail_completion: Cell::new(false),
             arena: Rc::new(RefCell::new(Arena::default())),
             native_matmul: Cell::new(raw.supportsFamily(MTLGPUFamily::Apple7)),
+            mlx_affine4_mpp_tile_k64: Cell::new(None),
             split_k_gemv: Cell::new(true),
             reference_math: Cell::new(false),
             batching: Cell::new(false),
@@ -325,6 +327,23 @@ impl MetalDevice {
         }
         self.native_matmul.set(enabled);
         Ok(())
+    }
+    /// Override the shape-aware MLX affine-Q4 MPP K-tile choice.
+    /// `Some(false)` selects K=128, `Some(true)` selects K=64, and `None`
+    /// restores the production heuristic.
+    pub fn set_mlx_affine4_mpp_tile_k64(&self, enabled: Option<bool>) -> Result<()> {
+        if self.batching.get() || (enabled == Some(true) && !self.mpp_projection()) {
+            return Err(Error::Parameter(
+                "MLX affine-Q4 MPP tile override requires an idle compatible device".into(),
+            ));
+        }
+        self.mlx_affine4_mpp_tile_k64.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn mlx_affine4_mpp_tile_k64(&self, batch_rows: usize) -> bool {
+        self.mlx_affine4_mpp_tile_k64
+            .get()
+            .unwrap_or((512..=1024).contains(&batch_rows))
     }
     /// Select the multi-SIMD split-K BF16 GEMV for large aligned rows.
     pub fn set_split_k_gemv(&self, enabled: bool) -> Result<()> {
@@ -466,7 +485,8 @@ impl MetalDevice {
                 | "q6_k_gemm"
                 | "q8_0_gemm"
                 | "mlx_affine4_gemm"
-                | "mlx_affine4_gemm_mpp" => "lm_head_matmul",
+                | "mlx_affine4_gemm_mpp"
+                | "mlx_affine4_gemm_mpp_k64" => "lm_head_matmul",
                 _ => name,
             }
         } else {
@@ -653,6 +673,7 @@ impl MetalDevice {
                 | "q4_k_gemm_mpp"
                 | "q5_k_gemm_mpp"
                 | "mlx_affine4_gemm_mpp"
+                | "mlx_affine4_gemm_mpp_k64"
                 | "q6_k_gemm_mpp"
                 | "q8_0_gemm_mpp"
                 | "attention_scores_mpp"
@@ -735,6 +756,7 @@ impl MetalDevice {
                 | "q4_k_gemm_mpp"
                 | "q5_k_gemm_mpp"
                 | "mlx_affine4_gemm_mpp"
+                | "mlx_affine4_gemm_mpp_k64"
                 | "q6_k_gemm_mpp"
                 | "q8_0_gemm_mpp"
                 | "attention_scores_mpp"
@@ -809,6 +831,7 @@ impl MetalDevice {
                     | "q4_k_gemm_mpp"
                     | "q5_k_gemm_mpp"
                     | "mlx_affine4_gemm_mpp"
+                    | "mlx_affine4_gemm_mpp_k64"
                     | "q6_k_gemm_mpp"
                     | "q8_0_gemm_mpp"
                     | "attention_scores_mpp"
@@ -830,6 +853,7 @@ impl MetalDevice {
                                 | "q4_k_gemm_mpp"
                                 | "q5_k_gemm_mpp"
                                 | "mlx_affine4_gemm_mpp"
+                                | "mlx_affine4_gemm_mpp_k64"
                                 | "q6_k_gemm_mpp"
                                 | "q8_0_gemm_mpp"
                         ) {
