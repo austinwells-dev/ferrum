@@ -184,31 +184,7 @@ impl QwenConfig {
 pub fn specifications(c: &ModelConfig) -> Vec<(String, String, Vec<usize>)> {
     let mut out = Vec::new();
     for (canonical, shape) in weights::specifications(c) {
-        let official = if canonical == "embedding.weight" {
-            "model.embed_tokens.weight".into()
-        } else if canonical == "final_norm.weight" {
-            "model.norm.weight".into()
-        } else if canonical == "lm_head.weight" {
-            canonical.clone()
-        } else {
-            let mut parts = canonical.split('.');
-            let _ = parts.next();
-            let layer = parts.next().unwrap_or_default();
-            let component = parts.next().unwrap_or_default();
-            let component = match component {
-                "input_norm" => "input_layernorm",
-                "post_norm" => "post_attention_layernorm",
-                "q" => "self_attn.q_proj",
-                "k" => "self_attn.k_proj",
-                "v" => "self_attn.v_proj",
-                "o" => "self_attn.o_proj",
-                "gate" => "mlp.gate_proj",
-                "up" => "mlp.up_proj",
-                "down" => "mlp.down_proj",
-                _ => component,
-            };
-            format!("model.layers.{layer}.{component}.weight")
-        };
+        let official = official_name(&canonical);
         out.push((official, canonical, shape));
     }
     for layer in 0..c.num_layers {
@@ -225,6 +201,35 @@ pub fn specifications(c: &ModelConfig) -> Vec<(String, String, Vec<usize>)> {
         }
     }
     out
+}
+pub(crate) fn official_name(canonical: &str) -> String {
+    if canonical == "embedding.weight" {
+        "model.embed_tokens.weight".into()
+    } else if canonical == "final_norm.weight" {
+        "model.norm.weight".into()
+    } else if canonical == "lm_head.weight" {
+        canonical.into()
+    } else {
+        let mut parts = canonical.split('.');
+        let _ = parts.next();
+        let layer = parts.next().unwrap_or_default();
+        let component = parts.next().unwrap_or_default();
+        let component = match component {
+            "input_norm" => "input_layernorm",
+            "post_norm" => "post_attention_layernorm",
+            "q" => "self_attn.q_proj",
+            "k" => "self_attn.k_proj",
+            "v" => "self_attn.v_proj",
+            "o" => "self_attn.o_proj",
+            "q_norm" => "self_attn.q_norm",
+            "k_norm" => "self_attn.k_norm",
+            "gate" => "mlp.gate_proj",
+            "up" => "mlp.up_proj",
+            "down" => "mlp.down_proj",
+            _ => component,
+        };
+        format!("model.layers.{layer}.{component}.weight")
+    }
 }
 pub fn map_weights(d: &MetalDevice, c: &ModelConfig, source: &Weights) -> Result<Weights> {
     c.validate()?;

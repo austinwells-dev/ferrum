@@ -1,5 +1,6 @@
 use super::{
     ModelConfig,
+    architecture::ArchitecturePolicy,
     weights::{self, DecoderLayer},
 };
 use crate::{
@@ -41,25 +42,46 @@ pub struct Transformer {
     final_norm: RmsNorm,
     lm_head: Linear,
     config: ModelConfig,
+    policy: ArchitecturePolicy,
     weight_bytes: usize,
 }
 impl Transformer {
     pub fn from_weights(d: &MetalDevice, config: ModelConfig, w: &Weights) -> Result<Self> {
+        Self::from_weights_with_policy(d, config, ArchitecturePolicy::default(), w)
+    }
+    pub fn from_weights_with_policy(
+        d: &MetalDevice,
+        config: ModelConfig,
+        policy: ArchitecturePolicy,
+        w: &Weights,
+    ) -> Result<Self> {
         config.validate()?;
-        let (embedding, layers, final_norm, lm_head) = weights::construct(d, &config, w)?;
-        Self::from_parts(config, embedding, layers, final_norm, lm_head)
+        policy.validate()?;
+        let (embedding, layers, final_norm, lm_head) = weights::construct(d, &config, policy, w)?;
+        Self::from_parts(config, policy, embedding, layers, final_norm, lm_head)
     }
     pub(crate) fn from_model_weights(
         d: &MetalDevice,
         config: ModelConfig,
         w: &weights::ModelWeights,
     ) -> Result<Self> {
+        Self::from_model_weights_with_policy(d, config, ArchitecturePolicy::default(), w)
+    }
+    pub(crate) fn from_model_weights_with_policy(
+        d: &MetalDevice,
+        config: ModelConfig,
+        policy: ArchitecturePolicy,
+        w: &weights::ModelWeights,
+    ) -> Result<Self> {
         config.validate()?;
-        let (embedding, layers, final_norm, lm_head) = weights::construct_mixed(d, &config, w)?;
-        Self::from_parts(config, embedding, layers, final_norm, lm_head)
+        policy.validate()?;
+        let (embedding, layers, final_norm, lm_head) =
+            weights::construct_mixed(d, &config, policy, w)?;
+        Self::from_parts(config, policy, embedding, layers, final_norm, lm_head)
     }
     fn from_parts(
         config: ModelConfig,
+        policy: ArchitecturePolicy,
         embedding: Embedding,
         layers: Vec<DecoderLayer>,
         final_norm: RmsNorm,
@@ -74,6 +96,16 @@ impl Transformer {
         for layer in &layers {
             weight_bytes +=
                 layer.input_norm.weight.byte_size() + layer.post_norm.weight.byte_size();
+            weight_bytes += layer
+                .attention
+                .q_norm
+                .as_ref()
+                .map_or(0, |norm| norm.weight.byte_size());
+            weight_bytes += layer
+                .attention
+                .k_norm
+                .as_ref()
+                .map_or(0, |norm| norm.weight.byte_size());
             for linear in [
                 &layer.attention.q,
                 &layer.attention.k,
@@ -93,11 +125,15 @@ impl Transformer {
             final_norm,
             lm_head,
             config,
+            policy,
             weight_bytes,
         })
     }
     pub fn config(&self) -> &ModelConfig {
         &self.config
+    }
+    pub fn policy(&self) -> ArchitecturePolicy {
+        self.policy
     }
     pub fn weight_bytes(&self) -> usize {
         self.weight_bytes

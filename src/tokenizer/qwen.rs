@@ -21,6 +21,50 @@ fn json(path: &Path) -> Result<Value> {
     serde_json::from_slice(&bytes).map_err(|e| Error::Tokenizer(format!("{}: {e}", path.display())))
 }
 impl QwenTokenizer {
+    /// Official Qwen3 simple system/user chat branch. Its thinking-enabled
+    /// generation prefix matches `chat_prompt`; tool calls are outside this API.
+    pub fn load_qwen3(dir: &Path, vocab_size: usize, bos_id: u32, eos_id: u32) -> Result<Self> {
+        let tc = json(&dir.join("tokenizer_config.json"))?;
+        let gc = json(&dir.join("generation_config.json"))?;
+        let bad = |message: &str| Error::Tokenizer(format!("Qwen3 tokenizer mismatch: {message}"));
+        if tc["tokenizer_class"] != "Qwen2Tokenizer"
+            || tc["add_bos_token"] != false
+            || !tc["bos_token"].is_null()
+            || tc["eos_token"] != "<|im_end|>"
+            || tc["pad_token"] != "<|endoftext|>"
+            || tc["clean_up_tokenization_spaces"] != false
+            || !tc["chat_template"].as_str().is_some_and(|template| {
+                template.contains("enable_thinking") && template.contains("<|im_start|>")
+            })
+        {
+            return Err(bad("unsupported special-token or chat-template policy"));
+        }
+        if gc["bos_token_id"] != bos_id
+            || gc["pad_token_id"] != bos_id
+            || gc["eos_token_id"] != serde_json::json!([eos_id, bos_id])
+        {
+            return Err(bad("generation special-token IDs differ from model config"));
+        }
+        let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+        if tokenizer.vocab_size() > vocab_size {
+            return Err(bad("tokenizer vocabulary exceeds embedding rows"));
+        }
+        for (token, id) in [
+            ("<|endoftext|>", bos_id),
+            ("<|im_start|>", 151644),
+            ("<|im_end|>", eos_id),
+        ] {
+            if tokenizer.0.token_to_id(token) != Some(id) || tokenizer.encode(token)? != [id] {
+                return Err(bad(&format!("invalid special token {token}")));
+            }
+        }
+        Ok(Self {
+            tokenizer,
+            eos_ids: vec![eos_id, bos_id],
+            pad_id: bos_id,
+        })
+    }
+
     pub(crate) fn from_gguf(
         tokens: &[String],
         merges: &[String],

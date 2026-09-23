@@ -1,8 +1,12 @@
-//! Strict Qwen2 GGUF adapter. GGUF indexing stays model-agnostic in
+//! Strict Qwen2/Qwen3 GGUF adapter. GGUF indexing stays model-agnostic in
 //! `loader::gguf`; this module maps Qwen names and metadata into Ferrum weights.
 #![forbid(unsafe_code)]
 
-use super::{ModelConfig, Transformer, weights};
+use super::{
+    ModelConfig, Transformer,
+    architecture::{ArchitecturePolicy, ProjectionBias},
+    weights,
+};
 use crate::{
     DType, Error, MetalDevice, Result, Tensor,
     loader::gguf::{GgufFile, MetadataType, MetadataValue, TensorInfo},
@@ -12,6 +16,7 @@ use crate::{
 use std::{collections::HashSet, path::Path};
 
 pub struct LoadedQwenGguf {
+    pub architecture: String,
     pub config: ModelConfig,
     pub model: Transformer,
     pub tokenizer: QwenTokenizer,
@@ -24,11 +29,12 @@ pub struct LoadedQwenGguf {
 pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGguf> {
     let mut reader = GgufFile::open(path)?;
     let architecture = metadata_string(reader.metadata(), "general.architecture")?.to_owned();
-    if architecture != "qwen2" {
+    if architecture != "qwen2" && architecture != "qwen3" {
         return Err(Error::Config(format!(
-            "GGUF architecture {architecture:?} is unsupported; expected qwen2"
+            "GGUF architecture {architecture:?} is unsupported; expected qwen2 or qwen3"
         )));
     }
+    let is_qwen3 = architecture == "qwen3";
     let tied_embeddings = if reader.tensors().contains_key("output.weight") {
         reader.tensors_equal_payload("token_embd.weight", "output.weight")?
     } else {
@@ -44,47 +50,77 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
     }
     if metadata.get("tokenizer.ggml.add_bos_token") != Some(&MetadataValue::Bool(false)) {
         return Err(Error::Tokenizer(
-            "Qwen2 GGUF must disable automatic BOS insertion".into(),
+            "Qwen GGUF must disable automatic BOS insertion".into(),
         ));
     }
 
     let embedding_info = reader.tensor("token_embd.weight")?.clone();
     let embedding_shape = embedding_info.logical_matrix_shape()?;
-    let hidden_size = metadata_usize(metadata, "qwen2.embedding_length")?;
+    let hidden_size = metadata_usize(metadata, &format!("{architecture}.embedding_length"))?;
     if embedding_shape[1] != hidden_size {
         return Err(Error::Config(format!(
             "token_embd.weight hidden dimension {} differs from metadata {hidden_size}",
             embedding_shape[1]
         )));
     }
-    let num_attention_heads = metadata_usize(metadata, "qwen2.attention.head_count")?;
-    let num_key_value_heads = metadata_usize(metadata, "qwen2.attention.head_count_kv")?;
-    let head_dim = match metadata.get("qwen2.rope.dimension_count") {
-        Some(_) => metadata_usize(metadata, "qwen2.rope.dimension_count")?,
-        None if num_attention_heads != 0 && hidden_size.is_multiple_of(num_attention_heads) => {
-            hidden_size / num_attention_heads
+    let num_attention_heads =
+        metadata_usize(metadata, &format!("{architecture}.attention.head_count"))?;
+    let num_key_value_heads =
+        metadata_usize(metadata, &format!("{architecture}.attention.head_count_kv"))?;
+    let head_dim = if is_qwen3 {
+        let key = metadata_usize(metadata, "qwen3.attention.key_length")?;
+        let value = metadata_usize(metadata, "qwen3.attention.value_length")?;
+        if key != value {
+            return Err(Error::Config("Qwen3 K/V head dimensions must match".into()));
         }
-        None => {
-            return Err(Error::Config(
-                "cannot infer head dimension from Qwen2 metadata".into(),
-            ));
+        key
+    } else {
+        match metadata.get("qwen2.rope.dimension_count") {
+            Some(_) => metadata_usize(metadata, "qwen2.rope.dimension_count")?,
+            None if num_attention_heads != 0 && hidden_size.is_multiple_of(num_attention_heads) => {
+                hidden_size / num_attention_heads
+            }
+            None => {
+                return Err(Error::Config(
+                    "cannot infer head dimension from Qwen2 metadata".into(),
+                ));
+            }
+        }
+    };
+    let rms_norm_epsilon = metadata_f32(
+        metadata,
+        &format!("{architecture}.attention.layer_norm_rms_epsilon"),
+    )?;
+    let policy = if is_qwen3 {
+        ArchitecturePolicy {
+            qk_norm_epsilon: Some(rms_norm_epsilon),
+            qkv_bias: ProjectionBias::Forbidden,
+        }
+    } else {
+        ArchitecturePolicy {
+            qk_norm_epsilon: None,
+            qkv_bias: ProjectionBias::Required,
         }
     };
     let config = ModelConfig {
         vocab_size: embedding_shape[0],
         hidden_size,
-        intermediate_size: metadata_usize(metadata, "qwen2.feed_forward_length")?,
-        num_layers: metadata_usize(metadata, "qwen2.block_count")?,
+        intermediate_size: metadata_usize(
+            metadata,
+            &format!("{architecture}.feed_forward_length"),
+        )?,
+        num_layers: metadata_usize(metadata, &format!("{architecture}.block_count"))?,
         num_attention_heads,
         num_key_value_heads,
         head_dim,
-        rms_norm_epsilon: metadata_f32(metadata, "qwen2.attention.layer_norm_rms_epsilon")?,
-        rope_theta: metadata_f32(metadata, "qwen2.rope.freq_base")?,
-        max_context_length: metadata_usize(metadata, "qwen2.context_length")?,
+        rms_norm_epsilon,
+        rope_theta: metadata_f32(metadata, &format!("{architecture}.rope.freq_base"))?,
+        max_context_length: metadata_usize(metadata, &format!("{architecture}.context_length"))?,
         tie_word_embeddings: tied_embeddings,
         dtype: DType::BF16,
     };
     config.validate()?;
+    policy.validate()?;
 
     let tokens = metadata_string_array(metadata, "tokenizer.ggml.tokens")?;
     let merges = metadata_string_array(metadata, "tokenizer.ggml.merges")?;
@@ -107,7 +143,7 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
 
     let mut source_names = HashSet::new();
     let mut expected = Vec::new();
-    for (canonical, shape) in weights::specifications(&config) {
+    for (canonical, shape) in weights::specifications_with_policy(&config, policy) {
         let source = gguf_weight_name(&canonical)?;
         source_names.insert(source.clone());
         expected.push((source, canonical, shape));
@@ -117,26 +153,27 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
         source_names.insert("output.weight".into());
     }
     let mut biases = Vec::with_capacity(config.num_layers * 3 + 1);
-    for layer in 0..config.num_layers {
-        for (short_name, length) in [
-            ("q", config.num_attention_heads * config.head_dim),
-            ("k", config.num_key_value_heads * config.head_dim),
-            ("v", config.num_key_value_heads * config.head_dim),
-        ] {
-            let source = format!(
-                "blk.{layer}.attn_{}.bias",
-                match short_name {
-                    "q" => "q",
-                    "k" => "k",
-                    _ => "v",
-                }
-            );
-            let canonical = format!("layers.{layer}.{short_name}.bias");
-            source_names.insert(source.clone());
-            biases.push((source, canonical, vec![length]));
+    if !is_qwen3 {
+        for layer in 0..config.num_layers {
+            for (short_name, length) in [
+                ("q", config.num_attention_heads * config.head_dim),
+                ("k", config.num_key_value_heads * config.head_dim),
+                ("v", config.num_key_value_heads * config.head_dim),
+            ] {
+                let source = format!("blk.{layer}.attn_{short_name}.bias");
+                let canonical = format!("layers.{layer}.{short_name}.bias");
+                source_names.insert(source.clone());
+                biases.push((source, canonical, vec![length]));
+            }
         }
     }
     if reader.tensors().contains_key("output.bias") {
+        if is_qwen3 {
+            return Err(Error::Weight {
+                name: "output.bias".into(),
+                message: "Qwen3 output projection has no bias".into(),
+            });
+        }
         source_names.insert("output.bias".into());
         biases.push((
             "output.bias".into(),
@@ -176,7 +213,7 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
         if !source_names.contains(source) {
             return Err(Error::Weight {
                 name: source.clone(),
-                message: "unexpected tensor for supported Qwen2 GGUF contract".into(),
+                message: "unexpected tensor for supported Qwen GGUF contract".into(),
             });
         }
     }
@@ -245,8 +282,10 @@ pub fn load(device: &MetalDevice, path: impl AsRef<Path>) -> Result<LoadedQwenGg
                 .checked_add(elements)
                 .ok_or_else(|| Error::Gguf("total parameter count overflow".into()))
         })?;
-    let model = Transformer::from_model_weights(device, config.clone(), &mixed)?;
+    let model =
+        Transformer::from_model_weights_with_policy(device, config.clone(), policy, &mixed)?;
     Ok(LoadedQwenGguf {
+        architecture,
         config,
         model,
         tokenizer,
@@ -365,6 +404,8 @@ fn gguf_weight_name(canonical: &str) -> Result<String> {
         "k" => "attn_k",
         "v" => "attn_v",
         "o" => "attn_output",
+        "q_norm" => "attn_q_norm",
+        "k_norm" => "attn_k_norm",
         "gate" => "ffn_gate",
         "up" => "ffn_up",
         "down" => "ffn_down",
@@ -384,7 +425,7 @@ fn source_shape(info: &TensorInfo) -> Result<Vec<usize>> {
         2 => Ok(vec![info.dimensions[1], info.dimensions[0]]),
         _ => Err(Error::Weight {
             name: info.name.clone(),
-            message: format!("unsupported Qwen2 tensor rank {}", info.dimensions.len()),
+            message: format!("unsupported Qwen tensor rank {}", info.dimensions.len()),
         }),
     }
 }
@@ -395,7 +436,7 @@ fn validate_tensor_type(info: &TensorInfo, rank: usize, name: &str) -> Result<()
         2 | 6 | 7 | 8 | 12 | 13 | 14 if rank == 2 => Ok(()),
         type_id => Err(Error::Weight {
             name: name.into(),
-            message: format!("unsupported GGML type {type_id} for Qwen2 tensor"),
+            message: format!("unsupported GGML type {type_id} for Qwen tensor"),
         }),
     }
 }

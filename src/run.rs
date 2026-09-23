@@ -4,7 +4,7 @@ use ferrum::{
     loader::Weights,
     model::{
         qwen::{self, QwenConfig},
-        qwen_gguf, qwen_mlx,
+        qwen_gguf, qwen_mlx, qwen3,
     },
     sampling::{Sampler, SamplingConfig},
     tokenizer::qwen::{DEFAULT_SYSTEM, QwenTokenizer},
@@ -174,13 +174,22 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             std::time::Duration::ZERO,
             std::time::Duration::ZERO,
             allocated,
-            "Qwen2 GGUF",
+            if loaded.architecture == "qwen3" {
+                "Qwen3 GGUF"
+            } else {
+                "Qwen2 GGUF"
+            },
         )
     } else {
-        let qc = QwenConfig::from_file(o.model.join("config.json"))?;
-        if qc.extra.contains_key("quantization") {
+        let config_path = o.model.join("config.json");
+        let metadata: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&config_path)
+                .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))?,
+        )
+        .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))?;
+        if metadata["model_type"] == "qwen3" {
             let before = d.counters();
-            let loaded = qwen_mlx::load(d, &o.model)?;
+            let loaded = qwen3::load(d, &o.model)?;
             let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
             (
                 loaded.config,
@@ -189,49 +198,75 @@ pub fn run(d: &MetalDevice) -> Result<()> {
                 loaded.source_tensor_bytes,
                 loaded.tensor_count,
                 loaded.parameter_count,
-                loaded.quantized_tensor_bytes,
+                0,
                 loaded.config_tokenizer_load,
                 loaded.weight_load,
                 loaded.construction,
                 allocated,
-                "Qwen2 MLX affine Q4",
+                "Qwen3 safetensors",
             )
+        } else if metadata["model_type"] == "qwen2" {
+            let qc = QwenConfig::from_file(&config_path)?;
+            if qc.extra.contains_key("quantization") {
+                let before = d.counters();
+                let loaded = qwen_mlx::load(d, &o.model)?;
+                let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
+                (
+                    loaded.config,
+                    loaded.tokenizer,
+                    loaded.model,
+                    loaded.source_tensor_bytes,
+                    loaded.tensor_count,
+                    loaded.parameter_count,
+                    loaded.quantized_tensor_bytes,
+                    loaded.config_tokenizer_load,
+                    loaded.weight_load,
+                    loaded.construction,
+                    allocated,
+                    "Qwen2 MLX affine Q4",
+                )
+            } else {
+                let start = Instant::now();
+                let c = qc.convert()?;
+                let tok = QwenTokenizer::load(&o.model, &qc)?;
+                let tokenizer_load = start.elapsed();
+                let start = Instant::now();
+                let source = Weights::from_file(d, o.model.join("model.safetensors"))?;
+                let weight_load = start.elapsed();
+                let source_bytes = source.bytes();
+                let tensor_count = source.names().count();
+                let parameter_count = source.names().try_fold(0usize, |total, name| {
+                    total
+                        .checked_add(source.get(name)?.numel())
+                        .ok_or_else(|| Error::Shape("source parameter count overflow".into()))
+                })?;
+                let before = d.counters();
+                let start = Instant::now();
+                let model = qwen::construct(d, c.clone(), &source)?;
+                let construction = start.elapsed();
+                let construction_bytes =
+                    generation::counter_delta(before, d.counters()).allocated_bytes;
+                drop(source);
+                (
+                    c,
+                    tok,
+                    model,
+                    source_bytes,
+                    tensor_count,
+                    parameter_count,
+                    0,
+                    tokenizer_load,
+                    weight_load,
+                    construction,
+                    construction_bytes,
+                    "Qwen2.5-0.5B-Instruct safetensors",
+                )
+            }
         } else {
-            let start = Instant::now();
-            let c = qc.convert()?;
-            let tok = QwenTokenizer::load(&o.model, &qc)?;
-            let tokenizer_load = start.elapsed();
-            let start = Instant::now();
-            let source = Weights::from_file(d, o.model.join("model.safetensors"))?;
-            let weight_load = start.elapsed();
-            let source_bytes = source.bytes();
-            let tensor_count = source.names().count();
-            let parameter_count = source.names().try_fold(0usize, |total, name| {
-                total
-                    .checked_add(source.get(name)?.numel())
-                    .ok_or_else(|| Error::Shape("source parameter count overflow".into()))
-            })?;
-            let before = d.counters();
-            let start = Instant::now();
-            let model = qwen::construct(d, c.clone(), &source)?;
-            let construction = start.elapsed();
-            let construction_bytes =
-                generation::counter_delta(before, d.counters()).allocated_bytes;
-            drop(source);
-            (
-                c,
-                tok,
-                model,
-                source_bytes,
-                tensor_count,
-                parameter_count,
-                0,
-                tokenizer_load,
-                weight_load,
-                construction,
-                construction_bytes,
-                "Qwen2.5-0.5B-Instruct safetensors",
-            )
+            return Err(Error::Config(format!(
+                "unsupported model_type {:?}",
+                metadata["model_type"]
+            )));
         }
     };
     let start = Instant::now();

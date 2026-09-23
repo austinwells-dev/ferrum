@@ -1,4 +1,4 @@
-use super::{Linear, kv_cache::KvCache};
+use super::{Linear, RmsNorm, kv_cache::KvCache};
 use crate::{Error, MetalDevice, Result, Tensor};
 /// Optional diagnostic snapshots; retaining them is explicitly opt-in.
 pub type Trace = std::collections::BTreeMap<String, Tensor>;
@@ -12,6 +12,8 @@ pub struct Attention {
     pub k: Linear,
     pub v: Linear,
     pub output: Linear,
+    pub q_norm: Option<RmsNorm>,
+    pub k_norm: Option<RmsNorm>,
     pub q_heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
@@ -38,15 +40,21 @@ impl Attention {
             return Err(Error::Shape("attention needs [S,hidden]".into()));
         }
         let offset = cache.layer_len(layer)?;
-        let q = d
+        let mut q = d
             .profile_projection("q_proj", || self.q.forward(d, x))?
             .reshape([s, self.q_heads, self.head_dim])?;
-        let k = d
+        let mut k = d
             .profile_projection("k_proj", || self.k.forward(d, x))?
             .reshape([s, self.kv_heads, self.head_dim])?;
         let v = d
             .profile_projection("v_proj", || self.v.forward(d, x))?
             .reshape([s, self.kv_heads, self.head_dim])?;
+        if let Some(norm) = &self.q_norm {
+            q = norm.forward(d, &q)?;
+        }
+        if let Some(norm) = &self.k_norm {
+            k = norm.forward(d, &k)?;
+        }
         let prefix = format!("layer.{layer}");
         for (name, t) in [("q", &q), ("k", &k), ("v", &v)] {
             record(&mut trace, format!("{prefix}.{name}"), t);

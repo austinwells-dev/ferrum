@@ -6,6 +6,8 @@ use ferrum::{
 };
 use std::path::Path;
 
+// Each measurement example consumes a different subset of this shared record.
+#[allow(dead_code)]
 pub struct QuantizedModel {
     pub config: ModelConfig,
     pub model: Transformer,

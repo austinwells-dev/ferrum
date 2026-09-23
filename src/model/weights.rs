@@ -1,4 +1,7 @@
-use super::ModelConfig;
+use super::{
+    ModelConfig,
+    architecture::{ArchitecturePolicy, ProjectionBias},
+};
 use crate::{
     Error, MetalDevice, Result, Tensor,
     loader::Weights,
@@ -49,6 +52,12 @@ impl ModelWeights {
     }
 }
 pub(crate) fn specifications(c: &ModelConfig) -> Vec<(String, Vec<usize>)> {
+    specifications_with_policy(c, ArchitecturePolicy::default())
+}
+pub(crate) fn specifications_with_policy(
+    c: &ModelConfig,
+    policy: ArchitecturePolicy,
+) -> Vec<(String, Vec<usize>)> {
     let h = c.hidden_size;
     let q = c.num_attention_heads * c.head_dim;
     let k = c.num_key_value_heads * c.head_dim;
@@ -74,8 +83,26 @@ pub(crate) fn specifications(c: &ModelConfig) -> Vec<(String, Vec<usize>)> {
         ] {
             specs.push((format!("layers.{l}.{name}"), shape));
         }
+        if policy.qk_norm_epsilon.is_some() {
+            for name in ["q_norm.weight", "k_norm.weight"] {
+                specs.push((format!("layers.{l}.{name}"), vec![c.head_dim]));
+            }
+        }
     }
     specs
+}
+fn check_qkv_bias(policy: ArchitecturePolicy, present: bool, name: &str) -> Result<()> {
+    match (policy.qkv_bias, present) {
+        (ProjectionBias::Required, false) => Err(Error::Weight {
+            name: name.into(),
+            message: "required Q/K/V projection bias is missing".into(),
+        }),
+        (ProjectionBias::Forbidden, true) => Err(Error::Weight {
+            name: name.into(),
+            message: "Q/K/V projection bias is forbidden by architecture policy".into(),
+        }),
+        _ => Ok(()),
+    }
 }
 pub(crate) fn checked(
     w: &Weights,
@@ -114,14 +141,15 @@ pub(crate) fn checked(
 pub(crate) fn construct(
     d: &MetalDevice,
     c: &ModelConfig,
+    policy: ArchitecturePolicy,
     w: &Weights,
 ) -> Result<(Embedding, Vec<DecoderLayer>, RmsNorm, Linear)> {
     // Complete validation precedes any preprocessing dispatch.
-    for (name, shape) in specifications(c) {
+    for (name, shape) in specifications_with_policy(c, policy) {
         checked(w, &name, &shape, c, d)?;
     }
     for l in 0..c.num_layers {
-        for (name, out) in [
+        for (component, out) in [
             ("q", c.num_attention_heads * c.head_dim),
             ("k", c.num_key_value_heads * c.head_dim),
             ("v", c.num_key_value_heads * c.head_dim),
@@ -130,7 +158,10 @@ pub(crate) fn construct(
             ("up", c.intermediate_size),
             ("down", c.hidden_size),
         ] {
-            let name = format!("layers.{l}.{name}.bias");
+            let name = format!("layers.{l}.{component}.bias");
+            if matches!(component, "q" | "k" | "v") {
+                check_qkv_bias(policy, w.optional(&name).is_some(), &name)?;
+            }
             if w.optional(&name).is_some() {
                 checked(w, &name, &[out], c, d)?;
             }
@@ -152,6 +183,17 @@ pub(crate) fn construct(
             w.optional(&format!("{name}.bias")).cloned(),
         )
     };
+    let head_norm = |name: &str| -> Result<Option<RmsNorm>> {
+        policy
+            .qk_norm_epsilon
+            .map(|epsilon| {
+                Ok(RmsNorm {
+                    weight: w.get(name)?.clone(),
+                    epsilon,
+                })
+            })
+            .transpose()
+    };
     let mut layers = Vec::new();
     for l in 0..c.num_layers {
         let p = format!("layers.{l}");
@@ -163,6 +205,8 @@ pub(crate) fn construct(
                 k: linear(&format!("{p}.k"))?,
                 v: linear(&format!("{p}.v"))?,
                 output: linear(&format!("{p}.o"))?,
+                q_norm: head_norm(&format!("{p}.q_norm.weight"))?,
+                k_norm: head_norm(&format!("{p}.k_norm.weight"))?,
                 q_heads: c.num_attention_heads,
                 kv_heads: c.num_key_value_heads,
                 head_dim: c.head_dim,
@@ -194,10 +238,11 @@ pub(crate) fn construct(
 pub(crate) fn construct_mixed(
     d: &MetalDevice,
     c: &ModelConfig,
+    policy: ArchitecturePolicy,
     w: &ModelWeights,
 ) -> Result<(Embedding, Vec<DecoderLayer>, RmsNorm, Linear)> {
     c.validate()?;
-    for (name, shape) in specifications(c) {
+    for (name, shape) in specifications_with_policy(c, policy) {
         let weight = w.get(&name)?;
         if weight.dimensions() != shape {
             return Err(Error::Weight {
@@ -251,6 +296,7 @@ pub(crate) fn construct_mixed(
             ("v", c.num_key_value_heads * c.head_dim),
         ] {
             let name = format!("layers.{l}.{name}.bias");
+            check_qkv_bias(policy, w.tensors.contains_key(&name), &name)?;
             if let Some(weight) = w.tensors.get(&name) {
                 check_dense_vector(d, &name, weight, out, c.dtype)?;
             }
@@ -296,6 +342,17 @@ pub(crate) fn construct_mixed(
             }
         }
     };
+    let head_norm = |name: &str| -> Result<Option<RmsNorm>> {
+        policy
+            .qk_norm_epsilon
+            .map(|epsilon| {
+                Ok(RmsNorm {
+                    weight: dense(name)?,
+                    epsilon,
+                })
+            })
+            .transpose()
+    };
 
     let mut layers = Vec::with_capacity(c.num_layers);
     for layer in 0..c.num_layers {
@@ -308,6 +365,8 @@ pub(crate) fn construct_mixed(
                 k: linear(&format!("{prefix}.k"))?,
                 v: linear(&format!("{prefix}.v"))?,
                 output: linear(&format!("{prefix}.o"))?,
+                q_norm: head_norm(&format!("{prefix}.q_norm.weight"))?,
+                k_norm: head_norm(&format!("{prefix}.k_norm.weight"))?,
                 q_heads: c.num_attention_heads,
                 kv_heads: c.num_key_value_heads,
                 head_dim: c.head_dim,

@@ -79,3 +79,49 @@ fn byte_level_bpe_tokenizer_fixture() {
     assert_eq!(t.encode("hi!").unwrap(), vec![2, 3]);
     assert_eq!(t.decode(&[2, 3]).unwrap(), "hi!");
 }
+
+#[test]
+fn indexed_safetensors_shards_verify_names_assignments_and_size() {
+    let device = MetalDevice::new().unwrap();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("ferrum-shards-{}-{stamp}", std::process::id()));
+    std::fs::create_dir(&dir).unwrap();
+    for (filename, name, data) in [
+        ("first.safetensors", "a.weight", [0x80, 0x3f, 0x00, 0x40]),
+        ("second.safetensors", "b.weight", [0x40, 0x40, 0x80, 0x40]),
+    ] {
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::BF16, vec![2], &data).unwrap();
+        let bytes = safetensors::serialize([(name, view)], None).unwrap();
+        std::fs::write(dir.join(filename), bytes).unwrap();
+    }
+    let index_path = dir.join("model.safetensors.index.json");
+    let index = serde_json::json!({
+        "metadata": {"total_size": 8},
+        "weight_map": {
+            "a.weight": "first.safetensors",
+            "b.weight": "second.safetensors"
+        }
+    });
+    std::fs::write(&index_path, index.to_string()).unwrap();
+    let loaded = Weights::from_directory(&device, &dir).unwrap();
+    assert_eq!(loaded.names().collect::<Vec<_>>(), ["a.weight", "b.weight"]);
+    assert_eq!(loaded.bytes(), 8);
+    assert_eq!(loaded.get("a.weight").unwrap().to_f32(), [1., 2.]);
+
+    let mut bad = index.clone();
+    bad["weight_map"]["b.weight"] = serde_json::json!("first.safetensors");
+    std::fs::write(&index_path, bad.to_string()).unwrap();
+    assert!(Weights::from_directory(&device, &dir).is_err());
+    bad["weight_map"]["b.weight"] = serde_json::json!("../second.safetensors");
+    std::fs::write(&index_path, bad.to_string()).unwrap();
+    assert!(Weights::from_directory(&device, &dir).is_err());
+    bad = index;
+    bad["metadata"]["total_size"] = serde_json::json!(9);
+    std::fs::write(&index_path, bad.to_string()).unwrap();
+    assert!(Weights::from_directory(&device, &dir).is_err());
+    std::fs::remove_dir_all(dir).unwrap();
+}
