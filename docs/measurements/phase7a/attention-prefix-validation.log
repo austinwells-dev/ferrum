@@ -1,0 +1,11 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.66s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 1 test
+2026-09-24 23:45:12.714 ferrum-508026e7fa9bdb9b[71716:6913144] Metal API Validation Enabled
+2026-09-24 23:45:12.715 ferrum-508026e7fa9bdb9b[71716:6913144] Metal GPU Validation Enabled
+test ops::transformer::fusion_tests::attention_softmax_prefix_matches_full_scan_for_causal_tails ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 82 filtered out; finished in 0.99s
+

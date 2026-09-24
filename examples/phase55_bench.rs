@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Persistent JSON-lines runner for paired Phase 5.5 external comparisons.
 //! Model loading is outside per-generation timings; each request starts with a fresh KV state.
 #[path = "support/phase5_common.rs"]
@@ -141,6 +143,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
     let pair = request_usize(request, "pair")?;
     let pair_order = request_string(request, "pair_order")?;
     let warmup = request["warmup"].as_bool().unwrap_or(false);
+    let attention_softmax_prefix = match request.get("attention_softmax_prefix") {
+        None | Some(Value::Null) => {
+            device.set_attention_softmax_prefix(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_attention_softmax_prefix(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field attention_softmax_prefix must be a boolean".into(),
+            ));
+        }
+    };
     let gguf_mpp_min_rows = match request.get("gguf_mpp_min_rows") {
         None | Some(Value::Null) => device.gguf_mpp_min_rows(),
         Some(value) => {
@@ -283,6 +300,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "pair": pair,
         "pair_order": pair_order,
         "warmup": warmup,
+        "attention_softmax_prefix": attention_softmax_prefix,
         "gguf_mpp_min_rows": gguf_mpp_min_rows,
         "moe_expert_tensorops": expert_tensorops,
         "moe_expert_tensorops_tile_k64": expert_tensorops_tile_k64,

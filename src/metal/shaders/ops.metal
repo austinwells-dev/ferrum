@@ -165,6 +165,26 @@ kernel void attention_softmax(ARGS, uint tid [[thread_index_in_threadgroup]], ui
     sum=simd_sum(lane<8?partial[lane]:0.f);
     for(uint j=tid;j<w;j+=256) store(c,base+j,p[4],exp(attention_scaled(a,base+j,j,row,p)-mx)/sum);
 }
+kernel void attention_softmax_prefix(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[8];
+    uint w=p[1], sequence=p[2], base=row*w, end=p[5]+row%sequence+1;
+    uint lane=tid%32, simd=tid/32;
+    float mx=-INFINITY;
+    for(uint j=tid;j<end;j+=256) mx=max(mx,attention_scaled(a,base+j,j,row,p));
+    mx=simd_max(mx);
+    if(lane==0) partial[simd]=mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx=simd_max(lane<8?partial[lane]:-INFINITY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum=0;
+    for(uint j=tid;j<end;j+=256) sum+=exp(attention_scaled(a,base+j,j,row,p)-mx);
+    sum=simd_sum(sum);
+    if(lane==0) partial[simd]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum=simd_sum(lane<8?partial[lane]:0.f);
+    for(uint j=tid;j<end;j+=256) store(c,base+j,p[4],exp(attention_scaled(a,base+j,j,row,p)-mx)/sum);
+    for(uint j=end+tid;j<w;j+=256) store(c,base+j,p[4],0.f);
+}
 // Adjacent-pair (interleaved) RoPE. The same supplied position applies to all heads.
 kernel void rope(ARGS, uint pair [[thread_position_in_grid]]) {
     uint i=pair*2; if(i>=p[0]) return;

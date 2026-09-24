@@ -267,6 +267,7 @@ pub struct MetalDevice {
     arena: Rc<RefCell<Arena>>,
     native_matmul: Cell<bool>,
     gguf_mpp_min_rows: Cell<Option<usize>>,
+    attention_softmax_prefix: Cell<bool>,
     q8_0_mpp_tile_k64: Cell<bool>,
     q5_1_mpp_tile_k64: Cell<bool>,
     q4_k_mpp_tile_k64: Cell<bool>,
@@ -315,6 +316,7 @@ impl MetalDevice {
             arena: Rc::new(RefCell::new(Arena::default())),
             native_matmul: Cell::new(raw.supportsFamily(MTLGPUFamily::Apple7)),
             gguf_mpp_min_rows: Cell::new(None),
+            attention_softmax_prefix: Cell::new(true),
             q8_0_mpp_tile_k64: Cell::new(true),
             q5_1_mpp_tile_k64: Cell::new(true),
             q4_k_mpp_tile_k64: Cell::new(true),
@@ -370,6 +372,20 @@ impl MetalDevice {
     /// Returns the explicit GGUF MPP row override, or `None` for automatic dispatch.
     pub fn gguf_mpp_min_rows(&self) -> Option<usize> {
         self.gguf_mpp_min_rows.get()
+    }
+    /// Enable or disable prefix-bounded causal softmax for measured full-prefill shapes.
+    /// The default is enabled; dispatch uses it only when M equals context width and M>=256.
+    pub fn set_attention_softmax_prefix(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "attention softmax variant can only change on an idle device".into(),
+            ));
+        }
+        self.attention_softmax_prefix.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn attention_softmax_prefix(&self, rows: usize, width: usize) -> bool {
+        self.attention_softmax_prefix.get() && rows >= 256 && rows == width
     }
     /// Select 64-element K tiles for Q8_0 MPP prompt GEMM.
     pub fn set_q8_0_mpp_tile_k64(&self, enabled: bool) -> Result<()> {
@@ -990,7 +1006,11 @@ impl MetalDevice {
         let required = if tiled
             || matches!(
                 name,
-                "rmsnorm" | "softmax" | "attention_softmax" | "attention_context_decode"
+                "rmsnorm"
+                    | "softmax"
+                    | "attention_softmax"
+                    | "attention_softmax_prefix"
+                    | "attention_context_decode"
             ) {
             256
         } else if matches!(
@@ -1237,7 +1257,11 @@ impl MetalDevice {
                 );
             } else if matches!(
                 name,
-                "rmsnorm" | "softmax" | "attention_softmax" | "attention_context_decode"
+                "rmsnorm"
+                    | "softmax"
+                    | "attention_softmax"
+                    | "attention_softmax_prefix"
+                    | "attention_context_decode"
             ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 256
                 {

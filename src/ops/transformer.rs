@@ -609,14 +609,12 @@ impl MetalDevice {
         p[2] = index(dims[1])?;
         p[5] = index(offset)?;
         p[7] = scale.to_bits();
-        self.run(
-            "attention_softmax",
-            scores,
-            None,
-            dims,
-            p,
-            [scores.numel() / dims[2], 1],
-        )
+        let kernel = if self.attention_softmax_prefix(dims[1], dims[2]) {
+            "attention_softmax_prefix"
+        } else {
+            "attention_softmax"
+        };
+        self.run(kernel, scores, None, dims, p, [scores.numel() / dims[2], 1])
     }
     pub(crate) fn attention_context(&self, probs: &Tensor, v: &Tensor) -> Result<Output> {
         let a = probs.shape().dimensions();
@@ -882,6 +880,56 @@ mod fusion_tests {
                 let a = d.softmax(&a).unwrap().tensor;
                 let b = d.attention_softmax(&x, offset, scale).unwrap().tensor;
                 assert_eq!(a.to_f32(), b.to_f32(), "{dtype:?} S={s} P={offset}");
+            }
+        }
+    }
+
+    #[test]
+    fn attention_softmax_prefix_matches_full_scan_for_causal_tails() {
+        let d = MetalDevice::new().unwrap();
+        d.set_attention_softmax_prefix(true).unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for (s, offset) in [
+                (1, 0),
+                (5, 3),
+                (17, 256),
+                (64, 64),
+                (128, 0),
+                (128, 128),
+                (256, 0),
+                (256, 256),
+            ] {
+                let shape = [2, s, s + offset];
+                let values = crate::reference::deterministic(shape.iter().product());
+                let x = Tensor::from_f32(&d, shape, dtype, &values).unwrap();
+                let expected = d
+                    .attention_softmax(&x, offset, 64f32.sqrt().recip())
+                    .unwrap();
+                let kernel = if s >= 256 && offset == 0 {
+                    "attention_softmax_prefix"
+                } else {
+                    "attention_softmax"
+                };
+                assert_eq!(
+                    expected.metrics.operation, kernel,
+                    "{dtype:?} S={s} P={offset}"
+                );
+                d.set_attention_softmax_prefix(false).unwrap();
+                let reference = d
+                    .attention_softmax(&x, offset, 64f32.sqrt().recip())
+                    .unwrap();
+                d.set_attention_softmax_prefix(true).unwrap();
+                let actual = expected.tensor.to_f32();
+                let reference = reference.tensor.to_f32();
+                let mismatch = actual
+                    .iter()
+                    .zip(&reference)
+                    .position(|(actual, reference)| actual != reference);
+                assert!(
+                    mismatch.is_none(),
+                    "{dtype:?} S={s} P={offset} mismatch={:?}",
+                    mismatch.map(|i| (i, actual[i], reference[i]))
+                );
             }
         }
     }
