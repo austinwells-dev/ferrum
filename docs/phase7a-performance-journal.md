@@ -497,3 +497,38 @@ Artifact SHA-256: `ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff768
 | Sustained decode | K=128 | 552.1→547.7 / 1,429.8 [0.388→0.383; 1.003] | 128.3→128.3 / 199.5 [0.644→0.644; 1.000] | 120.8→120.8 / 188.9 [0.638→0.640; 1.000] | 38.4→38.7 / 14.9 [2.559→2.591; 0.997] | C=K 3/3; K=L 0/3 |
 
 At 512 and 1,024 prompt tokens, all three paired runs improved prefill for both models: Qwen3 median candidate/control ratios were 1.086 and 1.083; Qwen2.5 ratios were 1.072 and 1.093. First-token latency and complete-generation throughput improved in these long-prefill workloads; cached-decode kernels were unchanged. Prefill ratios versus llama.cpp rose from 0.399→0.434 and 0.480→0.520 for Qwen3, and 0.426→0.460 and 0.439→0.479 for Qwen2.5. The general Phase 7 gate remains unmet.
+
+
+## Experiment 13: Q4_K MPP K=64 tile for 1,024-row prefill
+
+Status: retained for Q4_K Metal 4 MPP projections with `M >= 1024`; smaller batches keep the existing K=128 tile.
+
+Q4_K GGUF blocks contain a superblock scale/minimum and per-32-value 6-bit scale/minimum fields, so their packed payload is not a zero-copy native int4 TensorOps operand. This candidate keeps the exact existing BF16 dequantization and Metal 4 `matmul2d` path, but stages a 64x64 weight tile (8 KiB) instead of a 64x128 tile (16 KiB). The K=64 kernel makes two MPP calls per old K=128 tile. M=1 decode remains on the direct Q4_K GEMV shader.
+
+The correctness test used M=1,025, N=65, K=256, covering batch and output tails plus multiple K tiles. It compared the candidate against a scalar reference using the BF16-rounded inputs and weights. The focused test passed with Metal API Validation and GPU Shader Validation enabled. The production selector only enables K=64 at M>=1,024; the ordinary Q4_K projection dispatch remains unchanged at smaller M.
+
+The Qwen2.5-0.5B Q4_K_M release A/B used the pinned GGUF and llama.cpp reference, five workloads, and three interleaved control/candidate/reference pairs. The LFM2.5-8B-A1B Q4_K_M cross-check used the pinned artifact and the same 1,024-token prompt IDs for three pairs. Ferrum outputs matched control in all 18 pairs; LFM matched llama.cpp in all three pairs for this case. In Qwen2.5 at M=1,024, all three pairs improved prefill, complete-generation throughput, and first-token latency. The LFM median also improved across the three pairs, with one pair slightly slower; its paired prefill ratios ranged 0.984–1.051x and full-generation ratios 0.987–1.038x. The small decode changes are measurement noise because the decode kernel was untouched.
+
+Each throughput entry shows Ferrum control → K=64 candidate / llama.cpp in tok/s, followed by `[control/llama → candidate/llama; candidate/control]`. Ratios are medians of paired ratios. First-token latency is shown as control → candidate / llama.cpp in milliseconds. `K=128` rows use the same established kernel in both variants under the final shape guard.
+
+### Qwen2.5-0.5B Q4_K_M
+
+Artifact SHA-256: `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`. Final-dispatch matrix: `qwen2.5-q4_k_m-q4kk64-m1024-ab.jsonl` and `.run.log`. The earlier `q4kk64-ab` files preserve the shape sweep that led to the M>=1,024 threshold.
+
+| Workload | Tile | Prefill tok/s | Cached decode tok/s | Complete generation tok/s | First-token latency ms | IDs |
+|---|---|---:|---:|---:|---:|---|
+| Short | K=128 | 741.1→739.8 / 1,406.8 [0.538→0.522; 1.004] | 122.1→122.2 / 235.2 [0.515→0.518; 1.002] | 104.4→103.4 / 196.4 [0.532→0.529; 0.991] | 28.6→28.7 / 15.2 | C=K 3/3; K=L 0/3 |
+| 128 | K=128 | 3,534.9→3,526.1 / 6,919.6 [0.513→0.510; 0.993] | 124.0→123.5 / 241.2 [0.516→0.512; 0.993] | 100.5→100.3 / 189.3 [0.533→0.529; 0.998] | 36.5→36.6 / 18.8 | C=K 3/3; K=L 3/3 |
+| 512 | K=128 | 4,952.0→4,988.7 / 9,354.2 [0.529→0.534; 1.007] | 116.5→117.2 / 233.6 [0.499→0.498; 0.999] | 69.1→69.4 / 134.2 [0.513→0.517; 1.007] | 103.7→103.0 / 55.0 | C=K 3/3; K=L 3/3 |
+| 1,024 | K=64 | 4,742.1→4,830.9 / 8,752.9 [0.539→0.546; 1.014] | 107.9→108.3 / 231.6 [0.466→0.468; 1.005] | 45.8→46.3 / 89.4 [0.513→0.517; 1.008] | 216.3→212.3 / 117.2 | C=K 3/3; K=L 3/3 |
+| Sustained decode | K=128 | 720.8→710.6 / 1,385.6 [0.525→0.513; 0.986] | 119.0→119.2 / 244.2 [0.485→0.488; 1.003] | 113.6→113.7 / 222.2 [0.511→0.512; 1.001] | 29.4→29.9 / 15.4 | C=K 3/3; K=L 0/3 |
+
+### LFM2.5-8B-A1B Q4_K_M
+
+Artifact SHA-256: `4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0`. The one-case workload is `lfm2.5-8b-a1b-q4_k_m-1024-workload.jsonl`; paired results and runner output are `lfm2.5-8b-a1b-q4_k_m-q4kk64-m1024-ab.jsonl` and `.run.log`.
+
+| Workload | Tile | Prefill tok/s | Cached decode tok/s | Complete generation tok/s | First-token latency ms | IDs |
+|---|---|---:|---:|---:|---:|---|
+| 1,024 | K=64 | 477.3→494.4 / 2,160.6 [0.220→0.228; 1.036] | 22.4→22.4 / 102.0 [0.220→0.220; 1.002] | 5.9→6.1 / 26.8 [0.220→0.225; 1.025] | 2,145.7→2,071.6 / 474.2 | C=K 3/3; K=L 3/3 |
+
+The K=64 tile is retained as a shape-specific prefill win: Qwen2.5's 1,024-token prefill rose from 4,742.1 to 4,830.9 tok/s and first-token latency fell from 216.3 to 212.3 ms; LFM2.5's prefill rose from 477.3 to 494.4 tok/s and first-token latency fell from 2,145.7 to 2,071.6 ms. Cached decode was effectively flat. The absolute llama.cpp rates and Ferrum/reference ratios remain visible above; this change does not clear the Phase 7 gate.

@@ -840,6 +840,7 @@ impl MetalDevice {
             "q4_k_gemv_8rows",
             "q4_k_gemm",
             "q4_k_gemm_mpp",
+            "q4_k_gemm_mpp_k64",
             "q5_k_gemv",
             "q5_k_gemm",
             "q5_k_gemm_mpp",
