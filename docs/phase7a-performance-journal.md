@@ -422,3 +422,41 @@ Sources: control `qwen2.5-q4_k_m-q5n4-ab.jsonl`, candidate `qwen2.5-q4_k_m-q5n4-
 | Sustained decode | 671.3 → 674.7 / 1247.2 (0.982x; 0.541x) | 106.7 → 118.7 / 208.3 (1.120x; 0.574x) | 102.6 → 113.9 / 198.2 (1.110x; 0.573x) | 31.7 → 31.4 / 17.1 |
 
 The Q4_K cooperative-input experiment was run while the unrelated Q8_0 MPP K tile was set to 32; its own candidate/control ratio remains valid, while its absolute engine rates should not be treated as current-production rates. The M=16 and M=64 rows are rejected candidates; their llama.cpp column is the current threshold-8 reference matrix, so candidate/llama ratios are ratios of condition medians rather than interleaved timings.
+
+
+## Experiment 11: Q8_0 sixteen-row M=1 GEMV
+
+Status: rejected; the temporary direct-MSL kernel and dispatch were removed. It did not improve either the all-layer Qwen3 Q8_0 workload or the Qwen2.5 Q4_K_M vocabulary-head workload.
+
+The candidate assigned four output rows to each SIMD group and sixteen outputs to a 128-thread threadgroup, reusing each activation fragment across four rows. The retained Q8_0 M=1 path assigns two rows per SIMD group and eight outputs per threadgroup. This is a conventional MSL GEMV experiment, not Metal 4 TensorOps and not the standalone Apple Neural Engine/Core ML.
+
+The paired matrix used five workloads (short, 128-, 512-, and 1,024-token prompts, plus 128-token sustained decode), three interleaved repetitions, and the normal release settings. Control and candidate ran in one Ferrum process; llama.cpp used the same artifact and prompt IDs. Ferrum's dispatch batch limit remained at its normal 1,024 setting. The pinned llama.cpp revision is `9710a32175b3b8f04636aaac4aa3cc28651b505d`.
+
+Artifacts and raw results:
+
+- Qwen3-0.6B Q8_0, SHA-256 `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`: `qwen3-0.6b-q8_0-q8n16-ab.jsonl` and `qwen3-0.6b-q8_0-q8n16-ab.run.log`.
+- Qwen2.5-0.5B Q4_K_M, SHA-256 `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db`: `qwen2.5-q4_k_m-q8n16-ab.jsonl` and `qwen2.5-q4_k_m-q8n16-ab.run.log`.
+
+Each numeric cell gives Ferrum control → candidate absolute values / llama.cpp absolute values, followed by `[control/llama → candidate/llama; candidate/control]`. Ratios are medians of the per-pair ratios; throughput is in tok/s and first-token latency is in ms. For the latency ratios, below 1.0 means lower latency. `C=K` and `K=L` count full generated-ID matches across the three pairs for that workload.
+
+### Qwen3-0.6B Q8_0
+
+| Workload | Prefill tok/s | Cached decode tok/s | Complete generation tok/s | First token ms | IDs |
+|---|---:|---:|---:|---:|---|
+| Short | 409.7→414.8 / 1,180.6 [0.348→0.351; 1.022] | 97.8→93.4 / 144.4 [0.678→0.647; 0.955] | 77.1→75.5 / 129.3 [0.597→0.583; 0.971] | 51.6→50.9 / 18.1 [2.854→2.821; 0.978] | C=K 3/3; K=L 3/3 |
+| 128 | 1,872.4→1,844.1 / 5,653.5 [0.332→0.326; 0.992] | 97.3→93.3 / 143.7 [0.677→0.649; 0.957] | 71.9→69.4 / 124.0 [0.577→0.560; 0.970] | 68.7→69.7 / 22.9 [2.995→3.044; 1.008] | C=K 3/3; K=L 0/3 |
+| 512 | 2,635.0→2,642.0 / 6,504.9 [0.401→0.406; 1.010] | 89.2→85.9 / 134.7 [0.662→0.633; 0.959] | 44.3→43.4 / 84.9 [0.514→0.511; 0.978] | 194.6→194.1 / 79.0 [2.490→2.459; 0.990] | C=K 3/3; K=L 3/3 |
+| 1,024 | 2,760.3→2,786.1 / 5,786.6 [0.477→0.483; 1.009] | 80.0→76.3 / 125.8 [0.634→0.606; 0.955] | 28.8→28.6 / 55.2 [0.522→0.518; 0.993] | 371.3→367.9 / 177.2 [2.097→2.070; 0.991] | C=K 3/3; K=L 3/3 |
+| Sustained decode | 398.4→402.9 / 1,159.9 [0.344→0.347; 1.009] | 95.6→90.3 / 145.7 [0.655→0.620; 0.944] | 90.4→85.6 / 139.1 [0.647→0.616; 0.950] | 53.0→52.5 / 18.3 [2.886→2.863; 0.992] | C=K 3/3; K=L 0/3 |
+
+### Qwen2.5-0.5B Q4_K_M
+
+| Workload | Prefill tok/s | Cached decode tok/s | Complete generation tok/s | First token ms | IDs |
+|---|---:|---:|---:|---:|---|
+| Short | 711.6→717.8 / 1,329.1 [0.537→0.527; 1.016] | 113.1→112.7 / 207.1 [0.538→0.537; 0.999] | 97.4→97.4 / 176.0 [0.553→0.557; 1.002] | 29.8→29.6 / 16.0 [1.855→1.892; 0.984] | C=K 3/3; K=L 0/3 |
+| 128 | 3,260.5→3,269.7 / 6,233.1 [0.519→0.534; 0.998] | 113.7→113.9 / 201.3 [0.564→0.562; 1.002] | 92.4→92.0 / 164.9 [0.559→0.558; 0.996] | 39.6→39.5 / 20.8 [1.919→1.856; 1.001] | C=K 3/3; K=L 3/3 |
+| 512 | 4,607.5→4,616.4 / 8,414.4 [0.548→0.550; 1.002] | 108.1→107.7 / 201.6 [0.536→0.535; 0.995] | 64.1→64.2 / 118.7 [0.533→0.544; 1.005] | 111.5→111.2 / 61.1 [1.821→1.818; 0.998] | C=K 3/3; K=L 3/3 |
+| 1,024 | 4,347.8→4,434.6 / 8,054.1 [0.542→0.552; 1.020] | 98.2→101.0 / 200.3 [0.490→0.498; 1.009] | 42.1→42.9 / 80.7 [0.522→0.532; 1.018] | 235.9→231.2 / 127.4 [1.845→1.809; 0.980] | C=K 3/3; K=L 3/3 |
+| Sustained decode | 690.8→693.9 / 1,264.3 [0.547→0.546; 1.005] | 110.4→109.7 / 206.9 [0.534→0.527; 0.994] | 105.7→105.0 / 195.7 [0.541→0.536; 0.993] | 30.7→30.6 / 16.9 [1.820→1.824; 0.996] | C=K 3/3; K=L 0/3 |
+
+The candidate/control cached-decode ratios for Qwen3 ranged from 0.944 to 0.959; full-generation ratios ranged from 0.950 to 0.993. In Qwen2.5, decode ratios ranged from 0.994 to 1.009 and did not establish a repeatable gain for its Q8_0 vocabulary head. Candidate and control produced identical Ferrum token IDs in all 30 workload pairs. With no meaningful cross-shape win, the candidate kernel, selector, benchmark toggle, and temporary tail test were removed; the raw measurements remain as rejected-experiment evidence.
