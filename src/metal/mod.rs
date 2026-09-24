@@ -275,6 +275,7 @@ pub struct MetalDevice {
     mlx_affine4_gemv_quad: Cell<bool>,
     split_k_gemv: Cell<bool>,
     q5_0_gemv_n4: Cell<bool>,
+    q5_1_gemv_n4: Cell<bool>,
     q4_0_gemv_8rows: Cell<bool>,
     q4_k_gemv_8rows: Cell<bool>,
     q6_k_gemv_8rows: Cell<bool>,
@@ -324,6 +325,7 @@ impl MetalDevice {
             mlx_affine4_gemv_quad: Cell::new(true),
             split_k_gemv: Cell::new(true),
             q5_0_gemv_n4: Cell::new(true),
+            q5_1_gemv_n4: Cell::new(true),
             q4_0_gemv_8rows: Cell::new(true),
             q4_k_gemv_8rows: Cell::new(true),
             q6_k_gemv_8rows: Cell::new(true),
@@ -478,6 +480,19 @@ impl MetalDevice {
     }
     pub(crate) fn use_q5_0_gemv_n4(&self, output_rows: usize) -> bool {
         self.q5_0_gemv_n4.get() && output_rows >= 128
+    }
+    /// Select the four-output-row-per-SIMD Q5_1 M=1 GEMV path.
+    pub fn set_q5_1_gemv_n4(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q5_1 GEMV during execution".into(),
+            ));
+        }
+        self.q5_1_gemv_n4.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q5_1_gemv_n4(&self, output_rows: usize) -> bool {
+        self.q5_1_gemv_n4.get() && output_rows >= 128
     }
     /// Select the two-output-row-per-SIMD Q4_0 M=1 kernel for wide projections.
     pub fn set_q4_0_gemv_8rows(&self, enabled: bool) -> Result<()> {
@@ -1068,7 +1083,7 @@ impl MetalDevice {
                 | "mlx_affine4_gemm"
         ) {
             128
-        } else if name == "q5_0_gemv_n4" {
+        } else if matches!(name, "q5_0_gemv_n4" | "q5_1_gemv_n4") {
             64
         } else {
             32
@@ -1300,11 +1315,11 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if name == "q5_0_gemv_n4" {
+            } else if matches!(name, "q5_0_gemv_n4" | "q5_1_gemv_n4") {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 64
                 {
                     return Err(Error::Dispatch(
-                        "Q5_0 four-row GEMV requires two 32-wide SIMD groups".into(),
+                        "Q5_0/Q5_1 four-row GEMV requires two 32-wide SIMD groups".into(),
                     ));
                 }
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(

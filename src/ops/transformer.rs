@@ -73,7 +73,13 @@ impl MetalDevice {
             }
             (QuantizationFormat::Q5_0, false, true) => "q5_0_gemm_mpp",
             (QuantizationFormat::Q5_0, false, false) => "q5_0_gemm",
-            (QuantizationFormat::Q5_1, true, _) => "q5_1_gemv",
+            (QuantizationFormat::Q5_1, true, _) => {
+                if self.use_q5_1_gemv_n4(weight.rows()) {
+                    "q5_1_gemv_n4"
+                } else {
+                    "q5_1_gemv"
+                }
+            }
             (QuantizationFormat::Q5_1, false, true) => {
                 if self.q5_1_mpp_tile_k64(ad[0]) {
                     "q5_1_gemm_mpp_k64"
@@ -1487,6 +1493,32 @@ mod q5_tests {
                 assert!(
                     (actual - expected).abs() <= 5.0e-5,
                     "Q5_0 ({n}, {k}) index {index}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q5_1_gemv_n4_reuses_activations_and_covers_output_tail() {
+        let d = MetalDevice::new().unwrap();
+        assert!(d.use_q5_1_gemv_n4(128));
+        assert!(!d.use_q5_1_gemv_n4(127));
+        d.set_q5_1_gemv_n4(false).unwrap();
+        assert!(!d.use_q5_1_gemv_n4(128));
+        d.set_q5_1_gemv_n4(true).unwrap();
+        for (n, k) in [(131, 512), (4864, 896)] {
+            let weight = packed(&d, n, k, QuantizationFormat::Q5_1);
+            let values = input(1, k);
+            let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+            let output = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(output.metrics.operation, "q5_1_gemv_n4");
+            let expected = expected(&values, 1, n, k, QuantizationFormat::Q5_1);
+            for (index, (actual, expected)) in
+                output.tensor.to_f32().iter().zip(expected).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 5.0e-5,
+                    "Q5_1 ({n}, {k}) index {index}: actual={actual}, expected={expected}"
                 );
             }
         }

@@ -231,6 +231,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let q5_1_gemv_n4 = match request.get("q5_1_gemv_n4") {
+        None | Some(Value::Null) => {
+            device.set_q5_1_gemv_n4(false)?;
+            false
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_q5_1_gemv_n4(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field q5_1_gemv_n4 must be a boolean".into(),
+            ));
+        }
+    };
     let expert_tensorops = match request.get("moe_expert_tensorops") {
         None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
         Some(Value::Bool(enabled)) => {
@@ -309,6 +324,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "q5_1_mpp_tile_k64": q5_1_mpp_tile_k64,
         "q4_k_mpp_tile_k64": q4_k_mpp_tile_k64,
         "q5_0_gemv_n4": q5_0_gemv_n4,
+        "q5_1_gemv_n4": q5_1_gemv_n4,
         "model_format": model.format,
         "model_repository": model.repository,
         "model_revision": model.revision,
