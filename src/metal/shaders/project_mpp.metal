@@ -746,6 +746,7 @@ inline bfloat q6_k_expert_tile_value(device const uchar* row, uint column) {
 // Routed rows are compacted into expert-major 32-row segments before this
 // kernel. TensorOps then reuses each quantized expert tile across its prompt
 // rows; output rows scatter back to assignment order for existing MoE kernels.
+template<uint TILE_K>
 void expert_project_k_mpp_impl(
     device bfloat* input [[buffer(0)]],
     device const uchar* packed [[buffer(1)]],
@@ -757,7 +758,7 @@ void expert_project_k_mpp_impl(
     constant uint* p [[buffer(6)]],
     uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
-    constexpr uint TILE_M=32, TILE_N=64, TILE_K=128;
+    constexpr uint TILE_M=32, TILE_N=64;
     uint k=p[2], n=p[3], experts=p[5], type=p[7];
     uint expert=group.z;
     if(expert>=experts) return;
@@ -774,10 +775,10 @@ void expert_project_k_mpp_impl(
         dequantized,dextents<int,2>(int(TILE_K),int(TILE_N)));
     auto left=A.slice(0,int(m_tile));
     constexpr auto desc=matmul2d_descriptor(
-        32,64,128,false,true,false,
+        32,64,int(TILE_K),false,true,false,
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc,execution_simdgroups<4>> op;
-    auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
+    auto result=op.template get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
     uint k_tiles=(k+TILE_K-1)/TILE_K;
     for(uint kt=0;kt<k_tiles;kt++) {
         if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -821,7 +822,7 @@ kernel void expert_project_q4_k_mpp(
     constant uint* p [[buffer(6)]], uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     threadgroup bfloat dequantized[64*128];
-    expert_project_k_mpp_impl(a,b,ids,counts,bases,c,dequantized,p,tid,group);
+    expert_project_k_mpp_impl<128>(a,b,ids,counts,bases,c,dequantized,p,tid,group);
 }
 kernel void expert_project_q5_k_mpp(
     device bfloat* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
@@ -830,7 +831,7 @@ kernel void expert_project_q5_k_mpp(
     constant uint* p [[buffer(6)]], uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     threadgroup bfloat dequantized[64*128];
-    expert_project_k_mpp_impl(a,b,ids,counts,bases,c,dequantized,p,tid,group);
+    expert_project_k_mpp_impl<128>(a,b,ids,counts,bases,c,dequantized,p,tid,group);
 }
 kernel void expert_project_q6_k_mpp(
     device bfloat* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
@@ -839,7 +840,25 @@ kernel void expert_project_q6_k_mpp(
     constant uint* p [[buffer(6)]], uint tid [[thread_index_in_threadgroup]],
     uint3 group [[threadgroup_position_in_grid]]) {
     threadgroup bfloat dequantized[64*128];
-    expert_project_k_mpp_impl(a,b,ids,counts,bases,c,dequantized,p,tid,group);
+    expert_project_k_mpp_impl<128>(a,b,ids,counts,bases,c,dequantized,p,tid,group);
+}
+kernel void expert_project_q4_k_mpp_k64(
+    device bfloat* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
+    device const uint* ids [[buffer(2)]], device const uint* counts [[buffer(3)]],
+    device const uint* bases [[buffer(4)]], device ushort* c [[buffer(5)]],
+    constant uint* p [[buffer(6)]], uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat dequantized[64*64];
+    expert_project_k_mpp_impl<64>(a,b,ids,counts,bases,c,dequantized,p,tid,group);
+}
+kernel void expert_project_q6_k_mpp_k64(
+    device bfloat* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
+    device const uint* ids [[buffer(2)]], device const uint* counts [[buffer(3)]],
+    device const uint* bases [[buffer(4)]], device ushort* c [[buffer(5)]],
+    constant uint* p [[buffer(6)]], uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat dequantized[64*64];
+    expert_project_k_mpp_impl<64>(a,b,ids,counts,bases,c,dequantized,p,tid,group);
 }
 
 // Strided tensor views describe grouped sequence-major Q/K/V without copies.

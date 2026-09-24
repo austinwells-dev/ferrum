@@ -242,10 +242,14 @@ impl MetalDevice {
             && features <= i32::MAX as usize
             && self.mpp_projection();
         if use_tensorops {
-            let mpp_name = match ggml_type {
-                12 => "expert_project_q4_k_mpp",
-                13 => "expert_project_q5_k_mpp",
-                14 => "expert_project_q6_k_mpp",
+            let tile_k64 = self.moe_expert_tensorops_tile_k64();
+            let mpp_name = match (ggml_type, tile_k64) {
+                (12, false) => "expert_project_q4_k_mpp",
+                (13, false) => "expert_project_q5_k_mpp",
+                (14, false) => "expert_project_q6_k_mpp",
+                (12, true) => "expert_project_q4_k_mpp_k64",
+                (13, true) => "expert_project_q5_k_mpp",
+                (14, true) => "expert_project_q6_k_mpp_k64",
                 _ => unreachable!(),
             };
             return self.expert_project_quantized_mpp(

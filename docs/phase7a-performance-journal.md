@@ -86,7 +86,7 @@ Ferrum's `mpp::tensor_ops` kernels are inline MSL operations on the M5 GPU and u
 | --- | --- | --- |
 | Dense BF16 projections | `project_mpp` for eligible batched shapes; other batch sizes use native matrix or direct kernels | The large dense prefill path is already TensorOps-backed. M=1 GEMV stays on direct shaders. |
 | GGUF Q4_0, Q5_0, Q5_1, Q4_K, Q5_K, Q6_K, and Q8_0 projections | MPP GEMM is selected for BF16 activations when M>=16, K is divisible by 128, and the device supports Metal 4 / Apple GPU family 10. Existing quantized MPP kernels unpack the custom GGUF blocks into BF16 threadgroup tiles before `matmul2d`. | Batched M=2..15 and unsupported dtype/K shapes still use conventional `q*_gemm` MSL. M=1 uses format-specific direct `q*_gemv` kernels, including the measured Q4_K/Q6_K multirow cases retained above. MLX affine-Q4 is a separate F16 path and is outside this GGUF campaign. |
-| Quantized MoE expert projections | BF16 prefill batches that average at least 8 assignments per expert use expert grouping plus Q4_K/Q5_K/Q6_K MPP GEMM; one-token routing remains a separate GPU routing optimization. | Smaller batches, M=1, non-BF16 activations, and unsupported alignment continue through conventional SIMD expert kernels. MPP stages exact GGUF values into BF16 and uses a 32x64x128 `matmul2d` tile; it does not reinterpret GGUF blocks as Metal's native block-scaled int4/int8 tensors. |
+| Quantized MoE expert projections | BF16 prefill batches that average at least 8 assignments per expert use expert grouping plus Q4_K/Q5_K/Q6_K MPP GEMM; Q4_K and Q6_K use a 32x64x64 `matmul2d` tile, while Q5_K keeps K=128 pending a model-level measurement. One-token routing remains a separate GPU routing optimization. | Smaller batches, M=1, non-BF16 activations, and unsupported alignment continue through conventional SIMD expert kernels. MPP stages exact GGUF values into BF16; it does not reinterpret GGUF blocks as Metal's native block-scaled int4/int8 tensors. |
 | Prefill attention | BF16/F16 attention score and context products use TensorOps when query length exceeds one. | `attention_mask` and `attention_softmax` remain conventional kernels between those products. A fused FlashAttention-style TensorOps kernel using cooperative results and row reductions is a possible longer-prefill experiment. Decode's one-query context stays on its direct kernel. |
 
 The dispatch rules are visible in `src/ops/transformer.rs`; the current quantized MPP unpack/stage/multiply path is in `src/metal/shaders/project_mpp.metal`; quantized expert projection is in `src/metal/shaders/ops.metal`. Norm, RoPE, activation, and elementwise kernels are conventional MSL but are not matrix contractions that should be moved to `matmul2d` by default.
@@ -532,3 +532,28 @@ Artifact SHA-256: `4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2
 | 1,024 | K=64 | 477.3→494.4 / 2,160.6 [0.220→0.228; 1.036] | 22.4→22.4 / 102.0 [0.220→0.220; 1.002] | 5.9→6.1 / 26.8 [0.220→0.225; 1.025] | 2,145.7→2,071.6 / 474.2 | C=K 3/3; K=L 3/3 |
 
 The K=64 tile is retained as a shape-specific prefill win: Qwen2.5's 1,024-token prefill rose from 4,742.1 to 4,830.9 tok/s and first-token latency fell from 216.3 to 212.3 ms; LFM2.5's prefill rose from 477.3 to 494.4 tok/s and first-token latency fell from 2,145.7 to 2,071.6 ms. Cached decode was effectively flat. The absolute llama.cpp rates and Ferrum/reference ratios remain visible above; this change does not clear the Phase 7 gate.
+
+
+## Experiment 14: K=64 TensorOps tiles for quantized MoE experts
+
+Status: retained for grouped Q4_K and Q6_K expert MPP projections. Q5_K experts retain K=128 until a real-model matrix exercises that format.
+
+The LFM2.5-8B-A1B 1,024-token flushed-dispatch profile attributed 1.66 s of sampled GPU work to grouped expert MPP projections: Q4_K input 1.126 s, Q4_K output 0.316 s, and Q6_K output 0.215 s. These are diagnostic totals, not normal end-to-end timings. The candidate halves the staged BF16 weight tile from 64x128 to 64x64 (16 KiB to 8 KiB), while retaining the M=32, N=64 tile and exact GGUF dequantization. K=64 applies only after the existing route-density, dtype, alignment, and MPP eligibility checks; the conventional small-batch and M=1 expert paths are unchanged.
+
+The correctness tests exercise Q4_K, Q5_K, and Q6_K expert TensorOps over uneven expert groups, 65 output rows, and 512 input features. The production K=64 variants for Q4_K and Q6_K passed scalar-reference comparisons with the routing order restored. All eight focused expert TensorOps tests passed with Metal API Validation and GPU Shader Validation enabled; the validation log is `lfm2.5-8b-a1b-expert-k64-suite-validation.log`.
+
+The LFM2.5-8B-A1B Q4_K_M release A/B used the pinned model, five workloads, three interleaved pairs, and the same llama.cpp reference. Ferrum output IDs matched control in all 15 pairs. The candidate improved prefill at 128, 512, and 1,024 tokens while leaving cached decode effectively flat. At 512 tokens it raised Ferrum prefill from 458.1 to 476.2 tok/s; at 1,024 tokens, from 490.6 to 497.4 tok/s. Candidate/reference ratios are included with the absolute rates below. The 1,024-token flushed-dispatch profile reduced the sampled expert MPP GPU total from 1.531 s to 1.465 s (4.3%); this isolated profile is diagnostic only.
+
+Raw A/B rows and runner output are `lfm2.5-8b-a1b-expert-q4k64-ab.jsonl` and `.run.log`. The GPU-timing attribution capture is `lfm2.5-8b-a1b-expert-q4k64-profile.jsonl` and `.run.log`; the five-case prompts are from `lfm2.5-8b-a1b-q4_k_m-workloads.jsonl`.
+
+Each throughput entry shows Ferrum control → K=64 candidate / llama.cpp in tok/s, followed by `[control/llama → candidate/llama; candidate/control]`. Ratios are medians of paired ratios. First-token latency is shown as control → candidate / llama.cpp in milliseconds.
+
+| Workload | Prefill tok/s | Cached decode tok/s | Complete generation tok/s | First-token latency ms | IDs |
+|---|---:|---:|---:|---:|---|
+| Short | 24.2→24.2 / 235.1 [0.103→0.103; 1.000] | 23.0→22.9 / 102.9 [0.222→0.222; 0.998] | 14.7→14.7 / 82.0 [0.179→0.180; 1.001] | 454.0→454.2 / 47.0 | C=K 3/3; K=L 3/3 |
+| 128 prompt | 380.3→389.4 / 1,537.1 [0.247→0.252; 1.022] | 22.8→22.8 / 103.1 [0.222→0.221; 1.000] | 16.3→16.4 / 70.0 [0.233→0.235; 1.005] | 336.9→329.0 / 83.5 | C=K 3/3; K=L 0/3 |
+| 512 prompt | 458.1→476.2 / 2,157.7 [0.212→0.221; 1.040] | 22.4→22.5 / 102.6 [0.220→0.220; 1.002] | 9.3→9.5 / 42.7 [0.216→0.223; 1.026] | 1,118.0→1,075.4 / 237.5 | C=K 3/3; K=L 3/3 |
+| 1,024 prompt | 490.6→497.4 / 2,155.6 [0.228→0.231; 1.013] | 22.5→22.5 / 101.3 [0.222→0.222; 0.999] | 6.0→6.1 / 26.6 [0.226→0.228; 1.011] | 2,087.4→2,059.2 / 475.3 | C=K 3/3; K=L 3/3 |
+| Sustained decode | 21.8→24.3 / 234.2 [0.093→0.104; 1.115] | 22.7→22.8 / 102.2 [0.223→0.223; 1.000] | 20.9→21.1 / 96.7 [0.218→0.217; 1.011] | 504.8→452.9 / 47.2 | C=K 3/3; K=L 3/3 |
+
+The result supports K=64 for the Q4_K/Q6_K grouped expert path, not a blanket TensorOps dispatch. Q5_K remains on K=128 because no available end-to-end MoE artifact exercises Q5_K expert weights. The LFM2.5 engine gap remains architecture-specific and substantial; no large Qwen target is unlocked.

@@ -1853,10 +1853,80 @@ mod qk_tests {
             }
             let profile = d.take_profile();
             let operation = match format {
-                QuantizationFormat::Q4_K => "expert_project_q4_k_mpp",
+                QuantizationFormat::Q4_K => "expert_project_q4_k_mpp_k64",
                 QuantizationFormat::Q5_K => "expert_project_q5_k_mpp",
                 _ => unreachable!(),
             };
+            assert_eq!(profile.get(operation).unwrap().calls, 1);
+        }
+    }
+
+    #[test]
+    fn q4_k_expert_tensorops_k64_matches_reference() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        d.set_profiling(true);
+        d.set_moe_expert_tensorops_tile_k64(true).unwrap();
+        let (assignments, experts, rows_per_expert, columns) = (197, 3, 65, 512);
+        let expert_ids = (0..assignments)
+            .map(|assignment| (assignment + 1) % experts)
+            .collect::<Vec<_>>();
+        let values = input(assignments, columns);
+        let x = Tensor::from_f32(&d, [assignments, columns], DType::BF16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let metadata_values = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(assignment, &expert)| {
+                [
+                    f32::from_bits(expert as u32),
+                    f32::from_bits(assignment as u32),
+                    1.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let metadata =
+            Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata_values).unwrap();
+
+        for format in [QuantizationFormat::Q4_K] {
+            let packed = packed(&d, experts * rows_per_expert, columns, format);
+            let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+            let actual = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap()
+                .to_f32();
+            let expected = (0..assignments)
+                .flat_map(|assignment| {
+                    (0..rows_per_expert).map({
+                        let rounded_input = &rounded_input;
+                        let expert_ids = &expert_ids;
+                        move |row| {
+                            DType::BF16.round(
+                                (0..columns)
+                                    .map(|column| {
+                                        rounded_input[assignment * columns + column]
+                                            * DType::BF16.round(qk_value(
+                                                expert_ids[assignment] * rows_per_expert + row,
+                                                column,
+                                                format,
+                                            ))
+                                    })
+                                    .sum::<f32>(),
+                            )
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 0.08,
+                    "{format:?} K=64 expert index {index}: actual={actual}, expected={expected}"
+                );
+            }
+            let operation = "expert_project_q4_k_mpp_k64";
+            let profile = d.take_profile();
             assert_eq!(profile.get(operation).unwrap().calls, 1);
         }
     }
@@ -1929,7 +1999,7 @@ mod qk_tests {
             }
             let profile = d.take_profile();
             let operation = match format {
-                QuantizationFormat::Q4_K => "expert_project_q4_k_mpp",
+                QuantizationFormat::Q4_K => "expert_project_q4_k_mpp_k64",
                 QuantizationFormat::Q5_K => "expert_project_q5_k_mpp",
                 _ => unreachable!(),
             };
@@ -2004,7 +2074,7 @@ mod qk_tests {
             }
             let profile = d.take_profile();
             let operation = match format {
-                QuantizationFormat::Q4_K => "expert_project_q4_k_mpp",
+                QuantizationFormat::Q4_K => "expert_project_q4_k_mpp_k64",
                 QuantizationFormat::Q5_K => "expert_project_q5_k_mpp",
                 _ => unreachable!(),
             };
@@ -2258,6 +2328,76 @@ mod q6_k_tests {
     }
 
     #[test]
+    fn q6_k_expert_tensorops_k64_matches_reference() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        d.set_profiling(true);
+        d.set_moe_expert_tensorops_tile_k64(true).unwrap();
+        let (assignments, experts, rows_per_expert, columns) = (197, 3, 65, 512);
+        let expert_ids = (0..assignments)
+            .map(|assignment| (assignment + 1) % experts)
+            .collect::<Vec<_>>();
+        let packed = packed(&d, experts * rows_per_expert, columns);
+        let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+        let values = input(assignments, columns);
+        let x = Tensor::from_f32(&d, [assignments, columns], DType::BF16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let metadata_values = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(assignment, &expert)| {
+                [
+                    f32::from_bits(expert as u32),
+                    f32::from_bits(assignment as u32),
+                    1.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let metadata =
+            Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata_values).unwrap();
+        let actual = d
+            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+            .unwrap()
+            .to_f32();
+        let expected = (0..assignments)
+            .flat_map(|assignment| {
+                (0..rows_per_expert).map({
+                    let rounded_input = &rounded_input;
+                    let expert_ids = &expert_ids;
+                    move |row| {
+                        DType::BF16.round(
+                            (0..columns)
+                                .map(|column| {
+                                    rounded_input[assignment * columns + column]
+                                        * DType::BF16.round(q6_value(
+                                            expert_ids[assignment] * rows_per_expert + row,
+                                            column,
+                                        ))
+                                })
+                                .sum::<f32>(),
+                        )
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.16,
+                "Q6_K K=64 expert index {index}: actual={actual}, expected={expected}"
+            );
+        }
+        assert_eq!(
+            d.take_profile()
+                .get("expert_project_q6_k_mpp_k64")
+                .unwrap()
+                .calls,
+            1
+        );
+    }
+
+    #[test]
     fn q6_k_expert_tensorops_groups_routes_and_restores_assignment_order() {
         let d = MetalDevice::new().unwrap();
         if !d.mpp_projection() {
@@ -2319,7 +2459,7 @@ mod q6_k_tests {
         }
         assert_eq!(
             d.take_profile()
-                .get("expert_project_q6_k_mpp")
+                .get("expert_project_q6_k_mpp_k64")
                 .unwrap()
                 .calls,
             1
@@ -2390,7 +2530,7 @@ mod q6_k_tests {
         }
         assert_eq!(
             d.take_profile()
-                .get("expert_project_q6_k_mpp")
+                .get("expert_project_q6_k_mpp_k64")
                 .unwrap()
                 .calls,
             1
@@ -2460,7 +2600,7 @@ mod q6_k_tests {
         }
         assert_eq!(
             d.take_profile()
-                .get("expert_project_q6_k_mpp")
+                .get("expert_project_q6_k_mpp_k64")
                 .unwrap()
                 .calls,
             1

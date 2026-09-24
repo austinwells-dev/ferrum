@@ -277,6 +277,7 @@ pub struct MetalDevice {
     q6_k_gemv_8rows: Cell<bool>,
     moe_gpu_routing: Cell<bool>,
     moe_expert_tensorops: Cell<bool>,
+    moe_expert_tensorops_tile_k64: Cell<bool>,
     moe_expert_tensorops_min_routes_per_expert: Cell<usize>,
     reference_math: Cell<bool>,
     batching: Cell<bool>,
@@ -322,6 +323,7 @@ impl MetalDevice {
             q6_k_gemv_8rows: Cell::new(true),
             moe_gpu_routing: Cell::new(true),
             moe_expert_tensorops: Cell::new(true),
+            moe_expert_tensorops_tile_k64: Cell::new(true),
             moe_expert_tensorops_min_routes_per_expert: Cell::new(8),
             reference_math: Cell::new(false),
             batching: Cell::new(false),
@@ -491,6 +493,19 @@ impl MetalDevice {
     }
     pub fn moe_expert_tensorops_enabled(&self) -> bool {
         self.moe_expert_tensorops.get()
+    }
+    /// Select a 64-wide K tile for grouped Q4_K and Q6_K expert TensorOps.
+    pub fn set_moe_expert_tensorops_tile_k64(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() || (enabled && !self.mpp_projection()) {
+            return Err(Error::Parameter(
+                "expert TensorOps K=64 requires an idle compatible device".into(),
+            ));
+        }
+        self.moe_expert_tensorops_tile_k64.set(enabled);
+        Ok(())
+    }
+    pub fn moe_expert_tensorops_tile_k64(&self) -> bool {
+        self.moe_expert_tensorops_tile_k64.get()
     }
     /// Set the minimum average route count per expert for grouped expert TensorOps.
     pub fn set_moe_expert_tensorops_min_routes_per_expert(&self, routes: usize) -> Result<()> {
@@ -833,6 +848,8 @@ impl MetalDevice {
                 | "expert_project_q4_k_mpp"
                 | "expert_project_q5_k_mpp"
                 | "expert_project_q6_k_mpp"
+                | "expert_project_q4_k_mpp_k64"
+                | "expert_project_q6_k_mpp_k64"
                 | "attention_scores_mpp"
                 | "attention_context_mpp"
                 | "attention_scores_mpp_f16"
@@ -868,9 +885,11 @@ impl MetalDevice {
             | "expert_project_q4_k"
             | "expert_project_q5_k"
             | "expert_project_q6_k" => (3, 1),
-            "expert_project_q4_k_mpp" | "expert_project_q5_k_mpp" | "expert_project_q6_k_mpp" => {
-                (5, 1)
-            }
+            "expert_project_q4_k_mpp"
+            | "expert_project_q5_k_mpp"
+            | "expert_project_q6_k_mpp"
+            | "expert_project_q4_k_mpp_k64"
+            | "expert_project_q6_k_mpp_k64" => (5, 1),
             "lfm2_short_conv" => (4, 2),
             "lfm2_split3" => (1, 3),
             _ => (2, 1),
@@ -965,6 +984,8 @@ impl MetalDevice {
                 | "expert_project_q4_k_mpp"
                 | "expert_project_q5_k_mpp"
                 | "expert_project_q6_k_mpp"
+                | "expert_project_q4_k_mpp_k64"
+                | "expert_project_q6_k_mpp_k64"
                 | "attention_scores_mpp"
                 | "attention_context_mpp"
                 | "attention_scores_mpp_f16"
@@ -1053,6 +1074,8 @@ impl MetalDevice {
                     | "expert_project_q4_k_mpp"
                     | "expert_project_q5_k_mpp"
                     | "expert_project_q6_k_mpp"
+                    | "expert_project_q4_k_mpp_k64"
+                    | "expert_project_q6_k_mpp_k64"
                     | "attention_scores_mpp"
                     | "attention_context_mpp"
                     | "attention_scores_mpp_f16"
@@ -1070,6 +1093,8 @@ impl MetalDevice {
                                 "expert_project_q4_k_mpp"
                                     | "expert_project_q5_k_mpp"
                                     | "expert_project_q6_k_mpp"
+                                    | "expert_project_q4_k_mpp_k64"
+                                    | "expert_project_q6_k_mpp_k64"
                             ) {
                                 32
                             } else {
@@ -1097,6 +1122,8 @@ impl MetalDevice {
                             "expert_project_q4_k_mpp"
                                 | "expert_project_q5_k_mpp"
                                 | "expert_project_q6_k_mpp"
+                                | "expert_project_q4_k_mpp_k64"
+                                | "expert_project_q6_k_mpp_k64"
                         ) {
                             params[5] as usize
                         } else {

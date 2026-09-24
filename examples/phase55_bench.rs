@@ -198,6 +198,18 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let expert_tensorops_tile_k64 = match request.get("moe_expert_tensorops_tile_k64") {
+        None | Some(Value::Null) => device.moe_expert_tensorops_tile_k64(),
+        Some(Value::Bool(enabled)) => {
+            device.set_moe_expert_tensorops_tile_k64(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field moe_expert_tensorops_tile_k64 must be a boolean".into(),
+            ));
+        }
+    };
     let expert_tensorops_min_routes = match request
         .get("moe_expert_tensorops_min_routes_per_expert")
     {
@@ -244,6 +256,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "pair_order": pair_order,
         "warmup": warmup,
         "moe_expert_tensorops": expert_tensorops,
+        "moe_expert_tensorops_tile_k64": expert_tensorops_tile_k64,
         "moe_expert_tensorops_min_routes_per_expert": expert_tensorops_min_routes,
         "q8_0_mpp_tile_k64": q8_0_mpp_tile_k64,
         "q4_k_mpp_tile_k64": q4_k_mpp_tile_k64,
