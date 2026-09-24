@@ -557,3 +557,22 @@ Each throughput entry shows Ferrum control → K=64 candidate / llama.cpp in tok
 | Sustained decode | 21.8→24.3 / 234.2 [0.093→0.104; 1.115] | 22.7→22.8 / 102.2 [0.223→0.223; 1.000] | 20.9→21.1 / 96.7 [0.218→0.217; 1.011] | 504.8→452.9 / 47.2 | C=K 3/3; K=L 3/3 |
 
 The result supports K=64 for the Q4_K/Q6_K grouped expert path, not a blanket TensorOps dispatch. Q5_K remains on K=128 because no available end-to-end MoE artifact exercises Q5_K expert weights. The LFM2.5 engine gap remains architecture-specific and substantial; no large Qwen target is unlocked.
+
+
+## Experiment 15: Q6_K sixteen-row M=1 direct GEMV
+
+Status: rejected; the temporary direct-MSL kernel, selector, correctness test, and benchmark toggle were removed. The existing Q6_K M=1 GEMV remains in production. This experiment tested activation reuse across four output rows per SIMD group, for 16 output rows per threadgroup. It is a conventional direct shader, not Metal 4 TensorOps and not the standalone Apple Neural Engine/Core ML. Since this is M=1, the experiment deliberately evaluated a direct GEMV rather than forcing a cooperative-tensor path onto a one-row workload.
+
+The focused correctness case used an uneven N=133 output tail and K=512 and passed with Metal API Validation and GPU Shader Validation enabled; its log is `qwen2.5-q6_k-16rows-validation.log`. The Qwen2.5-0.5B Q6_K artifact SHA-256 is `2f82233630c349ccf6b8daccf48f9a7865713d9f08a2eadfa456cebe9b97c7f5`. The three-pair exploratory matrix is `qwen2.5-q6_k-q6k16rows-ab.jsonl` and `.run.log`; the five-pair decision matrix is `qwen2.5-q6_k-q6k16rows-ab-5pair.jsonl` and `.run.log`. The decision matrix has five interleaved control/candidate/llama.cpp pairs for each of short, 128-, 512-, and 1,024-token prompts and sustained 128-token decode.
+
+Each throughput cell shows Ferrum control → 16-row candidate / llama.cpp in tok/s, followed by `[control/llama → candidate/llama; candidate/control]`. Ratios are medians of paired ratios; first-token latency is in milliseconds. `C=K` and `K=L` count full generated-ID matches in the five pairs.
+
+| Workload | Prefill tok/s | Cached decode tok/s | Complete-generation tok/s | First-token latency ms | IDs |
+|---|---:|---:|---:|---:|---|
+| Short | 638.4→635.3 / 1,456.8 [0.436→0.436; 0.992] | 129.9→130.1 / 203.3 [0.642→0.640; 0.996] | 106.2→106.5 / 176.8 [0.601→0.602; 1.001] | 33.2→33.5 / 14.7 | C=K 5/5; K=L 5/5 |
+| 128 prompt | 3,018.8→2,995.5 / 7,114.3 [0.425→0.421; 1.001] | 129.5→131.4 / 203.1 [0.641→0.647; 1.008] | 100.4→100.9 / 170.8 [0.588→0.592; 1.008] | 42.7→43.0 / 18.2 | C=K 5/5; K=L 5/5 |
+| 512 prompt | 4,687.4→4,704.5 / 9,629.0 [0.485→0.490; 1.010] | 124.9→124.9 / 202.4 [0.620→0.618; 0.999] | 69.9→70.3 / 125.6 [0.558→0.561; 1.007] | 109.6→109.2 / 53.4 | C=K 5/5; K=L 5/5 |
+| 1,024 prompt | 4,592.7→4,595.5 / 9,051.4 [0.509→0.508; 1.002] | 115.4→115.6 / 198.0 [0.580→0.581; 1.002] | 46.2→46.2 / 86.2 [0.536→0.536; 1.004] | 223.3→223.2 / 113.4 | C=K 5/5; K=L 5/5 |
+| Sustained decode | 628.5→627.4 / 1,447.5 [0.436→0.433; 0.988] | 125.4→126.6 / 210.7 [0.594→0.601; 1.011] | 119.1→120.1 / 194.7 [0.612→0.616; 1.010] | 33.8→33.8 / 14.8 | C=K 5/5; K=L 0/5 |
+
+Across all 25 paired workload runs, the median candidate/control ratios were 1.002 for prefill, 1.006 for cached decode, and 1.006 for complete generation. Individual paired ratios varied from 0.776 to 1.141 for prefill, 0.988 to 1.028 for decode, and 0.938 to 1.065 for generation; one 128-prompt prefill timing was a clear outlier. The small median decode/generation changes and flat first-token latency do not establish a repeatable improvement. Ferrum control and candidate produced identical token IDs in all 25 pairs. The 16-row shader was therefore removed, with its raw matrices and correctness log retained as rejected-experiment evidence.
