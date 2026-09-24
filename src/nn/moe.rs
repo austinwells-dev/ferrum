@@ -2,13 +2,72 @@
 #![forbid(unsafe_code)]
 
 use crate::model::architecture::{MoeRoutingPolicy, MoeScoringFunction};
-use crate::{Error, MetalDevice, Result, Tensor};
+use crate::{Error, MetalDevice, Result, Tensor, quantization::QuantizedExpertMatrix};
 use std::{
     cell::Cell,
     time::{Duration, Instant},
 };
 
 const ROUTING_TEMPORARY_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Clone)]
+pub(crate) enum ExpertMatrix {
+    Dense(Tensor),
+    Quantized(QuantizedExpertMatrix),
+}
+
+impl ExpertMatrix {
+    fn geometry(&self) -> Option<(usize, usize, usize)> {
+        match self {
+            Self::Dense(tensor) => {
+                let dims = tensor.shape().dimensions();
+                (dims.len() == 3).then(|| (dims[0], dims[1], dims[2]))
+            }
+            Self::Quantized(tensor) => {
+                Some((tensor.experts(), tensor.rows_per_expert(), tensor.columns()))
+            }
+        }
+    }
+
+    fn dtype(&self) -> Option<crate::DType> {
+        match self {
+            Self::Dense(tensor) => Some(tensor.dtype()),
+            Self::Quantized(_) => None,
+        }
+    }
+
+    fn byte_size(&self) -> usize {
+        match self {
+            Self::Dense(tensor) => tensor.byte_size(),
+            Self::Quantized(tensor) => tensor.byte_size(),
+        }
+    }
+
+    fn is_owned_by(&self, device: &MetalDevice) -> bool {
+        match self {
+            Self::Dense(tensor) => device.owns(tensor.buffer()),
+            Self::Quantized(tensor) => device.owns(tensor.buffer()),
+        }
+    }
+
+    fn project(
+        &self,
+        device: &MetalDevice,
+        input: &Tensor,
+        metadata: &Tensor,
+        features: usize,
+        experts: usize,
+    ) -> Result<Tensor> {
+        match self {
+            Self::Dense(tensor) => {
+                device.expert_project(input, metadata, tensor, features, experts)
+            }
+            Self::Quantized(tensor) => {
+                device.expert_project_quantized(input, metadata, tensor, features, experts)
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MoeStats {
@@ -37,8 +96,8 @@ impl MoeStats {
 
 pub struct SparseMoe {
     router: crate::nn::Linear,
-    input_experts: Tensor,
-    output_experts: Tensor,
+    input_experts: ExpertMatrix,
+    output_experts: ExpertMatrix,
     selection_bias: Option<Vec<f32>>,
     expert_count: usize,
     routing: MoeRoutingPolicy,
@@ -51,24 +110,27 @@ impl SparseMoe {
     pub(crate) fn new(
         device: &MetalDevice,
         router_weight: Tensor,
-        input_experts: Tensor,
-        output_experts: Tensor,
+        input_experts: ExpertMatrix,
+        output_experts: ExpertMatrix,
         routing: MoeRoutingPolicy,
         selection_bias: Option<Tensor>,
     ) -> Result<Self> {
         let router_dims = router_weight.shape().dimensions();
-        let input_dims = input_experts.shape().dimensions();
-        let output_dims = output_experts.shape().dimensions();
+        let input_dims = input_experts.geometry();
+        let output_dims = output_experts.geometry();
         if router_dims.len() != 2
-            || input_dims.len() != 3
-            || output_dims.len() != 3
-            || router_dims[0] != input_dims[0]
-            || router_dims[0] != output_dims[0]
-            || input_dims[1] == 0
-            || !input_dims[1].is_multiple_of(2)
-            || router_dims[1] != input_dims[2]
-            || router_dims[1] != output_dims[1]
-            || output_dims[2].checked_mul(2) != Some(input_dims[1])
+            || input_dims.is_none()
+            || output_dims.is_none()
+            || input_dims.is_some_and(|dims| {
+                router_dims[0] != dims.0
+                    || dims.1 == 0
+                    || !dims.1.is_multiple_of(2)
+                    || router_dims[1] != dims.2
+            })
+            || output_dims.is_some_and(|dims| router_dims[0] != dims.0 || router_dims[1] != dims.1)
+            || input_dims
+                .zip(output_dims)
+                .is_some_and(|(input, output)| output.2.checked_mul(2) != Some(input.1))
             || routing.experts != router_dims[0]
             || routing.top_k == 0
             || routing.top_k > router_dims[0]
@@ -77,16 +139,15 @@ impl SparseMoe {
             || !routing.routed_scaling_factor.is_finite()
             || routing.routed_scaling_factor <= 0.
             || routing.use_expert_bias != selection_bias.is_some()
-            || [
-                router_weight.dtype(),
-                input_experts.dtype(),
-                output_experts.dtype(),
-            ]
-            .iter()
-            .any(|&dtype| dtype != input_experts.dtype())
+            || input_experts
+                .dtype()
+                .is_some_and(|dtype| dtype != router_weight.dtype())
+            || output_experts
+                .dtype()
+                .is_some_and(|dtype| dtype != router_weight.dtype())
             || !device.owns(router_weight.buffer())
-            || !device.owns(input_experts.buffer())
-            || !device.owns(output_experts.buffer())
+            || !input_experts.is_owned_by(device)
+            || !output_experts.is_owned_by(device)
             || selection_bias.as_ref().is_some_and(|bias| {
                 bias.shape().dimensions() != [router_dims.first().copied().unwrap_or(0)]
                     || bias.dtype() != crate::DType::F32
@@ -99,7 +160,7 @@ impl SparseMoe {
         }
         let expert_count = router_dims[0];
         let hidden_size = router_dims[1];
-        let intermediate_size = input_dims[1] / 2;
+        let intermediate_size = input_dims.expect("validated input expert geometry").1 / 2;
         let selection_bias = selection_bias.map(|bias| bias.to_f32());
         if selection_bias
             .as_ref()
@@ -220,10 +281,10 @@ impl SparseMoe {
                 device.expert_assign(&input, &metadata_tensor, self.routing.top_k)
             })?;
             let projected = device.profile_projection("moe.input_projection", || {
-                device.expert_project(
+                self.input_experts.project(
+                    device,
                     &assigned,
                     &metadata_tensor,
-                    &self.input_experts,
                     self.hidden_size,
                     self.expert_count,
                 )
@@ -232,10 +293,10 @@ impl SparseMoe {
                 device.expert_silu_mul(&projected, self.intermediate_size)
             })?;
             let expert_output = device.profile_projection("moe.output_projection", || {
-                device.expert_project(
+                self.output_experts.project(
+                    device,
                     &activated,
                     &metadata_tensor,
-                    &self.output_experts,
                     self.intermediate_size,
                     self.expert_count,
                 )
@@ -344,7 +405,7 @@ impl SparseMoe {
 
 #[cfg(test)]
 mod tests {
-    use super::{MoeRoutingPolicy, ROUTING_TEMPORARY_LIMIT, SparseMoe};
+    use super::{ExpertMatrix, MoeRoutingPolicy, ROUTING_TEMPORARY_LIMIT, SparseMoe};
     use crate::model::architecture::MoeScoringFunction;
     use crate::{DType, MetalDevice, Tensor};
 
@@ -407,8 +468,8 @@ mod tests {
         let moe = SparseMoe::new(
             &device,
             router,
-            input_experts,
-            output_experts,
+            ExpertMatrix::Dense(input_experts),
+            ExpertMatrix::Dense(output_experts),
             MoeRoutingPolicy::softmax(experts, top_k),
             None,
         )
@@ -500,7 +561,15 @@ mod tests {
         let router = Tensor::from_f32(&device, [3, 2], DType::F32, &[0.; 6]).unwrap();
         let input = Tensor::from_f32(&device, [3, 4, 2], DType::F32, &[0.; 24]).unwrap();
         let output = Tensor::from_f32(&device, [3, 2, 2], DType::F32, &[0.; 12]).unwrap();
-        let moe = SparseMoe::new(&device, router, input, output, routing, None).unwrap();
+        let moe = SparseMoe::new(
+            &device,
+            router,
+            ExpertMatrix::Dense(input),
+            ExpertMatrix::Dense(output),
+            routing,
+            None,
+        )
+        .unwrap();
         let routes = moe.select_routes(&[0., 2., -2.], 1).unwrap();
 
         assert_eq!(routes[0].to_bits(), 0);
@@ -532,7 +601,15 @@ mod tests {
         let input = Tensor::from_f32(&device, [3, 2, 1], DType::F32, &[0.; 6]).unwrap();
         let output = Tensor::from_f32(&device, [3, 1, 1], DType::F32, &[0.; 3]).unwrap();
         let bias = Tensor::from_f32(&device, [3], DType::F32, &[-10., 0., 2.]).unwrap();
-        let moe = SparseMoe::new(&device, router, input, output, routing, Some(bias)).unwrap();
+        let moe = SparseMoe::new(
+            &device,
+            router,
+            ExpertMatrix::Dense(input),
+            ExpertMatrix::Dense(output),
+            routing,
+            Some(bias),
+        )
+        .unwrap();
         let routes = moe.select_routes(&[2., 1., 0.], 1).unwrap();
 
         let sigmoid_one = 1. / (1. + (-1f32).exp());

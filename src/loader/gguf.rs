@@ -134,6 +134,19 @@ impl TensorInfo {
         }
         Ok([self.dimensions[1], self.dimensions[0]])
     }
+
+    /// GGUF order stores the contiguous input width first. Rank-three expert
+    /// tensors therefore map to `[experts, output_rows, input_columns]`.
+    pub fn logical_expert_shape(&self) -> Result<[usize; 3]> {
+        if self.dimensions.len() != 3 {
+            return Err(Error::Gguf(format!(
+                "tensor {} is rank {}, expected an expert matrix",
+                self.name,
+                self.dimensions.len()
+            )));
+        }
+        Ok([self.dimensions[2], self.dimensions[1], self.dimensions[0]])
+    }
 }
 
 /// A seekable GGUF reader. Tensor payloads are read on demand, so opening a
@@ -661,6 +674,25 @@ mod tests {
         file.read_tensor_into("blk.0.attn_q.weight", &mut destination)
             .unwrap();
         assert_eq!(destination, vec![1; 68]);
+    }
+
+    #[test]
+    fn expert_tensor_shape_reverses_gguf_dimension_order() {
+        let tensor = TensorInfo {
+            name: "blk.2.ffn_gate_exps.weight".into(),
+            dimensions: vec![2048, 1792, 32],
+            type_id: 12,
+            offset: 0,
+            byte_len: 0,
+        };
+        assert_eq!(tensor.logical_expert_shape().unwrap(), [32, 1792, 2048]);
+        assert!(tensor.logical_matrix_shape().is_err());
+
+        let matrix = TensorInfo {
+            dimensions: vec![2048, 1792],
+            ..tensor
+        };
+        assert!(matrix.logical_expert_shape().is_err());
     }
 
     #[test]

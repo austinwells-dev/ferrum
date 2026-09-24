@@ -17,6 +17,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod gguf;
+pub use gguf::load_gguf;
+
 const DOCUMENTED_CONTEXT_LENGTH: usize = 32_768;
 
 #[derive(Debug, Deserialize)]
@@ -485,6 +488,7 @@ pub struct LoadedLfm2Moe {
     pub tokenizer: Tokenizer,
     pub eos_ids: Vec<u32>,
     pub source_tensor_bytes: usize,
+    pub quantized_tensor_bytes: usize,
     pub tensor_count: usize,
     pub parameter_count: usize,
     pub config_tokenizer_load: Duration,
@@ -492,18 +496,25 @@ pub struct LoadedLfm2Moe {
     pub construction: Duration,
 }
 
-pub fn load(device: &MetalDevice, dir: impl AsRef<Path>) -> Result<LoadedLfm2Moe> {
-    let dir = dir.as_ref();
+struct PreparedLfm2Moe {
+    source_config: Lfm2MoeConfig,
+    config: ModelConfig,
+    policy: ArchitecturePolicy,
+    tokenizer: Tokenizer,
+    config_tokenizer_load: Duration,
+}
+
+fn prepare_metadata(model_dir: &Path) -> Result<PreparedLfm2Moe> {
     let started = Instant::now();
-    let source_config = Lfm2MoeConfig::from_file(dir.join("config.json"))?;
+    let source_config = Lfm2MoeConfig::from_file(model_dir.join("config.json"))?;
     let (config, policy) = source_config.convert()?;
     let tokenizer_config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(dir.join("tokenizer_config.json"))
+        &std::fs::read(model_dir.join("tokenizer_config.json"))
             .map_err(|e| Error::Tokenizer(format!("tokenizer_config.json: {e}")))?,
     )
     .map_err(|e| Error::Tokenizer(format!("tokenizer_config.json: {e}")))?;
     let generation_config: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(dir.join("generation_config.json"))
+        &std::fs::read(model_dir.join("generation_config.json"))
             .map_err(|e| Error::Tokenizer(format!("generation_config.json: {e}")))?,
     )
     .map_err(|e| Error::Tokenizer(format!("generation_config.json: {e}")))?;
@@ -520,7 +531,7 @@ pub fn load(device: &MetalDevice, dir: impl AsRef<Path>) -> Result<LoadedLfm2Moe
             "LFM2-MoE tokenizer/generation policy mismatch".into(),
         ));
     }
-    let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
+    let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json"))?;
     if tokenizer.vocab_size() > config.vocab_size
         || tokenizer.encode("<|startoftext|>")? != [source_config.bos_token_id]
         || tokenizer.encode("<|im_end|>")? != [source_config.eos_token_id]
@@ -530,7 +541,24 @@ pub fn load(device: &MetalDevice, dir: impl AsRef<Path>) -> Result<LoadedLfm2Moe
             "LFM2-MoE special-token IDs differ from config".into(),
         ));
     }
-    let config_tokenizer_load = started.elapsed();
+    Ok(PreparedLfm2Moe {
+        source_config,
+        config,
+        policy,
+        tokenizer,
+        config_tokenizer_load: started.elapsed(),
+    })
+}
+
+pub fn load(device: &MetalDevice, dir: impl AsRef<Path>) -> Result<LoadedLfm2Moe> {
+    let dir = dir.as_ref();
+    let PreparedLfm2Moe {
+        source_config,
+        config,
+        policy,
+        tokenizer,
+        config_tokenizer_load,
+    } = prepare_metadata(dir)?;
 
     let started = Instant::now();
     let mut source = Weights::from_directory(device, dir)?;
@@ -563,6 +591,7 @@ pub fn load(device: &MetalDevice, dir: impl AsRef<Path>) -> Result<LoadedLfm2Moe
         tokenizer,
         eos_ids: vec![source_config.eos_token_id],
         source_tensor_bytes,
+        quantized_tensor_bytes: 0,
         tensor_count,
         parameter_count,
         config_tokenizer_load,

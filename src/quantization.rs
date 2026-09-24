@@ -133,6 +133,66 @@ impl QuantizedMatrix {
     }
 }
 
+/// Packed row-major expert matrices stored as `[experts, rows_per_expert, columns]`.
+/// The physical allocation is a normal quantized matrix with the expert axis
+/// flattened into its row axis, so each existing GGML block stays unchanged.
+#[derive(Clone)]
+pub struct QuantizedExpertMatrix {
+    matrix: QuantizedMatrix,
+    experts: usize,
+    rows_per_expert: usize,
+}
+
+impl QuantizedExpertMatrix {
+    pub(crate) fn new(
+        matrix: QuantizedMatrix,
+        experts: usize,
+        rows_per_expert: usize,
+    ) -> Result<Self> {
+        if experts == 0
+            || rows_per_expert == 0
+            || experts.checked_mul(rows_per_expert) != Some(matrix.rows())
+        {
+            return Err(Error::Shape(
+                "quantized expert matrix row geometry mismatch".into(),
+            ));
+        }
+        Ok(Self {
+            matrix,
+            experts,
+            rows_per_expert,
+        })
+    }
+
+    pub fn experts(&self) -> usize {
+        self.experts
+    }
+
+    pub fn rows_per_expert(&self) -> usize {
+        self.rows_per_expert
+    }
+
+    pub fn columns(&self) -> usize {
+        self.matrix.columns()
+    }
+
+    pub fn format(&self) -> QuantizationFormat {
+        self.matrix.format()
+    }
+
+    pub fn byte_size(&self) -> usize {
+        self.matrix.byte_size()
+    }
+
+    pub(crate) fn matrix(&self) -> &QuantizedMatrix {
+        &self.matrix
+    }
+
+    pub(crate) fn buffer(&self) -> &crate::metal::MetalBuffer {
+        self.matrix.buffer()
+    }
+}
+
 fn format_name(format: QuantizationFormat) -> &'static str {
     match format {
         QuantizationFormat::Q4_0 => "Q4_0",
@@ -143,6 +203,67 @@ fn format_name(format: QuantizationFormat) -> &'static str {
         QuantizationFormat::Q8_0 => "Q8_0",
         QuantizationFormat::Q6_K => "Q6_K",
         QuantizationFormat::MlxAffine4Group64 => "MLX affine 4-bit group-64",
+    }
+}
+
+/// Validate the fields that must remain finite or in-range before a GGUF
+/// block is retained as packed storage. Quantized decoding stays in the Metal
+/// kernels; this bounded host check rejects corrupt scale metadata up front.
+pub(crate) fn validate_gguf_quantized_payload(
+    name: &str,
+    format: QuantizationFormat,
+    payload: &[u8],
+) -> Result<()> {
+    if !payload.len().is_multiple_of(format.block_bytes()) {
+        return Err(Error::Gguf(format!(
+            "tensor {name} {} stream ended inside a block",
+            format_name(format)
+        )));
+    }
+    for block in payload.chunks_exact(format.block_bytes()) {
+        let half_at = |offset| {
+            half::f16::from_bits(u16::from_le_bytes([block[offset], block[offset + 1]])).to_f32()
+        };
+        match format {
+            QuantizationFormat::Q4_0 | QuantizationFormat::Q5_0 => {
+                if !half_at(0).is_finite() {
+                    return Err(invalid_quantized_scale(name, format));
+                }
+            }
+            QuantizationFormat::Q5_1
+            | QuantizationFormat::Q4_K
+            | QuantizationFormat::Q5_K
+            | QuantizationFormat::MlxAffine4Group64 => {
+                if !half_at(0).is_finite() || !half_at(2).is_finite() {
+                    return Err(invalid_quantized_scale(name, format));
+                }
+            }
+            QuantizationFormat::Q8_0 => {
+                let scale = half_at(0);
+                if !scale.is_finite() || scale < 0.0 {
+                    return Err(invalid_quantized_scale(name, format));
+                }
+                if block[2..].contains(&0x80) {
+                    return Err(Error::Weight {
+                        name: name.into(),
+                        message: "Q8_0 value -128 is outside the GGML range".into(),
+                    });
+                }
+            }
+            QuantizationFormat::Q6_K => {
+                if !half_at(208).is_finite() {
+                    return Err(invalid_quantized_scale(name, format));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn invalid_quantized_scale(name: &str, format: QuantizationFormat) -> Error {
+    Error::Weight {
+        name: name.into(),
+        message: format!("{} scale must be finite", format_name(format)),
     }
 }
 

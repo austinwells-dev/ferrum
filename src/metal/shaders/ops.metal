@@ -1132,6 +1132,38 @@ kernel void expert_project(EXPERT_PROJECT_ARGS, uint tid [[thread_index_in_threa
     expert_project_impl(a,b,m,c,p,tid,group);
 }
 
+void expert_project_quantized_impl(device const uchar* input, device const uchar* weights,
+                                   device const uchar* metadata, device uchar* output,
+                                   constant uint* p, uint tid, uint2 group) {
+    uint assignment=group.y, row=group.x*4+tid/32, lane=tid%32;
+    uint k=p[2], rows=p[3], experts=p[5], ggml_type=p[7];
+    uint expert=as_type<uint>(load(metadata,assignment*3,p[6]));
+    uint packed_row=expert*rows+row;
+    float sum=0.f;
+    if(assignment<p[1] && row<rows && expert<experts) {
+        for(uint column=lane;column<k;column+=32) {
+            float value=0.f;
+            if(ggml_type==12) value=q4_k_weight(weights,packed_row,column,k);
+            else if(ggml_type==13) value=q5_k_weight(weights,packed_row,column,k);
+            else if(ggml_type==14) value=q6_k_weight(weights,packed_row,column,k);
+            sum+=load(input,assignment*k+column,p[4])*value;
+        }
+    }
+    sum=simd_sum(sum);
+    if(lane==0 && assignment<p[1] && row<rows && expert<experts)
+        store(output,assignment*rows+row,p[4],sum);
+}
+
+kernel void expert_project_q4_k(EXPERT_PROJECT_ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    expert_project_quantized_impl(a,b,m,c,p,tid,group);
+}
+kernel void expert_project_q5_k(EXPERT_PROJECT_ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    expert_project_quantized_impl(a,b,m,c,p,tid,group);
+}
+kernel void expert_project_q6_k(EXPERT_PROJECT_ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
+    expert_project_quantized_impl(a,b,m,c,p,tid,group);
+}
+
 kernel void expert_silu_mul(ARGS, uint i [[thread_position_in_grid]]) {
     uint assignments=p[1], intermediate=p[2];
     if(i<assignments*intermediate) {

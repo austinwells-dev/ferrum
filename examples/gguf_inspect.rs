@@ -13,8 +13,13 @@ fn main() -> Result<()> {
         file.tensors().len(),
         file.file_len()
     );
+    let architecture = match file.metadata_value("general.architecture") {
+        Some(ferrum::loader::gguf::MetadataValue::String(value)) => value.as_str(),
+        _ => "",
+    };
     for (name, value) in file.metadata() {
-        if name.starts_with("qwen")
+        if (!architecture.is_empty() && name.starts_with(&format!("{architecture}.")))
+            || name.starts_with("qwen")
             || name == "general.architecture"
             || name == "general.name"
             || name == "tokenizer.ggml.model"
@@ -31,6 +36,26 @@ fn main() -> Result<()> {
     println!("tensor type counts: {types:?}");
     for info in file.tensors().values().take(35) {
         println!("{} {:?} type {}", info.name, info.dimensions, info.type_id);
+    }
+    for info in file.tensors().values().filter(|info| {
+        info.name.contains("token_embd")
+            || info.name == "output.weight"
+            || info.name == "output_norm.weight"
+    }) {
+        println!(
+            "special {} {:?} type {}",
+            info.name, info.dimensions, info.type_id
+        );
+    }
+    for info in file
+        .tensors()
+        .values()
+        .filter(|info| info.name.contains("_exps"))
+    {
+        println!(
+            "expert {} {:?} type {}",
+            info.name, info.dimensions, info.type_id
+        );
     }
     Ok(())
 }

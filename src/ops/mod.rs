@@ -130,6 +130,93 @@ impl MetalDevice {
         Ok(tensor)
     }
 
+    pub(crate) fn expert_project_quantized(
+        &self,
+        input: &Tensor,
+        metadata: &Tensor,
+        weight: &crate::quantization::QuantizedExpertMatrix,
+        features: usize,
+        experts: usize,
+    ) -> Result<Tensor> {
+        use crate::quantization::QuantizationFormat;
+
+        let x = input.shape().dimensions();
+        let meta = metadata.shape().dimensions();
+        if x.len() != 2
+            || x[0] == 0
+            || x[1] != features
+            || meta != [x[0], 3]
+            || metadata.dtype() != DType::F32
+            || experts == 0
+            || weight.experts() != experts
+            || weight.columns() != features
+            || weight.rows_per_expert() == 0
+            || !self.owns(input.buffer())
+            || !self.owns(metadata.buffer())
+            || !self.owns(weight.buffer())
+        {
+            return Err(Error::Shape(
+                "quantized expert projection geometry mismatch".into(),
+            ));
+        }
+        let (name, ggml_type) = match weight.format() {
+            QuantizationFormat::Q4_K => ("expert_project_q4_k", 12),
+            QuantizationFormat::Q5_K => ("expert_project_q5_k", 13),
+            QuantizationFormat::Q6_K => ("expert_project_q6_k", 14),
+            format => {
+                return Err(Error::Gguf(format!(
+                    "no quantized expert projection for {format:?}"
+                )));
+            }
+        };
+        let rows = weight.rows_per_expert();
+        let dims = [x[0], rows];
+        let shape = crate::tensor::Shape::new(dims)?;
+        index(shape.numel())?;
+        let mut p = [0; 9];
+        p[0] = index(shape.numel())?;
+        p[1] = index(x[0])?;
+        p[2] = index(features)?;
+        p[3] = index(rows)?;
+        p[4] = input.dtype() as u32;
+        p[5] = index(experts)?;
+        p[6] = DType::F32 as u32;
+        p[7] = ggml_type;
+        let profile_start = self.profiling().then(std::time::Instant::now);
+        let wait_before = profile_start
+            .map(|_| self.counters().wait)
+            .unwrap_or_default();
+        let allocation_start = profile_start.map(|_| std::time::Instant::now());
+        let tensor = Tensor::output(self, &dims, input.dtype())?;
+        let allocation_time = allocation_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+        let timing = self.dispatch(
+            name,
+            &[
+                input.binding(),
+                weight.matrix().binding(),
+                metadata.binding(),
+                tensor.binding(),
+            ],
+            &p,
+            [rows, x[0]],
+            false,
+        )?;
+        if let Some(start) = profile_start {
+            self.record_profile(
+                name,
+                start
+                    .elapsed()
+                    .saturating_sub(self.counters().wait - wait_before),
+                allocation_time,
+                tensor.storage_info().allocation_bytes,
+                &timing,
+            );
+        }
+        Ok(tensor)
+    }
+
     pub(crate) fn expert_silu_mul(&self, input: &Tensor, intermediate: usize) -> Result<Tensor> {
         let x = input.shape().dimensions();
         if x.len() != 2 || intermediate.checked_mul(2) != Some(x[1]) || intermediate == 0 {

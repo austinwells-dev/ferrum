@@ -9,9 +9,12 @@ use crate::{
     DType, Error, MetalDevice, Result, Tensor,
     loader::Weights,
     nn::{
-        Embedding, Linear, Mlp, RmsNorm, attention::Attention, kv_cache::KvCache, moe::SparseMoe,
+        Embedding, Linear, Mlp, RmsNorm,
+        attention::Attention,
+        kv_cache::KvCache,
+        moe::{ExpertMatrix, SparseMoe},
     },
-    quantization::{QuantizationFormat, QuantizedMatrix},
+    quantization::{QuantizationFormat, QuantizedExpertMatrix, QuantizedMatrix},
 };
 use std::collections::BTreeMap;
 pub struct DecoderLayer {
@@ -126,12 +129,16 @@ impl FeedForward {
 pub(crate) enum ModelWeight {
     Dense(Tensor),
     Quantized(QuantizedMatrix),
+    QuantizedExperts(QuantizedExpertMatrix),
 }
 impl ModelWeight {
     fn dimensions(&self) -> Vec<usize> {
         match self {
             Self::Dense(tensor) => tensor.shape().dimensions().to_vec(),
             Self::Quantized(tensor) => vec![tensor.rows(), tensor.columns()],
+            Self::QuantizedExperts(tensor) => {
+                vec![tensor.experts(), tensor.rows_per_expert(), tensor.columns()]
+            }
         }
     }
 }
@@ -505,6 +512,27 @@ pub(crate) fn construct_mixed(
                     return Err(Error::DeviceMismatch);
                 }
             }
+            ModelWeight::QuantizedExperts(tensor) => {
+                if shape.len() != 3
+                    || !matches!(
+                        tensor.format(),
+                        QuantizationFormat::Q4_K
+                            | QuantizationFormat::Q5_K
+                            | QuantizationFormat::Q6_K
+                    )
+                {
+                    return Err(Error::Weight {
+                        name,
+                        message: format!(
+                            "unsupported quantized expert geometry or format {:?}",
+                            tensor.format()
+                        ),
+                    });
+                }
+                if !d.owns(tensor.buffer()) {
+                    return Err(Error::DeviceMismatch);
+                }
+            }
         }
     }
     for l in 0..c.num_layers {
@@ -536,6 +564,10 @@ pub(crate) fn construct_mixed(
                 name: name.into(),
                 message: "normalization tensors must be dense".into(),
             }),
+            ModelWeight::QuantizedExperts(_) => Err(Error::Weight {
+                name: name.into(),
+                message: "normalization tensors must be dense".into(),
+            }),
         }
     };
     let norm = |name: &str| -> Result<RmsNorm> {
@@ -556,6 +588,10 @@ pub(crate) fn construct_mixed(
                     name: bias_name.clone(),
                     message: "linear bias must be dense".into(),
                 }),
+                ModelWeight::QuantizedExperts(_) => Err(Error::Weight {
+                    name: bias_name.clone(),
+                    message: "linear bias must be dense".into(),
+                }),
             })
             .transpose()?;
         match w.get(&weight_name)? {
@@ -563,6 +599,20 @@ pub(crate) fn construct_mixed(
             ModelWeight::Quantized(tensor) => {
                 Linear::new_quantized(d, tensor.clone(), bias, c.dtype)
             }
+            ModelWeight::QuantizedExperts(_) => Err(Error::Weight {
+                name: weight_name,
+                message: "expert matrices cannot be used as linear weights".into(),
+            }),
+        }
+    };
+    let expert_matrix = |name: &str| -> Result<ExpertMatrix> {
+        match w.get(name)? {
+            ModelWeight::Dense(tensor) => Ok(ExpertMatrix::Dense(tensor.clone())),
+            ModelWeight::QuantizedExperts(tensor) => Ok(ExpertMatrix::Quantized(tensor.clone())),
+            ModelWeight::Quantized(_) => Err(Error::Weight {
+                name: name.into(),
+                message: "expert weights must have a three-dimensional layout".into(),
+            }),
         }
     };
     let head_norm = |name: &str| -> Result<Option<RmsNorm>> {
@@ -587,8 +637,8 @@ pub(crate) fn construct_mixed(
                 intermediate_size: _,
             } => {
                 let router = dense(&format!("{prefix}.moe.router.weight"))?;
-                let input_experts = dense(&format!("{prefix}.moe.input.weight"))?;
-                let output_experts = dense(&format!("{prefix}.moe.output.weight"))?;
+                let input_experts = expert_matrix(&format!("{prefix}.moe.input.weight"))?;
+                let output_experts = expert_matrix(&format!("{prefix}.moe.output.weight"))?;
                 let selection_bias = if routing.use_expert_bias {
                     Some(dense(&format!("{prefix}.moe.router_bias.weight"))?)
                 } else {
@@ -645,6 +695,12 @@ pub(crate) fn construct_mixed(
     let embedding = match w.get("embedding.weight")? {
         ModelWeight::Dense(tensor) => Embedding::new(tensor.clone())?,
         ModelWeight::Quantized(tensor) => Embedding::new_quantized(d, tensor.clone(), c.dtype)?,
+        ModelWeight::QuantizedExperts(_) => {
+            return Err(Error::Weight {
+                name: "embedding.weight".into(),
+                message: "expert matrices cannot be used as embeddings".into(),
+            });
+        }
     };
     let lm_head = if c.tie_word_embeddings {
         let bias = w
@@ -656,12 +712,22 @@ pub(crate) fn construct_mixed(
                     name: "lm_head.bias".into(),
                     message: "linear bias must be dense".into(),
                 }),
+                ModelWeight::QuantizedExperts(_) => Err(Error::Weight {
+                    name: "lm_head.bias".into(),
+                    message: "linear bias must be dense".into(),
+                }),
             })
             .transpose()?;
         match w.get("embedding.weight")? {
             ModelWeight::Dense(tensor) => Linear::new(d, tensor.clone(), bias)?,
             ModelWeight::Quantized(tensor) => {
                 Linear::new_quantized(d, tensor.clone(), bias, c.dtype)?
+            }
+            ModelWeight::QuantizedExperts(_) => {
+                return Err(Error::Weight {
+                    name: "embedding.weight".into(),
+                    message: "expert matrices cannot be used as an output projection".into(),
+                });
             }
         }
     } else {
@@ -679,7 +745,7 @@ fn check_dense_vector(
 ) -> Result<()> {
     let tensor = match weight {
         ModelWeight::Dense(tensor) => tensor,
-        ModelWeight::Quantized(_) => {
+        ModelWeight::Quantized(_) | ModelWeight::QuantizedExperts(_) => {
             return Err(Error::Weight {
                 name: name.into(),
                 message: "one-dimensional model tensors must be dense".into(),

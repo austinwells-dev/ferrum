@@ -732,7 +732,10 @@ impl MetalDevice {
         tiled: bool,
     ) -> Result<DispatchTiming> {
         let (input_count, output_count) = match name {
-            "expert_project" => (3, 1),
+            "expert_project"
+            | "expert_project_q4_k"
+            | "expert_project_q5_k"
+            | "expert_project_q6_k" => (3, 1),
             "lfm2_short_conv" => (4, 2),
             "lfm2_split3" => (1, 3),
             _ => (2, 1),
@@ -807,6 +810,9 @@ impl MetalDevice {
                 | "gemv_vector"
                 | "gemv_wide"
                 | "expert_project"
+                | "expert_project_q4_k"
+                | "expert_project_q5_k"
+                | "expert_project_q6_k"
                 | "project_wide_bf16"
                 | "project_wide_f16"
                 | "project_mpp"
@@ -1102,7 +1108,13 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if name == "expert_project" {
+            } else if matches!(
+                name,
+                "expert_project"
+                    | "expert_project_q4_k"
+                    | "expert_project_q5_k"
+                    | "expert_project_q6_k"
+            ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
                     return Err(Error::Dispatch(

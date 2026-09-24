@@ -1365,7 +1365,7 @@ mod q5_tests {
 #[cfg(test)]
 mod qk_tests {
     use super::*;
-    use crate::quantization::{QuantizationFormat, QuantizedMatrix};
+    use crate::quantization::{QuantizationFormat, QuantizedExpertMatrix, QuantizedMatrix};
 
     fn scales(row: usize, block: usize) -> [u8; 12] {
         std::array::from_fn(|i| ((row * 47 + block * 31 + i * 53 + 0x9d) & 255) as u8)
@@ -1584,6 +1584,65 @@ mod qk_tests {
     }
 
     #[test]
+    fn q4_k_and_q5_k_expert_projection_uses_assignment_metadata() {
+        let d = MetalDevice::new().unwrap();
+        let (experts, rows_per_expert, columns) = (3, 5, 512);
+        let expert_ids = [2usize, 1, 2, 0];
+        for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
+            let packed = packed(&d, experts * rows_per_expert, columns, format);
+            let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+            let values = input(expert_ids.len(), columns);
+            let x =
+                Tensor::from_f32(&d, [expert_ids.len(), columns], DType::BF16, &values).unwrap();
+            let rounded_input = x.to_f32();
+            let metadata = expert_ids
+                .iter()
+                .enumerate()
+                .flat_map(|(assignment, &expert)| {
+                    [
+                        f32::from_bits(expert as u32),
+                        f32::from_bits(assignment as u32),
+                        1.0,
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let metadata =
+                Tensor::from_f32(&d, [expert_ids.len(), 3], DType::F32, &metadata).unwrap();
+            let actual = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap()
+                .to_f32();
+            let expected = (0..expert_ids.len())
+                .flat_map(|assignment| {
+                    (0..rows_per_expert).map({
+                        let rounded_input = &rounded_input;
+                        move |row| {
+                            DType::BF16.round(
+                                (0..columns)
+                                    .map(|column| {
+                                        rounded_input[assignment * columns + column]
+                                            * qk_value(
+                                                expert_ids[assignment] * rows_per_expert + row,
+                                                column,
+                                                format,
+                                            )
+                                    })
+                                    .sum::<f32>(),
+                            )
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 0.06,
+                    "{format:?} index {index}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn q4_k_and_q5_k_reject_partial_superblocks() {
         let d = MetalDevice::new().unwrap();
         for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
@@ -1595,7 +1654,7 @@ mod qk_tests {
 #[cfg(test)]
 mod q6_k_tests {
     use super::*;
-    use crate::quantization::{QuantizationFormat, QuantizedMatrix};
+    use crate::quantization::{QuantizationFormat, QuantizedExpertMatrix, QuantizedMatrix};
 
     fn packed_byte(row: usize, block: usize, index: usize) -> u8 {
         ((row * 13 + block * 7 + index * 17 + 3) & 255) as u8
@@ -1751,6 +1810,60 @@ mod q6_k_tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn q6_k_expert_projection_uses_assignment_metadata() {
+        let d = MetalDevice::new().unwrap();
+        let (experts, rows_per_expert, columns) = (3, 5, 512);
+        let expert_ids = [2usize, 1, 2, 0];
+        let packed = packed(&d, experts * rows_per_expert, columns);
+        let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+        let values = input(expert_ids.len(), columns);
+        let x = Tensor::from_f32(&d, [expert_ids.len(), columns], DType::BF16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let metadata = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(assignment, &expert)| {
+                [
+                    f32::from_bits(expert as u32),
+                    f32::from_bits(assignment as u32),
+                    1.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let metadata = Tensor::from_f32(&d, [expert_ids.len(), 3], DType::F32, &metadata).unwrap();
+        let actual = d
+            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+            .unwrap()
+            .to_f32();
+        let expected = (0..expert_ids.len())
+            .flat_map(|assignment| {
+                (0..rows_per_expert).map({
+                    let rounded_input = &rounded_input;
+                    move |row| {
+                        DType::BF16.round(
+                            (0..columns)
+                                .map(|column| {
+                                    rounded_input[assignment * columns + column]
+                                        * q6_value(
+                                            expert_ids[assignment] * rows_per_expert + row,
+                                            column,
+                                        )
+                                })
+                                .sum::<f32>(),
+                        )
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.12,
+                "Q6_K index {index}: actual={actual}, expected={expected}"
+            );
+        }
     }
 
     #[test]
