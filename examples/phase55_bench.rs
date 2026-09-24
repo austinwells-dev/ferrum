@@ -153,6 +153,22 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let expert_tensorops_min_routes = match request
+        .get("moe_expert_tensorops_min_routes_per_expert")
+    {
+        None | Some(Value::Null) => device.moe_expert_tensorops_min_routes_per_expert(),
+        Some(value) => {
+            let routes = value
+                .as_u64()
+                .and_then(|routes| usize::try_from(routes).ok())
+                .filter(|routes| *routes > 0)
+                .ok_or_else(|| Error::Parameter(
+                    "request field moe_expert_tensorops_min_routes_per_expert must be a positive integer".into(),
+                ))?;
+            device.set_moe_expert_tensorops_min_routes_per_expert(routes)?;
+            routes
+        }
+    };
     if max_new_tokens == 0 {
         return Err(Error::Parameter("max_new_tokens must be positive".into()));
     }
@@ -183,6 +199,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "pair_order": pair_order,
         "warmup": warmup,
         "moe_expert_tensorops": expert_tensorops,
+        "moe_expert_tensorops_min_routes_per_expert": expert_tensorops_min_routes,
         "model_format": model.format,
         "model_repository": model.repository,
         "model_revision": model.revision,
@@ -267,6 +284,16 @@ fn main() -> Result<()> {
             }
         };
         device.set_moe_expert_tensorops(enabled)?;
+    }
+    if let Ok(value) = std::env::var("FERRUM_MOE_EXPERT_TENSOROPS_MIN_ROUTES_PER_EXPERT") {
+        let routes = value
+            .parse::<usize>()
+            .ok()
+            .filter(|routes| *routes > 0)
+            .ok_or_else(|| {
+                Error::Parameter("invalid FERRUM_MOE_EXPERT_TENSOROPS_MIN_ROUTES_PER_EXPERT".into())
+            })?;
+        device.set_moe_expert_tensorops_min_routes_per_expert(routes)?;
     }
     if let Ok(value) = std::env::var("FERRUM_MLX_AFFINE4_GEMV_QUAD") {
         let enabled = match value.as_str() {

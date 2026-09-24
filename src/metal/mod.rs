@@ -274,6 +274,7 @@ pub struct MetalDevice {
     q6_k_gemv_8rows: Cell<bool>,
     moe_gpu_routing: Cell<bool>,
     moe_expert_tensorops: Cell<bool>,
+    moe_expert_tensorops_min_routes_per_expert: Cell<usize>,
     reference_math: Cell<bool>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
@@ -315,6 +316,7 @@ impl MetalDevice {
             q6_k_gemv_8rows: Cell::new(true),
             moe_gpu_routing: Cell::new(true),
             moe_expert_tensorops: Cell::new(true),
+            moe_expert_tensorops_min_routes_per_expert: Cell::new(8),
             reference_math: Cell::new(false),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
@@ -444,6 +446,24 @@ impl MetalDevice {
     }
     pub fn moe_expert_tensorops_enabled(&self) -> bool {
         self.moe_expert_tensorops.get()
+    }
+    /// Set the minimum average route count per expert for grouped expert TensorOps.
+    pub fn set_moe_expert_tensorops_min_routes_per_expert(&self, routes: usize) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change expert TensorOps threshold during execution".into(),
+            ));
+        }
+        if routes == 0 {
+            return Err(Error::Parameter(
+                "expert TensorOps threshold must be positive".into(),
+            ));
+        }
+        self.moe_expert_tensorops_min_routes_per_expert.set(routes);
+        Ok(())
+    }
+    pub fn moe_expert_tensorops_min_routes_per_expert(&self) -> usize {
+        self.moe_expert_tensorops_min_routes_per_expert.get()
     }
     /// Select the multi-SIMD split-K BF16 GEMV for large aligned rows.
     pub fn set_split_k_gemv(&self, enabled: bool) -> Result<()> {

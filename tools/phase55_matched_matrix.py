@@ -93,6 +93,25 @@ class JsonLineProcess:
             raise RuntimeError(f"benchmark process exited with status {status}")
 
 
+class FerrumVariant:
+    """One per-request Ferrum option variant backed by a shared warm process."""
+
+    def __init__(self, process: JsonLineProcess, field: str, value: Any, name: str):
+        self.process = process
+        self.field = field
+        self.value = value
+        self.name = name
+        self.startup_ms: float | None = None
+
+    def request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        request = dict(payload)
+        request[self.field] = self.value
+        response = self.process.request(request)
+        self.startup_ms = self.process.startup_ms
+        response["ferrum_variant"] = self.name
+        return response
+
+
 class NativeMlx:
     def __init__(self, model_dir: Path):
         self.started_at = time.perf_counter()
@@ -242,6 +261,10 @@ def main() -> None:
     parser.add_argument("--llama-model", type=Path)
     parser.add_argument("--mlx-model", type=Path)
     parser.add_argument("--profile-ferrum", action="store_true")
+    parser.add_argument(
+        "--ferrum-paired-option",
+        help="interleave two Ferrum values in one process as FIELD=CONTROL,CANDIDATE (values are JSON)",
+    )
     args = parser.parse_args()
     if args.repeats <= 0:
         raise SystemExit("--repeats must be positive")
@@ -255,6 +278,19 @@ def main() -> None:
         raise SystemExit("Ferrum and llama.cpp must receive the same GGUF artifact")
     if args.ferrum_model and args.mlx_model and args.ferrum_model.resolve() != args.mlx_model.resolve():
         raise SystemExit("Ferrum and native MLX must receive the same affine-Q4 model directory")
+    if args.ferrum_paired_option and not args.ferrum_exe:
+        raise SystemExit("--ferrum-paired-option requires --ferrum-exe and --ferrum-model")
+
+    paired_option: tuple[str, Any, Any] | None = None
+    if args.ferrum_paired_option:
+        field, separator, values = args.ferrum_paired_option.partition("=")
+        control, value_separator, candidate = values.partition(",")
+        if not separator or not value_separator or not field:
+            raise SystemExit("--ferrum-paired-option must be FIELD=CONTROL,CANDIDATE")
+        try:
+            paired_option = (field, json.loads(control), json.loads(candidate))
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"paired Ferrum option values must be JSON: {error}") from error
 
     engines: dict[str, Any] = {}
     mlx = NativeMlx(args.mlx_model) if args.mlx_model else None
@@ -265,9 +301,13 @@ def main() -> None:
         ferrum_env = os.environ.copy()
         if args.profile_ferrum:
             ferrum_env["FERRUM_MATRIX_PROFILE"] = "1"
-        engines["ferrum"] = JsonLineProcess(
-            [str(args.ferrum_exe), str(args.ferrum_model)], ferrum_env
-        )
+        ferrum_process = JsonLineProcess([str(args.ferrum_exe), str(args.ferrum_model)], ferrum_env)
+        if paired_option is None:
+            engines["ferrum"] = ferrum_process
+        else:
+            field, control, candidate = paired_option
+            engines["ferrum-control"] = FerrumVariant(ferrum_process, field, control, "control")
+            engines["ferrum-candidate"] = FerrumVariant(ferrum_process, field, candidate, "candidate")
     if args.llama_exe:
         engines["llama.cpp"] = JsonLineProcess(
             [str(args.llama_exe), str(args.llama_model)], os.environ.copy()
@@ -335,9 +375,12 @@ def main() -> None:
                         output.flush()
                         print(json.dumps(result, separators=(",", ":")), flush=True)
     finally:
+        closed: set[int] = set()
         for engine in engines.values():
-            if isinstance(engine, JsonLineProcess):
-                engine.close()
+            process = engine.process if isinstance(engine, FerrumVariant) else engine
+            if isinstance(process, JsonLineProcess) and id(process) not in closed:
+                process.close()
+                closed.add(id(process))
 
 
 if __name__ == "__main__":

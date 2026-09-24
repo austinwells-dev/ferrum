@@ -1750,6 +1750,157 @@ mod qk_tests {
     }
 
     #[test]
+    fn q4_k_and_q5_k_expert_tensorops_cover_twelve_routes_per_expert() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        d.set_profiling(true);
+        assert!(d.set_moe_expert_tensorops_min_routes_per_expert(0).is_err());
+        d.set_moe_expert_tensorops_min_routes_per_expert(12)
+            .unwrap();
+        let (assignments, experts, rows_per_expert, columns) = (37, 3, 65, 512);
+        let expert_ids = (0..assignments)
+            .map(|assignment| (assignment + 1) % experts)
+            .collect::<Vec<_>>();
+        let values = input(assignments, columns);
+        let x = Tensor::from_f32(&d, [assignments, columns], DType::BF16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let metadata_values = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(assignment, &expert)| {
+                [
+                    f32::from_bits(expert as u32),
+                    f32::from_bits(assignment as u32),
+                    1.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let metadata =
+            Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata_values).unwrap();
+
+        for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
+            let packed = packed(&d, experts * rows_per_expert, columns, format);
+            let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+            let actual = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap()
+                .to_f32();
+            let expected = (0..assignments)
+                .flat_map(|assignment| {
+                    (0..rows_per_expert).map({
+                        let rounded_input = &rounded_input;
+                        let expert_ids = &expert_ids;
+                        move |row| {
+                            DType::BF16.round(
+                                (0..columns)
+                                    .map(|column| {
+                                        rounded_input[assignment * columns + column]
+                                            * DType::BF16.round(qk_value(
+                                                expert_ids[assignment] * rows_per_expert + row,
+                                                column,
+                                                format,
+                                            ))
+                                    })
+                                    .sum::<f32>(),
+                            )
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 0.08,
+                    "{format:?} index {index}: actual={actual}, expected={expected}"
+                );
+            }
+            let profile = d.take_profile();
+            let operation = match format {
+                QuantizationFormat::Q4_K => "expert_project_q4_k_mpp",
+                QuantizationFormat::Q5_K => "expert_project_q5_k_mpp",
+                _ => unreachable!(),
+            };
+            assert_eq!(profile.get(operation).unwrap().calls, 1);
+        }
+    }
+
+    #[test]
+    fn q4_k_and_q5_k_expert_tensorops_cover_eight_routes_per_expert() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        d.set_profiling(true);
+        assert_eq!(d.moe_expert_tensorops_min_routes_per_expert(), 8);
+        d.set_moe_expert_tensorops_min_routes_per_expert(8).unwrap();
+        let (assignments, experts, rows_per_expert, columns) = (25, 3, 65, 512);
+        let expert_ids = (0..assignments)
+            .map(|assignment| (assignment + 1) % experts)
+            .collect::<Vec<_>>();
+        let values = input(assignments, columns);
+        let x = Tensor::from_f32(&d, [assignments, columns], DType::BF16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let metadata_values = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(assignment, &expert)| {
+                [
+                    f32::from_bits(expert as u32),
+                    f32::from_bits(assignment as u32),
+                    1.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let metadata =
+            Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata_values).unwrap();
+
+        for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
+            let packed = packed(&d, experts * rows_per_expert, columns, format);
+            let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+            let actual = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap()
+                .to_f32();
+            let expected = (0..assignments)
+                .flat_map(|assignment| {
+                    (0..rows_per_expert).map({
+                        let rounded_input = &rounded_input;
+                        let expert_ids = &expert_ids;
+                        move |row| {
+                            DType::BF16.round(
+                                (0..columns)
+                                    .map(|column| {
+                                        rounded_input[assignment * columns + column]
+                                            * DType::BF16.round(qk_value(
+                                                expert_ids[assignment] * rows_per_expert + row,
+                                                column,
+                                                format,
+                                            ))
+                                    })
+                                    .sum::<f32>(),
+                            )
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 0.08,
+                    "{format:?} index {index}: actual={actual}, expected={expected}"
+                );
+            }
+            let profile = d.take_profile();
+            let operation = match format {
+                QuantizationFormat::Q4_K => "expert_project_q4_k_mpp",
+                QuantizationFormat::Q5_K => "expert_project_q5_k_mpp",
+                _ => unreachable!(),
+            };
+            assert_eq!(profile.get(operation).unwrap().calls, 1);
+        }
+    }
+
+    #[test]
     fn q4_k_and_q5_k_reject_partial_superblocks() {
         let d = MetalDevice::new().unwrap();
         for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
@@ -2052,6 +2203,147 @@ mod q6_k_tests {
             assert!(
                 (actual - expected).abs() <= 0.16,
                 "Q6_K TensorOps index {index}: actual={actual}, expected={expected}"
+            );
+        }
+        assert_eq!(
+            d.take_profile()
+                .get("expert_project_q6_k_mpp")
+                .unwrap()
+                .calls,
+            1
+        );
+    }
+
+    #[test]
+    fn q6_k_expert_tensorops_covers_twelve_routes_per_expert() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        d.set_profiling(true);
+        d.set_moe_expert_tensorops_min_routes_per_expert(12)
+            .unwrap();
+        let (assignments, experts, rows_per_expert, columns) = (37, 3, 65, 512);
+        let expert_ids = (0..assignments)
+            .map(|assignment| (assignment + 1) % experts)
+            .collect::<Vec<_>>();
+        let packed = packed(&d, experts * rows_per_expert, columns);
+        let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+        let values = input(assignments, columns);
+        let x = Tensor::from_f32(&d, [assignments, columns], DType::BF16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let metadata_values = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(assignment, &expert)| {
+                [
+                    f32::from_bits(expert as u32),
+                    f32::from_bits(assignment as u32),
+                    1.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let metadata =
+            Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata_values).unwrap();
+        let actual = d
+            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+            .unwrap()
+            .to_f32();
+        let expected = (0..assignments)
+            .flat_map(|assignment| {
+                (0..rows_per_expert).map({
+                    let rounded_input = &rounded_input;
+                    let expert_ids = &expert_ids;
+                    move |row| {
+                        DType::BF16.round(
+                            (0..columns)
+                                .map(|column| {
+                                    rounded_input[assignment * columns + column]
+                                        * DType::BF16.round(q6_value(
+                                            expert_ids[assignment] * rows_per_expert + row,
+                                            column,
+                                        ))
+                                })
+                                .sum::<f32>(),
+                        )
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.16,
+                "Q6_K index {index}: actual={actual}, expected={expected}"
+            );
+        }
+        assert_eq!(
+            d.take_profile()
+                .get("expert_project_q6_k_mpp")
+                .unwrap()
+                .calls,
+            1
+        );
+    }
+
+    #[test]
+    fn q6_k_expert_tensorops_covers_eight_routes_per_expert() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        d.set_profiling(true);
+        d.set_moe_expert_tensorops_min_routes_per_expert(8).unwrap();
+        let (assignments, experts, rows_per_expert, columns) = (25, 3, 65, 512);
+        let expert_ids = (0..assignments)
+            .map(|assignment| (assignment + 1) % experts)
+            .collect::<Vec<_>>();
+        let packed = packed(&d, experts * rows_per_expert, columns);
+        let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+        let values = input(assignments, columns);
+        let x = Tensor::from_f32(&d, [assignments, columns], DType::BF16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let metadata_values = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(assignment, &expert)| {
+                [
+                    f32::from_bits(expert as u32),
+                    f32::from_bits(assignment as u32),
+                    1.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let metadata =
+            Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata_values).unwrap();
+        let actual = d
+            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+            .unwrap()
+            .to_f32();
+        let expected = (0..assignments)
+            .flat_map(|assignment| {
+                (0..rows_per_expert).map({
+                    let rounded_input = &rounded_input;
+                    let expert_ids = &expert_ids;
+                    move |row| {
+                        DType::BF16.round(
+                            (0..columns)
+                                .map(|column| {
+                                    rounded_input[assignment * columns + column]
+                                        * DType::BF16.round(q6_value(
+                                            expert_ids[assignment] * rows_per_expert + row,
+                                            column,
+                                        ))
+                                })
+                                .sum::<f32>(),
+                        )
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.16,
+                "Q6_K index {index}: actual={actual}, expected={expected}"
             );
         }
         assert_eq!(
