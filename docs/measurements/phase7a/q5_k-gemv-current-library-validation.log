@@ -1,0 +1,95 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.69s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 85 tests
+test loader::gguf::tests::compares_tensor_aliases_with_bounded_reads ... ok
+test loader::gguf::tests::expert_tensor_shape_reverses_gguf_dimension_order ... ok
+test loader::gguf::tests::reads_aligned_q8_0_tensor_without_reordering_payload ... ok
+test loader::gguf::tests::rejects_bad_magic_and_truncated_header ... ok
+test loader::gguf::tests::rejects_unaligned_offsets_and_non_block_dimensions ... ok
+test loader::gguf::tests::rejects_unknown_quantization_and_overlapping_ranges ... ok
+test loader::gguf::tests::standard_block_sizes_match_the_ggml_layouts ... ok
+test metal::arena_tests::arena_never_recycles_live_or_pending_tensors ... 2026-09-25 00:14:47.130 ferrum-508026e7fa9bdb9b[72993:6937077] Metal API Validation Enabled
+2026-09-25 00:14:47.130 ferrum-508026e7fa9bdb9b[72993:6937077] Metal GPU Validation Enabled
+ok
+test metal::custom_output_tests::expert_projection_tracks_its_real_output_range ... ok
+test metal::failed_completion_tests::bounded_epochs_preserve_live_dependency_chain ... ok
+test metal::failed_completion_tests::failed_suffix_does_not_poison_published_cache_prefix ... ok
+test metal::tests::execution_owns_dropped_intermediates_and_drains_on_error ... ok
+test metal::tests::mapping_is_excluded_until_scope_completion ... ok
+test metal::transaction_tests::late_encoder_failure_preserves_cache_and_retry ... ok
+test model::lfm2_moe::tests::packed_expert_weights_preserve_official_gate_up_down_order ... ok
+test model::qwen_gguf::tests::q4_0_loader_checks_scale_and_block_boundary ... ok
+test model::qwen_gguf::tests::q4_k_loader_checks_both_superblock_scales_and_boundary ... ok
+test model::qwen_gguf::tests::q5_0_loader_checks_scale_and_block_boundary ... ok
+test model::qwen_gguf::tests::q5_1_loader_checks_scale_minimum_and_block_boundary ... ok
+test model::qwen_gguf::tests::q5_k_loader_checks_both_superblock_scales_and_boundary ... ok
+test model::qwen_gguf::tests::q6_k_loader_checks_superblock_scale_and_boundary ... ok
+test model::qwen_gguf::tests::q8_0_loader_checks_scale_range_and_block_boundary ... ok
+test model::qwen_mlx::tests::mlx_affine_accepts_signed_finite_scales_and_rejects_nonfinite_metadata ... ok
+test model::qwen_mlx::tests::mlx_affine_repack_preserves_u4_codes_and_f16_metadata ... ok
+test model::qwen_mlx::tests::safetensors_index_checks_dtype_geometry_ranges_and_trailing_bytes ... ok
+test model::transformer::hybrid_state_tests::failed_short_conv_forward_keeps_published_state_and_cache_retryable ... ok
+test nn::moe::tests::grouped_experts_preserve_long_token_indices_and_match_cpu ... ok
+test nn::moe::tests::metal_router_preserves_cpu_top_k_order_and_weights ... ok
+test nn::moe::tests::sigmoid_expert_bias_changes_selection_without_changing_route_scores ... ok
+test nn::moe::tests::sigmoid_top_k_routes_normalize_and_apply_scale ... ok
+test ops::transformer::fusion_tests::attention_softmax_prefix_matches_full_scan_for_causal_tails ... ok
+test ops::transformer::fusion_tests::attention_softmax_preserves_staged_rounding_and_causal_offsets ... ok
+test ops::transformer::fusion_tests::decode_context_partitions_cover_threshold_and_column_tails ... ok
+test ops::transformer::fusion_tests::fused_silu_multiply_preserves_storage_rounding ... ok
+test ops::transformer::fusion_tests::tiled_attention_products_match_scalar_for_grouping_and_tails ... ok
+test ops::transformer::lfm2_short_conv_tests::lfm2_short_conv_matches_causal_reference_and_updates_fresh_state ... ok
+test ops::transformer::lfm2_short_conv_tests::lfm2_split3_deinterleaves_each_token_row ... ok
+test ops::transformer::mlx_affine4_tests::affine4_direct_gemv_and_gemm_match_signed_scale_reference_with_tails ... ok
+test ops::transformer::mlx_affine4_tests::affine4_embedding_gather_dequantizes_only_requested_rows ... ok
+test ops::transformer::mlx_affine4_tests::affine4_mpp_gemm_handles_batch_and_output_tails_across_k_tiles ... ok
+test ops::transformer::mlx_affine4_tests::affine4_quad_gemv_reuses_activations_across_rows_and_covers_tails ... ok
+test ops::transformer::q4_0_tests::q4_0_embedding_gather_decodes_only_requested_rows ... ok
+test ops::transformer::q4_0_tests::q4_0_gemv_8rows_reuses_inputs_and_covers_output_tail ... ok
+test ops::transformer::q4_0_tests::q4_0_gemv_and_gemm_cover_output_and_batch_tails ... ok
+test ops::transformer::q4_0_tests::q4_0_gemv_honors_signed_block_scale ... ok
+test ops::transformer::q4_0_tests::q4_0_mpp_gemm_decodes_a_bounded_weight_tile ... ok
+test ops::transformer::q4_0_tests::q4_0_rejects_columns_that_do_not_form_ggml_blocks ... ok
+test ops::transformer::q4_0_tests::q4_0_small_batch_mpp_covers_row_and_column_tails ... ok
+test ops::transformer::q5_tests::q5_0_and_q5_1_embedding_gather_decode_selected_rows ... ok
+test ops::transformer::q5_tests::q5_0_and_q5_1_gemv_and_gemm_cover_output_and_batch_tails ... ok
+test ops::transformer::q5_tests::q5_0_and_q5_1_mpp_gemm_cover_batch_and_output_tails ... ok
+test ops::transformer::q5_tests::q5_0_and_q5_1_reject_partial_blocks ... ok
+test ops::transformer::q5_tests::q5_0_gemv_n4_reuses_activations_and_covers_output_tail ... ok
+test ops::transformer::q5_tests::q5_1_gemv_n4_reuses_activations_and_covers_output_tail ... ok
+test ops::transformer::q5_tests::q5_1_mpp_k64_covers_batch_output_and_k_tiles ... ok
+test ops::transformer::q6_k_tests::q6_k_eight_row_gemv_reuses_activations_and_covers_output_tail ... ok
+test ops::transformer::q6_k_tests::q6_k_embedding_gather_decodes_only_requested_rows ... ok
+test ops::transformer::q6_k_tests::q6_k_expert_projection_uses_assignment_metadata ... ok
+test ops::transformer::q6_k_tests::q6_k_expert_tensorops_covers_eight_routes_per_expert ... ok
+test ops::transformer::q6_k_tests::q6_k_expert_tensorops_covers_twelve_routes_per_expert ... ok
+test ops::transformer::q6_k_tests::q6_k_expert_tensorops_groups_routes_and_restores_assignment_order ... ok
+test ops::transformer::q6_k_tests::q6_k_expert_tensorops_k64_matches_reference ... ok
+test ops::transformer::q6_k_tests::q6_k_gemv_and_gemm_cover_superblock_and_batch_tails ... ok
+test ops::transformer::q6_k_tests::q6_k_mpp_gemm_decodes_bounded_tiles_with_row_and_k_tails ... ok
+test ops::transformer::q6_k_tests::q6_k_rejects_columns_that_do_not_form_ggml_superblocks ... ok
+test ops::transformer::q8_0_tests::q8_0_embedding_gather_decodes_only_requested_rows ... ok
+test ops::transformer::q8_0_tests::q8_0_gemv_and_gemm_cover_output_tails_and_odd_batch_sizes ... ok
+test ops::transformer::q8_0_tests::q8_0_mpp_gemm_dequantizes_only_a_tiled_weight_block ... ok
+test ops::transformer::q8_0_tests::q8_0_rejects_columns_that_cannot_form_upstream_blocks ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_embedding_gather_decodes_selected_rows ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_expert_projection_uses_assignment_metadata ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_expert_tensorops_cover_eight_routes_per_expert ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_expert_tensorops_cover_twelve_routes_per_expert ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_expert_tensorops_group_routes_and_restore_assignment_order ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_gemv_gemm_cover_blocks_and_batch_tails ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_mpp_gemm_cover_row_output_and_group_tails ... ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_reject_partial_superblocks ... ok
+test ops::transformer::qk_tests::q4_k_eight_row_gemv_reuses_activations_and_covers_output_tail ... ok
+test ops::transformer::qk_tests::q4_k_expert_tensorops_k64_matches_reference ... ok
+test ops::transformer::qk_tests::q4_k_mpp_k64_covers_batch_output_and_k_tiles ... ok
+test ops::transformer::qk_tests::q5_k_eight_row_gemv_reuses_activations_and_covers_output_tail ... ok
+test quantization::tests::k_block_formats_match_ggml_type_ids_and_block_geometry ... ok
+test quantization::tests::mlx_affine_runtime_layout_is_explicitly_not_a_ggml_type ... ok
+test quantization::tests::q5_formats_match_ggml_type_ids_and_block_geometry ... ok
+test tokenizer::qwen::tests::mlx_chat_template_accepts_only_its_documentation_brace_variant ... ok
+
+test result: ok. 85 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 14.60s
+

@@ -278,6 +278,7 @@ pub struct MetalDevice {
     q5_1_gemv_n4: Cell<bool>,
     q4_0_gemv_8rows: Cell<bool>,
     q4_k_gemv_8rows: Cell<bool>,
+    q5_k_gemv_8rows: Cell<bool>,
     q6_k_gemv_8rows: Cell<bool>,
     moe_gpu_routing: Cell<bool>,
     moe_expert_tensorops: Cell<bool>,
@@ -328,6 +329,7 @@ impl MetalDevice {
             q5_1_gemv_n4: Cell::new(true),
             q4_0_gemv_8rows: Cell::new(true),
             q4_k_gemv_8rows: Cell::new(true),
+            q5_k_gemv_8rows: Cell::new(true),
             q6_k_gemv_8rows: Cell::new(true),
             moe_gpu_routing: Cell::new(true),
             moe_expert_tensorops: Cell::new(true),
@@ -519,6 +521,19 @@ impl MetalDevice {
     }
     pub(crate) fn use_q4_k_gemv_8rows(&self, output_rows: usize) -> bool {
         self.q4_k_gemv_8rows.get() && output_rows >= 128
+    }
+    /// Select the two-output-row-per-SIMD Q5_K M=1 GEMV path.
+    pub fn set_q5_k_gemv_8rows(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q5_K GEMV during execution".into(),
+            ));
+        }
+        self.q5_k_gemv_8rows.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q5_k_gemv_8rows(&self, output_rows: usize) -> bool {
+        self.q5_k_gemv_8rows.get() && output_rows >= 128
     }
     /// Select the two-output-row-per-SIMD Q6_K M=1 kernel for wide projections.
     pub fn set_q6_k_gemv_8rows(&self, enabled: bool) -> Result<()> {
@@ -1065,6 +1080,7 @@ impl MetalDevice {
                 | "q8_0_gemv_8rows"
                 | "q4_0_gemv_8rows"
                 | "q4_k_gemv_8rows"
+                | "q5_k_gemv_8rows"
                 | "q6_k_gemv_8rows"
                 | "q4_0_gemv"
                 | "q5_0_gemv"
@@ -1341,6 +1357,7 @@ impl MetalDevice {
                     | "q5_1_gemv"
                     | "q4_k_gemv"
                     | "q5_k_gemv"
+                    | "q5_k_gemv_8rows"
                     | "q6_k_gemv"
                     | "q8_0_gemv"
                     | "q8_0_gemv_8rows"
@@ -1363,6 +1380,7 @@ impl MetalDevice {
                                 "q8_0_gemv_8rows"
                                     | "q4_0_gemv_8rows"
                                     | "q4_k_gemv_8rows"
+                                    | "q5_k_gemv_8rows"
                                     | "q6_k_gemv_8rows"
                             ) {
                                 8
