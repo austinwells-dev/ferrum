@@ -850,6 +850,7 @@ impl MetalDevice {
             "q8_0_gemv",
             "q8_0_gemv_8rows",
             "q8_0_gemm",
+            "q8_0_gemm_mpp_k64",
             "mlx_affine4_gemv",
             "mlx_affine4_gemm",
             "mlx_affine4_gemm_mpp",

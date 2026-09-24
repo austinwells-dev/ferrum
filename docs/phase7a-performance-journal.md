@@ -460,3 +460,40 @@ Each numeric cell gives Ferrum control → candidate absolute values / llama.cpp
 | Sustained decode | 690.8→693.9 / 1,264.3 [0.547→0.546; 1.005] | 110.4→109.7 / 206.9 [0.534→0.527; 0.994] | 105.7→105.0 / 195.7 [0.541→0.536; 0.993] | 30.7→30.6 / 16.9 [1.820→1.824; 0.996] | C=K 3/3; K=L 0/3 |
 
 The candidate/control cached-decode ratios for Qwen3 ranged from 0.944 to 0.959; full-generation ratios ranged from 0.950 to 0.993. In Qwen2.5, decode ratios ranged from 0.994 to 1.009 and did not establish a repeatable gain for its Q8_0 vocabulary head. Candidate and control produced identical Ferrum token IDs in all 30 workload pairs. With no meaningful cross-shape win, the candidate kernel, selector, benchmark toggle, and temporary tail test were removed; the raw measurements remain as rejected-experiment evidence.
+
+
+## Experiment 12: Q8_0 MPP K=64 tile for long prefill
+
+Status: retained for Q8_0 MPP projection batches with `M >= 512`; smaller batches continue using K=128.
+
+Q8_0 prompt GEMM already dispatches to Metal 4 MPP `matmul2d` for BF16 inputs when `M >= 16` and K is divisible by 128. The existing kernel stages a 64x128 BF16-dequantized weight tile (16 KiB) and reuses it across 64 prompt rows. This candidate stages a 64x64 tile (8 KiB), invokes the same cooperative `matmul2d` operation twice as often along K, and keeps the quantized weights packed in model storage. M=1 remains on the direct Q8_0 GEMV shader; this is MPP on the M5 GPU, not the standalone Neural Engine or Core ML.
+
+The final shape guard selects K=64 at `M >= 512`, matching the shapes where both model families showed repeatable gains. Three interleaved pairs were run for each of five workloads on each model. The K=64 code path was validated at M=515, N=65, K=256, exercising M and N tails and multiple K tiles; the focused test passed with Metal API Validation and GPU Shader Validation enabled. Candidate/control generated IDs matched in all 30 pairs.
+
+The matrices report Ferrum control → candidate absolute values / llama.cpp absolute values, followed by `[control/llama → candidate/llama; candidate/control]`. Ratios are medians of paired ratios; throughput is tok/s and first-token latency is ms. `K=64` marks rows where the final production selector uses the candidate; `K=128` rows use the same established path for both variants and their small differences are run variance.
+
+### Qwen3-0.6B Q8_0
+
+Artifact SHA-256: `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031`. Final-dispatch files: `qwen3-0.6b-q8_0-q8k64-m512-ab.jsonl` and `.run.log`. The earlier `q8k64-ab` pair files preserve the forced K=64 shape exploration used to choose the M threshold.
+
+| Workload | Tile | Prefill tok/s | Cached decode tok/s | Complete generation tok/s | First token ms | IDs |
+|---|---|---:|---:|---:|---:|---|
+| Short | K=128 | 438.9→439.4 / 1,273.3 [0.345→0.345; 1.001] | 106.2→106.6 / 164.5 [0.642→0.647; 1.004] | 84.0→84.2 / 145.2 [0.576→0.579; 1.003] | 48.1→48.1 / 16.8 [2.872→2.872; 0.999] | C=K 3/3; K=L 3/3 |
+| 128 | K=128 | 1,975.6→1,955.0 / 6,116.9 [0.323→0.320; 0.984] | 107.2→106.0 / 164.2 [0.654→0.649; 0.994] | 78.0→77.4 / 139.6 [0.561→0.555; 0.989] | 65.1→65.8 / 21.2 [3.068→3.110; 1.016] | C=K 3/3; K=L 0/3 |
+| 512 | K=64 | 2,837.5→3,082.8 / 7,109.9 [0.399→0.434; 1.086] | 98.8→97.4 / 156.2 [0.632→0.625; 0.986] | 47.9→49.8 / 95.6 [0.501→0.521; 1.042] | 180.8→166.4 / 72.3 [2.501→2.302; 0.920] | C=K 3/3; K=L 3/3 |
+| 1,024 | K=64 | 3,019.3→3,247.0 / 6,256.3 [0.480→0.520; 1.083] | 87.3→87.5 / 143.1 [0.610→0.614; 0.997] | 31.4→32.9 / 60.9 [0.515→0.542; 1.053] | 339.5→315.7 / 163.9 [2.080→1.921; 0.923] | C=K 3/3; K=L 3/3 |
+| Sustained decode | K=128 | 431.2→428.9 / 1,234.5 [0.349→0.349; 0.995] | 103.7→103.8 / 164.3 [0.630→0.630; 1.000] | 97.9→97.9 / 157.3 [0.622→0.622; 0.999] | 49.0→49.3 / 17.3 [2.840→2.841; 1.006] | C=K 3/3; K=L 0/3 |
+
+### Qwen2.5-0.5B Q8_0
+
+Artifact SHA-256: `ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e`. Final-dispatch files: `qwen2.5-q8_0-q8k64-m512-ab.jsonl` and `.run.log`. The earlier `q8k64-ab` pair files preserve the forced K=64 shape exploration used to choose the M threshold.
+
+| Workload | Tile | Prefill tok/s | Cached decode tok/s | Complete generation tok/s | First token ms | IDs |
+|---|---|---:|---:|---:|---:|---|
+| Short | K=128 | 558.1→557.4 / 1,465.6 [0.384→0.379; 0.999] | 131.2→132.0 / 199.4 [0.661→0.663; 0.996] | 104.2→104.3 / 173.6 [0.601→0.602; 0.995] | 37.9→38.0 / 14.6 [2.580→2.613; 1.002] | C=K 3/3; K=L 0/3 |
+| 128 | K=128 | 2,715.1→2,718.2 / 7,008.9 [0.387→0.387; 1.001] | 134.1→134.0 / 197.8 [0.675→0.678; 0.990] | 100.0→100.1 / 165.2 [0.600→0.606; 1.000] | 47.5→47.4 / 18.5 [2.561→2.566; 0.999] | C=K 3/3; K=L 3/3 |
+| 512 | K=64 | 4,184.2→4,499.4 / 9,780.8 [0.426→0.460; 1.072] | 127.1→128.4 / 198.2 [0.647→0.645; 1.011] | 66.9→69.5 / 124.5 [0.537→0.558; 1.038] | 122.7→114.1 / 52.6 [2.341→2.169; 0.933] | C=K 3/3; K=L 3/3 |
+| 1,024 | K=64 | 4,029.2→4,403.0 / 9,172.6 [0.439→0.479; 1.093] | 117.2→117.8 / 195.1 [0.597→0.600; 1.005] | 42.8→45.4 / 86.5 [0.493→0.525; 1.058] | 254.4→232.9 / 111.9 [2.278→2.085; 0.915] | C=K 3/3; K=L 3/3 |
+| Sustained decode | K=128 | 552.1→547.7 / 1,429.8 [0.388→0.383; 1.003] | 128.3→128.3 / 199.5 [0.644→0.644; 1.000] | 120.8→120.8 / 188.9 [0.638→0.640; 1.000] | 38.4→38.7 / 14.9 [2.559→2.591; 0.997] | C=K 3/3; K=L 0/3 |
+
+At 512 and 1,024 prompt tokens, all three paired runs improved prefill for both models: Qwen3 median candidate/control ratios were 1.086 and 1.083; Qwen2.5 ratios were 1.072 and 1.093. First-token latency and complete-generation throughput improved in these long-prefill workloads; cached-decode kernels were unchanged. Prefill ratios versus llama.cpp rose from 0.399→0.434 and 0.480→0.520 for Qwen3, and 0.426→0.460 and 0.439→0.479 for Qwen2.5. The general Phase 7 gate remains unmet.

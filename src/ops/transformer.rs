@@ -32,7 +32,13 @@ impl MetalDevice {
                     "q8_0_gemv"
                 }
             }
-            (QuantizationFormat::Q8_0, false, true) => "q8_0_gemm_mpp",
+            (QuantizationFormat::Q8_0, false, true) => {
+                if self.q8_0_mpp_tile_k64(ad[0]) {
+                    "q8_0_gemm_mpp_k64"
+                } else {
+                    "q8_0_gemm_mpp"
+                }
+            }
             (QuantizationFormat::Q8_0, false, false) => "q8_0_gemm",
             (QuantizationFormat::Q4_0, true, _) => {
                 if self.use_q4_0_gemv_8rows(weight.rows()) {
@@ -951,7 +957,10 @@ mod q8_0_tests {
         if !d.mpp_projection() {
             return;
         }
-        let (m, n, k) = (35, 65, 128);
+        assert!(d.q8_0_mpp_tile_k64(512));
+        assert!(!d.q8_0_mpp_tile_k64(128));
+        d.set_q8_0_mpp_tile_k64(false).unwrap();
+        let (m, n, k) = (515, 65, 256);
         let weight = packed(&d, n, k);
         let values = input(m, k);
         let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
@@ -970,6 +979,22 @@ mod q8_0_tests {
             assert!(
                 (actual - expected).abs() <= 0.06,
                 "index {index}: actual={actual}, expected={expected}"
+            );
+        }
+
+        d.set_q8_0_mpp_tile_k64(true).unwrap();
+        let candidate = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(candidate.metrics.operation, "q8_0_gemm_mpp_k64");
+        for (index, (actual, expected)) in candidate
+            .tensor
+            .to_f32()
+            .iter()
+            .zip(reference.to_f32())
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 0.06,
+                "K=64 index {index}: actual={actual}, expected={expected}"
             );
         }
     }
