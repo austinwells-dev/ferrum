@@ -91,11 +91,13 @@ Ferrum's `mpp::tensor_ops` kernels are inline MSL operations on the M5 GPU and u
 
 The dispatch rules are visible in `src/ops/transformer.rs`; the current quantized MPP unpack/stage/multiply path is in `src/metal/shaders/project_mpp.metal`; quantized expert projection is in `src/metal/shaders/ops.metal`. Norm, RoPE, activation, and elementwise kernels are conventional MSL but are not matrix contractions that should be moved to `matmul2d` by default.
 
+Profile attribution shows why the remaining conventional shapes need separate treatment. In Qwen2.5 Q4_K M=1 decode, the leading projection costs were `up_proj.q5_0_gemv` at 1.812 ms, `lm_head.q8_0_gemv_8rows` at 1.650 ms, and `gate_proj.q5_0_gemv` at 1.332 ms. These one-row GEMVs are not TensorOps candidates for this dispatch; direct shaders remain selected. In the LFM2.5 1,024-token flushed-dispatch diagnostic, no conventional expert projection fallback appeared: grouped MPP expert products accounted for about 1.126 s (Q4_K input), 0.316 s (Q4_K output), and 0.215 s (Q6_K output). Conventional `attention_softmax` was about 17 ms in that capture, while attention score and context products already used TensorOps. These are diagnostic GPU totals rather than end-to-end timings.
+
 ### Native quantized API constraints
 
-The installed Metal 4 MPP `matmul2d` API supports BF16/half inputs with native signed or unsigned 4-bit and 8-bit operands, as well as cooperative tensors as matmul inputs. Apple's current API documentation also describes native int4/int8 data tensors and block-scaled multi-plane tensors. In the current SDK, a scales plane uses FP8 E8M0 with a 32-element block factor; cooperative-input conversion is constrained to a single SIMD-group scope. See the [Metal Performance Primitives programming guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf) and the WWDC26 session linked above.
+The installed Xcode 27 SDK's `matmul2d` declarations include BF16/half multiplied by native signed or unsigned 4-bit and 8-bit operands, plus cooperative tensors as inputs and destinations. Metal tensor data types expose signed/unsigned int4 from macOS 26.4; macOS 27 adds int2, FP4, and FP8 types. macOS 27 multi-plane tensors support an auxiliary scale plane encoded only as FP8 UE8M0, with the first-axis block factor fixed at 32. This is a power-of-two scale representation, not a general FP16 scale. Cooperative tensor operands have scope and layout constraints, and the API provides compatibility checks before reusing them as inputs. The Q4_K input experiment used a single-SIMD-group operation and a 32x32 output tile. See the [Metal Performance Primitives programming guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf), the [current MTLTensor data-type API](https://developer.apple.com/documentation/metal/mtltensordatatype), and the WWDC26 session linked above.
 
-Those native types are not a lossless, zero-copy view of Ferrum's common GGUF blocks. Q8_0 stores an arbitrary FP16 scale per 32 signed bytes. Q4_K stores a superblock FP16 scale/minimum plus per-32-value 6-bit scale/minimum fields and packed nibbles. The E8M0 plane cannot represent those scale values exactly, and Q4_K also has a non-native affine offset layout. Re-encoding to E8M0 would change weights and was not used. Cooperative input tensors can preserve custom GGUF math, but they still require custom unpacking.
+Those native types are not a lossless, zero-copy view of Ferrum's common GGUF blocks. Q4_0 stores an arbitrary FP16 scale per 32 values and packs the low 16 logical values separately from the high 16; its nibble order must be rearranged for a native int4 operand. Q8_0 stores an arbitrary FP16 scale per 32 signed bytes. Q4_K stores a superblock FP16 scale/minimum plus per-32-value 6-bit scale/minimum fields and packed nibbles. The E8M0 plane cannot represent those scales exactly, and Q4_K also has a non-native affine offset layout. Re-encoding to E8M0 would change weights and was not used. Cooperative input tensors can preserve custom GGUF math, but still require custom unpacking and conversion.
 
 ### Rejected cooperative-input experiment
 
@@ -198,3 +200,21 @@ Three paired M32/M64 runs were collected for each of the same five workloads in 
 Transient peak memory rose from 34.04 to 49.82 MiB at 128 tokens, with no change at 512 or 1,024 tokens. Cumulative allocated bytes at 1,024 tokens increased from 885.25 to 901.25 MiB; sampled process RSS remained about 5.30 GiB. The M64 correctness path passed the same six focused tests under Metal API Validation and GPU Shader Validation. Its validation output is `lfm2.5-8b-a1b-expert-tensorops-m64-validation.log`; raw paired samples and runner output are `lfm2.5-8b-a1b-expert-tensorops-m32-vs-m64.jsonl` and `lfm2.5-8b-a1b-expert-tensorops-m32-vs-m64.run.log` in `docs/measurements/phase7a/`.
 
 After removing M64, the six production M32 expert TensorOps tests also passed with both validation layers enabled; the current-path output is `lfm2.5-8b-a1b-expert-tensorops-m32-current-validation.log`.
+
+## Experiment 9: Native signed-int4 TensorOps for Q4_0 prefill
+
+Status: rejected; the temporary kernel, dispatch control, and benchmark option were removed. The experiment tested whether Metal's native signed-int4 `matmul2d` operand could avoid the existing Q4_0 MPP path's BF16 threadgroup staging. It reordered Q4_0's split nibble halves into a packed logical int4 tile, retained each block's FP16 scale in the surrounding shader, and used M=32, N=64, K=32 TensorOps calls (four calls per existing K=128 tile). The current M=1 direct GEMV dispatch was not changed.
+
+The native int4 path passed a Q4_0 reference check at M=35, N=65, K=512 with Metal API Validation and GPU Shader Validation enabled. The release A/B used the pinned Qwen2.5-0.5B Q4_0 artifact (SHA-256 `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed`), three interleaved control/candidate pairs for each of the short, 128-, 512-, and 1,024-token prompts plus sustained decode. Candidate/control paired median throughput ratios were:
+
+| Workload | Prefill | Cached decode | Full generation | Exact generated IDs |
+| --- | ---: | ---: | ---: | ---: |
+| Short | 0.825x | 1.001x | 0.968x | 3 / 3 |
+| 128-token prompt | 0.658x | 0.993x | 0.901x | 3 / 3 |
+| 512-token prompt | 0.580x | 0.992x | 0.768x | 3 / 3 |
+| 1,024-token prompt | 0.601x | 1.016x | 0.721x | 3 / 3 |
+| Sustained decode | 0.826x | 1.005x | 0.998x | 0 / 3 |
+
+All matched pairs had identical transient prefill peaks. On sustained decode, control and candidate first differed at generated token 64 in each pair. Cached decode was flat, and the 128–1,024-token prefill cases consistently regressed, so the native int4 path was not retained. This supports keeping one-token projections on direct GEMV shaders and the current BF16-staged TensorOps path for eligible batched shapes.
+
+Raw A/B rows, the complete runner output, and correctness output are `qwen2.5-q4_0-native-int4-ab.jsonl`, `qwen2.5-q4_0-native-int4-ab.run.log`, and `qwen2.5-q4_0-native-int4-validation.log` in `docs/measurements/phase7a/`.
