@@ -576,3 +576,22 @@ Each throughput cell shows Ferrum control → 16-row candidate / llama.cpp in to
 | Sustained decode | 628.5→627.4 / 1,447.5 [0.436→0.433; 0.988] | 125.4→126.6 / 210.7 [0.594→0.601; 1.011] | 119.1→120.1 / 194.7 [0.612→0.616; 1.010] | 33.8→33.8 / 14.8 | C=K 5/5; K=L 0/5 |
 
 Across all 25 paired workload runs, the median candidate/control ratios were 1.002 for prefill, 1.006 for cached decode, and 1.006 for complete generation. Individual paired ratios varied from 0.776 to 1.141 for prefill, 0.988 to 1.028 for decode, and 0.938 to 1.065 for generation; one 128-prompt prefill timing was a clear outlier. The small median decode/generation changes and flat first-token latency do not establish a repeatable improvement. Ferrum control and candidate produced identical token IDs in all 25 pairs. The 16-row shader was therefore removed, with its raw matrices and correctness log retained as rejected-experiment evidence.
+
+
+## Experiment 16: Q6_K MPP K=64 tile for long prefill
+
+Status: rejected; Q6_K projections retain the K=128 Metal 4 MPP kernel. The candidate halved the staged BF16 weight tile from 64x128 (16 KiB) to 64x64 (8 KiB), with twice as many `matmul2d` calls along K. Unlike native int4/int8 TensorOps operands, Q6_K's packed values and per-subblock scales require dequantization into the bounded BF16 tile. This was MPP/TensorOps work on the M5 GPU's Neural Accelerators, not the standalone Apple Neural Engine or Core ML. M=1 remained on its direct GEMV path.
+
+The focused reference case used M=515, N=65, K=256, covering an awkward output dimension and batch tail across multiple K64 tiles. It passed scalar-reference comparison with Metal API Validation and GPU Shader Validation enabled; the log is `qwen2.5-q6_k-q6k64-validation.log`. The Qwen2.5-0.5B Q6_K five-pair matrix used the same artifact, prompt IDs, generation settings, and llama.cpp reference as the Q6_K baseline. The matrix and runner output are `qwen2.5-q6_k-q6k64-m512-ab.jsonl` and `.run.log`. Candidate K64 was selected only when the projection batch had at least 512 rows; short and 128-row prompts therefore remained on K=128 in both variants.
+
+Each throughput cell shows Ferrum control → K64 candidate / llama.cpp in tok/s, followed by `[control/llama → candidate/llama; candidate/control]`. Ratios are medians of paired ratios; first-token latency is in milliseconds. `C=K` and `K=L` count full generated-ID matches across five pairs.
+
+| Workload | Prefill tok/s | Cached decode tok/s | Complete-generation tok/s | First-token latency ms | IDs |
+|---|---:|---:|---:|---:|---|
+| Short | 639.7→632.6 / 1,481.1 [0.429→0.428; 0.996] | 129.1→128.6 / 202.4 [0.638→0.639; 1.001] | 106.1→105.5 / 174.4 [0.608→0.601; 0.997] | 33.1→33.6 / 14.4 | C=K 5/5; K=L 5/5 |
+| 128 prompt | 3,020.4→2,992.9 / 7,051.3 [0.430→0.423; 0.986] | 130.8→129.6 / 202.2 [0.647→0.637; 0.985] | 100.5→100.2 / 170.1 [0.590→0.585; 0.997] | 42.7→43.1 / 18.4 | C=K 5/5; K=L 5/5 |
+| 512 prompt | 4,693.9→4,363.5 / 9,659.6 [0.486→0.452; 0.928] | 125.3→124.0 / 200.5 [0.625→0.620; 0.990] | 70.0→67.8 / 125.5 [0.561→0.540; 0.963] | 109.4→117.6 / 53.2 | C=K 5/5; K=L 5/5 |
+| 1,024 prompt | 4,588.6→4,377.7 / 9,094.7 [0.504→0.482; 0.954] | 114.9→115.2 / 200.3 [0.573→0.576; 0.999] | 46.2→44.9 / 86.9 [0.532→0.517; 0.969] | 223.5→234.2 / 112.8 | C=K 5/5; K=L 5/5 |
+| Sustained decode | 620.7→626.2 / 1,424.6 [0.430→0.440; 1.000] | 125.8→125.5 / 209.4 [0.601→0.598; 0.997] | 119.3→119.1 / 194.7 [0.613→0.613; 1.000] | 34.2→33.8 / 15.0 | C=K 5/5; K=L 0/5 |
+
+Across all 25 paired runs, the median candidate/control ratios were 0.987 for prefill, 0.997 for cached decode, and 0.997 for complete generation. At the targeted 512- and 1,024-row prefills, absolute throughput fell by 330.4 and 210.9 tok/s, respectively; first-token latency increased by 8.2 and 10.7 ms. Ferrum candidate IDs matched control in all 25 pairs. The lower K tile did not repay the extra MPP calls, so the kernel, selector, test, and benchmark toggle were removed; the correctness log and raw timing matrix remain as rejected-experiment evidence.
