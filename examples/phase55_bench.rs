@@ -218,8 +218,8 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
     };
     let q5_0_gemv_n4 = match request.get("q5_0_gemv_n4") {
         None | Some(Value::Null) => {
-            device.set_q5_0_gemv_n4(false)?;
-            false
+            device.set_q5_0_gemv_n4(true)?;
+            true
         }
         Some(Value::Bool(enabled)) => {
             device.set_q5_0_gemv_n4(*enabled)?;
@@ -233,8 +233,8 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
     };
     let q5_1_gemv_n4 = match request.get("q5_1_gemv_n4") {
         None | Some(Value::Null) => {
-            device.set_q5_1_gemv_n4(false)?;
-            false
+            device.set_q5_1_gemv_n4(true)?;
+            true
         }
         Some(Value::Bool(enabled)) => {
             device.set_q5_1_gemv_n4(*enabled)?;
