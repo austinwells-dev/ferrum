@@ -141,6 +141,19 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
     let pair = request_usize(request, "pair")?;
     let pair_order = request_string(request, "pair_order")?;
     let warmup = request["warmup"].as_bool().unwrap_or(false);
+    let gguf_mpp_min_rows = match request.get("gguf_mpp_min_rows") {
+        None | Some(Value::Null) => device.gguf_mpp_min_rows(),
+        Some(value) => {
+            let rows = value
+                .as_u64()
+                .and_then(|rows| usize::try_from(rows).ok())
+                .ok_or_else(|| {
+                    Error::Parameter("request field gguf_mpp_min_rows must be an integer".into())
+                })?;
+            device.set_gguf_mpp_min_rows(rows)?;
+            Some(rows)
+        }
+    };
     let q8_0_mpp_tile_k64 = match request.get("q8_0_mpp_tile_k64") {
         None | Some(Value::Null) => {
             device.set_q8_0_mpp_tile_k64(true)?;
@@ -270,6 +283,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "pair": pair,
         "pair_order": pair_order,
         "warmup": warmup,
+        "gguf_mpp_min_rows": gguf_mpp_min_rows,
         "moe_expert_tensorops": expert_tensorops,
         "moe_expert_tensorops_tile_k64": expert_tensorops_tile_k64,
         "moe_expert_tensorops_min_routes_per_expert": expert_tensorops_min_routes,

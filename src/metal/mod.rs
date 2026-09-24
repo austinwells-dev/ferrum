@@ -266,6 +266,7 @@ pub struct MetalDevice {
     fail_completion: Cell<bool>,
     arena: Rc<RefCell<Arena>>,
     native_matmul: Cell<bool>,
+    gguf_mpp_min_rows: Cell<Option<usize>>,
     q8_0_mpp_tile_k64: Cell<bool>,
     q5_1_mpp_tile_k64: Cell<bool>,
     q4_k_mpp_tile_k64: Cell<bool>,
@@ -313,6 +314,7 @@ impl MetalDevice {
             fail_completion: Cell::new(false),
             arena: Rc::new(RefCell::new(Arena::default())),
             native_matmul: Cell::new(raw.supportsFamily(MTLGPUFamily::Apple7)),
+            gguf_mpp_min_rows: Cell::new(None),
             q8_0_mpp_tile_k64: Cell::new(true),
             q5_1_mpp_tile_k64: Cell::new(true),
             q4_k_mpp_tile_k64: Cell::new(true),
@@ -351,6 +353,23 @@ impl MetalDevice {
         }
         self.native_matmul.set(enabled);
         Ok(())
+    }
+    /// Override the automatic, measured per-format batch boundary for GGUF Metal 4 GEMM.
+    ///
+    /// A newly created device uses its automatic format-specific boundary until this is set.
+    pub fn set_gguf_mpp_min_rows(&self, rows: usize) -> Result<()> {
+        if self.batching.get() || !(2..=16).contains(&rows) || (rows < 16 && !self.mpp_projection())
+        {
+            return Err(Error::Parameter(
+                "GGUF MPP minimum rows must be 2..=16 on an idle compatible device".into(),
+            ));
+        }
+        self.gguf_mpp_min_rows.set(Some(rows));
+        Ok(())
+    }
+    /// Returns the explicit GGUF MPP row override, or `None` for automatic dispatch.
+    pub fn gguf_mpp_min_rows(&self) -> Option<usize> {
+        self.gguf_mpp_min_rows.get()
     }
     /// Select 64-element K tiles for Q8_0 MPP prompt GEMM.
     pub fn set_q8_0_mpp_tile_k64(&self, enabled: bool) -> Result<()> {

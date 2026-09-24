@@ -17,7 +17,22 @@ impl MetalDevice {
         p[1] = index(ad[0])?;
         p[2] = index(ad[1])?;
         p[3] = index(weight.rows())?;
-        let supports_mpp = ad[0] >= 16
+        let automatic_min_mpp_rows = match weight.format() {
+            // M5 crossover points from paired MSL/MPP measurements.
+            QuantizationFormat::Q4_0 | QuantizationFormat::Q4_K => 4,
+            QuantizationFormat::Q5_K | QuantizationFormat::Q6_K => 8,
+            QuantizationFormat::Q8_0 => 12,
+            // Keep unmeasured formats at the existing conservative boundary.
+            QuantizationFormat::Q5_0
+            | QuantizationFormat::Q5_1
+            | QuantizationFormat::MlxAffine4Group64 => 16,
+        };
+        let min_mpp_rows = if weight.format() == QuantizationFormat::MlxAffine4Group64 {
+            16
+        } else {
+            self.gguf_mpp_min_rows().unwrap_or(automatic_min_mpp_rows)
+        };
+        let supports_mpp = ad[0] >= min_mpp_rows
             && ((weight.format() == QuantizationFormat::MlxAffine4Group64
                 && a.dtype() == DType::F16)
                 || (weight.format() != QuantizationFormat::MlxAffine4Group64
@@ -969,6 +984,33 @@ mod q8_0_tests {
         if !d.mpp_projection() {
             return;
         }
+        let (small_n, small_k) = (65, 256);
+        let small_weight = packed(&d, small_n, small_k);
+        for m in [11, 12, 15] {
+            let values = input(m, small_k);
+            let x = Tensor::from_f32(&d, [m, small_k], DType::BF16, &values).unwrap();
+            let rounded_input = x.to_f32();
+            let reference = expected(&rounded_input, m, small_n, small_k);
+            let reference = Tensor::from_f32(&d, [m, small_n], DType::BF16, &reference).unwrap();
+            let output = d.project_quantized(&x, &small_weight).unwrap();
+            assert_eq!(
+                output.metrics.operation,
+                if m < 12 { "q8_0_gemm" } else { "q8_0_gemm_mpp" },
+                "M={m}"
+            );
+            for (index, (actual, expected)) in output
+                .tensor
+                .to_f32()
+                .iter()
+                .zip(reference.to_f32())
+                .enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 0.06,
+                    "M={m} index {index}: actual={actual}, expected={expected}"
+                );
+            }
+        }
         assert!(d.q8_0_mpp_tile_k64(512));
         assert!(!d.q8_0_mpp_tile_k64(128));
         d.set_q8_0_mpp_tile_k64(false).unwrap();
@@ -1164,6 +1206,36 @@ mod q4_0_tests {
                 "index {index}: actual={actual}, expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn q4_0_small_batch_mpp_covers_row_and_column_tails() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let (n, k) = (65, 128);
+        let weight = packed(&d, n, k);
+        for m in [4, 8, 15] {
+            let values = input(m, k);
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
+            let expected = expected(&x.to_f32(), m, n, k);
+            let output = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(output.metrics.operation, "q4_0_gemm_mpp");
+            for (index, (actual, expected)) in
+                output.tensor.to_f32().iter().zip(&expected).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 0.06,
+                    "M={m} Q4_0 MPP index {index}: actual={actual}, expected={expected}"
+                );
+            }
+        }
+        d.set_gguf_mpp_min_rows(2).unwrap();
+        let values = input(1, k);
+        let x = Tensor::from_f32(&d, [1, k], DType::BF16, &values).unwrap();
+        let output = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(output.metrics.operation, "q4_0_gemv");
     }
 
     #[test]
@@ -1378,31 +1450,35 @@ mod q5_tests {
         if !d.mpp_projection() {
             return;
         }
-        let (m, n, k) = (35, 65, 128);
+        let (n, k) = (65, 128);
+        d.set_gguf_mpp_min_rows(8).unwrap();
         for format in [QuantizationFormat::Q5_0, QuantizationFormat::Q5_1] {
             let weight = packed(&d, n, k, format);
-            let values = input(m, k);
-            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
-            let reference_values = expected(&x.to_f32(), m, n, k, format);
-            let reference = Tensor::from_f32(&d, [m, n], DType::BF16, &reference_values).unwrap();
-            let output = d.project_quantized(&x, &weight).unwrap();
-            let expected_kernel = match format {
-                QuantizationFormat::Q5_0 => "q5_0_gemm_mpp",
-                QuantizationFormat::Q5_1 => "q5_1_gemm_mpp",
-                _ => unreachable!(),
-            };
-            assert_eq!(output.metrics.operation, expected_kernel);
-            for (index, (actual, expected)) in output
-                .tensor
-                .to_f32()
-                .iter()
-                .zip(reference.to_f32())
-                .enumerate()
-            {
-                assert!(
-                    (actual - expected).abs() <= 0.08,
-                    "{format:?} index {index}: actual={actual}, expected={expected}"
-                );
+            for m in [8, 15, 35] {
+                let values = input(m, k);
+                let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
+                let reference_values = expected(&x.to_f32(), m, n, k, format);
+                let reference =
+                    Tensor::from_f32(&d, [m, n], DType::BF16, &reference_values).unwrap();
+                let output = d.project_quantized(&x, &weight).unwrap();
+                let expected_kernel = match format {
+                    QuantizationFormat::Q5_0 => "q5_0_gemm_mpp",
+                    QuantizationFormat::Q5_1 => "q5_1_gemm_mpp",
+                    _ => unreachable!(),
+                };
+                assert_eq!(output.metrics.operation, expected_kernel);
+                for (index, (actual, expected)) in output
+                    .tensor
+                    .to_f32()
+                    .iter()
+                    .zip(reference.to_f32())
+                    .enumerate()
+                {
+                    assert!(
+                        (actual - expected).abs() <= 0.08,
+                        "{format:?} M={m} index {index}: actual={actual}, expected={expected}"
+                    );
+                }
             }
         }
     }
@@ -1650,46 +1726,58 @@ mod qk_tests {
         if !d.mpp_projection() {
             return;
         }
-        let (m, n, k) = (35, 65, 512);
+        let (n, k) = (65, 512);
         for format in [QuantizationFormat::Q4_K, QuantizationFormat::Q5_K] {
             let weight = packed(&d, n, k, format);
-            let values = input(m, k);
-            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
-            let rounded_input = x.to_f32();
-            let rounded_input = &rounded_input;
-            let expected = (0..m)
-                .flat_map(|row| {
-                    (0..n).map(move |column| {
-                        (0..k)
-                            .map(|index| {
-                                rounded_input[row * k + index]
-                                    * DType::BF16.round(qk_value(column, index, format))
-                            })
-                            .sum::<f32>()
+            let batch_sizes: &[usize] = &[4, 8, 15, 35];
+            for &m in batch_sizes {
+                let values = input(m, k);
+                let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
+                let rounded_input = x.to_f32();
+                let rounded_input = &rounded_input;
+                let expected = (0..m)
+                    .flat_map(|row| {
+                        (0..n).map(move |column| {
+                            (0..k)
+                                .map(|index| {
+                                    rounded_input[row * k + index]
+                                        * DType::BF16.round(qk_value(column, index, format))
+                                })
+                                .sum::<f32>()
+                        })
                     })
-                })
-                .collect::<Vec<_>>();
-            let reference = Tensor::from_f32(&d, [m, n], DType::BF16, &expected).unwrap();
-            let output = d.project_quantized(&x, &weight).unwrap();
-            assert_eq!(
-                output.metrics.operation,
-                if format == QuantizationFormat::Q4_K {
-                    "q4_k_gemm_mpp"
-                } else {
-                    "q5_k_gemm_mpp"
-                }
-            );
-            for (index, (actual, reference)) in output
-                .tensor
-                .to_f32()
-                .iter()
-                .zip(reference.to_f32())
-                .enumerate()
-            {
-                assert!(
-                    (actual - reference).abs() <= 0.04,
-                    "{format:?} index {index}: actual={actual}, expected={reference}"
+                    .collect::<Vec<_>>();
+                let reference = Tensor::from_f32(&d, [m, n], DType::BF16, &expected).unwrap();
+                let output = d.project_quantized(&x, &weight).unwrap();
+                let use_mpp = match format {
+                    QuantizationFormat::Q4_K => m >= 4,
+                    QuantizationFormat::Q5_K => m >= 8,
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    output.metrics.operation,
+                    match (format, use_mpp) {
+                        (QuantizationFormat::Q4_K, true) => "q4_k_gemm_mpp",
+                        (QuantizationFormat::Q5_K, true) => "q5_k_gemm_mpp",
+                        (QuantizationFormat::Q5_K, false) => "q5_k_gemm",
+                        _ => unreachable!(),
+                    }
                 );
+                if !use_mpp {
+                    continue;
+                }
+                for (index, (actual, reference)) in output
+                    .tensor
+                    .to_f32()
+                    .iter()
+                    .zip(reference.to_f32())
+                    .enumerate()
+                {
+                    assert!(
+                        (actual - reference).abs() <= 0.04,
+                        "{format:?} M={m} index {index}: actual={actual}, expected={reference}"
+                    );
+                }
             }
         }
     }
@@ -2271,26 +2359,31 @@ mod q6_k_tests {
         if !d.mpp_projection() {
             return;
         }
-        let (m, n, k) = (35, 65, 512);
+        let (n, k) = (65, 512);
         let weight = packed(&d, n, k);
-        let values = input(m, k);
-        let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
-        let rounded_input = x.to_f32();
-        let reference = expected(&rounded_input, m, n, k);
-        let reference = Tensor::from_f32(&d, [m, n], DType::BF16, &reference).unwrap();
-        let output = d.project_quantized(&x, &weight).unwrap();
-        assert_eq!(output.metrics.operation, "q6_k_gemm_mpp");
-        for (index, (actual, expected)) in output
-            .tensor
-            .to_f32()
-            .iter()
-            .zip(reference.to_f32())
-            .enumerate()
-        {
-            assert!(
-                (actual - expected).abs() <= 0.12,
-                "index {index}: actual={actual}, expected={expected}"
+        for m in [4, 8, 15, 35] {
+            let values = input(m, k);
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
+            let rounded_input = x.to_f32();
+            let reference = expected(&rounded_input, m, n, k);
+            let reference = Tensor::from_f32(&d, [m, n], DType::BF16, &reference).unwrap();
+            let output = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(
+                output.metrics.operation,
+                if m < 8 { "q6_k_gemm" } else { "q6_k_gemm_mpp" }
             );
+            for (index, (actual, expected)) in output
+                .tensor
+                .to_f32()
+                .iter()
+                .zip(reference.to_f32())
+                .enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 0.12,
+                    "M={m} index {index}: actual={actual}, expected={expected}"
+                );
+            }
         }
     }
 

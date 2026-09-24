@@ -1,0 +1,8 @@
+{"model":"qwen3-phase7a-small-batch-shape-probe-q8_0","case":"m02","prompt_ids":[151644,8948],"max_new_tokens":16}
+{"model":"qwen3-phase7a-small-batch-shape-probe-q8_0","case":"m04","prompt_ids":[151644,8948,198,2610],"max_new_tokens":16}
+{"model":"qwen3-phase7a-small-batch-shape-probe-q8_0","case":"m08","prompt_ids":[151644,8948,198,2610,525,264,10950,17847],"max_new_tokens":16}
+{"model":"qwen3-phase7a-small-batch-shape-probe-q8_0","case":"m12","prompt_ids":[151644,8948,198,2610,525,264,10950,17847,13,151645,198,151644],"max_new_tokens":16}
+{"model":"qwen3-phase7a-small-batch-shape-probe-q8_0","case":"m15","prompt_ids":[151644,8948,198,2610,525,264,10950,17847,13,151645,198,151644,872,198,9707],"max_new_tokens":16}
+{"model":"qwen3-phase7a-small-batch-shape-probe-q8_0","case":"m16","prompt_ids":[151644,8948,198,2610,525,264,10950,17847,13,151645,198,151644,872,198,9707,0],"max_new_tokens":16}
+{"model":"qwen3-phase7a-small-batch-shape-probe-q8_0","case":"m21","prompt_ids":[151644,8948,198,2610,525,264,10950,17847,13,151645,198,151644,872,198,9707,0,151645,198,151644,77091,198],"max_new_tokens":16}
+{"model":"qwen3-phase7a-small-batch-shape-probe-q8_0","case":"m128","prompt_ids":[151644,8948,198,2610,525,264,10950,17847,13,151645,198,151644,872,198,9707,0,151645,198,151644,77091,198],"max_new_tokens":16}
