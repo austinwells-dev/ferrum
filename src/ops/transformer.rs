@@ -59,7 +59,13 @@ impl MetalDevice {
             (QuantizationFormat::Q5_0, false, true) => "q5_0_gemm_mpp",
             (QuantizationFormat::Q5_0, false, false) => "q5_0_gemm",
             (QuantizationFormat::Q5_1, true, _) => "q5_1_gemv",
-            (QuantizationFormat::Q5_1, false, true) => "q5_1_gemm_mpp",
+            (QuantizationFormat::Q5_1, false, true) => {
+                if self.q5_1_mpp_tile_k64(ad[0]) {
+                    "q5_1_gemm_mpp_k64"
+                } else {
+                    "q5_1_gemm_mpp"
+                }
+            }
             (QuantizationFormat::Q5_1, false, false) => "q5_1_gemm",
             (QuantizationFormat::Q4_K, true, _) => {
                 if self.use_q4_k_gemv_8rows(weight.rows()) {
@@ -1398,6 +1404,41 @@ mod q5_tests {
                     "{format:?} index {index}: actual={actual}, expected={expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn q5_1_mpp_k64_covers_batch_output_and_k_tiles() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        assert!(!d.q5_1_mpp_tile_k64(511));
+        assert!(d.q5_1_mpp_tile_k64(512));
+        d.set_q5_1_mpp_tile_k64(false).unwrap();
+        let (m, n, k) = (515, 65, 256);
+        let weight = packed(&d, n, k, QuantizationFormat::Q5_1);
+        let values = input(m, k);
+        let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
+        let reference_values = expected(&x.to_f32(), m, n, k, QuantizationFormat::Q5_1);
+        let reference = Tensor::from_f32(&d, [m, n], DType::BF16, &reference_values).unwrap();
+
+        let control = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(control.metrics.operation, "q5_1_gemm_mpp");
+        d.set_q5_1_mpp_tile_k64(true).unwrap();
+        let candidate = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(candidate.metrics.operation, "q5_1_gemm_mpp_k64");
+        for (index, (actual, expected)) in candidate
+            .tensor
+            .to_f32()
+            .iter()
+            .zip(reference.to_f32())
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 0.08,
+                "Q5_1 K=64 index {index}: actual={actual}, expected={expected}"
+            );
         }
     }
 

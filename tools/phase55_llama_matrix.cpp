@@ -17,6 +17,10 @@
 using json = nlohmann::json;
 using clock_type = std::chrono::steady_clock;
 
+#ifndef PHASE55_LLAMA_COMMIT
+#define PHASE55_LLAMA_COMMIT "unspecified"
+#endif
+
 static double milliseconds(clock_type::duration elapsed) {
     return std::chrono::duration<double, std::milli>(elapsed).count();
 }
@@ -111,6 +115,7 @@ static json run_request(
     return json{
         {"runtime", "llama.cpp"},
         {"llama_version", llama_version()},
+        {"llama_commit", PHASE55_LLAMA_COMMIT},
         {"case", case_name},
         {"pair", pair},
         {"pair_order", pair_order},
@@ -172,6 +177,7 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("could not create llama context");
         }
         std::cerr << "phase55_llama_matrix ready: version=" << llama_version()
+                  << " commit=" << PHASE55_LLAMA_COMMIT
                   << " n_ctx=" << llama_n_ctx(ctx)
                   << " n_batch=" << llama_n_batch(ctx)
                   << " n_ubatch=" << llama_n_ubatch(ctx)

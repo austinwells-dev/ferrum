@@ -1,0 +1,9 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.04s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 1 test
+test ops::transformer::q5_tests::q5_1_mpp_k64_covers_batch_output_and_k_tiles ... 2026-09-24 22:30:18.858 ferrum-508026e7fa9bdb9b[66904:6833090] Metal API Validation Enabled
+2026-09-24 22:30:18.858 ferrum-508026e7fa9bdb9b[66904:6833090] Metal GPU Validation Enabled
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 80 filtered out; finished in 0.62s
