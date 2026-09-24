@@ -141,6 +141,18 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
     let pair = request_usize(request, "pair")?;
     let pair_order = request_string(request, "pair_order")?;
     let warmup = request["warmup"].as_bool().unwrap_or(false);
+    let expert_tensorops = match request.get("moe_expert_tensorops") {
+        None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
+        Some(Value::Bool(enabled)) => {
+            device.set_moe_expert_tensorops(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field moe_expert_tensorops must be a boolean".into(),
+            ));
+        }
+    };
     if max_new_tokens == 0 {
         return Err(Error::Parameter("max_new_tokens must be positive".into()));
     }
@@ -170,6 +182,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "pair": pair,
         "pair_order": pair_order,
         "warmup": warmup,
+        "moe_expert_tensorops": expert_tensorops,
         "model_format": model.format,
         "model_repository": model.repository,
         "model_revision": model.revision,
@@ -242,6 +255,18 @@ fn main() -> Result<()> {
             _ => return Err(Error::Parameter("invalid FERRUM_MOE_GPU_ROUTING".into())),
         };
         device.set_moe_gpu_routing(enabled)?;
+    }
+    if let Ok(value) = std::env::var("FERRUM_MOE_EXPERT_TENSOROPS") {
+        let enabled = match value.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => {
+                return Err(Error::Parameter(
+                    "invalid FERRUM_MOE_EXPERT_TENSOROPS".into(),
+                ));
+            }
+        };
+        device.set_moe_expert_tensorops(enabled)?;
     }
     if let Ok(value) = std::env::var("FERRUM_MLX_AFFINE4_GEMV_QUAD") {
         let enabled = match value.as_str() {

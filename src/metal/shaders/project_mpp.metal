@@ -594,6 +594,140 @@ kernel void q6_k_gemm_mpp(device bfloat* a [[buffer(0)]],
     }
 }
 
+inline bfloat q4_k_expert_tile_value(device const uchar* row, uint column) {
+    uint within=column&255, group=within>>5, lane=within&31, chunk=within>>6;
+    uchar packed=row[16+chunk*32+lane];
+    uint q=(group&1)==0?uint(packed&15):uint(packed>>4);
+    float d=float(*((device const half*)row));
+    float dmin=float(*((device const half*)(row+2)));
+    return bfloat(d*float(qk4_scale_mpp(row+4,group))*float(q)
+                  -dmin*float(qk4_min_mpp(row+4,group)));
+}
+
+inline bfloat q5_k_expert_tile_value(device const uchar* row, uint column) {
+    uint within=column&255, group=within>>5, lane=within&31, chunk=within>>6;
+    uchar packed=row[48+chunk*32+lane];
+    uint nibble=(group&1)==0?uint(packed&15):uint(packed>>4);
+    uint high=(uint(row[16+lane])>>group)&1;
+    float d=float(*((device const half*)row));
+    float dmin=float(*((device const half*)(row+2)));
+    return bfloat(d*float(qk4_scale_mpp(row+4,group))*float(nibble|(high<<4))
+                  -dmin*float(qk4_min_mpp(row+4,group)));
+}
+
+inline bfloat q6_k_expert_tile_value(device const uchar* row, uint column) {
+    uint within=column&255, group=within>>5, lane=within&31;
+    uint half_block=group>>2, slice=group&3;
+    uint ql_index=half_block*64+((slice&1)*32)+lane;
+    uchar packed=row[ql_index];
+    uint low=slice<2?uint(packed&15):uint(packed>>4);
+    uint high=(uint(row[128+half_block*32+lane])>>(slice*2))&3;
+    int q=int(low|(high<<4))-32;
+    uint scale_index=192+half_block*8+slice*2+(lane>>4);
+    char scale=((device const char*)row)[scale_index];
+    float d=float(*((device const half*)(row+208)));
+    return bfloat(d*float(scale)*float(q));
+}
+
+// Routed rows are compacted into expert-major 32-row segments before this
+// kernel. TensorOps then reuses each quantized expert tile across its prompt
+// rows; output rows scatter back to assignment order for existing MoE kernels.
+void expert_project_k_mpp_impl(
+    device bfloat* input [[buffer(0)]],
+    device const uchar* packed [[buffer(1)]],
+    device const uint* assignment_ids [[buffer(2)]],
+    device const uint* counts [[buffer(3)]],
+    device const uint* bases [[buffer(4)]],
+    device ushort* output [[buffer(5)]],
+    threadgroup bfloat* dequantized,
+    constant uint* p [[buffer(6)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    constexpr uint TILE_M=32, TILE_N=64, TILE_K=128;
+    uint k=p[2], n=p[3], experts=p[5], type=p[7];
+    uint expert=group.z;
+    if(expert>=experts) return;
+    uint count=counts[expert], base=bases[expert], m_tile=group.y*TILE_M;
+    if(m_tile>=count) return;
+    uint padded_rows=((count+TILE_M-1)/TILE_M)*TILE_M;
+    uint blocks=k/256;
+    uint bytes_per_block=type==12?144:(type==13?176:210);
+    uint bytes_per_row=blocks*bytes_per_block;
+    device const uchar* expert_weights=packed+expert*n*bytes_per_row;
+    tensor<device bfloat,dextents<int,2>,tensor_inline> A(
+        input+base*k,dextents<int,2>(int(k),int(padded_rows)));
+    tensor<threadgroup bfloat,dextents<int,2>,tensor_inline> B(
+        dequantized,dextents<int,2>(int(TILE_K),int(TILE_N)));
+    auto left=A.slice(0,int(m_tile));
+    constexpr auto desc=matmul2d_descriptor(
+        32,64,128,false,true,false,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc,execution_simdgroups<4>> op;
+    auto result=op.get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
+    uint k_tiles=(k+TILE_K-1)/TILE_K;
+    for(uint kt=0;kt<k_tiles;kt++) {
+        if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
+        for(uint i=tid;i<TILE_N*TILE_K;i+=128) {
+            uint out_col=i/TILE_K, in_col=i%TILE_K;
+            uint column=group.x*TILE_N+out_col, source_k=kt*TILE_K+in_col;
+            bfloat value=bfloat(0.0f);
+            if(column<n && source_k<k) {
+                device const uchar* row=expert_weights+column*bytes_per_row;
+                if(type==12) value=q4_k_expert_tile_value(
+                    row+(source_k>>8)*144,source_k);
+                else if(type==13) value=q5_k_expert_tile_value(
+                    row+(source_k>>8)*176,source_k);
+                else value=q6_k_expert_tile_value(
+                    row+(source_k>>8)*210,source_k);
+            }
+            dequantized[i]=value;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto right=B;
+        auto left_k=A.slice(int(kt*TILE_K),int(m_tile));
+        op.run(left_k,right,result);
+    }
+    for(uint i=0;i<result.get_capacity();i++) {
+        auto coord=result.get_multidimensional_index(i);
+        uint column=group.x*TILE_N+coord[0], row=m_tile+coord[1];
+        if(row<count && column<n) {
+            uint assignment=assignment_ids[base+row];
+            float x=result[i]; uint bits=as_type<uint>(x);
+            output[assignment*n+column]=isnan(x)
+                ?ushort((bits>>16)|0x40)
+                :ushort((bits+0x7fff+((bits>>16)&1))>>16);
+        }
+    }
+}
+
+kernel void expert_project_q4_k_mpp(
+    device bfloat* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
+    device const uint* ids [[buffer(2)]], device const uint* counts [[buffer(3)]],
+    device const uint* bases [[buffer(4)]], device ushort* c [[buffer(5)]],
+    constant uint* p [[buffer(6)]], uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat dequantized[64*128];
+    expert_project_k_mpp_impl(a,b,ids,counts,bases,c,dequantized,p,tid,group);
+}
+kernel void expert_project_q5_k_mpp(
+    device bfloat* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
+    device const uint* ids [[buffer(2)]], device const uint* counts [[buffer(3)]],
+    device const uint* bases [[buffer(4)]], device ushort* c [[buffer(5)]],
+    constant uint* p [[buffer(6)]], uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat dequantized[64*128];
+    expert_project_k_mpp_impl(a,b,ids,counts,bases,c,dequantized,p,tid,group);
+}
+kernel void expert_project_q6_k_mpp(
+    device bfloat* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
+    device const uint* ids [[buffer(2)]], device const uint* counts [[buffer(3)]],
+    device const uint* bases [[buffer(4)]], device ushort* c [[buffer(5)]],
+    constant uint* p [[buffer(6)]], uint tid [[thread_index_in_threadgroup]],
+    uint3 group [[threadgroup_position_in_grid]]) {
+    threadgroup bfloat dequantized[64*128];
+    expert_project_k_mpp_impl(a,b,ids,counts,bases,c,dequantized,p,tid,group);
+}
+
 // Strided tensor views describe grouped sequence-major Q/K/V without copies.
 template<typename T, bool Context, bool BFloat>
 void grouped_mpp(device T* a, device T* b, device ushort* c,

@@ -273,6 +273,7 @@ pub struct MetalDevice {
     q4_k_gemv_8rows: Cell<bool>,
     q6_k_gemv_8rows: Cell<bool>,
     moe_gpu_routing: Cell<bool>,
+    moe_expert_tensorops: Cell<bool>,
     reference_math: Cell<bool>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
@@ -313,6 +314,7 @@ impl MetalDevice {
             q4_k_gemv_8rows: Cell::new(true),
             q6_k_gemv_8rows: Cell::new(true),
             moe_gpu_routing: Cell::new(true),
+            moe_expert_tensorops: Cell::new(true),
             reference_math: Cell::new(false),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
@@ -429,6 +431,19 @@ impl MetalDevice {
     }
     pub(crate) fn use_moe_gpu_routing(&self, top_k: usize, token_count: usize) -> bool {
         self.moe_gpu_routing.get() && top_k <= 16 && token_count == 1
+    }
+    /// Enable grouped TensorOps for sufficiently large quantized expert batches.
+    pub fn set_moe_expert_tensorops(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change expert TensorOps during execution".into(),
+            ));
+        }
+        self.moe_expert_tensorops.set(enabled);
+        Ok(())
+    }
+    pub fn moe_expert_tensorops_enabled(&self) -> bool {
+        self.moe_expert_tensorops.get()
     }
     /// Select the multi-SIMD split-K BF16 GEMV for large aligned rows.
     pub fn set_split_k_gemv(&self, enabled: bool) -> Result<()> {
@@ -748,6 +763,9 @@ impl MetalDevice {
                 | "mlx_affine4_gemm_mpp_k64"
                 | "q6_k_gemm_mpp"
                 | "q8_0_gemm_mpp"
+                | "expert_project_q4_k_mpp"
+                | "expert_project_q5_k_mpp"
+                | "expert_project_q6_k_mpp"
                 | "attention_scores_mpp"
                 | "attention_context_mpp"
                 | "attention_scores_mpp_f16"
@@ -777,10 +795,15 @@ impl MetalDevice {
         tiled: bool,
     ) -> Result<DispatchTiming> {
         let (input_count, output_count) = match name {
+            "expert_segments" => (1, 3),
+            "expert_assign_compact" => (2, 3),
             "expert_project"
             | "expert_project_q4_k"
             | "expert_project_q5_k"
             | "expert_project_q6_k" => (3, 1),
+            "expert_project_q4_k_mpp" | "expert_project_q5_k_mpp" | "expert_project_q6_k_mpp" => {
+                (5, 1)
+            }
             "lfm2_short_conv" => (4, 2),
             "lfm2_split3" => (1, 3),
             _ => (2, 1),
@@ -870,6 +893,9 @@ impl MetalDevice {
                 | "mlx_affine4_gemm_mpp_k64"
                 | "q6_k_gemm_mpp"
                 | "q8_0_gemm_mpp"
+                | "expert_project_q4_k_mpp"
+                | "expert_project_q5_k_mpp"
+                | "expert_project_q6_k_mpp"
                 | "attention_scores_mpp"
                 | "attention_context_mpp"
                 | "attention_scores_mpp_f16"
@@ -951,6 +977,9 @@ impl MetalDevice {
                     | "mlx_affine4_gemm_mpp_k64"
                     | "q6_k_gemm_mpp"
                     | "q8_0_gemm_mpp"
+                    | "expert_project_q4_k_mpp"
+                    | "expert_project_q5_k_mpp"
+                    | "expert_project_q6_k_mpp"
                     | "attention_scores_mpp"
                     | "attention_context_mpp"
                     | "attention_scores_mpp_f16"
@@ -962,7 +991,18 @@ impl MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
                         width: grid[0].div_ceil(64),
-                        height: grid[1].div_ceil(64),
+                        height: grid[1].div_ceil(
+                            if matches!(
+                                name,
+                                "expert_project_q4_k_mpp"
+                                    | "expert_project_q5_k_mpp"
+                                    | "expert_project_q6_k_mpp"
+                            ) {
+                                32
+                            } else {
+                                64
+                            },
+                        ),
                         depth: if matches!(
                             name,
                             "project_mpp"
@@ -977,6 +1017,13 @@ impl MetalDevice {
                                 | "q8_0_gemm_mpp"
                         ) {
                             1
+                        } else if matches!(
+                            name,
+                            "expert_project_q4_k_mpp"
+                                | "expert_project_q5_k_mpp"
+                                | "expert_project_q6_k_mpp"
+                        ) {
+                            params[5] as usize
                         } else {
                             params[3] as usize
                         },
@@ -1179,6 +1226,25 @@ impl MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
                         width: grid[0].div_ceil(4),
+                        height: grid[1],
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if name == "expert_assign_compact" {
+                if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
+                {
+                    return Err(Error::Dispatch(
+                        "expert compaction requires 32-wide SIMD and 128-thread groups".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: 1,
                         height: grid[1],
                         depth: 1,
                     },

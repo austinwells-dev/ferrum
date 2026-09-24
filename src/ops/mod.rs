@@ -228,6 +228,28 @@ impl MetalDevice {
         let dims = [x[0], rows];
         let shape = crate::tensor::Shape::new(dims)?;
         index(shape.numel())?;
+        let tensorops_min_rows = experts.checked_mul(24).unwrap_or(usize::MAX);
+        let use_tensorops = input.dtype() == DType::BF16
+            && self.moe_expert_tensorops_enabled()
+            && x[0] >= tensorops_min_rows
+            && rows >= 64
+            && features >= 128
+            && features.is_multiple_of(128)
+            && x[0] <= i32::MAX as usize
+            && rows <= i32::MAX as usize
+            && features <= i32::MAX as usize
+            && self.mpp_projection();
+        if use_tensorops {
+            let mpp_name = match ggml_type {
+                12 => "expert_project_q4_k_mpp",
+                13 => "expert_project_q5_k_mpp",
+                14 => "expert_project_q6_k_mpp",
+                _ => unreachable!(),
+            };
+            return self.expert_project_quantized_mpp(
+                input, metadata, weight, experts, features, rows, ggml_type, mpp_name,
+            );
+        }
         let mut p = [0; 9];
         p[0] = index(shape.numel())?;
         p[1] = index(x[0])?;
@@ -270,6 +292,147 @@ impl MetalDevice {
             );
         }
         Ok(tensor)
+    }
+
+    fn expert_project_quantized_mpp(
+        &self,
+        input: &Tensor,
+        metadata: &Tensor,
+        weight: &crate::quantization::QuantizedExpertMatrix,
+        experts: usize,
+        features: usize,
+        rows: usize,
+        ggml_type: u32,
+        name: &'static str,
+    ) -> Result<Tensor> {
+        let assignments = input.shape().dimensions()[0];
+        let padded_capacity = assignments
+            .checked_add(
+                experts
+                    .checked_mul(31)
+                    .ok_or_else(|| Error::Shape("expert TensorOps padding overflow".into()))?,
+            )
+            .ok_or_else(|| Error::Shape("expert TensorOps capacity overflow".into()))?;
+        let compact_elements = padded_capacity
+            .checked_mul(features)
+            .ok_or_else(|| Error::Shape("expert TensorOps input size overflow".into()))?;
+        let output_dims = [assignments, rows];
+        let output_shape = crate::tensor::Shape::new(output_dims)?;
+        index(padded_capacity)?;
+        index(compact_elements)?;
+        index(output_shape.numel())?;
+
+        let profile_start = self.profiling().then(std::time::Instant::now);
+        let wait_before = profile_start
+            .map(|_| self.counters().wait)
+            .unwrap_or_default();
+        let allocation_start = profile_start.map(|_| std::time::Instant::now());
+        let counts = Tensor::output(self, &[experts], DType::F32)?;
+        let bases = Tensor::output(self, &[experts], DType::F32)?;
+        let cursors = Tensor::output(self, &[experts], DType::F32)?;
+        let compact = Tensor::output(self, &[padded_capacity, features], DType::BF16)?;
+        let assignment_ids = Tensor::output(self, &[padded_capacity], DType::F32)?;
+        let output = Tensor::output(self, &output_dims, DType::BF16)?;
+        let allocation_time = allocation_start
+            .map(|start| start.elapsed())
+            .unwrap_or_default();
+        let allocation_bytes = [
+            counts.storage_info().allocation_bytes,
+            bases.storage_info().allocation_bytes,
+            cursors.storage_info().allocation_bytes,
+            compact.storage_info().allocation_bytes,
+            assignment_ids.storage_info().allocation_bytes,
+            output.storage_info().allocation_bytes,
+        ]
+        .into_iter()
+        .sum();
+
+        let mut segments_params = [0; 9];
+        segments_params[1] = index(assignments)?;
+        segments_params[2] = index(experts)?;
+        segments_params[3] = DType::F32 as u32;
+        let segments_timing = self.dispatch(
+            "expert_segments",
+            &[
+                metadata.binding(),
+                counts.binding(),
+                bases.binding(),
+                cursors.binding(),
+            ],
+            &segments_params,
+            [1, 1],
+            false,
+        )?;
+
+        let mut compact_params = [0; 9];
+        compact_params[1] = index(assignments)?;
+        compact_params[2] = index(features)?;
+        compact_params[3] = index(experts)?;
+        compact_params[4] = DType::F32 as u32;
+        let compact_timing = self.dispatch(
+            "expert_assign_compact",
+            &[
+                input.binding(),
+                metadata.binding(),
+                cursors.binding(),
+                compact.binding(),
+                assignment_ids.binding(),
+            ],
+            &compact_params,
+            [1, assignments],
+            false,
+        )?;
+
+        let mut mpp_params = [0; 9];
+        mpp_params[0] = index(output_shape.numel())?;
+        mpp_params[1] = index(assignments)?;
+        mpp_params[2] = index(features)?;
+        mpp_params[3] = index(rows)?;
+        mpp_params[4] = DType::BF16 as u32;
+        mpp_params[5] = index(experts)?;
+        mpp_params[6] = DType::F32 as u32;
+        mpp_params[7] = ggml_type;
+        let mpp_timing = self.dispatch(
+            name,
+            &[
+                compact.binding(),
+                weight.matrix().binding(),
+                assignment_ids.binding(),
+                counts.binding(),
+                bases.binding(),
+                output.binding(),
+            ],
+            &mpp_params,
+            [rows, assignments],
+            false,
+        )?;
+
+        if let Some(start) = profile_start {
+            let mut timing = DispatchTiming::default();
+            let mut gpu = std::time::Duration::ZERO;
+            let mut has_gpu = true;
+            for part in [segments_timing, compact_timing, mpp_timing] {
+                timing.submission += part.submission;
+                timing.synchronized += part.synchronized;
+                timing.dispatches += part.dispatches;
+                if let Some(part_gpu) = part.gpu {
+                    gpu += part_gpu;
+                } else {
+                    has_gpu = false;
+                }
+            }
+            timing.gpu = has_gpu.then_some(gpu);
+            self.record_profile(
+                name,
+                start
+                    .elapsed()
+                    .saturating_sub(self.counters().wait - wait_before),
+                allocation_time,
+                allocation_bytes,
+                &timing,
+            );
+        }
+        Ok(output)
     }
 
     pub(crate) fn expert_silu_mul(&self, input: &Tensor, intermediate: usize) -> Result<Tensor> {

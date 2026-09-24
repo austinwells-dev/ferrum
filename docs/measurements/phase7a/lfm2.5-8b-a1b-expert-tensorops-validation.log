@@ -1,0 +1,11 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.67s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 2 tests
+test ops::transformer::q6_k_tests::q6_k_expert_tensorops_groups_routes_and_restores_assignment_order ... 2026-09-24 18:24:33.478 ferrum-508026e7fa9bdb9b[53145:6558664] Metal API Validation Enabled
+2026-09-24 18:24:33.478 ferrum-508026e7fa9bdb9b[53145:6558664] Metal GPU Validation Enabled
+ok
+test ops::transformer::qk_tests::q4_k_and_q5_k_expert_tensorops_group_routes_and_restore_assignment_order ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 70 filtered out; finished in 3.16s

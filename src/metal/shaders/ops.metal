@@ -1270,6 +1270,59 @@ kernel void expert_assign(ARGS, uint i [[thread_position_in_grid]]) {
     }
 }
 
+// Build expert-local offsets and counters on the GPU. Rows are padded to the
+// MPP M tile so each expert segment can be consumed by complete 32-row tiles.
+kernel void expert_segments(
+    device const uchar* metadata [[buffer(0)]],
+    device uchar* counts [[buffer(1)]],
+    device uchar* bases [[buffer(2)]],
+    device uchar* cursors [[buffer(3)]],
+    constant uint* p [[buffer(4)]],
+    uint tid [[thread_position_in_grid]]) {
+    if(tid!=0) return;
+    uint assignments=p[1], experts=p[2], dtype=p[3];
+    device uint* count_values=(device uint*)counts;
+    device uint* base_values=(device uint*)bases;
+    device uint* cursor_values=(device uint*)cursors;
+    for(uint expert=0;expert<experts;expert++) count_values[expert]=0;
+    for(uint assignment=0;assignment<assignments;assignment++) {
+        uint expert=as_type<uint>(load(metadata,assignment*3,dtype));
+        if(expert<experts) count_values[expert]++;
+    }
+    uint offset=0;
+    for(uint expert=0;expert<experts;expert++) {
+        base_values[expert]=offset;
+        cursor_values[expert]=offset;
+        offset+=((count_values[expert]+31)/32)*32;
+    }
+}
+
+// Compact assignment-major activations into expert-major runs. Each
+// threadgroup reserves one row, then copies that BF16 row cooperatively.
+kernel void expert_assign_compact(
+    device const uchar* input [[buffer(0)]],
+    device const uchar* metadata [[buffer(1)]],
+    device atomic_uint* cursors [[buffer(2)]],
+    device uchar* compact [[buffer(3)]],
+    device uchar* assignment_ids [[buffer(4)]],
+    constant uint* p [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+    threadgroup uint compact_row;
+    uint assignment=group.y, assignments=p[1], features=p[2], experts=p[3];
+    if(assignment>=assignments) return;
+    uint expert=as_type<uint>(load(metadata,assignment*3,p[4]));
+    if(expert>=experts) return;
+    if(tid==0) {
+        compact_row=atomic_fetch_add_explicit(&cursors[expert],1u,memory_order_relaxed);
+        ((device uint*)assignment_ids)[compact_row]=assignment;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for(uint column=tid;column<features;column+=128)
+        ((device ushort*)compact)[compact_row*features+column]
+            =((device const ushort*)input)[assignment*features+column];
+}
+
 void expert_project_impl(device const uchar* input, device const uchar* weights,
                          device const uchar* metadata, device uchar* output,
                          constant uint* p, uint tid, uint2 group) {
