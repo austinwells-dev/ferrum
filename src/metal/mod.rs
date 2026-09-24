@@ -271,6 +271,7 @@ pub struct MetalDevice {
     q8_0_mpp_tile_k64: Cell<bool>,
     q5_1_mpp_tile_k64: Cell<bool>,
     q4_k_mpp_tile_k64: Cell<bool>,
+    q5_k_mpp_tile_k64: Cell<bool>,
     mlx_affine4_mpp_tile_k64: Cell<Option<bool>>,
     mlx_affine4_gemv_quad: Cell<bool>,
     split_k_gemv: Cell<bool>,
@@ -322,6 +323,7 @@ impl MetalDevice {
             q8_0_mpp_tile_k64: Cell::new(true),
             q5_1_mpp_tile_k64: Cell::new(true),
             q4_k_mpp_tile_k64: Cell::new(true),
+            q5_k_mpp_tile_k64: Cell::new(true),
             mlx_affine4_mpp_tile_k64: Cell::new(None),
             mlx_affine4_gemv_quad: Cell::new(true),
             split_k_gemv: Cell::new(true),
@@ -429,6 +431,19 @@ impl MetalDevice {
     }
     pub(crate) fn q4_k_mpp_tile_k64(&self, batch_rows: usize) -> bool {
         self.q4_k_mpp_tile_k64.get() && batch_rows >= 1024
+    }
+    /// Select 64-element K tiles for Q5_K MPP prompt GEMM.
+    pub fn set_q5_k_mpp_tile_k64(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() || (enabled && !self.mpp_projection()) {
+            return Err(Error::Parameter(
+                "Q5_K MPP K=64 requires an idle compatible device".into(),
+            ));
+        }
+        self.q5_k_mpp_tile_k64.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn q5_k_mpp_tile_k64(&self, batch_rows: usize) -> bool {
+        self.q5_k_mpp_tile_k64.get() && batch_rows >= 1024
     }
     /// Override the shape-aware MLX affine-Q4 MPP K-tile choice.
     /// `Some(false)` selects K=128, `Some(true)` selects K=64, and `None`
@@ -921,6 +936,7 @@ impl MetalDevice {
                 | "q4_k_gemm_mpp"
                 | "q4_k_gemm_mpp_k64"
                 | "q5_k_gemm_mpp"
+                | "q5_k_gemm_mpp_k64"
                 | "mlx_affine4_gemm_mpp"
                 | "mlx_affine4_gemm_mpp_k64"
                 | "q6_k_gemm_mpp"
@@ -1062,6 +1078,7 @@ impl MetalDevice {
                 | "q4_k_gemm_mpp"
                 | "q4_k_gemm_mpp_k64"
                 | "q5_k_gemm_mpp"
+                | "q5_k_gemm_mpp_k64"
                 | "mlx_affine4_gemm_mpp"
                 | "mlx_affine4_gemm_mpp_k64"
                 | "q6_k_gemm_mpp"
@@ -1154,6 +1171,7 @@ impl MetalDevice {
                     | "q4_k_gemm_mpp"
                     | "q4_k_gemm_mpp_k64"
                     | "q5_k_gemm_mpp"
+                    | "q5_k_gemm_mpp_k64"
                     | "mlx_affine4_gemm_mpp"
                     | "mlx_affine4_gemm_mpp_k64"
                     | "q6_k_gemm_mpp"
@@ -1199,6 +1217,7 @@ impl MetalDevice {
                                 | "q4_k_gemm_mpp"
                                 | "q4_k_gemm_mpp_k64"
                                 | "q5_k_gemm_mpp"
+                                | "q5_k_gemm_mpp_k64"
                                 | "mlx_affine4_gemm_mpp"
                                 | "mlx_affine4_gemm_mpp_k64"
                                 | "q6_k_gemm_mpp"
