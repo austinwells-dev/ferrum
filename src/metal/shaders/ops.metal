@@ -18,6 +18,10 @@ inline void store(device uchar* p, uint i, uint dtype, float x) {
         ((device ushort*)p)[i] = b;
     }
 }
+inline uint total_order_key(float x) {
+    uint bits = as_type<uint>(x);
+    return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
+}
 inline float round_storage(float x, uint dtype) {
     if(dtype==1) return float(half(x));
     if(dtype==2) {
@@ -535,6 +539,18 @@ inline float q4_k_pair_dot(device const uchar* block, device const uchar* activa
     return w0*load(activations,column+lane,dtype)
          + w1*load(activations,column+lane+32,dtype);
 }
+inline float q4_k_pair_dot_values(device const uchar* block, float x0, float x1,
+                                   uint chunk, uint lane) {
+    uint group0=chunk*2;
+    uchar packed=block[16+chunk*32+lane];
+    float d=float(*((device const half*)block));
+    float dmin=float(*((device const half*)(block+2)));
+    uint scale0=q4_k_scale(block+4,group0), scale1=q4_k_scale(block+4,group0+1);
+    uint min0=q4_k_minimum(block+4,group0), min1=q4_k_minimum(block+4,group0+1);
+    float w0=d*float(scale0)*float(packed&15)-dmin*float(min0);
+    float w1=d*float(scale1)*float(packed>>4)-dmin*float(min1);
+    return w0*x0+w1*x1;
+}
 inline float q5_k_pair_dot(device const uchar* block, device const uchar* activations,
                             uint column, uint chunk, uint lane, uint dtype) {
     uint group0=chunk*2;
@@ -566,6 +582,46 @@ kernel void q4_k_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group
         }
     float sum=simd_sum((sum0+sum1)+(sum2+sum3));
     if(lane==0 && row<p[3]) store(c,row,p[4],sum);
+}
+// Two output rows share each SIMD group's activation loads. Four simdgroups
+// therefore cover eight adjacent rows per threadgroup for wide M=1 projections.
+kernel void q4_k_gemv_8rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32;
+    uint row0=group*8+simd*2, row1=row0+1;
+    uint k=p[2], blocks=k/256;
+    float sum00=0.f, sum01=0.f, sum02=0.f, sum03=0.f;
+    float sum10=0.f, sum11=0.f, sum12=0.f, sum13=0.f;
+    if(row0<p[3]) {
+        device const uchar* row0_weights=b+row0*blocks*144;
+        device const uchar* row1_weights=row1<p[3] ? b+row1*blocks*144 : row0_weights;
+        for(uint block_index=0;block_index<blocks;block_index++) {
+            device const uchar* block0=row0_weights+block_index*144;
+            device const uchar* block1=row1_weights+block_index*144;
+            uint base=block_index*256;
+            float x00=load(a,base+0*64+lane,p[4]);
+            float x01=load(a,base+0*64+lane+32,p[4]);
+            float x10=load(a,base+1*64+lane,p[4]);
+            float x11=load(a,base+1*64+lane+32,p[4]);
+            float x20=load(a,base+2*64+lane,p[4]);
+            float x21=load(a,base+2*64+lane+32,p[4]);
+            float x30=load(a,base+3*64+lane,p[4]);
+            float x31=load(a,base+3*64+lane+32,p[4]);
+            sum00+=q4_k_pair_dot_values(block0,x00,x01,0,lane);
+            sum01+=q4_k_pair_dot_values(block0,x10,x11,1,lane);
+            sum02+=q4_k_pair_dot_values(block0,x20,x21,2,lane);
+            sum03+=q4_k_pair_dot_values(block0,x30,x31,3,lane);
+            if(row1<p[3]) {
+                sum10+=q4_k_pair_dot_values(block1,x00,x01,0,lane);
+                sum11+=q4_k_pair_dot_values(block1,x10,x11,1,lane);
+                sum12+=q4_k_pair_dot_values(block1,x20,x21,2,lane);
+                sum13+=q4_k_pair_dot_values(block1,x30,x31,3,lane);
+            }
+        }
+    }
+    float sum0=simd_sum((sum00+sum01)+(sum02+sum03));
+    float sum1=simd_sum((sum10+sum11)+(sum12+sum13));
+    if(lane==0 && row0<p[3]) store(c,row0,p[4],sum0);
+    if(lane==0 && row1<p[3]) store(c,row1,p[4],sum1);
 }
 kernel void q4_k_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
     uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;
@@ -776,6 +832,43 @@ kernel void q6_k_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group
     }
     float sum=simd_sum((sum0+sum1)+(sum2+sum3));
     if(lane==0 && row<p[3]) store(c,row,p[4],sum);
+}
+// Reuse each activation fragment across two Q6_K output rows per SIMD group.
+kernel void q6_k_gemv_8rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32;
+    uint row0=group*8+simd*2, row1=row0+1;
+    uint k=p[2], chunks=k/32;
+    float sum00=0.f, sum01=0.f, sum02=0.f, sum03=0.f;
+    float sum10=0.f, sum11=0.f, sum12=0.f, sum13=0.f;
+    if(row0<p[3]) {
+        for(uint tile=0;tile<chunks/4;tile++) {
+            uint base=tile*4*32+lane;
+            float x0=load(a,base+0*32,p[4]);
+            float x1=load(a,base+1*32,p[4]);
+            float x2=load(a,base+2*32,p[4]);
+            float x3=load(a,base+3*32,p[4]);
+            sum00+=q6_k_weight(b,row0,base+0*32,k)*x0;
+            sum01+=q6_k_weight(b,row0,base+1*32,k)*x1;
+            sum02+=q6_k_weight(b,row0,base+2*32,k)*x2;
+            sum03+=q6_k_weight(b,row0,base+3*32,k)*x3;
+            if(row1<p[3]) {
+                sum10+=q6_k_weight(b,row1,base+0*32,k)*x0;
+                sum11+=q6_k_weight(b,row1,base+1*32,k)*x1;
+                sum12+=q6_k_weight(b,row1,base+2*32,k)*x2;
+                sum13+=q6_k_weight(b,row1,base+3*32,k)*x3;
+            }
+        }
+        for(uint chunk=chunks/4*4;chunk<chunks;chunk++) {
+            uint column=chunk*32+lane;
+            float x=load(a,column,p[4]);
+            sum00+=q6_k_weight(b,row0,column,k)*x;
+            if(row1<p[3]) sum10+=q6_k_weight(b,row1,column,k)*x;
+        }
+    }
+    float sum0=simd_sum((sum00+sum01)+(sum02+sum03));
+    float sum1=simd_sum((sum10+sum11)+(sum12+sum13));
+    if(lane==0 && row0<p[3]) store(c,row0,p[4],sum0);
+    if(lane==0 && row1<p[3]) store(c,row1,p[4],sum1);
 }
 kernel void q6_k_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
     uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;
@@ -1100,6 +1193,71 @@ kernel void gemv_wide(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 grou
     if(p[4]==0) gemv_wide_impl<float>((device const float4*)a,(device const float4*)b,c,p,tid,row,batch,partial);
     else if(p[4]==2) gemv_wide_impl<bfloat>((device const bfloat4*)a,(device const bfloat4*)b,c,p,tid,row,batch,partial);
     else gemv_wide_impl<half>((device const half4*)a,(device const half4*)b,c,p,tid,row,batch,partial);
+}
+
+kernel void moe_route(ARGS, uint token [[thread_position_in_grid]]) {
+    uint tokens=p[1], experts=p[2], top_k=p[3], dtype=p[4];
+    if(token>=tokens) return;
+    float maximum=-INFINITY;
+    if(p[6]==0) {
+        for(uint expert=0;expert<experts;expert++)
+            maximum=max(maximum,load(a,token*experts+expert,dtype));
+    }
+    float softmax_normalizer=0.f;
+    if(p[6]==0) {
+        for(uint expert=0;expert<experts;expert++)
+            softmax_normalizer+=exp(load(a,token*experts+expert,dtype)-maximum);
+    }
+    uint selected_ids[16];
+    float selected_scores[16];
+    float selected_sum=0.f;
+    for(uint rank=0;rank<top_k;rank++) {
+        uint best_id=0xffffffffu;
+        uint best_key=0u;
+        float best_score=0.f;
+        for(uint expert=0;expert<experts;expert++) {
+            bool used=false;
+            for(uint previous=0;previous<rank;previous++)
+                used=used || selected_ids[previous]==expert;
+            if(used) continue;
+            float logit=load(a,token*experts+expert,dtype);
+            float score=p[6]==1 ? 1.f/(1.f+exp(-logit)) : exp(logit-maximum)/softmax_normalizer;
+            float selection_score=score+(p[5]!=0 ? load(b,expert,0) : 0.f);
+            uint key=total_order_key(selection_score);
+            if(best_id==0xffffffffu || key>best_key || (key==best_key && expert<best_id)) {
+                best_id=expert;
+                best_key=key;
+                best_score=score;
+            }
+        }
+        selected_ids[rank]=best_id;
+        selected_scores[rank]=best_score;
+        if(p[7]!=0) selected_sum+=best_score;
+    }
+    // Match the CPU path's expert-ID accumulation order during combination.
+    for(uint i=1;i<top_k;i++) {
+        uint id=selected_ids[i];
+        float score=selected_scores[i];
+        uint j=i;
+        while(j>0 && selected_ids[j-1]>id) {
+            selected_ids[j]=selected_ids[j-1];
+            selected_scores[j]=selected_scores[j-1];
+            j--;
+        }
+        selected_ids[j]=id;
+        selected_scores[j]=score;
+    }
+    float denominator=selected_sum+as_type<float>(p[0]);
+    float scaling=as_type<float>(p[8]);
+    for(uint rank=0;rank<top_k;rank++) {
+        float weight=selected_scores[rank];
+        if(p[7]!=0) weight/=denominator;
+        weight*=scaling;
+        uint offset=(token*top_k+rank)*3;
+        store(c,offset,0,as_type<float>(selected_ids[rank]));
+        store(c,offset+1,0,as_type<float>(token));
+        store(c,offset+2,0,weight);
+    }
 }
 
 kernel void expert_assign(ARGS, uint i [[thread_position_in_grid]]) {

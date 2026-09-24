@@ -1,0 +1,8 @@
+Command: MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --lib q4_k_mpp_cooperative_input_matches_block_quantization -- --test-threads=1
+
+running 1 test
+test ops::transformer::qk_tests::q4_k_mpp_cooperative_input_matches_block_quantization ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 70 filtered out
+
+Shape covered: M=35, N=65, K=512. This was the temporary cooperative-input prototype; it was removed after the matched performance result showed no win.

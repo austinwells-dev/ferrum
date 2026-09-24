@@ -24,13 +24,24 @@ pub struct QuantizedModel {
 pub fn load(device: &MetalDevice, path: &Path) -> Result<QuantizedModel> {
     if path.is_file() {
         let loaded = qwen_gguf::load(device, path)?;
+        let (repository, revision) = if loaded.architecture == "qwen3" {
+            (
+                "Qwen/Qwen3-0.6B-GGUF",
+                "23749fefcc72300e3a2ad315e1317431b06b590a",
+            )
+        } else {
+            (
+                "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+                "9217f5db79a29953eb74d5343926648285ec7e67",
+            )
+        };
         Ok(QuantizedModel {
             config: loaded.config,
             model: loaded.model,
             tokenizer: loaded.tokenizer,
             format: "GGUF",
-            repository: "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-            revision: "9217f5db79a29953eb74d5343926648285ec7e67",
+            repository,
+            revision,
             source_tensor_bytes: loaded.source_tensor_bytes,
             quantized_tensor_bytes: loaded.quantized_tensor_bytes,
             tensor_count: loaded.tensor_count,

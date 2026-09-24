@@ -270,6 +270,9 @@ pub struct MetalDevice {
     mlx_affine4_gemv_quad: Cell<bool>,
     split_k_gemv: Cell<bool>,
     q4_0_gemv_8rows: Cell<bool>,
+    q4_k_gemv_8rows: Cell<bool>,
+    q6_k_gemv_8rows: Cell<bool>,
+    moe_gpu_routing: Cell<bool>,
     reference_math: Cell<bool>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
@@ -307,6 +310,9 @@ impl MetalDevice {
             mlx_affine4_gemv_quad: Cell::new(true),
             split_k_gemv: Cell::new(true),
             q4_0_gemv_8rows: Cell::new(true),
+            q4_k_gemv_8rows: Cell::new(true),
+            q6_k_gemv_8rows: Cell::new(true),
+            moe_gpu_routing: Cell::new(true),
             reference_math: Cell::new(false),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
@@ -384,6 +390,45 @@ impl MetalDevice {
     }
     pub(crate) fn use_q4_0_gemv_8rows(&self, output_rows: usize) -> bool {
         self.q4_0_gemv_8rows.get() && output_rows >= 128
+    }
+    /// Select the two-output-row-per-SIMD Q4_K M=1 kernel for wide projections.
+    pub fn set_q4_k_gemv_8rows(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q4_K GEMV during execution".into(),
+            ));
+        }
+        self.q4_k_gemv_8rows.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q4_k_gemv_8rows(&self, output_rows: usize) -> bool {
+        self.q4_k_gemv_8rows.get() && output_rows >= 128
+    }
+    /// Select the two-output-row-per-SIMD Q6_K M=1 kernel for wide projections.
+    pub fn set_q6_k_gemv_8rows(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q6_K GEMV during execution".into(),
+            ));
+        }
+        self.q6_k_gemv_8rows.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q6_k_gemv_8rows(&self, output_rows: usize) -> bool {
+        self.q6_k_gemv_8rows.get() && output_rows >= 128
+    }
+    /// Route sparse experts on Metal to avoid a router-logit readback boundary.
+    pub fn set_moe_gpu_routing(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change MoE routing during execution".into(),
+            ));
+        }
+        self.moe_gpu_routing.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_moe_gpu_routing(&self, top_k: usize, token_count: usize) -> bool {
+        self.moe_gpu_routing.get() && top_k <= 16 && token_count == 1
     }
     /// Select the multi-SIMD split-K BF16 GEMV for large aligned rows.
     pub fn set_split_k_gemv(&self, enabled: bool) -> Result<()> {
@@ -832,6 +877,8 @@ impl MetalDevice {
                 | "q8_0_gemv"
                 | "q8_0_gemv_8rows"
                 | "q4_0_gemv_8rows"
+                | "q4_k_gemv_8rows"
+                | "q6_k_gemv_8rows"
                 | "q4_0_gemv"
                 | "q5_0_gemv"
                 | "q5_1_gemv"
@@ -1053,6 +1100,8 @@ impl MetalDevice {
                     | "q8_0_gemv"
                     | "q8_0_gemv_8rows"
                     | "q4_0_gemv_8rows"
+                    | "q4_k_gemv_8rows"
+                    | "q6_k_gemv_8rows"
                     | "mlx_affine4_gemv"
             ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
@@ -1064,7 +1113,13 @@ impl MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
                         width: grid[0].div_ceil(
-                            if matches!(name, "q8_0_gemv_8rows" | "q4_0_gemv_8rows") {
+                            if matches!(
+                                name,
+                                "q8_0_gemv_8rows"
+                                    | "q4_0_gemv_8rows"
+                                    | "q4_k_gemv_8rows"
+                                    | "q6_k_gemv_8rows"
+                            ) {
                                 8
                             } else {
                                 4

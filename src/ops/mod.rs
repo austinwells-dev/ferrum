@@ -1,6 +1,9 @@
 #![forbid(unsafe_code)]
 use crate::{
-    DType, Error, MetalDevice, Result, Tensor, metal::DispatchTiming, quantization::QuantizedMatrix,
+    DType, Error, MetalDevice, Result, Tensor,
+    metal::DispatchTiming,
+    model::architecture::{MoeRoutingPolicy, MoeScoringFunction},
+    quantization::QuantizedMatrix,
 };
 #[derive(Debug, Clone)]
 pub struct Metrics {
@@ -17,6 +20,58 @@ pub struct Output {
     pub metrics: Metrics,
 }
 impl MetalDevice {
+    pub(crate) fn moe_route(
+        &self,
+        logits: &Tensor,
+        selection_bias: Option<&Tensor>,
+        policy: MoeRoutingPolicy,
+    ) -> Result<Tensor> {
+        let dims = logits.shape().dimensions();
+        if dims.len() != 2
+            || dims[0] == 0
+            || dims[1] == 0
+            || dims[1] != policy.experts
+            || policy.top_k == 0
+            || policy.top_k > 16
+            || policy.top_k > policy.experts
+            || !policy.normalization_epsilon.is_finite()
+            || policy.normalization_epsilon < 0.
+            || !policy.routed_scaling_factor.is_finite()
+            || policy.routed_scaling_factor <= 0.
+            || !self.owns(logits.buffer())
+            || selection_bias.is_some_and(|bias| {
+                bias.shape().dimensions() != [policy.experts]
+                    || bias.dtype() != DType::F32
+                    || !self.owns(bias.buffer())
+            })
+        {
+            return Err(Error::Shape("invalid sparse routing geometry".into()));
+        }
+        let assignments = dims[0]
+            .checked_mul(policy.top_k)
+            .ok_or_else(|| Error::Shape("expert assignment count overflow".into()))?;
+        let output = Tensor::output(self, &[assignments, 3], DType::F32)?;
+        let mut params = [0; 9];
+        params[0] = policy.normalization_epsilon.to_bits();
+        params[1] = index(dims[0])?;
+        params[2] = index(dims[1])?;
+        params[3] = index(policy.top_k)?;
+        params[4] = logits.dtype() as u32;
+        params[5] = u32::from(selection_bias.is_some());
+        params[6] = u32::from(policy.scoring_function == MoeScoringFunction::Sigmoid);
+        params[7] = u32::from(policy.normalize_top_k_prob);
+        params[8] = policy.routed_scaling_factor.to_bits();
+        let bias = selection_bias.unwrap_or(logits);
+        self.dispatch(
+            "moe_route",
+            &[logits.binding(), bias.binding(), output.binding()],
+            &params,
+            [dims[0], 1],
+            false,
+        )?;
+        Ok(output)
+    }
+
     pub(crate) fn expert_assign(
         &self,
         hidden: &Tensor,
@@ -617,6 +672,7 @@ impl MetalDevice {
             "q5_1_gemm",
             "q5_1_gemm_mpp",
             "q4_k_gemv",
+            "q4_k_gemv_8rows",
             "q4_k_gemm",
             "q4_k_gemm_mpp",
             "q5_k_gemv",
@@ -624,6 +680,7 @@ impl MetalDevice {
             "q5_k_gemm_mpp",
             "q6_k_gemm_mpp",
             "q6_k_gemv",
+            "q6_k_gemv_8rows",
             "q6_k_gemm",
             "q8_0_gemv",
             "q8_0_gemv_8rows",

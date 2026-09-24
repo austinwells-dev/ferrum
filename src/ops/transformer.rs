@@ -49,13 +49,25 @@ impl MetalDevice {
             (QuantizationFormat::Q5_1, true, _) => "q5_1_gemv",
             (QuantizationFormat::Q5_1, false, true) => "q5_1_gemm_mpp",
             (QuantizationFormat::Q5_1, false, false) => "q5_1_gemm",
-            (QuantizationFormat::Q4_K, true, _) => "q4_k_gemv",
+            (QuantizationFormat::Q4_K, true, _) => {
+                if self.use_q4_k_gemv_8rows(weight.rows()) {
+                    "q4_k_gemv_8rows"
+                } else {
+                    "q4_k_gemv"
+                }
+            }
             (QuantizationFormat::Q4_K, false, true) => "q4_k_gemm_mpp",
             (QuantizationFormat::Q4_K, false, false) => "q4_k_gemm",
             (QuantizationFormat::Q5_K, true, _) => "q5_k_gemv",
             (QuantizationFormat::Q5_K, false, true) => "q5_k_gemm_mpp",
             (QuantizationFormat::Q5_K, false, false) => "q5_k_gemm",
-            (QuantizationFormat::Q6_K, true, _) => "q6_k_gemv",
+            (QuantizationFormat::Q6_K, true, _) => {
+                if self.use_q6_k_gemv_8rows(weight.rows()) {
+                    "q6_k_gemv_8rows"
+                } else {
+                    "q6_k_gemv"
+                }
+            }
             (QuantizationFormat::Q6_K, false, true) => "q6_k_gemm_mpp",
             (QuantizationFormat::Q6_K, false, false) => "q6_k_gemm",
             (QuantizationFormat::MlxAffine4Group64, true, _) => {
@@ -1510,6 +1522,28 @@ mod qk_tests {
     }
 
     #[test]
+    fn q4_k_eight_row_gemv_reuses_activations_and_covers_output_tail() {
+        let d = MetalDevice::new().unwrap();
+        assert!(!d.use_q4_k_gemv_8rows(127));
+        d.set_q4_k_gemv_8rows(true).unwrap();
+        let (n, k) = (133, 512);
+        assert!(d.use_q4_k_gemv_8rows(n));
+        let weight = packed(&d, n, k, QuantizationFormat::Q4_K);
+        let values = input(1, k);
+        let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+        let output = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(output.metrics.operation, "q4_k_gemv_8rows");
+        let reference = expected(&values, 1, n, k, QuantizationFormat::Q4_K);
+        for (index, (actual, reference)) in output.tensor.to_f32().iter().zip(reference).enumerate()
+        {
+            assert!(
+                (actual - reference).abs() <= 2.0e-4,
+                "eight-row GEMV index {index}: actual={actual}, expected={reference}"
+            );
+        }
+    }
+
+    #[test]
     fn q4_k_and_q5_k_mpp_gemm_cover_row_output_and_group_tails() {
         let d = MetalDevice::new().unwrap();
         if !d.mpp_projection() {
@@ -1760,6 +1794,27 @@ mod q6_k_tests {
                     "index {index}: actual={actual}, expected={expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn q6_k_eight_row_gemv_reuses_activations_and_covers_output_tail() {
+        let d = MetalDevice::new().unwrap();
+        assert!(!d.use_q6_k_gemv_8rows(127));
+        let (n, k) = (133, 512);
+        assert!(d.use_q6_k_gemv_8rows(n));
+        let weight = packed(&d, n, k);
+        let values = input(1, k);
+        let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+        let output = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(output.metrics.operation, "q6_k_gemv_8rows");
+        let reference = expected(&values, 1, n, k);
+        for (index, (actual, reference)) in output.tensor.to_f32().iter().zip(reference).enumerate()
+        {
+            assert!(
+                (actual - reference).abs() <= 0.02,
+                "eight-row GEMV index {index}: actual={actual}, expected={reference}"
+            );
         }
     }
 

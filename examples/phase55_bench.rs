@@ -3,12 +3,102 @@
 #[path = "support/phase5_common.rs"]
 mod phase5_common;
 
-use ferrum::{Error, MetalDevice, Result, generation};
+use ferrum::{
+    Error, MetalDevice, Result, generation,
+    loader::gguf::{GgufFile, MetadataValue},
+    model::{Transformer, lfm2_moe, qwen_gguf},
+};
 use serde_json::{Value, json};
 use std::{
     io::{self, BufRead, Write},
     path::Path,
 };
+
+struct BenchModel {
+    model: Transformer,
+    format: &'static str,
+    repository: &'static str,
+    revision: &'static str,
+    source_tensor_bytes: usize,
+    quantized_tensor_bytes: usize,
+    tensor_count: usize,
+    parameter_count: usize,
+}
+
+fn load_model(device: &MetalDevice, path: &Path) -> Result<BenchModel> {
+    if path.is_dir() {
+        let loaded = phase5_common::load(device, path)?;
+        return Ok(BenchModel {
+            model: loaded.model,
+            format: loaded.format,
+            repository: loaded.repository,
+            revision: loaded.revision,
+            source_tensor_bytes: loaded.source_tensor_bytes,
+            quantized_tensor_bytes: loaded.quantized_tensor_bytes,
+            tensor_count: loaded.tensor_count,
+            parameter_count: loaded.parameter_count,
+        });
+    }
+
+    let gguf = GgufFile::open(path)?;
+    let architecture = match gguf.metadata_value("general.architecture") {
+        Some(MetadataValue::String(value)) => value.as_str(),
+        _ => {
+            return Err(Error::Config(
+                "GGUF is missing string general.architecture".into(),
+            ));
+        }
+    };
+    match architecture {
+        "qwen2" | "qwen3" => {
+            let loaded = qwen_gguf::load(device, path)?;
+            let (repository, revision) = if loaded.architecture == "qwen3" {
+                (
+                    "Qwen/Qwen3-0.6B-GGUF",
+                    "23749fefcc72300e3a2ad315e1317431b06b590a",
+                )
+            } else {
+                (
+                    "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+                    "9217f5db79a29953eb74d5343926648285ec7e67",
+                )
+            };
+            Ok(BenchModel {
+                model: loaded.model,
+                format: "GGUF",
+                repository,
+                revision,
+                source_tensor_bytes: loaded.source_tensor_bytes,
+                quantized_tensor_bytes: loaded.quantized_tensor_bytes,
+                tensor_count: loaded.tensor_count,
+                parameter_count: loaded.parameter_count,
+            })
+        }
+        "lfm2moe" => {
+            let metadata_dir = std::env::var_os("FERRUM_PHASE7A_LFM2_METADATA")
+                .map(std::path::PathBuf::from)
+                .ok_or_else(|| {
+                    Error::Parameter(
+                        "LFM2-MoE GGUF requires FERRUM_PHASE7A_LFM2_METADATA to point to its official config/tokenizer directory".into(),
+                    )
+                })?;
+            let loaded = lfm2_moe::load_gguf(device, path, metadata_dir)?;
+            Ok(BenchModel {
+                model: loaded.model,
+                format: "GGUF",
+                repository: "LiquidAI/LFM2.5-8B-A1B-GGUF",
+                revision: "49c14831707011e64d70b2ebd8462ba08d608434",
+                source_tensor_bytes: loaded.source_tensor_bytes,
+                quantized_tensor_bytes: loaded.quantized_tensor_bytes,
+                tensor_count: loaded.tensor_count,
+                parameter_count: loaded.parameter_count,
+            })
+        }
+        other => Err(Error::Config(format!(
+            "benchmark GGUF architecture {other:?} is unsupported"
+        ))),
+    }
+}
 
 fn request_usize(request: &Value, key: &str) -> Result<usize> {
     request[key]
@@ -44,11 +134,7 @@ fn prompt_ids(request: &Value) -> Result<Vec<u32>> {
     Ok(ids)
 }
 
-fn handle(
-    device: &MetalDevice,
-    model: &phase5_common::QuantizedModel,
-    request: &Value,
-) -> Result<Value> {
+fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<Value> {
     let prompt = prompt_ids(request)?;
     let max_new_tokens = request_usize(request, "max_new_tokens")?;
     let case = request_string(request, "case")?;
@@ -105,6 +191,8 @@ fn handle(
         "retained_weight_bytes": model.model.weight_bytes(),
         "source_tensor_bytes": model.source_tensor_bytes,
         "packed_quantized_bytes": model.quantized_tensor_bytes,
+        "tensor_count": model.tensor_count,
+        "parameter_count": model.parameter_count,
         "prefill_counters": result.prefill_counters,
         "decode_counters": result.decode_counters,
         "kv_active_bytes": result.kv_bytes,
@@ -131,6 +219,30 @@ fn main() -> Result<()> {
         };
         device.set_q4_0_gemv_8rows(enabled)?;
     }
+    if let Ok(value) = std::env::var("FERRUM_Q4_K_GEMV_8ROWS") {
+        let enabled = match value.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => return Err(Error::Parameter("invalid FERRUM_Q4_K_GEMV_8ROWS".into())),
+        };
+        device.set_q4_k_gemv_8rows(enabled)?;
+    }
+    if let Ok(value) = std::env::var("FERRUM_Q6_K_GEMV_8ROWS") {
+        let enabled = match value.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => return Err(Error::Parameter("invalid FERRUM_Q6_K_GEMV_8ROWS".into())),
+        };
+        device.set_q6_k_gemv_8rows(enabled)?;
+    }
+    if let Ok(value) = std::env::var("FERRUM_MOE_GPU_ROUTING") {
+        let enabled = match value.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => return Err(Error::Parameter("invalid FERRUM_MOE_GPU_ROUTING".into())),
+        };
+        device.set_moe_gpu_routing(enabled)?;
+    }
     if let Ok(value) = std::env::var("FERRUM_MLX_AFFINE4_GEMV_QUAD") {
         let enabled = match value.as_str() {
             "1" | "true" => true,
@@ -149,7 +261,7 @@ fn main() -> Result<()> {
             .map_err(|_| Error::Parameter("invalid FERRUM_BATCH_LIMIT".into()))?;
         device.set_batch_limit(limit)?;
     }
-    let model = phase5_common::load(&device, Path::new(&args[1]))?;
+    let model = load_model(&device, Path::new(&args[1]))?;
     eprintln!(
         "phase55_bench ready: format={} weights={} packed={} tensors={}",
         model.format,

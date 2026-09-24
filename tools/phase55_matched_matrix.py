@@ -31,10 +31,13 @@ def source_cases(path: Path) -> list[dict[str, Any]]:
     cases: dict[str, dict[str, Any]] = {}
     for row in rows:
         case = str(row["case"])
+        requested = row.get("max_new_tokens", len(row.get("generated_ids", [])))
+        if isinstance(requested, bool) or not isinstance(requested, int) or requested <= 0:
+            raise ValueError(f"case {case!r} needs a positive integer max_new_tokens")
         previous = cases.get(case)
         if previous is not None and (
             previous["prompt_ids"] != row["prompt_ids"]
-            or len(previous["generated_ids"]) != len(row["generated_ids"])
+            or previous.get("max_new_tokens", len(previous.get("generated_ids", []))) != requested
         ):
             raise ValueError(f"case {case!r} has inconsistent prompt or output lengths")
         cases.setdefault(case, row)
@@ -296,7 +299,7 @@ def main() -> None:
         with args.output.open("w", encoding="utf-8") as output:
             for case_index, row in enumerate(cases):
                 prompt = row["prompt_ids"]
-                max_tokens = len(row["generated_ids"])
+                max_tokens = row.get("max_new_tokens", len(row.get("generated_ids", [])))
                 for pair in range(args.repeats):
                     order = pair_order(names, case_index, pair)
                     order_label = ">".join(order)
@@ -320,6 +323,9 @@ def main() -> None:
                             result["ferrum_options"] = {
                                 "batch_limit_dispatches": int(os.environ.get("FERRUM_BATCH_LIMIT", "1024")),
                                 "q4_0_gemv_8rows": os.environ.get("FERRUM_Q4_0_GEMV_8ROWS", "true").lower() in ("1", "true"),
+                                "q4_k_gemv_8rows": os.environ.get("FERRUM_Q4_K_GEMV_8ROWS", "true").lower() in ("1", "true"),
+                                "q6_k_gemv_8rows": os.environ.get("FERRUM_Q6_K_GEMV_8ROWS", "true").lower() in ("1", "true"),
+                                "moe_gpu_routing": os.environ.get("FERRUM_MOE_GPU_ROUTING", "true").lower() in ("1", "true"),
                                 "mlx_affine4_gemv_quad": os.environ.get("FERRUM_MLX_AFFINE4_GEMV_QUAD", "true").lower() in ("1", "true"),
                             }
                         result["engine_order"] = order

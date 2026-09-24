@@ -172,6 +172,7 @@ impl Transformer {
                     total.expert_dispatch += stats.expert_dispatch;
                     total.combine_dispatch += stats.combine_dispatch;
                     total.active_experts += stats.active_experts;
+                    total.active_experts_known &= stats.active_experts_known;
                     total.assignments += stats.assignments;
                     total.peak_temporary_bytes =
                         total.peak_temporary_bytes.max(stats.peak_temporary_bytes);

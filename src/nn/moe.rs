@@ -69,7 +69,7 @@ impl ExpertMatrix {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy)]
 pub struct MoeStats {
     pub router_projection_enqueue: Duration,
     pub routing: Duration,
@@ -77,8 +77,25 @@ pub struct MoeStats {
     pub expert_dispatch: Duration,
     pub combine_dispatch: Duration,
     pub active_experts: usize,
+    pub active_experts_known: bool,
     pub assignments: usize,
     pub peak_temporary_bytes: usize,
+}
+
+impl Default for MoeStats {
+    fn default() -> Self {
+        Self {
+            router_projection_enqueue: Duration::default(),
+            routing: Duration::default(),
+            routing_boundary_wait: Duration::default(),
+            expert_dispatch: Duration::default(),
+            combine_dispatch: Duration::default(),
+            active_experts: 0,
+            active_experts_known: true,
+            assignments: 0,
+            peak_temporary_bytes: 0,
+        }
+    }
 }
 
 impl MoeStats {
@@ -89,6 +106,7 @@ impl MoeStats {
         self.expert_dispatch += other.expert_dispatch;
         self.combine_dispatch += other.combine_dispatch;
         self.active_experts += other.active_experts;
+        self.active_experts_known &= other.active_experts_known;
         self.assignments += other.assignments;
         self.peak_temporary_bytes = self.peak_temporary_bytes.max(other.peak_temporary_bytes);
     }
@@ -99,6 +117,7 @@ pub struct SparseMoe {
     input_experts: ExpertMatrix,
     output_experts: ExpertMatrix,
     selection_bias: Option<Vec<f32>>,
+    selection_bias_tensor: Option<Tensor>,
     expert_count: usize,
     routing: MoeRoutingPolicy,
     hidden_size: usize,
@@ -161,8 +180,8 @@ impl SparseMoe {
         let expert_count = router_dims[0];
         let hidden_size = router_dims[1];
         let intermediate_size = input_dims.expect("validated input expert geometry").1 / 2;
-        let selection_bias = selection_bias.map(|bias| bias.to_f32());
-        if selection_bias
+        let selection_bias_values = selection_bias.as_ref().map(Tensor::to_f32);
+        if selection_bias_values
             .as_ref()
             .is_some_and(|bias| bias.iter().any(|value| !value.is_finite()))
         {
@@ -173,7 +192,8 @@ impl SparseMoe {
             router,
             input_experts,
             output_experts,
-            selection_bias,
+            selection_bias: selection_bias_values,
+            selection_bias_tensor: selection_bias,
             expert_count,
             routing,
             hidden_size,
@@ -242,28 +262,39 @@ impl SparseMoe {
             let router_logits =
                 device.profile_projection("moe.router", || self.router.forward(device, &input))?;
             total_stats.router_projection_enqueue += route_start.elapsed();
-            // Router choice is data-dependent. Complete the GPU projection before
-            // reading it; all staged cache changes remain local to the caller.
-            let boundary_start = Instant::now();
-            device.synchronize()?;
-            total_stats.routing_boundary_wait += boundary_start.elapsed();
-            let route_start = Instant::now();
-            let logits = router_logits.to_f32();
-            let metadata = self.select_routes(&logits, count)?;
-            let active = metadata
-                .chunks_exact(3)
-                .map(|item| item[0].to_bits() as usize)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len();
-            total_stats.routing += route_start.elapsed();
-            total_stats.active_experts += active;
             let assignment_count = count
                 .checked_mul(self.routing.top_k)
                 .ok_or_else(|| Error::Shape("expert assignment count overflow".into()))?;
             total_stats.assignments += assignment_count;
-
-            let metadata_tensor =
-                Tensor::from_f32(device, [assignment_count, 3], crate::DType::F32, &metadata)?;
+            let metadata_tensor = if device.use_moe_gpu_routing(self.routing.top_k, dims[0]) {
+                let route_start = Instant::now();
+                let metadata = device.profile_projection("moe.route", || {
+                    device.moe_route(
+                        &router_logits,
+                        self.selection_bias_tensor.as_ref(),
+                        self.routing,
+                    )
+                })?;
+                total_stats.routing += route_start.elapsed();
+                total_stats.active_experts_known = false;
+                metadata
+            } else {
+                // Router choice is data-dependent. Complete the GPU projection before
+                // reading it; all staged cache changes remain local to the caller.
+                let boundary_start = Instant::now();
+                device.synchronize()?;
+                total_stats.routing_boundary_wait += boundary_start.elapsed();
+                let route_start = Instant::now();
+                let logits = router_logits.to_f32();
+                let metadata = self.select_routes(&logits, count)?;
+                total_stats.active_experts += metadata
+                    .chunks_exact(3)
+                    .map(|item| item[0].to_bits() as usize)
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .len();
+                total_stats.routing += route_start.elapsed();
+                Tensor::from_f32(device, [assignment_count, 3], crate::DType::F32, &metadata)?
+            };
             let temp_bytes = assignment_count
                 .checked_mul(bytes_per_assignment)
                 .and_then(|v| {
@@ -619,5 +650,85 @@ mod tests {
         assert!((routes[2] - sigmoid_one / normalizer).abs() < 1e-6);
         assert_eq!(routes[3].to_bits(), 2);
         assert!((routes[5] - sigmoid_zero / normalizer).abs() < 1e-6);
+    }
+
+    #[test]
+    fn metal_router_preserves_cpu_top_k_order_and_weights() {
+        let device = MetalDevice::new().unwrap();
+        let experts = 5;
+        let hidden = 1;
+        let top_k = 3;
+        let router = Tensor::from_f32(&device, [experts, hidden], DType::F32, &[0.; 5]).unwrap();
+        let input_experts =
+            Tensor::from_f32(&device, [experts, 2, hidden], DType::F32, &[0.; 10]).unwrap();
+        let output_experts =
+            Tensor::from_f32(&device, [experts, hidden, 1], DType::F32, &[0.; 5]).unwrap();
+        let bias =
+            Tensor::from_f32(&device, [experts], DType::F32, &[0.1, 0.05, 0.1, -0.3, 0.1]).unwrap();
+        let logits = Tensor::from_f32(
+            &device,
+            [2, experts],
+            DType::BF16,
+            &[0., 0., 0., 0., 0., 2., 0.5, -1., 1.5, 0.],
+        )
+        .unwrap();
+        let logits_values = logits.to_f32();
+
+        for (scoring_function, use_expert_bias) in [
+            (MoeScoringFunction::Sigmoid, true),
+            (MoeScoringFunction::Softmax, true),
+            (MoeScoringFunction::Softmax, false),
+        ] {
+            let policy = MoeRoutingPolicy {
+                experts,
+                top_k,
+                scoring_function,
+                normalize_top_k_prob: true,
+                normalization_epsilon: 1e-6,
+                routed_scaling_factor: 1.25,
+                use_expert_bias,
+            };
+            let selection_bias = use_expert_bias.then(|| bias.clone());
+            let moe = SparseMoe::new(
+                &device,
+                router.clone(),
+                ExpertMatrix::Dense(input_experts.clone()),
+                ExpertMatrix::Dense(output_experts.clone()),
+                policy,
+                selection_bias.clone(),
+            )
+            .unwrap();
+            let expected = moe.select_routes(&logits_values, 2).unwrap();
+            let execution = device.execution().unwrap();
+            let actual_tensor = device
+                .moe_route(&logits, selection_bias.as_ref(), policy)
+                .unwrap();
+            let hidden = Tensor::from_f32(&device, [2, 1], DType::BF16, &[1., 2.]).unwrap();
+            let assigned = device
+                .expert_assign(&hidden, &actual_tensor, top_k)
+                .unwrap();
+            execution.finish().unwrap();
+            let actual = actual_tensor.to_f32();
+            let assigned_values = assigned.to_f32();
+
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                if index % 3 != 2 {
+                    assert_eq!(
+                        actual.to_bits(),
+                        expected.to_bits(),
+                        "metadata index {index}"
+                    );
+                } else {
+                    assert!(
+                        (actual - expected).abs() <= 2e-6,
+                        "weight index {index}: {actual} vs {expected}"
+                    );
+                }
+            }
+            for (assignment, route) in expected.chunks_exact(3).enumerate() {
+                let token = route[1].to_bits() as usize;
+                assert_eq!(assigned_values[assignment], [1., 2.][token]);
+            }
+        }
     }
 }
