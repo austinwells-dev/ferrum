@@ -118,10 +118,10 @@ impl GraniteMoeConfig {
             embedding_multiplier: self.embedding_multiplier,
             residual_multiplier: self.residual_multiplier,
             logits_divisor: self.logits_scaling,
-            moe: Some(MoeRoutingPolicy {
-                experts: self.num_local_experts,
-                top_k: self.num_experts_per_tok,
-            }),
+            moe: Some(MoeRoutingPolicy::softmax(
+                self.num_local_experts,
+                self.num_experts_per_tok,
+            )),
             ..ArchitecturePolicy::default()
         };
         policy.validate()?;

@@ -6,7 +6,7 @@ use super::{
     },
 };
 use crate::{
-    Error, MetalDevice, Result, Tensor,
+    DType, Error, MetalDevice, Result, Tensor,
     loader::Weights,
     nn::{
         Embedding, Linear, Mlp, RmsNorm, attention::Attention, kv_cache::KvCache, moe::SparseMoe,
@@ -220,20 +220,28 @@ pub(crate) fn specifications_with_policy(
             LayerFeedForwardPolicy::Sparse {
                 routing,
                 intermediate_size,
-            } => specs.extend([
-                (
-                    format!("layers.{l}.moe.router.weight"),
-                    vec![routing.experts, h],
-                ),
-                (
-                    format!("layers.{l}.moe.input.weight"),
-                    vec![routing.experts, 2 * intermediate_size, h],
-                ),
-                (
-                    format!("layers.{l}.moe.output.weight"),
-                    vec![routing.experts, h, intermediate_size],
-                ),
-            ]),
+            } => {
+                specs.extend([
+                    (
+                        format!("layers.{l}.moe.router.weight"),
+                        vec![routing.experts, h],
+                    ),
+                    (
+                        format!("layers.{l}.moe.input.weight"),
+                        vec![routing.experts, 2 * intermediate_size, h],
+                    ),
+                    (
+                        format!("layers.{l}.moe.output.weight"),
+                        vec![routing.experts, h, intermediate_size],
+                    ),
+                ]);
+                if routing.use_expert_bias {
+                    specs.push((
+                        format!("layers.{l}.moe.router_bias.weight"),
+                        vec![routing.experts],
+                    ));
+                }
+            }
         }
         if matches!(layer.operator, LayerOperatorPolicy::Attention)
             && policy.qk_norm_epsilon.is_some()
@@ -457,12 +465,17 @@ pub(crate) fn construct_mixed(
         }
         match weight {
             ModelWeight::Dense(tensor) => {
-                if tensor.dtype() != c.dtype {
+                let expected_dtype = if name.ends_with(".moe.router_bias.weight") {
+                    DType::F32
+                } else {
+                    c.dtype
+                };
+                if tensor.dtype() != expected_dtype {
                     return Err(Error::Weight {
                         name,
                         message: format!(
                             "dense model tensor must be {:?}, found {:?}",
-                            c.dtype,
+                            expected_dtype,
                             tensor.dtype()
                         ),
                     });
@@ -576,12 +589,18 @@ pub(crate) fn construct_mixed(
                 let router = dense(&format!("{prefix}.moe.router.weight"))?;
                 let input_experts = dense(&format!("{prefix}.moe.input.weight"))?;
                 let output_experts = dense(&format!("{prefix}.moe.output.weight"))?;
+                let selection_bias = if routing.use_expert_bias {
+                    Some(dense(&format!("{prefix}.moe.router_bias.weight"))?)
+                } else {
+                    None
+                };
                 FeedForward::Sparse(SparseMoe::new(
                     d,
                     router,
                     input_experts,
                     output_experts,
-                    routing.top_k,
+                    routing,
+                    selection_bias,
                 )?)
             }
             LayerFeedForwardPolicy::Dense { .. } => FeedForward::Dense(Mlp {

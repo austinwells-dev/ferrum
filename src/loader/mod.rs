@@ -218,6 +218,12 @@ impl Weights {
         }
         Ok(())
     }
+    pub(crate) fn remove(&mut self, name: &str) -> Result<Tensor> {
+        self.tensors.remove(name).ok_or_else(|| Error::Weight {
+            name: name.into(),
+            message: "missing tensor".into(),
+        })
+    }
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.tensors.keys().map(String::as_str)
     }

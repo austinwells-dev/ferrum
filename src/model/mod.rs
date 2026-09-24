@@ -9,6 +9,7 @@ pub use transformer::Transformer;
 pub mod granite;
 pub mod granite_moe;
 pub mod lfm2;
+pub mod lfm2_moe;
 pub mod olmo2;
 pub mod qwen;
 pub mod qwen3;

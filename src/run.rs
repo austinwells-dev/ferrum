@@ -3,7 +3,7 @@ use ferrum::{
     generation::{self, Generation},
     loader::Weights,
     model::{
-        granite, granite_moe, lfm2, olmo2,
+        granite, granite_moe, lfm2, lfm2_moe, olmo2,
         qwen::{self, QwenConfig},
         qwen_gguf, qwen_mlx, qwen3,
     },
@@ -246,7 +246,29 @@ pub fn run(d: &MetalDevice) -> Result<()> {
                 .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))?,
         )
         .map_err(|e| Error::Config(format!("{}: {e}", config_path.display())))?;
-        if metadata["model_type"] == "lfm2" {
+        if metadata["model_type"] == "lfm2_moe" {
+            let before = d.counters();
+            let loaded = lfm2_moe::load(d, &o.model)?;
+            let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;
+            (
+                loaded.config,
+                RuntimeTokenizer {
+                    tokenizer: loaded.tokenizer,
+                    eos_ids: loaded.eos_ids,
+                    format: PromptFormat::Lfm2,
+                },
+                loaded.model,
+                loaded.source_tensor_bytes,
+                loaded.tensor_count,
+                loaded.parameter_count,
+                0,
+                loaded.config_tokenizer_load,
+                loaded.weight_load,
+                loaded.construction,
+                allocated,
+                "LFM2.5-8B-A1B hybrid MoE safetensors",
+            )
+        } else if metadata["model_type"] == "lfm2" {
             let before = d.counters();
             let loaded = lfm2::load(d, &o.model)?;
             let allocated = generation::counter_delta(before, d.counters()).allocated_bytes;

@@ -1,6 +1,7 @@
 //! Shared sparse top-k expert routing and grouped expert projection runtime.
 #![forbid(unsafe_code)]
 
+use crate::model::architecture::{MoeRoutingPolicy, MoeScoringFunction};
 use crate::{Error, MetalDevice, Result, Tensor};
 use std::{
     cell::Cell,
@@ -38,8 +39,9 @@ pub struct SparseMoe {
     router: crate::nn::Linear,
     input_experts: Tensor,
     output_experts: Tensor,
+    selection_bias: Option<Vec<f32>>,
     expert_count: usize,
-    top_k: usize,
+    routing: MoeRoutingPolicy,
     hidden_size: usize,
     intermediate_size: usize,
     stats: Cell<MoeStats>,
@@ -51,7 +53,8 @@ impl SparseMoe {
         router_weight: Tensor,
         input_experts: Tensor,
         output_experts: Tensor,
-        top_k: usize,
+        routing: MoeRoutingPolicy,
+        selection_bias: Option<Tensor>,
     ) -> Result<Self> {
         let router_dims = router_weight.shape().dimensions();
         let input_dims = input_experts.shape().dimensions();
@@ -66,8 +69,14 @@ impl SparseMoe {
             || router_dims[1] != input_dims[2]
             || router_dims[1] != output_dims[1]
             || output_dims[2].checked_mul(2) != Some(input_dims[1])
-            || top_k == 0
-            || top_k > router_dims[0]
+            || routing.experts != router_dims[0]
+            || routing.top_k == 0
+            || routing.top_k > router_dims[0]
+            || !routing.normalization_epsilon.is_finite()
+            || routing.normalization_epsilon < 0.
+            || !routing.routed_scaling_factor.is_finite()
+            || routing.routed_scaling_factor <= 0.
+            || routing.use_expert_bias != selection_bias.is_some()
             || [
                 router_weight.dtype(),
                 input_experts.dtype(),
@@ -78,6 +87,11 @@ impl SparseMoe {
             || !device.owns(router_weight.buffer())
             || !device.owns(input_experts.buffer())
             || !device.owns(output_experts.buffer())
+            || selection_bias.as_ref().is_some_and(|bias| {
+                bias.shape().dimensions() != [router_dims.first().copied().unwrap_or(0)]
+                    || bias.dtype() != crate::DType::F32
+                    || !device.owns(bias.buffer())
+            })
         {
             return Err(Error::Config(
                 "invalid sparse expert weight geometry".into(),
@@ -86,13 +100,21 @@ impl SparseMoe {
         let expert_count = router_dims[0];
         let hidden_size = router_dims[1];
         let intermediate_size = input_dims[1] / 2;
+        let selection_bias = selection_bias.map(|bias| bias.to_f32());
+        if selection_bias
+            .as_ref()
+            .is_some_and(|bias| bias.iter().any(|value| !value.is_finite()))
+        {
+            return Err(Error::Config("MoE selection bias must be finite".into()));
+        }
         let router = crate::nn::Linear::new(device, router_weight, None)?;
         Ok(Self {
             router,
             input_experts,
             output_experts,
+            selection_bias,
             expert_count,
-            top_k,
+            routing,
             hidden_size,
             intermediate_size,
             stats: Cell::new(MoeStats::default()),
@@ -103,6 +125,10 @@ impl SparseMoe {
         self.router.weight_bytes()
             + self.input_experts.byte_size()
             + self.output_experts.byte_size()
+            + self
+                .selection_bias
+                .as_ref()
+                .map_or(0, |bias| bias.len() * std::mem::size_of::<f32>())
     }
 
     pub fn take_stats(&self) -> MoeStats {
@@ -129,7 +155,7 @@ impl SparseMoe {
             .and_then(|v| v.checked_add(3 * std::mem::size_of::<f32>()))
             .ok_or_else(|| Error::Shape("expert temporary size overflow".into()))?;
         let bytes_per_token = bytes_per_assignment
-            .checked_mul(self.top_k)
+            .checked_mul(self.routing.top_k)
             .and_then(|v| {
                 v.checked_add(
                     self.expert_count
@@ -171,7 +197,7 @@ impl SparseMoe {
             total_stats.routing += route_start.elapsed();
             total_stats.active_experts += active;
             let assignment_count = count
-                .checked_mul(self.top_k)
+                .checked_mul(self.routing.top_k)
                 .ok_or_else(|| Error::Shape("expert assignment count overflow".into()))?;
             total_stats.assignments += assignment_count;
 
@@ -191,7 +217,7 @@ impl SparseMoe {
 
             let dispatch_start = Instant::now();
             let assigned = device.profile_projection("moe.assign", || {
-                device.expert_assign(&input, &metadata_tensor, self.top_k)
+                device.expert_assign(&input, &metadata_tensor, self.routing.top_k)
             })?;
             let projected = device.profile_projection("moe.input_projection", || {
                 device.expert_project(
@@ -222,7 +248,7 @@ impl SparseMoe {
                     &metadata_tensor,
                     count,
                     self.hidden_size,
-                    self.top_k,
+                    self.routing.top_k,
                 )
             })?;
             total_stats.combine_dispatch += combine_start.elapsed();
@@ -254,26 +280,52 @@ impl SparseMoe {
             return Err(Error::Validation("router produced invalid logits".into()));
         }
         let capacity = tokens
-            .checked_mul(self.top_k)
+            .checked_mul(self.routing.top_k)
             .and_then(|value| value.checked_mul(3))
             .ok_or_else(|| Error::Shape("expert routing metadata overflow".into()))?;
         let mut metadata = Vec::with_capacity(capacity);
         for token in 0..tokens {
             let row = &logits[token * self.expert_count..(token + 1) * self.expert_count];
+            let scores = match self.routing.scoring_function {
+                MoeScoringFunction::Softmax => {
+                    let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut values: Vec<_> =
+                        row.iter().map(|score| (score - maximum).exp()).collect();
+                    let normalizer: f32 = values.iter().sum();
+                    for value in &mut values {
+                        *value /= normalizer;
+                    }
+                    values
+                }
+                MoeScoringFunction::Sigmoid => {
+                    row.iter().map(|score| 1. / (1. + (-score).exp())).collect()
+                }
+            };
             let mut order: Vec<usize> = (0..self.expert_count).collect();
-            order.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then_with(|| a.cmp(&b)));
-            order.truncate(self.top_k);
-            let maximum = order
-                .iter()
-                .map(|&expert| row[expert])
-                .fold(f32::NEG_INFINITY, f32::max);
+            order.sort_by(|&a, &b| {
+                let score_a = scores[a] + self.selection_bias.as_ref().map_or(0., |bias| bias[a]);
+                let score_b = scores[b] + self.selection_bias.as_ref().map_or(0., |bias| bias[b]);
+                score_b.total_cmp(&score_a).then_with(|| a.cmp(&b))
+            });
+            order.truncate(self.routing.top_k);
             let mut selected: Vec<_> = order
                 .into_iter()
-                .map(|expert| (expert, (row[expert] - maximum).exp()))
+                .map(|expert| (expert, scores[expert]))
                 .collect();
-            let normalizer: f32 = selected.iter().map(|(_, weight)| weight).sum();
+            if self.routing.normalize_top_k_prob {
+                let normalizer: f32 = selected.iter().map(|(_, weight)| weight).sum();
+                let denominator = normalizer + self.routing.normalization_epsilon;
+                if !denominator.is_finite() || denominator <= 0. {
+                    return Err(Error::Validation(
+                        "router produced invalid selected scores".into(),
+                    ));
+                }
+                for (_, weight) in &mut selected {
+                    *weight /= denominator;
+                }
+            }
             for (_, weight) in &mut selected {
-                *weight /= normalizer;
+                *weight *= self.routing.routed_scaling_factor;
             }
             // Grouped expert execution uses the reference's expert-ID ordering
             // when combining the selected contributions for each token.
@@ -292,7 +344,8 @@ impl SparseMoe {
 
 #[cfg(test)]
 mod tests {
-    use super::{ROUTING_TEMPORARY_LIMIT, SparseMoe};
+    use super::{MoeRoutingPolicy, ROUTING_TEMPORARY_LIMIT, SparseMoe};
+    use crate::model::architecture::MoeScoringFunction;
     use crate::{DType, MetalDevice, Tensor};
 
     #[test]
@@ -351,7 +404,15 @@ mod tests {
             &output_weights,
         )
         .unwrap();
-        let moe = SparseMoe::new(&device, router, input_experts, output_experts, top_k).unwrap();
+        let moe = SparseMoe::new(
+            &device,
+            router,
+            input_experts,
+            output_experts,
+            MoeRoutingPolicy::softmax(experts, top_k),
+            None,
+        )
+        .unwrap();
 
         let mut input_values = Vec::with_capacity(tokens * hidden);
         for token in 0..tokens {
@@ -422,5 +483,64 @@ mod tests {
         assert_eq!(stats.assignments, tokens * top_k);
         assert_eq!(stats.active_experts, 2);
         assert!(stats.peak_temporary_bytes < ROUTING_TEMPORARY_LIMIT);
+    }
+
+    #[test]
+    fn sigmoid_top_k_routes_normalize_and_apply_scale() {
+        let device = MetalDevice::new().unwrap();
+        let routing = MoeRoutingPolicy {
+            experts: 3,
+            top_k: 2,
+            scoring_function: MoeScoringFunction::Sigmoid,
+            normalize_top_k_prob: true,
+            normalization_epsilon: 1e-6,
+            routed_scaling_factor: 1.5,
+            use_expert_bias: false,
+        };
+        let router = Tensor::from_f32(&device, [3, 2], DType::F32, &[0.; 6]).unwrap();
+        let input = Tensor::from_f32(&device, [3, 4, 2], DType::F32, &[0.; 24]).unwrap();
+        let output = Tensor::from_f32(&device, [3, 2, 2], DType::F32, &[0.; 12]).unwrap();
+        let moe = SparseMoe::new(&device, router, input, output, routing, None).unwrap();
+        let routes = moe.select_routes(&[0., 2., -2.], 1).unwrap();
+
+        assert_eq!(routes[0].to_bits(), 0);
+        assert_eq!(routes[1].to_bits(), 0);
+        assert_eq!(routes[3].to_bits(), 1);
+        let sigmoid_zero = 0.5;
+        let sigmoid_two = 1. / (1. + (-2f32).exp());
+        let denominator = sigmoid_zero + sigmoid_two + 1e-6;
+        let expected_zero = sigmoid_zero / denominator * 1.5;
+        let expected_two = sigmoid_two / denominator * 1.5;
+        assert!((routes[2] - expected_zero).abs() < 1e-6);
+        assert!((routes[5] - expected_two).abs() < 1e-6);
+        assert!((routes[2] + routes[5] - 1.5).abs() < 2e-6);
+    }
+
+    #[test]
+    fn sigmoid_expert_bias_changes_selection_without_changing_route_scores() {
+        let device = MetalDevice::new().unwrap();
+        let routing = MoeRoutingPolicy {
+            experts: 3,
+            top_k: 2,
+            scoring_function: MoeScoringFunction::Sigmoid,
+            normalize_top_k_prob: true,
+            normalization_epsilon: 1e-6,
+            routed_scaling_factor: 1.,
+            use_expert_bias: true,
+        };
+        let router = Tensor::from_f32(&device, [3, 1], DType::F32, &[0.; 3]).unwrap();
+        let input = Tensor::from_f32(&device, [3, 2, 1], DType::F32, &[0.; 6]).unwrap();
+        let output = Tensor::from_f32(&device, [3, 1, 1], DType::F32, &[0.; 3]).unwrap();
+        let bias = Tensor::from_f32(&device, [3], DType::F32, &[-10., 0., 2.]).unwrap();
+        let moe = SparseMoe::new(&device, router, input, output, routing, Some(bias)).unwrap();
+        let routes = moe.select_routes(&[2., 1., 0.], 1).unwrap();
+
+        let sigmoid_one = 1. / (1. + (-1f32).exp());
+        let sigmoid_zero = 0.5;
+        let normalizer = sigmoid_one + sigmoid_zero + 1e-6;
+        assert_eq!(routes[0].to_bits(), 1);
+        assert!((routes[2] - sigmoid_one / normalizer).abs() < 1e-6);
+        assert_eq!(routes[3].to_bits(), 2);
+        assert!((routes[5] - sigmoid_zero / normalizer).abs() < 1e-6);
     }
 }

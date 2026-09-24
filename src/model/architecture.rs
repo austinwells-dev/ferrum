@@ -16,7 +16,7 @@ pub enum LayerOperatorPolicy {
     ShortConv { kernel_size: usize },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum LayerFeedForwardPolicy {
     Dense {
         intermediate_size: usize,
@@ -27,7 +27,7 @@ pub enum LayerFeedForwardPolicy {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LayerPolicy {
     pub operator: LayerOperatorPolicy,
     pub feed_forward: LayerFeedForwardPolicy,
@@ -65,10 +65,46 @@ pub enum ResidualTopology {
     PostNorm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MoeScoringFunction {
+    #[default]
+    Softmax,
+    Sigmoid,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct MoeRoutingPolicy {
     pub experts: usize,
     pub top_k: usize,
+    pub scoring_function: MoeScoringFunction,
+    pub normalize_top_k_prob: bool,
+    pub normalization_epsilon: f32,
+    pub routed_scaling_factor: f32,
+    pub use_expert_bias: bool,
+}
+
+impl MoeRoutingPolicy {
+    pub const fn softmax(experts: usize, top_k: usize) -> Self {
+        Self {
+            experts,
+            top_k,
+            scoring_function: MoeScoringFunction::Softmax,
+            normalize_top_k_prob: true,
+            normalization_epsilon: 0.,
+            routed_scaling_factor: 1.,
+            use_expert_bias: false,
+        }
+    }
+
+    fn is_valid(self) -> bool {
+        self.experts > 0
+            && self.top_k > 0
+            && self.top_k <= self.experts
+            && self.normalization_epsilon.is_finite()
+            && self.normalization_epsilon >= 0.
+            && self.routed_scaling_factor.is_finite()
+            && self.routed_scaling_factor > 0.
+    }
 }
 
 impl Default for ArchitecturePolicy {
@@ -103,9 +139,7 @@ impl ArchitecturePolicy {
                 "post-normalized residual multiplier is unsupported".into(),
             ));
         }
-        if self.moe.is_some_and(|routing| {
-            routing.experts == 0 || routing.top_k == 0 || routing.top_k > routing.experts
-        }) {
+        if self.moe.is_some_and(|routing| !routing.is_valid()) {
             return Err(Error::Config(
                 "MoE requires positive expert count and top-k within expert count".into(),
             ));
@@ -125,12 +159,7 @@ impl ArchitecturePolicy {
                     LayerFeedForwardPolicy::Sparse {
                         routing,
                         intermediate_size,
-                    } => {
-                        routing.experts == 0
-                            || routing.top_k == 0
-                            || routing.top_k > routing.experts
-                            || intermediate_size == 0
-                    }
+                    } => !routing.is_valid() || intermediate_size == 0,
                 }
             })
         }) {

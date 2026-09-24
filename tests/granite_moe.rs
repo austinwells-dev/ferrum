@@ -20,13 +20,7 @@ fn official_granite_moe_config_selects_shared_sparse_policy() {
     assert_eq!(policy.embedding_multiplier, 12.);
     assert_eq!(policy.residual_multiplier, 0.22);
     assert_eq!(policy.logits_divisor, 6.);
-    assert_eq!(
-        policy.moe,
-        Some(MoeRoutingPolicy {
-            experts: 32,
-            top_k: 8,
-        })
-    );
+    assert_eq!(policy.moe, Some(MoeRoutingPolicy::softmax(32, 8)));
 
     for (key, value) in [
         ("model_type", serde_json::json!("granite")),
