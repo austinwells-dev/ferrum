@@ -141,6 +141,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
     let pair = request_usize(request, "pair")?;
     let pair_order = request_string(request, "pair_order")?;
     let warmup = request["warmup"].as_bool().unwrap_or(false);
+    let q5_0_gemv_n4 = match request.get("q5_0_gemv_n4") {
+        None | Some(Value::Null) => {
+            device.set_q5_0_gemv_n4(false)?;
+            false
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_q5_0_gemv_n4(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field q5_0_gemv_n4 must be a boolean".into(),
+            ));
+        }
+    };
     let expert_tensorops = match request.get("moe_expert_tensorops") {
         None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
         Some(Value::Bool(enabled)) => {
@@ -200,6 +215,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "warmup": warmup,
         "moe_expert_tensorops": expert_tensorops,
         "moe_expert_tensorops_min_routes_per_expert": expert_tensorops_min_routes,
+        "q5_0_gemv_n4": q5_0_gemv_n4,
         "model_format": model.format,
         "model_repository": model.repository,
         "model_revision": model.revision,

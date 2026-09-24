@@ -43,7 +43,13 @@ impl MetalDevice {
             }
             (QuantizationFormat::Q4_0, false, true) => "q4_0_gemm_mpp",
             (QuantizationFormat::Q4_0, false, false) => "q4_0_gemm",
-            (QuantizationFormat::Q5_0, true, _) => "q5_0_gemv",
+            (QuantizationFormat::Q5_0, true, _) => {
+                if self.use_q5_0_gemv_n4(weight.rows()) {
+                    "q5_0_gemv_n4"
+                } else {
+                    "q5_0_gemv"
+                }
+            }
             (QuantizationFormat::Q5_0, false, true) => "q5_0_gemm_mpp",
             (QuantizationFormat::Q5_0, false, false) => "q5_0_gemm",
             (QuantizationFormat::Q5_1, true, _) => "q5_1_gemv",
@@ -1302,6 +1308,29 @@ mod q5_tests {
                         "{format:?} index {index}: actual={actual}, expected={expected}"
                     );
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn q5_0_gemv_n4_reuses_activations_and_covers_output_tail() {
+        let d = MetalDevice::new().unwrap();
+        assert!(d.use_q5_0_gemv_n4(128));
+        assert!(!d.use_q5_0_gemv_n4(127));
+        for (n, k) in [(131, 512), (4864, 896)] {
+            let weight = packed(&d, n, k, QuantizationFormat::Q5_0);
+            let values = input(1, k);
+            let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+            let output = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(output.metrics.operation, "q5_0_gemv_n4");
+            let expected = expected(&values, 1, n, k, QuantizationFormat::Q5_0);
+            for (index, (actual, expected)) in
+                output.tensor.to_f32().iter().zip(expected).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 5.0e-5,
+                    "Q5_0 ({n}, {k}) index {index}: actual={actual}, expected={expected}"
+                );
             }
         }
     }

@@ -218,3 +218,207 @@ The native int4 path passed a Q4_0 reference check at M=35, N=65, K=512 with Met
 All matched pairs had identical transient prefill peaks. On sustained decode, control and candidate first differed at generated token 64 in each pair. Cached decode was flat, and the 128–1,024-token prefill cases consistently regressed, so the native int4 path was not retained. This supports keeping one-token projections on direct GEMV shaders and the current BF16-staged TensorOps path for eligible batched shapes.
 
 Raw A/B rows, the complete runner output, and correctness output are `qwen2.5-q4_0-native-int4-ab.jsonl`, `qwen2.5-q4_0-native-int4-ab.run.log`, and `qwen2.5-q4_0-native-int4-validation.log` in `docs/measurements/phase7a/`.
+
+## Experiment 10: Four-row-per-SIMD Q5_0 M=1 GEMV
+
+Status: retained as the default for Q5_0 M=1 projections with at least 128 output rows. The direct MSL kernel follows llama.cpp's Q5_0 row organization: four adjacent output rows per SIMD group, two SIMD groups per 64-thread threadgroup. Each SIMD group loads the activation fragment once and reuses it across those four rows. Dispatch remains format-, batch-, and shape-based; this is not a TensorOps path and does not use model identity.
+
+The A/B used the pinned Qwen2.5-0.5B Q4_K_M artifact and the same llama.cpp revision, prompt IDs, greedy policy, and three interleaved control/candidate pairs for each of the five workloads. The candidate improved paired-median cached-decode throughput by 9.8–12.4% across the five cases. Absolute Ferrum control/candidate decode medians were 111.5→122.8 tok/s (short), 112.1→123.3 (128-token prompt), 107.7→119.3 (512), 98.8→110.7 (1,024), and 106.7→118.7 (sustained decode). Complete-generation throughput rose from 96.2→103.4, 92.4→100.7, 63.8→68.4, 41.7→44.2, and 102.6→113.9 tok/s respectively. Prefill stayed near the control rates; first-token latency changed from 30.8→31.0, 39.7→38.8, 113.0→112.2, 238.7→236.3, and 31.7→31.4 ms.
+
+The candidate and control produced identical IDs for all three runs of the short, 128-, 512-, and 1,024-token workloads. Sustained decode diverged from control at generated token 39 in all three pairs; it matched llama.cpp through token 14 and first diverged at token 15. This output divergence is retained in the raw records; the numerical tolerance was not changed. The Q5_0 scalar-reference test passed for an output-tail shape (N=131, K=512) and a production-sized wide projection (N=4,864, K=896), with Metal API Validation and GPU Shader Validation enabled. The same test verifies the N>=128 dispatch boundary. Its log is `qwen2.5-q5_0-n4-gemv-validation.log`.
+
+The release A/B records are `qwen2.5-q4_k_m-q5n4-ab.jsonl` and `qwen2.5-q4_k_m-q5n4-ab.run.log`. The full absolute Ferrum/control, candidate, and llama.cpp rates, their ratios, and first-token latencies are in the JSONL-derived matrix below. The sustained decode gain leaves Qwen2.5 Q4_K_M at 0.574x of llama.cpp decode throughput; this kernel does not change the Phase 7 gate status.
+
+## Absolute performance record (JSONL-derived)
+
+This section applies the reporting format requested for Phase 7: absolute Ferrum and llama.cpp throughput is shown beside each ratio, and first-token latency is shown in milliseconds. Values are computed from the existing JSONL files; no benchmark was rerun just to change presentation. Throughput and latency values are medians across the three runs for each condition and workload. Baseline ratios are medians of matched per-pair ratios. Internal candidate/control ratios use the recorded pair ordering. Candidate/llama.cpp ratios use matched pairs when the llama.cpp rows share the candidate A/B matrix; otherwise they are ratios of the displayed condition medians from the named reference matrix. `Prefill`, `cached decode`, and `complete generation` are kept distinct.
+
+### Matched baseline and current production matrices
+
+| Model / workload | Prefill tok/s: Ferrum / llama.cpp (ratio) | Cached decode tok/s: Ferrum / llama.cpp (ratio) | Complete-generation tok/s: Ferrum / llama.cpp (ratio) | First-token latency ms: Ferrum / llama.cpp |
+|---|---:|---:|---:|---:|
+| Qwen2.5 Q4_0 / Short | 758.6 / 1450.8 (0.523x) | 114.7 / 263.6 (0.447x) | 99.9 / 199.5 (0.496x) | 28.0 / 14.7 |
+| Qwen2.5 Q4_0 / 128 prompt | 3385.4 / 6767.5 (0.496x) | 115.1 / 215.0 (0.548x) | 96.3 / 182.9 (0.526x) | 38.1 / 19.1 |
+| Qwen2.5 Q4_0 / 512 prompt | 4882.8 / 9068.0 (0.538x) | 111.5 / 237.5 (0.470x) | 67.3 / 133.2 (0.507x) | 105.2 / 56.7 |
+| Qwen2.5 Q4_0 / 1,024 prompt | 4578.6 / 8612.9 (0.531x) | 103.3 / 233.1 (0.447x) | 44.1 / 88.7 (0.499x) | 224.0 / 119.1 |
+| Qwen2.5 Q4_0 / Sustained decode | 656.8 / 1347.3 (0.487x) | 113.8 / 272.2 (0.420x) | 109.8 / 224.9 (0.488x) | 32.3 / 15.8 |
+| Qwen2.5 Q4_K_M initial / Short | 693.9 / 1267.0 (0.548x) | 108.6 / 194.3 (0.559x) | 93.8 / 179.1 (0.524x) | 30.6 / 16.8 |
+| Qwen2.5 Q4_K_M initial / 128 prompt | 3235.1 / 6399.1 (0.483x) | 109.3 / 193.6 (0.564x) | 89.5 / 171.9 (0.526x) | 39.9 / 20.2 |
+| Qwen2.5 Q4_K_M initial / 512 prompt | 4554.2 / 8535.8 (0.535x) | 103.7 / 192.9 (0.536x) | 62.3 / 122.9 (0.509x) | 112.8 / 60.2 |
+| Qwen2.5 Q4_K_M initial / 1,024 prompt | 4447.2 / 8038.8 (0.550x) | 97.7 / 208.1 (0.469x) | 42.5 / 81.8 (0.517x) | 230.6 / 127.6 |
+| Qwen2.5 Q4_K_M initial / Sustained decode | 633.4 / 1257.4 (0.512x) | 105.7 / 235.3 (0.448x) | 101.3 / 200.4 (0.506x) | 33.5 / 17.0 |
+| Qwen2.5 Q5_K_M / Short | 662.6 / 1255.2 (0.525x) | 103.5 / 188.2 (0.551x) | 89.4 / 173.4 (0.517x) | 32.0 / 17.0 |
+| Qwen2.5 Q5_K_M / 128 prompt | 3106.6 / 6289.9 (0.500x) | 104.8 / 188.8 (0.555x) | 84.7 / 167.3 (0.519x) | 41.5 / 20.6 |
+| Qwen2.5 Q5_K_M / 512 prompt | 4416.9 / 8575.7 (0.504x) | 101.6 / 186.9 (0.542x) | 60.9 / 119.9 (0.500x) | 116.2 / 59.9 |
+| Qwen2.5 Q5_K_M / 1,024 prompt | 4278.0 / 8144.6 (0.525x) | 95.4 / 183.5 (0.519x) | 41.1 / 80.5 (0.504x) | 239.7 / 126.0 |
+| Qwen2.5 Q5_K_M / Sustained decode | 594.5 / 1266.2 (0.459x) | 102.5 / 199.4 (0.514x) | 98.1 / 194.3 (0.505x) | 35.6 / 16.9 |
+| Qwen2.5 Q6_K initial / Short | 585.0 / 1381.2 (0.424x) | 115.5 / 172.8 (0.669x) | 96.3 / 162.2 (0.597x) | 36.2 / 15.5 |
+| Qwen2.5 Q6_K initial / 128 prompt | 2739.7 / 6532.1 (0.409x) | 115.8 / 173.5 (0.666x) | 90.7 / 155.6 (0.583x) | 47.0 / 19.8 |
+| Qwen2.5 Q6_K initial / 512 prompt | 4027.6 / 8992.5 (0.456x) | 110.8 / 178.1 (0.626x) | 61.3 / 115.9 (0.536x) | 127.5 / 57.2 |
+| Qwen2.5 Q6_K initial / 1,024 prompt | 3961.4 / 8320.6 (0.474x) | 103.7 / 170.7 (0.607x) | 40.8 / 79.4 (0.513x) | 258.8 / 123.3 |
+| Qwen2.5 Q6_K initial / Sustained decode | 548.0 / 1298.5 (0.423x) | 112.7 / 173.5 (0.648x) | 108.1 / 176.0 (0.616x) | 38.6 / 16.4 |
+| Qwen2.5 Q8_0 / Short | 520.2 / 1418.6 (0.367x) | 118.3 / 171.3 (0.691x) | 95.6 / 159.7 (0.598x) | 40.7 / 15.1 |
+| Qwen2.5 Q8_0 / 128 prompt | 2522.5 / 6605.4 (0.386x) | 119.1 / 169.4 (0.707x) | 91.1 / 151.6 (0.601x) | 51.1 / 19.7 |
+| Qwen2.5 Q8_0 / 512 prompt | 3756.5 / 8914.4 (0.421x) | 114.9 / 167.9 (0.685x) | 60.8 / 111.9 (0.542x) | 136.6 / 57.7 |
+| Qwen2.5 Q8_0 / 1,024 prompt | 3735.6 / 8453.4 (0.442x) | 107.2 / 166.9 (0.642x) | 39.6 / 79.2 (0.500x) | 274.5 / 121.4 |
+| Qwen2.5 Q8_0 / Sustained decode | 480.7 / 1360.9 (0.351x) | 115.4 / 168.7 (0.684x) | 110.7 / 170.2 (0.651x) | 44.0 / 15.7 |
+| Qwen3-0.6B Q8_0 / Short | 407.9 / 1152.5 (0.355x) | 97.9 / 145.3 (0.674x) | 77.6 / 133.0 (0.581x) | 51.8 / 18.5 |
+| Qwen3-0.6B Q8_0 / 128 prompt | 1795.6 / 5717.6 (0.314x) | 97.9 / 144.4 (0.677x) | 72.0 / 126.8 (0.561x) | 71.6 / 22.6 |
+| Qwen3-0.6B Q8_0 / 512 prompt | 2618.5 / 6509.4 (0.403x) | 90.5 / 137.8 (0.658x) | 43.9 / 87.3 (0.504x) | 195.9 / 78.9 |
+| Qwen3-0.6B Q8_0 / 1,024 prompt | 2748.1 / 5757.1 (0.479x) | 80.3 / 128.3 (0.626x) | 28.6 / 56.0 (0.510x) | 373.0 / 178.1 |
+| Qwen3-0.6B Q8_0 / Sustained decode | 368.8 / 1127.0 (0.328x) | 95.4 / 146.1 (0.653x) | 90.3 / 145.4 (0.620x) | 57.2 / 18.9 |
+| LFM2.5-8B-A1B Q4_K_M initial / Short | 22.4 / 217.3 (0.103x) | 18.6 / 93.3 (0.200x) | 12.5 / 74.5 (0.168x) | 491.8 / 50.8 |
+| LFM2.5-8B-A1B Q4_K_M initial / 128 prompt | 28.2 / 1414.5 (0.020x) | 18.4 / 94.0 (0.195x) | 3.1 / 63.7 (0.049x) | 4542.3 / 90.7 |
+| LFM2.5-8B-A1B Q4_K_M initial / 512 prompt | 28.4 / 1970.5 (0.014x) | 18.4 / 93.9 (0.196x) | 0.9 / 39.0 (0.023x) | 18033.8 / 260.1 |
+| LFM2.5-8B-A1B Q4_K_M initial / 1,024 prompt | 29.6 / 2168.7 (0.014x) | 19.6 / 100.2 (0.196x) | 0.5 / 26.8 (0.018x) | 34551.9 / 472.4 |
+| LFM2.5-8B-A1B Q4_K_M initial / Sustained decode | 24.1 / 233.2 (0.103x) | 20.0 / 101.9 (0.196x) | 18.7 / 96.5 (0.194x) | 457.0 / 47.4 |
+| LFM2.5-8B-A1B Q4_K_M threshold-8 current / Short | 22.5 / 216.6 (0.104x) | 21.1 / 94.7 (0.223x) | 13.5 / 74.8 (0.181x) | 490.1 / 51.0 |
+| LFM2.5-8B-A1B Q4_K_M threshold-8 current / 128 prompt | 329.8 / 1334.2 (0.247x) | 20.2 / 88.3 (0.229x) | 14.4 / 60.6 (0.238x) | 388.4 / 96.2 |
+| LFM2.5-8B-A1B Q4_K_M threshold-8 current / 512 prompt | 414.7 / 1973.6 (0.211x) | 20.8 / 94.7 (0.219x) | 8.5 / 39.2 (0.216x) | 1234.9 / 259.7 |
+| LFM2.5-8B-A1B Q4_K_M threshold-8 current / 1,024 prompt | 442.4 / 1986.7 (0.225x) | 20.7 / 93.6 (0.221x) | 5.5 / 24.6 (0.224x) | 2314.8 / 515.7 |
+| LFM2.5-8B-A1B Q4_K_M threshold-8 current / Sustained decode | 22.1 / 216.5 (0.103x) | 21.0 / 94.4 (0.222x) | 19.5 / 89.0 (0.219x) | 497.1 / 51.0 |
+
+### Internal candidate/control matrices with reference context
+
+Each throughput cell reports Ferrum control → candidate and the llama.cpp value, followed by candidate/control and candidate/llama.cpp ratios. For experiments whose A/B JSONL did not contain llama.cpp rows, the matching reference matrix is named in the subsection and uses the same artifact and workload definitions. This keeps the internal kernel decision and the engine comparison visible together.
+
+
+#### Qwen2.5 Q4_K_M: Q4_K M=1 row-reuse GEMV
+
+Sources: control `qwen2.5-q4_k_m-baseline-recheck.jsonl`, candidate `qwen2.5-q4_k_m-q4k8rows-current.jsonl`, llama.cpp reference `qwen2.5-q4_k_m-q4k8rows-current.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 749.8 → 748.6 / 1441.8 (0.999x; 0.518x) | 117.9 → 120.0 / 228.7 (1.017x; 0.520x) | 101.3 → 102.2 / 194.4 (1.008x; 0.526x) | 28.3 → 28.4 / 14.8 |
+| 128 prompt | 3476.2 → 3501.1 / 6943.7 (1.003x; 0.510x) | 119.1 → 121.2 / 236.0 (1.018x; 0.518x) | 96.9 → 98.5 / 182.7 (1.015x; 0.539x) | 37.3 → 37.0 / 18.8 |
+| 512 prompt | 4951.6 → 4948.3 / 9377.7 (0.995x; 0.528x) | 113.5 → 115.5 / 233.8 (1.019x; 0.494x) | 67.8 → 68.6 / 134.3 (1.008x; 0.510x) | 103.7 → 103.8 / 54.8 |
+| 1,024 prompt | 4712.6 → 4700.0 / 8790.6 (1.001x; 0.535x) | 104.5 → 105.8 / 226.7 (1.015x; 0.467x) | 45.2 → 45.4 / 89.4 (1.005x; 0.508x) | 217.6 → 218.2 / 116.8 |
+| Sustained decode | 649.2 → 661.6 / 1383.0 (1.033x; 0.478x) | 113.7 → 116.7 / 243.2 (1.023x; 0.479x) | 107.6 → 111.1 / 220.8 (1.030x; 0.503x) | 32.6 → 32.0 / 15.4 |
+
+#### Qwen2.5 Q6_K: Q6_K M=1 row-reuse GEMV
+
+Sources: control `qwen2.5-q6_k-baseline-recheck.jsonl`, candidate `qwen2.5-q6_k-q6k8rows-candidate.jsonl`, llama.cpp reference `qwen2.5-q6_k-q6k8rows-candidate.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 635.0 → 636.9 / 1450.9 (0.998x; 0.441x) | 126.0 → 129.6 / 200.3 (1.025x; 0.645x) | 103.7 → 106.1 / 174.6 (1.023x; 0.602x) | 33.4 → 33.3 / 14.7 |
+| 128 prompt | 3013.8 → 3007.1 / 7071.3 (0.998x; 0.425x) | 124.9 → 129.2 / 201.2 (1.031x; 0.642x) | 97.1 → 99.1 / 166.2 (1.018x; 0.596x) | 42.8 → 42.9 / 18.4 |
+| 512 prompt | 4428.8 → 4395.0 / 9583.9 (1.000x; 0.459x) | 121.0 → 124.7 / 199.0 (1.028x; 0.628x) | 67.2 → 68.0 / 123.8 (1.015x; 0.551x) | 115.9 → 116.8 / 53.7 |
+| 1,024 prompt | 4291.1 → 4293.1 / 9092.6 (1.000x; 0.472x) | 111.4 → 115.5 / 199.1 (1.036x; 0.582x) | 44.0 → 44.4 / 86.7 (1.011x; 0.511x) | 239.0 → 238.9 / 112.9 |
+| Sustained decode | 574.7 → 568.2 / 1406.6 (0.989x; 0.404x) | 121.5 → 125.2 / 207.9 (1.030x; 0.602x) | 115.9 → 118.9 / 193.7 (1.027x; 0.615x) | 36.8 → 37.3 / 15.2 |
+
+#### LFM2.5: GPU-resident one-token route selection
+
+Sources: control `lfm2.5-8b-a1b-gpu-route-guard-baseline.jsonl`, candidate `lfm2.5-8b-a1b-gpu-route-guard-candidate.jsonl`, llama.cpp reference `lfm2.5-8b-a1b-gpu-route-guard-candidate.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 22.4 → 22.4 / 212.0 (0.994x; 0.106x) | 19.5 → 21.0 / 93.7 (1.078x; 0.224x) | 12.9 → 13.6 / 74.8 (1.051x; 0.182x) | 490.3 → 492.1 / 52.1 |
+| 128 prompt | 27.8 → 28.0 / 1385.6 (1.004x; 0.020x) | 19.3 → 20.3 / 93.9 (1.066x; 0.222x) | 3.1 → 3.2 / 63.6 (1.016x; 0.050x) | 4597.8 → 4579.1 / 92.6 |
+| 512 prompt | 28.0 → 28.0 / 1972.8 (1.001x; 0.014x) | 19.4 → 20.9 / 93.5 (1.078x; 0.223x) | 0.9 → 0.9 / 38.9 (1.005x; 0.023x) | 18271.5 → 18260.2 / 259.8 |
+| 1,024 prompt | 27.9 → 28.0 / 1971.4 (1.002x; 0.014x) | 18.8 → 20.6 / 88.6 (1.083x; 0.225x) | 0.5 → 0.5 / 24.1 (1.004x; 0.019x) | 36667.8 → 36599.2 / 519.7 |
+| Sustained decode | 21.3 → 21.3 / 214.8 (1.012x; 0.100x) | 19.4 → 20.9 / 91.1 (1.078x; 0.230x) | 17.9 → 19.3 / 85.8 (1.077x; 0.226x) | 517.1 → 516.5 / 51.4 |
+
+#### Qwen3 Q8_0: native signed-int8 TensorOps
+
+Sources: control `qwen3-0.6b-q8_0-native-i8-ab.jsonl`, candidate `qwen3-0.6b-q8_0-native-i8-ab.jsonl`, llama.cpp reference `qwen3-0.6b-q8_0-current.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 400.1 → 517.9 / 1152.5 (1.304x; 0.449x) | 99.1 → 98.1 / 145.3 (0.999x; 0.675x) | 77.9 → 82.2 / 133.0 (1.057x; 0.618x) | 52.8 → 40.8 / 18.5 |
+| 128 prompt | 1811.4 → 1950.2 / 5717.6 (1.067x; 0.341x) | 98.1 → 101.1 / 144.4 (1.024x; 0.700x) | 71.7 → 74.7 / 126.8 (1.039x; 0.590x) | 71.0 → 65.9 / 22.6 |
+| 512 prompt | 2615.7 → 2140.0 / 6509.4 (0.836x; 0.329x) | 91.0 → 90.6 / 137.8 (0.996x; 0.657x) | 44.1 → 38.9 / 87.3 (0.901x; 0.446x) | 196.0 → 239.6 / 78.9 |
+| 1,024 prompt | 2715.8 → 2077.0 / 5757.1 (0.770x; 0.361x) | 81.1 → 80.5 / 128.3 (0.992x; 0.627x) | 28.6 → 23.9 / 56.0 (0.838x; 0.427x) | 377.4 → 493.4 / 178.1 |
+| Sustained decode | 378.7 → 457.9 / 1127.0 (1.171x; 0.406x) | 95.7 → 95.4 / 146.1 (0.998x; 0.653x) | 90.3 → 91.0 / 145.4 (1.015x; 0.626x) | 55.8 → 46.2 / 18.9 |
+
+
+#### LFM2.5: cooperative-input Q4_K TensorOps
+
+Sources: control `lfm2.5-8b-a1b-q4_k_m-tensorops-baseline.jsonl`, candidate `lfm2.5-8b-a1b-q4_k_m-tensorops-candidate.jsonl`, llama.cpp reference `lfm2.5-8b-a1b-q4_k_m-tensorops-candidate.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 24.3 → 24.3 / 236.4 (1.000x; 0.103x) | 22.9 → 22.9 / 100.3 (0.997x; 0.228x) | 14.7 → 14.7 / 80.3 (0.999x; 0.183x) | 453.0 → 453.7 / 46.7 |
+| 128 prompt | 30.6 → 30.2 / 1531.4 (0.986x; 0.020x) | 22.7 → 22.7 / 102.0 (1.003x; 0.223x) | 3.5 → 3.4 / 69.4 (0.988x; 0.049x) | 4187.3 → 4239.9 / 83.8 |
+| 512 prompt | 30.2 → 30.3 / 2138.4 (1.003x; 0.014x) | 22.6 → 22.7 / 101.6 (1.001x; 0.224x) | 1.0 → 1.0 / 42.4 (1.003x; 0.023x) | 16938.5 → 16884.1 / 239.7 |
+| 1,024 prompt | 30.2 → 30.3 / 2150.9 (1.001x; 0.014x) | 22.3 → 22.4 / 101.0 (1.002x; 0.222x) | 0.5 → 0.5 / 26.6 (1.004x; 0.019x) | 33881.0 → 33809.3 / 476.2 |
+| Sustained decode | 22.8 → 24.2 / 233.1 (1.057x; 0.104x) | 22.4 → 22.7 / 101.2 (1.016x; 0.225x) | 20.4 → 21.1 / 96.2 (1.029x; 0.219x) | 482.9 → 455.4 / 47.4 |
+
+#### LFM2.5: grouped expert TensorOps at threshold 24
+
+Sources: control `lfm2.5-8b-a1b-expert-tensorops-ab.jsonl`, candidate `lfm2.5-8b-a1b-expert-tensorops-ab.jsonl`, llama.cpp reference `lfm2.5-8b-a1b-q4_k_m-current.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 22.4 → 21.7 / 217.3 (0.968x; 0.100x) | 21.1 → 21.0 / 93.3 (0.995x; 0.225x) | 13.6 → 13.4 / 74.5 (0.986x; 0.179x) | 491.9 → 508.1 / 50.8 |
+| 128 prompt | 28.0 → 27.9 / 1414.5 (0.997x; 0.020x) | 20.9 → 20.1 / 94.0 (0.962x; 0.213x) | 3.2 → 3.1 / 63.7 (0.992x; 0.049x) | 4579.0 → 4594.1 / 90.7 |
+| 512 prompt | 28.0 → 118.7 / 1970.5 (4.246x; 0.060x) | 20.8 → 20.7 / 93.9 (0.999x; 0.220x) | 0.9 → 3.3 / 39.0 (3.720x; 0.085x) | 18316.2 → 4314.0 / 260.1 |
+| 1,024 prompt | 29.4 → 119.4 / 2168.7 (4.297x; 0.055x) | 20.5 → 20.7 / 100.2 (1.006x; 0.206x) | 0.5 → 1.8 / 26.8 (4.017x; 0.068x) | 34858.5 → 8579.6 / 472.4 |
+| Sustained decode | 23.7 → 23.4 / 233.2 (0.990x; 0.100x) | 22.3 → 21.6 / 101.9 (1.002x; 0.212x) | 20.4 → 20.0 / 96.5 (1.002x; 0.207x) | 464.2 → 470.0 / 47.4 |
+
+
+#### LFM2.5: grouped expert threshold 8 vs 24
+
+Sources: control `lfm2.5-8b-a1b-expert-tensorops-threshold-24-vs-8.jsonl`, candidate `lfm2.5-8b-a1b-expert-tensorops-threshold-24-vs-8.jsonl`, llama.cpp reference `lfm2.5-8b-a1b-threshold8-current.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 22.4 → 22.5 / 216.6 (1.002x; 0.104x) | 21.1 → 21.1 / 94.7 (1.001x; 0.223x) | 13.6 → 13.6 / 74.8 (0.999x; 0.182x) | 491.7 → 490.2 / 51.0 |
+| 128 prompt | 28.3 → 343.8 / 1334.2 (12.125x; 0.258x) | 20.9 → 21.0 / 88.3 (1.004x; 0.238x) | 3.2 → 15.0 / 60.6 (4.664x; 0.247x) | 4515.6 → 372.6 / 96.2 |
+| 512 prompt | 120.4 → 425.5 / 1973.6 (3.536x; 0.216x) | 20.9 → 20.6 / 94.7 (0.988x; 0.218x) | 3.4 → 8.6 / 39.2 (2.545x; 0.219x) | 4253.5 → 1203.5 / 259.7 |
+| 1,024 prompt | 120.5 → 447.0 / 1986.7 (3.717x; 0.225x) | 20.7 → 20.7 / 93.6 (0.999x; 0.221x) | 1.8 → 5.5 / 24.6 (3.013x; 0.224x) | 8498.6 → 2291.4 / 515.7 |
+| Sustained decode | 22.4 → 22.4 / 216.5 (0.998x; 0.103x) | 21.0 → 20.9 / 94.4 (0.998x; 0.222x) | 19.5 → 19.5 / 89.0 (1.000x; 0.219x) | 490.8 → 491.4 / 51.0 |
+
+
+#### LFM2.5: expert TensorOps M16 vs M32 tile
+
+Sources: control `lfm2.5-8b-a1b-expert-tensorops-m32-vs-m16.jsonl`, candidate `lfm2.5-8b-a1b-expert-tensorops-m32-vs-m16.jsonl`, llama.cpp reference `lfm2.5-8b-a1b-threshold8-current.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 22.4 → 22.4 / 216.6 (0.999x; 0.103x) | 21.1 → 21.1 / 94.7 (1.000x; 0.223x) | 13.6 → 13.6 / 74.8 (0.997x; 0.181x) | 491.2 → 491.5 / 51.0 |
+| 128 prompt | 351.7 → 273.0 / 1334.2 (0.780x; 0.205x) | 21.0 → 21.0 / 88.3 (1.001x; 0.238x) | 15.1 → 13.8 / 60.6 (0.915x; 0.228x) | 364.2 → 469.2 / 96.2 |
+| 512 prompt | 431.4 → 303.0 / 1973.6 (0.702x; 0.154x) | 20.8 → 20.8 / 94.7 (1.002x; 0.220x) | 8.6 → 6.9 / 39.2 (0.796x; 0.176x) | 1187.1 → 1689.9 / 259.7 |
+| 1,024 prompt | 454.7 → 312.7 / 1986.7 (0.689x; 0.157x) | 20.6 → 20.7 / 93.6 (1.004x; 0.221x) | 5.6 → 4.2 / 24.6 (0.749x; 0.170x) | 2252.4 → 3275.1 / 515.7 |
+| Sustained decode | 22.4 → 22.4 / 216.5 (0.999x; 0.103x) | 20.9 → 21.0 / 94.4 (1.000x; 0.222x) | 19.5 → 19.5 / 89.0 (1.000x; 0.219x) | 490.9 → 491.5 / 51.0 |
+
+
+#### LFM2.5: expert TensorOps M64 vs M32 tile
+
+Sources: control `lfm2.5-8b-a1b-expert-tensorops-m32-vs-m64.jsonl`, candidate `lfm2.5-8b-a1b-expert-tensorops-m32-vs-m64.jsonl`, llama.cpp reference `lfm2.5-8b-a1b-threshold8-current.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 23.8 → 23.8 / 216.6 (1.001x; 0.110x) | 22.5 → 22.5 / 94.7 (1.002x; 0.237x) | 14.4 → 14.5 / 74.8 (1.004x; 0.193x) | 462.3 → 461.8 / 51.0 |
+| 128 prompt | 365.7 → 393.4 / 1334.2 (1.078x; 0.295x) | 22.4 → 22.4 / 88.3 (0.998x; 0.254x) | 15.9 → 16.3 / 60.6 (1.030x; 0.269x) | 350.3 → 325.7 / 96.2 |
+| 512 prompt | 446.2 → 473.7 / 1973.6 (1.062x; 0.240x) | 22.2 → 22.3 / 94.7 (1.005x; 0.235x) | 9.1 → 9.4 / 39.2 (1.037x; 0.241x) | 1147.7 → 1081.0 / 259.7 |
+| 1,024 prompt | 473.2 → 527.3 / 1986.7 (1.119x; 0.265x) | 22.0 → 22.1 / 93.6 (1.001x; 0.236x) | 5.8 → 6.3 / 24.6 (1.085x; 0.258x) | 2164.5 → 1942.3 / 515.7 |
+| Sustained decode | 22.2 → 22.9 / 216.5 (1.044x; 0.106x) | 21.9 → 22.3 / 94.4 (1.023x; 0.237x) | 20.0 → 20.3 / 89.0 (1.036x; 0.228x) | 495.7 → 480.0 / 51.0 |
+
+
+#### Qwen2.5 Q4_0: native signed-int4 TensorOps
+
+Sources: control `qwen2.5-q4_0-native-int4-ab.jsonl`, candidate `qwen2.5-q4_0-native-int4-ab.jsonl`, llama.cpp reference `qwen2.5-q4_0-current.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 793.3 → 652.6 / 1450.8 (0.825x; 0.450x) | 127.7 → 127.7 / 263.6 (1.001x; 0.485x) | 108.9 → 105.6 / 199.5 (0.968x; 0.529x) | 26.8 → 32.5 / 14.7 |
+| 128 prompt | 3714.9 → 2460.7 / 6767.5 (0.658x; 0.364x) | 128.4 → 127.5 / 215.0 (0.993x; 0.593x) | 104.2 → 93.8 / 182.9 (0.901x; 0.513x) | 34.8 → 52.3 / 19.1 |
+| 512 prompt | 5155.3 → 2991.7 / 9068.0 (0.580x; 0.330x) | 121.9 → 120.9 / 237.5 (0.992x; 0.509x) | 71.1 → 54.8 / 133.2 (0.768x; 0.411x) | 99.6 → 171.5 / 56.7 |
+| 1,024 prompt | 4951.1 → 2969.4 / 8612.9 (0.601x; 0.345x) | 112.7 → 113.9 / 233.1 (1.016x; 0.489x) | 47.9 → 34.5 / 88.7 (0.721x; 0.389x) | 207.2 → 345.2 / 119.1 |
+| Sustained decode | 785.6 → 649.0 / 1347.3 (0.826x; 0.482x) | 123.4 → 124.0 / 272.2 (1.005x; 0.455x) | 117.9 → 117.7 / 224.9 (0.998x; 0.523x) | 27.1 → 32.7 / 15.8 |
+
+
+#### Qwen2.5 Q4_K_M: Q5_0 N4 direct GEMV
+
+Sources: control `qwen2.5-q4_k_m-q5n4-ab.jsonl`, candidate `qwen2.5-q4_k_m-q5n4-ab.jsonl`, llama.cpp reference `qwen2.5-q4_k_m-q5n4-ab.jsonl`.
+
+| Workload | Prefill tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Cached decode tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | Complete-generation tok/s: control → candidate / llama.cpp (candidate/control; candidate/llama) | First-token latency ms: control → candidate / llama.cpp |
+|---|---:|---:|---:|---:|
+| Short | 689.1 → 684.8 / 1312.6 (1.004x; 0.522x) | 111.5 → 122.8 / 188.5 (1.112x; 0.644x) | 96.2 → 103.4 / 169.3 (1.089x; 0.609x) | 30.8 → 31.0 / 16.3 |
+| 128 prompt | 3253.4 → 3323.7 / 6307.1 (1.020x; 0.525x) | 112.1 → 123.3 / 212.8 (1.098x; 0.583x) | 92.4 → 100.7 / 170.1 (1.085x; 0.592x) | 39.7 → 38.8 / 20.5 |
+| 512 prompt | 4544.3 → 4579.5 / 8625.6 (1.009x; 0.532x) | 107.7 → 119.3 / 194.8 (1.112x; 0.610x) | 63.8 → 68.4 / 122.3 (1.073x; 0.559x) | 113.0 → 112.2 / 59.6 |
+| 1,024 prompt | 4295.2 → 4340.1 / 8055.4 (1.010x; 0.539x) | 98.8 → 110.7 / 189.5 (1.124x; 0.564x) | 41.7 → 44.2 / 81.6 (1.056x; 0.541x) | 238.7 → 236.3 / 127.4 |
+| Sustained decode | 671.3 → 674.7 / 1247.2 (0.982x; 0.541x) | 106.7 → 118.7 / 208.3 (1.120x; 0.574x) | 102.6 → 113.9 / 198.2 (1.110x; 0.573x) | 31.7 → 31.4 / 17.1 |
+
+The Q4_K cooperative-input experiment was run while the unrelated Q8_0 MPP K tile was set to 32; its own candidate/control ratio remains valid, while its absolute engine rates should not be treated as current-production rates. The M=16 and M=64 rows are rejected candidates; their llama.cpp column is the current threshold-8 reference matrix, so candidate/llama ratios are ratios of condition medians rather than interleaved timings.

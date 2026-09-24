@@ -417,6 +417,75 @@ kernel void q5_0_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group
     float sum=simd_sum((sum0+sum1)+(sum2+sum3));
     if(lane==0 && row<p[3]) store(c,row,p[4],sum);
 }
+inline float q5_0_block_dot_y(device const uchar* block, float sumy,
+                              thread const float* y, uint il) {
+    float scale=float(*((device const half*)block));
+    uint qh=uint(block[2]) | (uint(block[3])<<8) | (uint(block[4])<<16) | (uint(block[5])<<24);
+    float acc0=0.0f, acc1=0.0f, acc2=0.0f, acc3=0.0f;
+    for(uint i=0;i<8;i+=2) {
+        uint qs_index=6+il+i;
+        uint qs=uint(block[qs_index]) | (uint(block[qs_index+1])<<8);
+        uint q0=(qs&0x000f) | (((qh>>(i+il))&1)<<4);
+        uint q1=(qs&0x0f00) | (((qh>>(i+1+il))&1)<<12);
+        uint q2=(qs&0x00f0) | (((qh>>(i+il+16))&1)<<8);
+        uint q3=(qs&0xf000) | (((qh>>(i+1+il+16))&1)<<16);
+        acc0+=y[i+0]*float(q0);
+        acc1+=y[i+1]*float(q1);
+        acc2+=y[i+8]*float(q2);
+        acc3+=y[i+9]*float(q3);
+    }
+    return scale*(sumy*-16.0f+acc0+acc1+acc2+acc3);
+}
+// Upstream-style row ownership: four output rows per SIMD group, two
+// SIMD groups per threadgroup. Each thread caches one 16-value activation
+// fragment and reuses it across the four output rows.
+kernel void q5_0_gemv_n4(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32;
+    uint first_row=group*8+simd*4;
+    uint ix=lane/2, il=(lane%2)*8;
+    uint k=p[2], blocks=k/32;
+    float sum0=0.0f, sum1=0.0f, sum2=0.0f, sum3=0.0f;
+    float y[16];
+    for(uint block=ix;block<blocks;block+=16) {
+        uint column=block*32+il;
+        float sumy=0.0f;
+        for(uint i=0;i<8;i+=2) {
+            float y0=load(a,column+i+0,p[4]);
+            float y1=load(a,column+i+1,p[4]);
+            float y16=load(a,column+i+16,p[4]);
+            float y17=load(a,column+i+17,p[4]);
+            sumy+=(y0+y1)+(y16+y17);
+            y[i+0]=y0;
+            y[i+1]=y1/256.0f;
+            y[i+8]=y16/16.0f;
+            y[i+9]=y17/4096.0f;
+        }
+        if(first_row+0<uint(p[3])) {
+            device const uchar* w=b+(first_row+0)*blocks*22+block*22;
+            sum0+=q5_0_block_dot_y(w,sumy,y,il);
+        }
+        if(first_row+1<uint(p[3])) {
+            device const uchar* w=b+(first_row+1)*blocks*22+block*22;
+            sum1+=q5_0_block_dot_y(w,sumy,y,il);
+        }
+        if(first_row+2<uint(p[3])) {
+            device const uchar* w=b+(first_row+2)*blocks*22+block*22;
+            sum2+=q5_0_block_dot_y(w,sumy,y,il);
+        }
+        if(first_row+3<uint(p[3])) {
+            device const uchar* w=b+(first_row+3)*blocks*22+block*22;
+            sum3+=q5_0_block_dot_y(w,sumy,y,il);
+        }
+    }
+    float total0=simd_sum(sum0), total1=simd_sum(sum1);
+    float total2=simd_sum(sum2), total3=simd_sum(sum3);
+    if(lane==0) {
+        if(first_row+0<uint(p[3])) store(c,first_row+0,p[4],total0);
+        if(first_row+1<uint(p[3])) store(c,first_row+1,p[4],total1);
+        if(first_row+2<uint(p[3])) store(c,first_row+2,p[4],total2);
+        if(first_row+3<uint(p[3])) store(c,first_row+3,p[4],total3);
+    }
+}
 kernel void q5_0_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
     uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;
     uint k=p[2], blocks=k/32;
