@@ -1,0 +1,7 @@
+Experiment: cooperative TensorOps fusion for short-prefill attention
+Host SDK: Xcode 27.0 (27A266a), macOS 27.0 SDK
+Command: MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --lib ops::transformer::fusion_tests::fused_short_prefill_attention_matches_staged_tensorops_path -- --exact --nocapture
+
+The first shader compilation found unsupported cooperative-tensor get_mask/unroll syntax and a dynamic inner dimension for cooperative input. Those source errors were corrected, and the next attempt compiled the pipeline and entered the kernel dispatch.
+
+On the first M=2 BF16 GQA case, the test did not return after more than two minutes. A process sample showed the test thread waiting in MetalDevice::flush -> MTLCommandBuffer::waitUntilCompleted. The test process was interrupted. No A/B or throughput/latency samples were collected. The experimental source was removed; this log records a rejected prototype, not a performance result.
