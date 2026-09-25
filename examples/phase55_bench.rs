@@ -186,6 +186,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let q8_0_gemv_k_split = match request.get("q8_0_gemv_k_split") {
+        None | Some(Value::Null) => {
+            device.set_q8_0_gemv_k_split(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_q8_0_gemv_k_split(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field q8_0_gemv_k_split must be a boolean".into(),
+            ));
+        }
+    };
     let q5_1_mpp_tile_k64 = match request.get("q5_1_mpp_tile_k64") {
         None | Some(Value::Null) => {
             device.set_q5_1_mpp_tile_k64(true)?;
@@ -351,6 +366,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "moe_expert_tensorops_tile_k64": expert_tensorops_tile_k64,
         "moe_expert_tensorops_min_routes_per_expert": expert_tensorops_min_routes,
         "q8_0_mpp_tile_k64": q8_0_mpp_tile_k64,
+        "q8_0_gemv_k_split": q8_0_gemv_k_split,
         "q5_1_mpp_tile_k64": q5_1_mpp_tile_k64,
         "q4_k_mpp_tile_k64": q4_k_mpp_tile_k64,
         "q5_k_mpp_tile_k64": q5_k_mpp_tile_k64,

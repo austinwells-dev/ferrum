@@ -269,6 +269,7 @@ pub struct MetalDevice {
     gguf_mpp_min_rows: Cell<Option<usize>>,
     attention_softmax_prefix: Cell<bool>,
     q8_0_mpp_tile_k64: Cell<bool>,
+    q8_0_gemv_k_split: Cell<bool>,
     q5_1_mpp_tile_k64: Cell<bool>,
     q4_k_mpp_tile_k64: Cell<bool>,
     q5_k_mpp_tile_k64: Cell<bool>,
@@ -321,6 +322,7 @@ impl MetalDevice {
             gguf_mpp_min_rows: Cell::new(None),
             attention_softmax_prefix: Cell::new(true),
             q8_0_mpp_tile_k64: Cell::new(true),
+            q8_0_gemv_k_split: Cell::new(true),
             q5_1_mpp_tile_k64: Cell::new(true),
             q4_k_mpp_tile_k64: Cell::new(true),
             q5_k_mpp_tile_k64: Cell::new(true),
@@ -484,6 +486,19 @@ impl MetalDevice {
     }
     pub(crate) fn q8_0_gemv_8rows(&self, output_rows: usize) -> bool {
         output_rows >= 128 && output_rows.is_multiple_of(8)
+    }
+    /// Select the four-SIMD-group K-reduction Q8_0 M=1 GEMV path.
+    pub fn set_q8_0_gemv_k_split(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q8_0 K-split GEMV during execution".into(),
+            ));
+        }
+        self.q8_0_gemv_k_split.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn q8_0_gemv_k_split(&self, output_rows: usize, input_columns: usize) -> bool {
+        self.q8_0_gemv_k_split.get() && output_rows >= 128 && input_columns >= 768
     }
     /// Select the four-output-row-per-SIMD Q5_0 M=1 candidate for wide outputs.
     pub fn set_q5_0_gemv_n4(&self, enabled: bool) -> Result<()> {
@@ -1095,6 +1110,7 @@ impl MetalDevice {
                 | "attention_context_mpp_f16"
                 | "q8_0_gemv"
                 | "q8_0_gemv_8rows"
+                | "q8_0_gemv_k_split"
                 | "q4_0_gemv_8rows"
                 | "q4_k_gemv_8rows"
                 | "q5_k_gemv_8rows"
@@ -1380,6 +1396,7 @@ impl MetalDevice {
                     | "q6_k_gemv"
                     | "q8_0_gemv"
                     | "q8_0_gemv_8rows"
+                    | "q8_0_gemv_k_split"
                     | "q4_0_gemv_8rows"
                     | "q4_k_gemv_8rows"
                     | "q6_k_gemv_8rows"
@@ -1393,20 +1410,20 @@ impl MetalDevice {
                 }
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: grid[0].div_ceil(
-                            if matches!(
-                                name,
-                                "q8_0_gemv_8rows"
-                                    | "q4_0_gemv_8rows"
-                                    | "q4_k_gemv_8rows"
-                                    | "q5_k_gemv_8rows"
-                                    | "q6_k_gemv_8rows"
-                            ) {
-                                8
-                            } else {
-                                4
-                            },
-                        ),
+                        width: grid[0].div_ceil(if matches!(name, "q8_0_gemv_k_split") {
+                            2
+                        } else if matches!(
+                            name,
+                            "q8_0_gemv_8rows"
+                                | "q4_0_gemv_8rows"
+                                | "q4_k_gemv_8rows"
+                                | "q5_k_gemv_8rows"
+                                | "q6_k_gemv_8rows"
+                        ) {
+                            8
+                        } else {
+                            4
+                        }),
                         height: 1,
                         depth: 1,
                     },

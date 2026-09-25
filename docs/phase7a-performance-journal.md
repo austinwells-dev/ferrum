@@ -817,3 +817,50 @@ The Qwen2.5-0.5B Q5_K_M five-pair A/B used the pinned artifact (SHA-256 `0414745
 At the selected 1,024-row shape, prefill rose by 73.5 tok/s (4,967.9->5,041.4), complete generation rose by 0.4 tok/s (48.9->49.3), cached decode changed by -0.1 tok/s (117.7->117.6), and first-token latency fell 3.1 ms (206.5->203.4). The paired candidate/control ratios were 1.020x, 1.012x, and 0.998x for those three throughput metrics. The five-pair exploratory matrix that forced K=64 at M>=512 showed no repeatable benefit at 512 rows, so the production selector stays at M>=1024. Candidate and control matched all generated IDs in all 25 pairs; the Phase 7 prefill/decode gates remain unmet.
 
 The final-selector matrix and runner output are `qwen2.5-q5_k_m-q5kk64-m1024-ab.jsonl` and `.run.log`. The forced M>=512 exploration is preserved in `qwen2.5-q5_k_m-q5kk64-m512-ab.jsonl` and `.run.log`; no benchmark was rerun to prepare this journal summary.
+
+
+## Experiment 23: Q8_0 K-split M=1 GEMV
+
+Status: retained by default for Q8_0 M=1 projections with N>=128 and K>=768. This is a direct MSL GEMV selected by quant format and shape; it does not invoke Metal 4 TensorOps or the standalone Apple Neural Engine/Core ML. M=1 has no matrix tile to feed to TensorOps, and the measured candidate is faster than the existing direct shader on models with Q8_0 throughout their projections.
+
+The Qwen2.5 Q5_K_M decode profile attributed 23.69 ms across 16 samples to the Q8_0 vocabulary-head GEMV, about 1.48 ms per sample. Current llama.cpp uses two output rows per tile and splits K over four SIMD groups (N_R0_Q8_0=2, N_SG_Q8_0=4). Ferrum's candidate adopts that scheduling shape: each lane processes eight adjacent quantized values, four SIMD groups reduce separate K regions, then a threadgroup reduction combines them for two output rows. Outside the candidate's N and K bounds, dispatch falls back to the existing direct Q8_0 GEMV selection, using the eight-row path only where N is divisible by eight. No dispatch rule depends on model identity.
+
+The test uses N=129 and K=1056 to cover an odd output tail and a long K reduction, checks the selector boundary and scalar-reference values, and verifies the control path. It passed with Metal API Validation and GPU Shader Validation enabled; the focused log is q8_0_gemv_k_split-validation.log. The complete library suite also passed all 86 tests with both validation layers enabled; output is q8_0_gemv_k_split-library-validation.log.
+
+Three five-pair release A/B matrices used exact prompt IDs, the same GGUF artifact within each comparison, and current official llama.cpp 84e76d8a23162eca70490da131945ebec1f09bf4: Qwen3-0.6B Q8_0, Qwen2.5-0.5B Q8_0, and Qwen2.5-0.5B Q5_K_M. The last model isolates the Q8_0 vocabulary head while its other projections use the model's other quant formats. Ratios are medians of matched pair rates; absolute throughput and first-token latency are condition medians. Each throughput cell shows Ferrum control -> K-split / llama.cpp, followed by [control/llama -> K-split/llama; K-split/control]. Latencies are milliseconds; IDs count exact complete generated sequences as control=K-split; K-split=llama.cpp; control=llama.cpp.
+
+### Qwen3-0.6B Q8_0
+
+| Workload | Prefill tok/s C->K / llama [C/L->K/L; K/C] | Cached decode tok/s C->K / llama [C/L->K/L; K/C] | Complete generation tok/s C->K / llama [C/L->K/L; K/C] | First-token ms C->K / llama | IDs C=K; K=L; C=L |
+|---|---:|---:|---:|---:|---:|
+| Short | 438.3->440.8 / 1,241.6 [0.353->0.355; 1.003] | 106.9->113.6 / 161.1 [0.656->0.705; 1.067] | 84.2->88.2 / 140.9 [0.595->0.622; 1.053] | 48.21->47.93 / 17.17 | 5/5; 5/5; 5/5 |
+| 128 prompt | 1,976.7->1,968.2 / 6,054.1 [0.325->0.322; 0.995] | 107.4->114.5 / 162.1 [0.663->0.706; 1.068] | 78.1->81.3 / 138.2 [0.566->0.588; 1.041] | 65.05->65.33 / 21.39 | 0/5; 0/5; 0/5 |
+| 512 prompt | 3,120.7->3,122.9 / 7,086.1 [0.440->0.442; 1.001] | 99.2->105.4 / 153.5 [0.645->0.684; 1.062] | 50.4->51.7 / 94.7 [0.531->0.546; 1.028] | 164.38->164.26 / 72.50 | 5/5; 5/5; 5/5 |
+| 1,024 prompt | 3,337.6->3,336.7 / 6,250.6 [0.535->0.533; 1.004] | 88.9->93.4 / 141.9 [0.625->0.659; 1.053] | 33.5->34.1 / 60.7 [0.551->0.562; 1.021] | 307.13->307.19 / 164.06 | 5/5; 5/5; 5/5 |
+| Sustained decode | 424.9->430.3 / 1,218.0 [0.352->0.350; 1.004] | 104.0->111.0 / 163.3 [0.637->0.679; 1.067] | 98.6->104.8 / 156.1 [0.631->0.670; 1.063] | 49.79->49.10 / 17.49 | 0/5; 0/5; 0/5 |
+
+### Qwen2.5-0.5B Q8_0
+
+| Workload | Prefill tok/s C->K / llama [C/L->K/L; K/C] | Cached decode tok/s C->K / llama [C/L->K/L; K/C] | Complete generation tok/s C->K / llama [C/L->K/L; K/C] | First-token ms C->K / llama | IDs C=K; K=L; C=L |
+|---|---:|---:|---:|---:|---:|
+| Short | 558.8->555.2 / 1,490.8 [0.374->0.371; 1.001] | 131.8->135.8 / 197.8 [0.670->0.685; 1.026] | 104.3->106.5 / 171.9 [0.610->0.614; 1.017] | 37.88->38.12 / 14.35 | 0/5; 5/5; 0/5 |
+| 128 prompt | 2,736.8->2,731.2 / 7,047.2 [0.388->0.388; 0.999] | 133.1->135.7 / 196.9 [0.677->0.691; 1.020] | 99.9->101.5 / 166.1 [0.602->0.610; 1.015] | 47.07->47.16 / 18.41 | 5/5; 5/5; 5/5 |
+| 512 prompt | 4,557.9->4,567.4 / 9,736.6 [0.468->0.470; 1.006] | 127.8->130.1 / 196.1 [0.655->0.664; 1.017] | 69.8->70.7 / 123.9 [0.566->0.571; 1.012] | 112.65->112.42 / 52.82 | 5/5; 5/5; 5/5 |
+| 1,024 prompt | 4,530.8->4,503.5 / 9,186.0 [0.493->0.490; 0.995] | 117.8->119.6 / 193.1 [0.608->0.621; 1.015] | 46.3->46.3 / 86.2 [0.537->0.537; 1.000] | 226.33->227.72 / 111.70 | 5/5; 5/5; 5/5 |
+| Sustained decode | 551.4->551.7 / 1,443.7 [0.388->0.385; 0.982] | 129.1->132.1 / 199.9 [0.643->0.661; 1.028] | 121.9->124.4 / 189.4 [0.644->0.657; 1.021] | 38.38->38.36 / 14.80 | 0/5; 0/5; 0/5 |
+
+### Qwen2.5-0.5B Q5_K_M, with Q8_0 vocabulary head
+
+| Workload | Prefill tok/s C->K / llama [C/L->K/L; K/C] | Cached decode tok/s C->K / llama [C/L->K/L; K/C] | Complete generation tok/s C->K / llama [C/L->K/L; K/C] | First-token ms C->K / llama | IDs C=K; K=L; C=L |
+|---|---:|---:|---:|---:|---:|
+| Short | 708.4->709.3 / 1,406.3 [0.507->0.504; 0.995] | 133.9->134.1 / 226.1 [0.592->0.595; 1.004] | 110.8->111.0 / 192.6 [0.577->0.579; 0.998] | 29.93->29.90 / 15.17 | 0/5; 0/5; 5/5 |
+| 128 prompt | 3,356.1->3,321.5 / 6,914.5 [0.485->0.480; 0.989] | 134.2->134.2 / 229.1 [0.585->0.586; 1.002] | 106.1->105.2 / 185.5 [0.571->0.571; 0.996] | 38.44->38.83 / 18.75 | 5/5; 5/5; 5/5 |
+| 512 prompt | 5,030.8->5,079.1 / 9,334.2 [0.541->0.544; 1.007] | 128.8->127.3 / 224.5 [0.576->0.555; 0.988] | 73.5->73.3 / 131.4 [0.556->0.554; 1.001] | 102.10->101.13 / 55.08 | 5/5; 5/5; 5/5 |
+| 1,024 prompt | 5,010.3->4,986.5 / 8,823.0 [0.565->0.566; 1.004] | 118.1->118.6 / 222.0 [0.532->0.533; 1.002] | 49.1->49.2 / 88.9 [0.552->0.555; 1.003] | 204.67->205.68 / 116.29 | 5/5; 5/5; 5/5 |
+| Sustained decode | 691.6->703.1 / 1,381.5 [0.501->0.507; 1.018] | 129.4->130.2 / 234.8 [0.552->0.553; 1.002] | 123.1->123.4 / 216.1 [0.570->0.571; 1.003] | 30.70->30.16 / 15.46 | 0/5; 0/5; 0/5 |
+
+Across all 25 matched pairs per model, the median cached-decode candidate/control ratios were 1.064x for Qwen3 Q8_0, 1.021x for Qwen2.5 Q8_0, and 1.002x for Qwen2.5 Q5_K_M. Their corresponding absolute condition medians were 99.2->105.4, 127.8->130.1, and 128.8->127.3 tok/s on the 512-token workload; this last row is a small head-only-model regression, while the whole-matrix Q5_K_M decode result is effectively flat. Median complete-generation candidate/control ratios were 1.042x, 1.015x, and 1.001x. Prefill and first-token latency were effectively unchanged because this M=1 kernel is used during decode. Output IDs changed in some cases: across 25 pairs, control/candidate matched 15/25 for each model; candidate/llama.cpp matched 15/25, 20/25, and 15/25 respectively. The per-workload counts above preserve where those divergences occurred.
+
+The wider Q8_0 models show repeatable decode wins: all 25 Qwen3 pairs improved cached decode (paired ratios ranged 1.045-1.081x), as did all 25 Qwen2.5 Q8_0 pairs (1.003-1.040x). The Q5_K_M model, where the Q8_0 path is chiefly the vocabulary head, is flat and does not establish a standalone end-to-end win. The shape policy is format-and-shape based rather than model specific. This is a retained M5 direct-GEMV win with a narrower measured benefit than the prefill TensorOps changes; it does not change Phase 7 gate status.
+
+Raw A/B matrices and runner logs are qwen3-0.6b-q8_0-gemv-k-split-ab.jsonl and .run.log, qwen2.5-q8_0-gemv-k-split-ab.jsonl and .run.log, and qwen2.5-q5_k_m-q8_0-head-k-split-ab.jsonl and .run.log. The runner now accepts source matrices that identify their model with source_matrix_case_model when they do not have a model field; the fix is in tools/phase55_matched_matrix.py. No benchmark was rerun for journal formatting.

@@ -27,7 +27,11 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def source_cases(path: Path) -> list[dict[str, Any]]:
-    rows = [row for row in read_jsonl(path) if row.get("model") != "bf16"]
+    rows = [
+        row
+        for row in read_jsonl(path)
+        if row.get("model", row.get("source_matrix_case_model")) != "bf16"
+    ]
     cases: dict[str, dict[str, Any]] = {}
     for row in rows:
         case = str(row["case"])
@@ -358,7 +362,9 @@ def main() -> None:
                             if engine_name == "native-mlx-lm"
                             else engine.request(request)
                         )
-                        result["source_matrix_case_model"] = row["model"]
+                        result["source_matrix_case_model"] = row.get(
+                            "model", row.get("source_matrix_case_model", "unknown")
+                        )
                         if engine_name == "ferrum":
                             result["ferrum_options"] = {
                                 "batch_limit_dispatches": int(os.environ.get("FERRUM_BATCH_LIMIT", "1024")),

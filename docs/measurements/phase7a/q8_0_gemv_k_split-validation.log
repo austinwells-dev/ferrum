@@ -1,0 +1,11 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.73s
+     Running unittests src/lib.rs (target/debug/deps/ferrum-508026e7fa9bdb9b)
+
+running 1 test
+test ops::transformer::q8_0_tests::q8_0_gemv_and_gemm_cover_output_tails_and_odd_batch_sizes ... 2026-09-25 01:12:27.355 ferrum-508026e7fa9bdb9b[78184:6986677] Metal API Validation Enabled
+2026-09-25 01:12:27.356 ferrum-508026e7fa9bdb9b[78184:6986677] Metal GPU Validation Enabled
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 85 filtered out; finished in 0.85s
+

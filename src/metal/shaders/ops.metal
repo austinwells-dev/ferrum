@@ -1221,6 +1221,56 @@ kernel void q8_0_gemv_8rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint
         if(row1<p[3]) store(c,row1,p[4],total1);
     }
 }
+
+// Reimplements the two-row, four-SIMD-group K split used by current
+// ggml-metal's Q8_0 GEMV (N_R0_Q8_0=2, N_SG_Q8_0=4). Each lane accumulates
+// eight adjacent values from one Q8_0 block; the four SIMD groups cooperate
+// on the K reduction before writing the two output rows.
+kernel void q8_0_gemv_k_split(ARGS,
+                              uint tid [[thread_index_in_threadgroup]],
+                              uint group [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[8];
+    uint lane=tid%32, simd=tid/32;
+    uint row0=group*2, row1=row0+1;
+    uint k=p[2], blocks=k/32;
+    uint block_lane=lane/4, sub=lane%4;
+    float sum0=0.0f, sum1=0.0f;
+    for(uint tile=0;tile<blocks;tile+=32) {
+        uint block=tile+simd*8+block_lane;
+        if(block<blocks) {
+            device const uchar* packed0=b+(row0*blocks+block)*34;
+            device const uchar* packed1=row1<p[3] ? b+(row1*blocks+block)*34 : packed0;
+            float scale0=float(*((device const half*)packed0));
+            float scale1=row1<p[3] ? float(*((device const half*)packed1)) : 0.0f;
+            device const char* q0=(device const char*)(packed0+2)+sub*8;
+            device const char* q1=(device const char*)(packed1+2)+sub*8;
+            uint column=block*32+sub*8;
+            float dot0=0.0f, dot1=0.0f;
+            for(uint i=0;i<8;i++) {
+                float x=load(a,column+i,p[4]);
+                dot0+=float(q0[i])*x;
+                if(row1<p[3]) dot1+=float(q1[i])*x;
+            }
+            sum0+=dot0*scale0;
+            if(row1<p[3]) sum1+=dot1*scale1;
+        }
+    }
+    float reduced0=simd_sum(sum0), reduced1=simd_sum(sum1);
+    if(lane==0) {
+        partial[simd*2+0]=reduced0;
+        partial[simd*2+1]=reduced1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(simd==0) {
+        float x0=lane<4 ? partial[lane*2+0] : 0.0f;
+        float x1=lane<4 ? partial[lane*2+1] : 0.0f;
+        float total0=simd_sum(x0), total1=simd_sum(x1);
+        if(lane==0) {
+            store(c,row0,p[4],total0);
+            if(row1<p[3]) store(c,row1,p[4],total1);
+        }
+    }
+}
 // One SIMD group handles one output channel across four independent sequence
 // rows. The packed weight and its scale are loaded once for four outputs.
 kernel void q8_0_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
