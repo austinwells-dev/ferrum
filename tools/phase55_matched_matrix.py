@@ -370,6 +370,7 @@ def main() -> None:
                                 "batch_limit_dispatches": int(os.environ.get("FERRUM_BATCH_LIMIT", "1024")),
                                 "q4_0_gemv_8rows": os.environ.get("FERRUM_Q4_0_GEMV_8ROWS", "true").lower() in ("1", "true"),
                                 "q4_k_gemv_8rows": os.environ.get("FERRUM_Q4_K_GEMV_8ROWS", "true").lower() in ("1", "true"),
+                                "q4_k_mpp_tile_m128": result.get("q4_k_mpp_tile_m128", True),
                                 "q4_k_expert_project_8rows": result.get("q4_k_expert_project_8rows", False),
                                 "q6_k_gemv_8rows": os.environ.get("FERRUM_Q6_K_GEMV_8ROWS", "true").lower() in ("1", "true"),
                                 "moe_gpu_routing": os.environ.get("FERRUM_MOE_GPU_ROUTING", "true").lower() in ("1", "true"),

@@ -98,7 +98,9 @@ impl MetalDevice {
                 }
             }
             (QuantizationFormat::Q4_K, false, true) => {
-                if self.q4_k_mpp_tile_k64(ad[0]) {
+                if self.q4_k_mpp_tile_m128(ad[0]) {
+                    "q4_k_gemm_mpp_k64_m128"
+                } else if self.q4_k_mpp_tile_k64(ad[0]) {
                     "q4_k_gemm_mpp_k64"
                 } else {
                     "q4_k_gemm_mpp"
@@ -1945,6 +1947,9 @@ mod qk_tests {
         }
         assert!(!d.q4_k_mpp_tile_k64(512));
         assert!(d.q4_k_mpp_tile_k64(1024));
+        assert!(!d.q4_k_mpp_tile_m128(1023));
+        assert!(d.q4_k_mpp_tile_m128(1024));
+        d.set_q4_k_mpp_tile_m128(false).unwrap();
         d.set_q4_k_mpp_tile_k64(false).unwrap();
         let (m, n, k) = (1025, 65, 256);
         let weight = packed(&d, n, k, QuantizationFormat::Q4_K);
@@ -1985,6 +1990,26 @@ mod qk_tests {
             assert!(
                 (actual - expected).abs() <= 0.04,
                 "Q4_K K=64 index {index}: actual={actual}, expected={expected}"
+            );
+        }
+
+        assert!(!d.q4_k_mpp_tile_m128(1023));
+        assert!(!d.q4_k_mpp_tile_m128(1024));
+        d.set_q4_k_mpp_tile_m128(true).unwrap();
+        assert!(!d.q4_k_mpp_tile_m128(1023));
+        assert!(d.q4_k_mpp_tile_m128(1024));
+        let candidate_m128 = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(candidate_m128.metrics.operation, "q4_k_gemm_mpp_k64_m128");
+        for (index, (actual, expected)) in candidate_m128
+            .tensor
+            .to_f32()
+            .iter()
+            .zip(reference.to_f32())
+            .enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 0.04,
+                "Q4_K M=128 K=64 index {index}: actual={actual}, expected={expected}"
             );
         }
     }
