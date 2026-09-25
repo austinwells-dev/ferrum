@@ -1,0 +1,101 @@
+   Compiling ferrum v0.1.0 (/Users/austinwells/Documents/ChatGPT/ferrum)
+    Finished `release` profile [optimized] target(s) in 16.32s
+     Running unittests src/lib.rs (target/release/deps/ferrum-c7e7116ab5dd7db1)
+
+running 1 test
+2026-09-25 17:18:19.280 ferrum-c7e7116ab5dd7db1[19623:7603001] Metal API Validation Enabled
+2026-09-25 17:18:19.280 ferrum-c7e7116ab5dd7db1[19623:7603001] Metal GPU Validation Enabled
+test ops::transformer::qk_tests::q6_k_expert_row_reuse_and_sixteen_row_projection_covers_tail ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 90 filtered out; finished in 0.76s
+
+     Running unittests src/main.rs (target/release/deps/ferrum-d34864d37e09006b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/correctness.rs (target/release/deps/correctness-e883503388e3932b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
+     Running tests/granite.rs (target/release/deps/granite-9f3149867240d458)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/granite_moe.rs (target/release/deps/granite_moe-9ab471e0726b3218)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/lfm2.rs (target/release/deps/lfm2-df64f581c966f729)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/lfm2_moe.rs (target/release/deps/lfm2_moe-41923ac50cb638c7)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/lfm2_moe_gguf.rs (target/release/deps/lfm2_moe_gguf-150851b18d0e0fde)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/loading.rs (target/release/deps/loading-7e2d19524194f3a2)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/olmo2.rs (target/release/deps/olmo2-ca5976afde744a39)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/qwen.rs (target/release/deps/qwen-d854e9ef3c56a281)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/qwen3.rs (target/release/deps/qwen3-1b340091e622fa4b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/qwen3_gguf.rs (target/release/deps/qwen3_gguf-e7ab39b3c79d8355)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s
+
+     Running tests/real_model.rs (target/release/deps/real_model-87438668e8662d80)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/runtime_optimization.rs (target/release/deps/runtime_optimization-a467bf6a9115a483)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 7 filtered out; finished in 0.00s
+
+     Running tests/transformer.rs (target/release/deps/transformer-00f85f17f484c280)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 10 filtered out; finished in 0.00s
+
