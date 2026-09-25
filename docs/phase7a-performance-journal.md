@@ -12,21 +12,21 @@ Reporting rule: every important Ferrum-versus-llama.cpp result reports absolute 
 
 - Machine: Apple M5, Mac17,2, 32 GiB unified memory; macOS 27.0; Metal 4 / Apple GPU family 10.
 - Ferrum: release build from this branch, native Rust and Metal kernels.
-- Historical reference for the initial matrices and earlier experiments: official `ggml-org/llama.cpp` at commit `9710a32175b3b8f04636aaac4aa3cc28651b505d`. These measurements remain useful for those paired experiments but are not the current-upstream gate baseline. The refreshed official upstream `origin/HEAD`, fetched on 2026-09-24, is `84e76d8a23162eca70490da131945ebec1f09bf4`; its Metal Release build uses an embedded Metal library, OpenMP off, and tests/examples/server off. `tools/phase55_llama_matrix.cpp` records `llama_commit` in every refreshed reference row.
-- Both runtimes use the same GGUF bytes and exact prompt token IDs per pair, greedy argmax, BF16 KV, context 4096, batch 2048, microbatch 512, four CPU threads, and all model layers on Metal. Model loading and one two-token warmup per workload are outside measured generation. Historical baseline matrices have three interleaved pairs per workload; the current-upstream refresh has three pairs except the Q5_1 tile A/B, which has five.
+- Historical reference for the initial matrices and earlier experiments: official `ggml-org/llama.cpp` at commit `9710a32175b3b8f04636aaac4aa3cc28651b505d`. The 2026-09-24 upstream refresh at `84e76d8a23162eca70490da131945ebec1f09bf4` is now also historical. The latest official `master` fetched on 2026-09-25 is `1ab7e5ad2d4e7295c94c3b966a3e0b70fa365865`; its Metal Release build used an embedded Metal library, OpenMP off, and optional tools/tests/server off. Its build log is `llama.cpp-1ab7e5a-current-upstream-build.log`. `tools/phase55_llama_matrix.cpp` records `llama_commit` in every current reference row.
+- Both runtimes use the same GGUF bytes and exact prompt token IDs per pair, greedy argmax, BF16 KV, context 4096, batch 2048, microbatch 512, four CPU threads, and all model layers on Metal. Model loading and one two-token warmup per workload are outside measured generation. Historical baseline matrices have three interleaved pairs per workload; the 2026-09-24 `84e76d8` refresh and 2026-09-25 `1ab7e5a` refresh have five interleaved pairs per workload.
 - Prefill, first-token latency, cached decode, full-generation throughput, output IDs, KV allocation, and process RSS are retained separately in the JSONL records. Prompt tokenization is outside the timed path.
 
 ## Artifacts and workload coverage
 
-| Model / format | Pinned artifact | SHA-256 | Workload file | Matched matrix |
-| --- | --- | --- | --- | --- |
-| Qwen2.5-0.5B Q4_0 | Phase 5 pinned `Q4_0.gguf` | `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q4_0-current.jsonl`; refreshed: `qwen2.5-q4_0-llama84e76d8-current.jsonl` |
-| Qwen2.5-0.5B Q4_K_M | Phase 5 pinned `Q4_K_M.gguf` | `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q4_k_m-current.jsonl` and `qwen2.5-q4_k_m-baseline-recheck.jsonl`; refreshed: `qwen2.5-q4_k_m-llama84e76d8-current.jsonl` |
-| Qwen2.5-0.5B Q5_K_M | Phase 5 pinned `Q5_K_M.gguf` | `041474553fcabfc2a2d67903f9d2c2e50bd92528e670da4f33b5d0ce6e59fd55` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q5_k_m-current.jsonl`; refreshed candidates: `qwen2.5-q5_k_m-q5_1k64-m512-ab.jsonl`, `qwen2.5-q5_k_m-q5kk64-m1024-ab.jsonl` |
-| Qwen2.5-0.5B Q6_K | Phase 5 pinned `Q6_K.gguf` | `2f82233630c349ccf6b8daccf48f9a7865713d9f08a2eadfa456cebe9b97c7f5` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q6_k-current.jsonl`; refreshed: `qwen2.5-q6_k-llama84e76d8-current.jsonl` |
-| Qwen2.5-0.5B Q8_0 | Phase 5 pinned `Q8_0.gguf` | `ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q8_0-current.jsonl`; refreshed: `qwen2.5-q8_0-llama84e76d8-current.jsonl` |
-| Qwen3-0.6B Q8_0 | `Qwen/Qwen3-0.6B-GGUF`, revision `23749fefcc72300e3a2ad315e1317431b06b590a` | `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031` | `qwen3-0.6b-q8_0-workloads.jsonl` | Historical: `qwen3-0.6b-q8_0-current.jsonl`; refreshed: `qwen3-0.6b-q8_0-llama84e76d8-current.jsonl` |
-| LFM2.5-8B-A1B Q4_K_M | `LiquidAI/LFM2.5-8B-A1B-GGUF`, revision `49c14831707011e64d70b2ebd8462ba08d608434` | `4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0` | `lfm2.5-8b-a1b-q4_k_m-workloads.jsonl` | Historical: `lfm2.5-8b-a1b-q4_k_m-current.jsonl`; refreshed: `lfm2.5-8b-a1b-q4_k_m-llama84e76d8-current.jsonl` |
+| Model / format | Pinned artifact | SHA-256 | Workload file | Historical / 84e76d8 matrices | Current upstream matrix (1ab7e5a) |
+| --- | --- | --- | --- | --- | --- |
+| Qwen2.5-0.5B Q4_0 | Phase 5 pinned `Q4_0.gguf` | `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q4_0-current.jsonl`; 84e76d8: `qwen2.5-q4_0-llama84e76d8-current.jsonl` | 1ab7e5a: `qwen2.5-q4_0-llama1ab7e5a-current.jsonl` |
+| Qwen2.5-0.5B Q4_K_M | Phase 5 pinned `Q4_K_M.gguf` | `74a4da8c9fdbcd15bd1f6d01d621410d31c6fc00986f5eb687824e7b93d7a9db` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q4_k_m-current.jsonl` and `qwen2.5-q4_k_m-baseline-recheck.jsonl`; 84e76d8: `qwen2.5-q4_k_m-llama84e76d8-current.jsonl` | 1ab7e5a: `qwen2.5-q4_k_m-llama1ab7e5a-current.jsonl` |
+| Qwen2.5-0.5B Q5_K_M | Phase 5 pinned `Q5_K_M.gguf` | `041474553fcabfc2a2d67903f9d2c2e50bd92528e670da4f33b5d0ce6e59fd55` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q5_k_m-current.jsonl`; 84e76d8 experiment matrices: `qwen2.5-q5_k_m-q5_1k64-m512-ab.jsonl`, `qwen2.5-q5_k_m-q5kk64-m1024-ab.jsonl` | 1ab7e5a: `qwen2.5-q5_k_m-llama1ab7e5a-current.jsonl` |
+| Qwen2.5-0.5B Q6_K | Phase 5 pinned `Q6_K.gguf` | `2f82233630c349ccf6b8daccf48f9a7865713d9f08a2eadfa456cebe9b97c7f5` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q6_k-current.jsonl`; 84e76d8: `qwen2.5-q6_k-llama84e76d8-current.jsonl` | 1ab7e5a: `qwen2.5-q6_k-llama1ab7e5a-current.jsonl` |
+| Qwen2.5-0.5B Q8_0 | Phase 5 pinned `Q8_0.gguf` | `ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e` | `qwen2.5-q4k-workloads.jsonl` | Historical: `qwen2.5-q8_0-current.jsonl`; 84e76d8: `qwen2.5-q8_0-llama84e76d8-current.jsonl` | 1ab7e5a: `qwen2.5-q8_0-llama1ab7e5a-current.jsonl` |
+| Qwen3-0.6B Q8_0 | `Qwen/Qwen3-0.6B-GGUF`, revision `23749fefcc72300e3a2ad315e1317431b06b590a` | `9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031` | `qwen3-0.6b-q8_0-workloads.jsonl` | Historical: `qwen3-0.6b-q8_0-current.jsonl`; 84e76d8: `qwen3-0.6b-q8_0-llama84e76d8-current.jsonl` | 1ab7e5a: `qwen3-0.6b-q8_0-llama1ab7e5a-current.jsonl` |
+| LFM2.5-8B-A1B Q4_K_M | `LiquidAI/LFM2.5-8B-A1B-GGUF`, revision `49c14831707011e64d70b2ebd8462ba08d608434` | `4923ec14f06b968b74d663e5949867d2d9c3bf13a20b8be1a9f9af39989b2bb0` | `lfm2.5-8b-a1b-q4_k_m-workloads.jsonl` | Historical: `lfm2.5-8b-a1b-q4_k_m-current.jsonl`; 84e76d8: `lfm2.5-8b-a1b-q4_k_m-llama84e76d8-current.jsonl` | 1ab7e5a: `lfm2.5-8b-a1b-llama1ab7e5a-current.jsonl` |
 
 Each baseline matrix has 30 raw rows (15 paired samples) across short, 128-, 512-, and 1,024-token prefill, plus a 129-token sustained-decode workload. Short Qwen3 and LFM2 prompts reproduce the saved Phase 6 reference IDs exactly using the official tokenizer. Long prompts are tokenized once with the matching official tokenizer and then passed as fixed IDs. The 1,601-token generation case from Phase 5.5 is not included in this first campaign.
 
@@ -48,7 +48,7 @@ Each ratio is the median of the 15 paired Ferrum/reference throughput ratios acr
 
 Every decode ratio is below 0.70 except Qwen2.5 Q8_0 at 0.688; each medium/long prefill ratio is below 0.80. The gate is not met, so large Qwen model performance runs remain deferred. The 8B hybrid model's sampled maximum process RSS was 5.29 GiB for Ferrum and 4.98 GiB for llama.cpp; the model and matched workloads fit comfortably in the available memory. Qwen Q4_K_M per-case decode ratios ranged from 0.446 to 0.565. The full raw rows retain first-token timings, all generated IDs, KV bytes, and per-process memory observations.
 
-This gate-ratio summary is an index; absolute Ferrum and llama.cpp tok/s plus first-token latency for each workload are tabulated in the current-upstream refresh and the JSONL-derived absolute performance record below.
+This gate-ratio summary is an index; absolute Ferrum and llama.cpp tok/s plus first-token latency for each workload are tabulated in the upstream refreshes below.
 
 Output differences are format/workload dependent. The five Qwen2.5 matrices produced exact IDs in 9–12 of 15 pairs; Qwen3 did so in 12 of 15. LFM2 matched all short and sustained sequences and the 1,024-token case, while its 128- and 512-token cases diverged after 9 and 8 generated IDs respectively. Divergences remain visible in raw rows and are not hidden by throughput summaries.
 
@@ -96,6 +96,52 @@ The following refresh uses the same artifacts, prompt IDs, generation lengths, g
 
 Across this refresh snapshot, no representative format meets the medium/long prefill or sustained-decode threshold. Qwen2.5 Q6_K has the strongest sustained-decode ratio at 0.609x (125.6 / 205.9 tok/s); the Q5_K_M 1,024-token row in this snapshot is 0.551x prefill (4,841.0 / 8,794.4 tok/s), 0.476x cached decode (104.0 / 217.6 tok/s), and 0.517x complete generation (45.7 / 88.2 tok/s), with 211.8 / 116.7 ms first-token latency. Experiment 22 later measures the Q5_K K=64 prefill candidate with absolute before/after and llama.cpp values. All results remain below their Phase 7 thresholds, so the large Qwen targets remain locked.
 
+### Current-upstream refresh: llama.cpp `1ab7e5ad`
+
+This 2026-09-25 refresh uses official `ggml-org/llama.cpp` commit `1ab7e5ad2d4e7295c94c3b966a3e0b70fa365865`, built for Metal Release on the same M5 with an embedded Metal library and optional OpenMP, tests, examples, server, and tools disabled. The complete build output is `docs/measurements/phase7a/llama.cpp-1ab7e5a-current-upstream-build.log`. Source inspection found the Q4_K M=1 tuning unchanged from the prior refresh: `N_R0_Q4_K=2` and `N_SG_Q4_K=2`; the relevant direct MSL kernel had no intervening diff.
+
+All seven pinned GGUF artifacts and hashes in the table above were independently reverified. Each matrix has five interleaved pairs for each workload and 50 JSONL rows (two runtimes × five workloads × five pairs). Prompt IDs, generation lengths, greedy decoding, BF16 KV, and runner options match within each pair. Ferrum and llama.cpp rates below are condition medians; ratios are medians of the five matched per-pair throughput ratios. First-token latency is the condition median in milliseconds. Exact IDs count full output-sequence matches across the five pairs. Rates are tok/s.
+
+| Model / workload | Prefill tok/s Ferrum / llama.cpp (ratio) | Cached decode tok/s Ferrum / llama.cpp (ratio) | Complete-generation tok/s Ferrum / llama.cpp (ratio) | First-token ms Ferrum / llama.cpp | Exact IDs |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_0 / Short | 804.0 / 1,550.7 (0.518x) | 130.2 / 269.3 (0.484x) | 110.5 / 217.2 (0.511x) | 26.4 / 13.8 | 5/5 |
+| Qwen2.5 Q4_0 / 128-token prompt | 3,756.8 / 7,401.1 (0.505x) | 128.8 / 273.2 (0.474x) | 105.3 / 209.4 (0.501x) | 34.4 / 17.6 | 5/5 |
+| Qwen2.5 Q4_0 / 512-token prompt | 5,451.4 / 9,925.7 (0.549x) | 122.8 / 268.8 (0.457x) | 74.4 / 146.3 (0.508x) | 94.3 / 51.8 | 5/5 |
+| Qwen2.5 Q4_0 / 1,024-token prompt | 5,306.8 / 9,393.7 (0.565x) | 114.4 / 264.8 (0.432x) | 50.2 / 96.5 (0.517x) | 193.3 / 109.3 | 5/5 |
+| Qwen2.5 Q4_0 / Sustained decode | 779.4 / 1,513.0 (0.507x) | 125.8 / 276.2 (0.457x) | 120.1 / 248.1 (0.485x) | 27.2 / 14.1 | 0/5 |
+| Qwen2.5 Q4_K_M / Short | 742.6 / 1,406.7 (0.526x) | 138.3 / 238.8 (0.578x) | 114.3 / 197.5 (0.579x) | 28.6 / 15.2 | 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 3,532.0 / 6,989.8 (0.504x) | 138.2 / 230.7 (0.593x) | 109.1 / 187.6 (0.582x) | 36.5 / 18.6 | 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 5,065.8 / 9,336.9 (0.543x) | 131.2 / 233.5 (0.562x) | 74.9 / 133.5 (0.560x) | 101.4 / 55.1 | 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 5,220.3 / 8,844.2 (0.592x) | 121.2 / 236.5 (0.513x) | 50.8 / 90.0 (0.567x) | 196.5 / 116.0 | 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 737.3 / 1,385.7 (0.534x) | 132.4 / 244.3 (0.543x) | 126.0 / 221.8 (0.569x) | 28.8 / 15.4 | 0/5 |
+| Qwen2.5 Q5_K_M / Short | 707.4 / 1,432.7 (0.496x) | 133.5 / 226.2 (0.590x) | 110.4 / 189.8 (0.584x) | 30.0 / 14.9 | 0/5 |
+| Qwen2.5 Q5_K_M / 128-token prompt | 3,363.7 / 6,900.3 (0.487x) | 132.9 / 221.0 (0.601x) | 104.9 / 180.7 (0.578x) | 38.4 / 18.8 | 5/5 |
+| Qwen2.5 Q5_K_M / 512-token prompt | 5,081.0 / 9,306.5 (0.546x) | 126.4 / 227.6 (0.555x) | 73.1 / 130.5 (0.560x) | 101.1 / 55.3 | 5/5 |
+| Qwen2.5 Q5_K_M / 1,024-token prompt | 5,109.7 / 8,844.5 (0.581x) | 118.1 / 217.3 (0.539x) | 49.7 / 88.2 (0.563x) | 200.8 / 116.0 | 5/5 |
+| Qwen2.5 Q5_K_M / Sustained decode | 691.2 / 1,382.2 (0.495x) | 129.1 / 231.5 (0.558x) | 122.2 / 210.6 (0.578x) | 30.7 / 15.4 | 0/5 |
+| Qwen2.5 Q6_K / Short | 629.9 / 1,478.6 (0.430x) | 132.1 / 199.1 (0.658x) | 107.3 / 173.9 (0.619x) | 33.7 / 14.5 | 5/5 |
+| Qwen2.5 Q6_K / 128-token prompt | 2,984.5 / 7,068.9 (0.423x) | 134.6 / 201.8 (0.667x) | 102.4 / 168.2 (0.607x) | 43.2 / 18.4 | 5/5 |
+| Qwen2.5 Q6_K / 512-token prompt | 4,779.1 / 9,643.1 (0.499x) | 127.2 / 203.2 (0.624x) | 71.1 / 125.0 (0.571x) | 107.5 / 53.4 | 5/5 |
+| Qwen2.5 Q6_K / 1,024-token prompt | 4,778.7 / 9,077.0 (0.526x) | 116.8 / 197.2 (0.594x) | 47.6 / 86.3 (0.551x) | 214.6 / 113.1 | 5/5 |
+| Qwen2.5 Q6_K / Sustained decode | 575.6 / 1,451.0 (0.397x) | 128.2 / 202.7 (0.631x) | 120.9 / 191.2 (0.632x) | 36.8 / 14.7 | 0/5 |
+| Qwen2.5 Q8_0 / Short | 554.1 / 1,446.1 (0.382x) | 134.3 / 198.5 (0.674x) | 105.3 / 173.5 (0.607x) | 38.2 / 14.8 | 5/5 |
+| Qwen2.5 Q8_0 / 128-token prompt | 2,707.6 / 7,074.1 (0.386x) | 135.8 / 197.8 (0.684x) | 100.4 / 165.5 (0.601x) | 47.6 / 18.3 | 5/5 |
+| Qwen2.5 Q8_0 / 512-token prompt | 4,565.4 / 9,772.5 (0.466x) | 128.3 / 198.8 (0.645x) | 70.2 / 124.2 (0.564x) | 112.5 / 52.6 | 5/5 |
+| Qwen2.5 Q8_0 / 1,024-token prompt | 4,592.1 / 9,132.3 (0.504x) | 118.9 / 195.3 (0.608x) | 46.8 / 86.1 (0.545x) | 223.3 / 112.4 | 5/5 |
+| Qwen2.5 Q8_0 / Sustained decode | 511.5 / 1,449.3 (0.353x) | 130.9 / 199.9 (0.656x) | 122.8 / 189.4 (0.648x) | 41.4 / 14.7 | 0/5 |
+| Qwen3-0.6B Q8_0 / Short | 435.8 / 1,258.3 (0.347x) | 113.2 / 164.5 (0.690x) | 87.6 / 143.8 (0.608x) | 48.5 / 17.0 | 5/5 |
+| Qwen3-0.6B Q8_0 / 128-token prompt | 1,970.9 / 6,001.2 (0.323x) | 113.5 / 163.8 (0.696x) | 80.9 / 138.8 (0.580x) | 65.3 / 21.6 | 0/5 |
+| Qwen3-0.6B Q8_0 / 512-token prompt | 3,114.7 / 7,099.6 (0.437x) | 104.0 / 154.9 (0.673x) | 51.1 / 95.2 (0.538x) | 164.7 / 72.4 | 5/5 |
+| Qwen3-0.6B Q8_0 / 1,024-token prompt | 3,359.8 / 6,283.2 (0.536x) | 92.1 / 143.3 (0.641x) | 34.2 / 61.1 (0.561x) | 305.1 / 163.2 | 5/5 |
+| Qwen3-0.6B Q8_0 / Sustained decode | 391.0 / 1,241.8 (0.312x) | 110.3 / 164.7 (0.669x) | 103.4 / 157.4 (0.657x) | 54.1 / 17.2 | 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / Short | 42.9 / 215.6 (0.191x) | 30.8 / 86.4 (0.337x) | 21.5 / 72.5 (0.292x) | 257.0 / 51.2 | 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 392.5 / 1,511.1 (0.260x) | 31.3 / 98.2 (0.320x) | 20.2 / 67.5 (0.300x) | 326.4 / 84.9 | 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 470.5 / 2,108.3 (0.222x) | 30.6 / 97.5 (0.314x) | 10.5 / 41.2 (0.253x) | 1,088.6 / 243.1 | 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 481.0 / 2,141.5 (0.225x) | 29.5 / 96.4 (0.306x) | 6.3 / 25.8 (0.245x) | 2,129.0 / 478.4 | 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 38.9 / 233.7 (0.167x) | 31.1 / 101.2 (0.308x) | 28.2 / 95.7 (0.296x) | 282.7 / 47.3 | 0/5 |
+
+No format/architecture meets the gate. The strongest sustained decode in this refresh is Qwen3 Q8_0 at 0.669x (110.3 / 164.7 tok/s); Qwen2.5 Q8_0 reaches 0.656x (130.9 / 199.9 tok/s). The strongest 1,024-token prefill ratio is Q4_K_M at 0.592x (5,220.3 / 8,844.2 tok/s), still below 0.80x. Large Qwen tuning stays locked. A fresh flushed LFM M=1 diagnostic profile measured 34.41 prefill, 9.05 cached-decode, and 7.87 complete-generation tok/s with 319.92 ms first-token latency. It attributed 246.68 ms across 352 dispatches to the retained sparse-expert Q4_K 16-row path and 60.46 ms across 576 dispatches to dense `q4_k_gemv_8rows`. The latter is the next direct-MSL candidate. This per-dispatch-flushed profile is diagnostic and is not comparable to production throughput.
+
 ## Upstream Metal review
 
 The refreshed official upstream `84e76d8a` Metal source keeps its Q4_K M=1 defaults at `N_R0_Q4_K=2` and `N_SG_Q4_K=2` in `ggml-metal/ggml-metal-impl.h`; `kernel_mul_mv_q4_K_f32_impl` in `ggml-metal/kernels/mul_mv.metal` reuses activation fragments while accumulating adjacent output rows. An M5-specific tuning discussion in [llama.cpp issue 19303](https://github.com/ggml-org/llama.cpp/issues/19303) reports a larger Q4_K row-tile experiment, but that remains an unmerged result. The refreshed upstream also has a multi-kernel `flash_attn_ext` implementation in `ggml-metal/kernels/fa.metal` and its Metal host scheduler. Ferrum's prefill attention score/context products already use MPP, but its mask and softmax remain separate conventional MSL kernels; fusing the score product, mask, row softmax, and context product with TensorOps cooperative intermediates is still a plausible prefill candidate. A flushed Qwen Q5 profile attributed 28.51 ms to 24 `attention_softmax` calls at 1,024 rows; this is diagnostic GPU time, not end-to-end latency.
@@ -112,6 +158,16 @@ The test `q4_k_eight_row_gemv_reuses_activations_and_covers_output_tail` compare
 
 The same-period three-pair baseline recheck and candidate matrices use the same prompts, generation lengths, build, and reference process options. Across all 15 paired Ferrum runs, the candidate's decode throughput was 1.019x the original kernel (range 1.011–1.035x), and full-generation throughput was 1.008x (range 1.002–1.038x). Prefill was effectively unchanged at 1.001x. Generated IDs were identical between the two Ferrum paths in all 15 pairs, with 9/15 exact matches against llama.cpp in both matrices. The Ferrum/reference median decode ratio rose from 0.480 to 0.494; generation rose from 0.506 to 0.510. Because the measured gain is small, it remains a narrow Q4_K shape rule and does not change the overall gate status. The production default is enabled for `N >= 128`; `FERRUM_Q4_K_GEMV_8ROWS=false` selects the original kernel for controlled comparisons.
 
+The table reports condition-median absolute rates and first-token latency; bracketed ratios are medians of matched pairs in the saved JSONL. Rate cells are Ferrum control -> 8-row candidate / llama.cpp tok/s, followed by `[control/llama -> candidate/llama; candidate/control]`.
+
+| Workload | Prefill tok/s C -> 8 / llama | Cached decode tok/s C -> 8 / llama | Complete generation tok/s C -> 8 / llama | First-token ms C -> 8 / llama | IDs C=8; 8=L |
+|---|---:|---:|---:|---:|---:|
+| Short | 749.75 -> 748.59 / 1,441.79 `[0.519 -> 0.518; 0.999]` | 117.87 -> 119.99 / 228.75 `[0.480 -> 0.520; 1.017]` | 101.33 -> 102.21 / 194.44 `[0.511 -> 0.526; 1.008]` | 28.3 -> 28.4 / 14.8 | 3/3; 0/3 |
+| 128-token prompt | 3,476.22 -> 3,501.10 / 6,943.69 `[0.516 -> 0.510; 1.003]` | 119.11 -> 121.21 / 236.00 `[0.522 -> 0.518; 1.018]` | 96.91 -> 98.50 / 182.72 `[0.529 -> 0.539; 1.015]` | 37.3 -> 37.0 / 18.8 | 3/3; 3/3 |
+| 512-token prompt | 4,951.64 -> 4,948.33 / 9,377.70 `[0.532 -> 0.528; 0.995]` | 113.46 -> 115.46 / 233.77 `[0.493 -> 0.494; 1.019]` | 67.77 -> 68.58 / 134.33 `[0.506 -> 0.510; 1.008]` | 103.7 -> 103.8 / 54.8 | 3/3; 3/3 |
+| 1,024-token prompt | 4,712.56 -> 4,699.98 / 8,790.56 `[0.539 -> 0.535; 1.001]` | 104.48 -> 105.77 / 226.72 `[0.461 -> 0.467; 1.015]` | 45.15 -> 45.39 / 89.42 `[0.506 -> 0.508; 1.005]` | 217.6 -> 218.2 / 116.8 | 3/3; 3/3 |
+| Sustained decode | 649.23 -> 661.58 / 1,383.01 `[0.471 -> 0.478; 1.033]` | 113.74 -> 116.66 / 243.17 `[0.476 -> 0.479; 1.023]` | 107.60 -> 111.12 / 220.81 `[0.497 -> 0.503; 1.030]` | 32.6 -> 32.0 / 15.4 | 3/3; 0/3 |
+
 ## Experiment 2: Q6_K two-row reuse for M=1
 
 Status: accepted for wide Q6_K M=1 projections; the matched matrix showed a consistent decode improvement with unchanged outputs.
@@ -119,6 +175,16 @@ Status: accepted for wide Q6_K M=1 projections; the matched matrix showed a cons
 The candidate uses the same two-output-row-per-SIMD-group mapping and four-group, eight-row tile for Q6_K. It reuses the Q6_K activation fragment across adjacent rows and handles output tails. Selection is limited to M=1 projections with at least 128 output rows. The focused 133-row tail test passed with Metal API Validation and GPU Shader Validation enabled. The upstream reference keeps `N_R0_Q6_K=2`; the Ferrum candidate uses two rows per SIMD group and eight rows per threadgroup, a separate M5-specific shape selected from this paired measurement.
 
 The A/B used the same-period baseline recheck and candidate matrices, three interleaved pairs per workload. Candidate decode throughput was 1.030x the original kernel at the median across 15 pairs (range 1.018–1.043x); per-workload medians ranged from 1.025x to 1.036x. Prefill was effectively unchanged (median 0.999x), and full-generation throughput improved by roughly 1–3%. Generated IDs matched the original Ferrum path in all 15 pairs. The Ferrum/reference decode medians after the change remain below the Phase 7 gate, so this kernel improves Q6_K M=1 without clearing the model-level gate. The production default is enabled for `N >= 128`; `FERRUM_Q6_K_GEMV_8ROWS=false` selects the original kernel for controlled comparisons.
+
+The table reports condition-median absolute rates and first-token latency; bracketed ratios are medians of matched pairs in the saved JSONL. Rate cells are Ferrum control -> 8-row candidate / llama.cpp tok/s, followed by `[control/llama -> candidate/llama; candidate/control]`.
+
+| Workload | Prefill tok/s C -> 8 / llama | Cached decode tok/s C -> 8 / llama | Complete generation tok/s C -> 8 / llama | First-token ms C -> 8 / llama | IDs C=8; 8=L |
+|---|---:|---:|---:|---:|---:|
+| Short | 635.04 -> 636.90 / 1,450.93 `[0.431 -> 0.441; 0.998]` | 126.02 -> 129.60 / 200.27 `[0.624 -> 0.645; 1.025]` | 103.69 -> 106.07 / 174.59 `[0.587 -> 0.602; 1.023]` | 33.4 -> 33.3 / 14.7 | 3/3; 3/3 |
+| 128-token prompt | 3,013.76 -> 3,007.08 / 7,071.29 `[0.420 -> 0.425; 0.998]` | 124.94 -> 129.24 / 201.21 `[0.618 -> 0.642; 1.031]` | 97.11 -> 99.13 / 166.20 `[0.579 -> 0.596; 1.018]` | 42.8 -> 42.9 / 18.4 | 3/3; 3/3 |
+| 512-token prompt | 4,428.82 -> 4,395.02 / 9,583.89 `[0.461 -> 0.459; 1.000]` | 120.99 -> 124.69 / 199.01 `[0.606 -> 0.628; 1.028]` | 67.18 -> 68.02 / 123.77 `[0.538 -> 0.551; 1.015]` | 115.9 -> 116.8 / 53.7 | 3/3; 3/3 |
+| 1,024-token prompt | 4,291.08 -> 4,293.15 / 9,092.63 `[0.470 -> 0.472; 1.000]` | 111.45 -> 115.52 / 199.12 `[0.571 -> 0.582; 1.036]` | 43.97 -> 44.38 / 86.75 `[0.508 -> 0.511; 1.011]` | 239.0 -> 238.9 / 112.9 | 3/3; 3/3 |
+| Sustained decode | 574.73 -> 568.21 / 1,406.63 `[0.413 -> 0.404; 0.989]` | 121.48 -> 125.24 / 207.88 `[0.598 -> 0.602; 1.030]` | 115.86 -> 118.95 / 193.75 `[0.600 -> 0.615; 1.027]` | 36.8 -> 37.3 / 15.2 | 3/3; 0/3 |
 
 ## Raw evidence
 
@@ -145,7 +211,7 @@ A follow-up isolated LFM2.5 M=1 capture used the saved 11-token prompt and `FERR
 
 ### Native quantized API constraints
 
-The current Xcode 27.0 SDK header `Metal.framework/Headers/MTLTensor.h` exposes signed/unsigned int8 tensors in macOS 26, int4/uint4 in macOS 26.4, and int2/uint2 plus FP4 and FP8 tensor formats in macOS 27. The installed `MPPTensorOpsMatMul2d.h` documents native `int4b_format`/`uint4b_format` and int8/uint8 matmul operands with half or BF16 activations, plus the newer int2 and FP4/FP8 combinations. Cooperative tensors are supported as matmul inputs through `get_left_input_cooperative_tensor` and `get_right_input_cooperative_tensor`; callers can query layout compatibility before reusing an intermediate. Cooperative storage is distributed across participating threads; it can remove a threadgroup-memory round trip, but layout is chosen by the operation and all required threads must participate. For custom-format dequantization, Apple's recommended options are a threadgroup inline tensor or dequantizing into a cooperative tensor. The current scales plane accepts only FP8 UE8M0 and has block factors `[32, 1]`, so it cannot encode arbitrary GGUF FP16 scales/minima exactly. Int4/FP4/FP8 formats also carry stricter row and 128-byte buffer/slice alignment requirements in the installed SDK. Our cooperative-input prototype used the compiler-accepted single-SIMD-group mode and a 32x32 output tile. Sources: [Metal Performance Primitives programming guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf), [MTLTensorDataType API](https://developer.apple.com/documentation/metal/mtltensordatatype), [Running inline ML operations in a shader with Metal 4](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4), and [WWDC26 Metal tensors session](https://developer.apple.com/videos/play/wwdc2026/330/).
+The installed Xcode 27.0 SDK (`MacOSX27.0.sdk`) confirms the current API surface. `MTLTensorDataTypeInt8`/`UInt8` are available with the macOS 26 tensor API; `Int4`/`UInt4` arrive in macOS 26.4; macOS 27 adds `Int2`/`UInt2`, FP4 E2M1, FP8 E4M3/E5M2, and the UE8M0 block-scale type. The installed `MPPTensorOpsMatMul2d.h` explicitly lists native `int8_t`/`uint8_t` and `int4b_format`/`uint4b_format` operand combinations with half or BF16 activations; it also lists integer accumulations and FP32 destinations for supported combinations. The `get_left_input_cooperative_tensor` and `get_right_input_cooperative_tensor` methods can produce operation-compatible cooperative input layouts from values already held in cooperative tensors, avoiding an intermediate threadgroup-memory round trip. Cooperative element ownership is chosen by the operation, so every participating thread must execute the operation and the existing cooperative value must match the required layout. Apple's MPP guide describes cooperative tensors as a fusion tool and notes that threadgroup tensors remain an option when custom thread ownership is needed. The current scales plane accepts only FP8 UE8M0 with block factors `[32, 1]`; it cannot encode arbitrary GGUF FP16 scales/minima exactly. Native 4-bit and FP8 tensor rows also have stricter row, stride, and 128-byte buffer-alignment rules in the installed feature tables. Our cooperative-input prototype used the compiler-accepted single-SIMD-group mode and a 32x32 output tile. Sources: [Metal Performance Primitives programming guide](https://developer.apple.com/download/files/Metal-Performance-Primitives-Programming-Guide.pdf), [MTLTensorDataType API](https://developer.apple.com/documentation/metal/mtltensordatatype), [Metal feature-set tables](https://developer.apple.com/metal/Metal-Feature-Set-Tables.pdf), [Running inline ML operations in a shader with Metal 4](https://developer.apple.com/documentation/metal/running-inline-ml-operations-in-a-shader-with-metal-4), and [WWDC26 Metal tensors session](https://developer.apple.com/videos/play/wwdc2026/330/).
 
 Those native types are not a lossless, zero-copy view of Ferrum's common GGUF blocks. Q4_0 stores an arbitrary FP16 scale per 32 values and packs the low 16 logical values separately from the high 16; its nibble order must be rearranged for a native int4 operand. Q8_0 stores an arbitrary FP16 scale per 32 signed bytes. Q4_K stores a superblock FP16 scale/minimum plus per-32-value 6-bit scale/minimum fields and packed nibbles. The E8M0 plane cannot represent those scales exactly, and Q4_K also has a non-native affine offset layout. Re-encoding to E8M0 would change weights and was not used. Cooperative input tensors can preserve custom GGUF math, but still require custom unpacking and conversion.
 
@@ -175,6 +241,16 @@ Status: retained for one-token steps. The GPU route kernel preserves the CPU rou
 
 The current-build A/B used three pairs for each of five LFM2.5-8B-A1B Q4_K_M workloads with all Q4_K/Q6_K GEMV settings held constant. Candidate/control decode medians by case were short 1.078x, 128 tokens 1.066x, 512 tokens 1.078x, 1,024 tokens 1.083x, and sustained decode 1.078x. The paired median across all 15 samples was 1.078x for decode and 1.016x for full generation. Prefill was unchanged at a 1.002x overall median; the 128-, 512-, and 1,024-token cases were 1.004x, 1.001x, and 1.002x respectively.
 
+Absolute rates and first-token latency below are condition medians; bracketed ratios are medians of matched pairs. Rate cells are CPU-route control -> GPU-route candidate / llama.cpp tok/s, followed by `[control/llama -> candidate/llama; candidate/control]`.
+
+| Workload | Prefill tok/s C -> GPU / llama | Cached decode tok/s C -> GPU / llama | Complete generation tok/s C -> GPU / llama | First-token ms C -> GPU / llama | IDs C=GPU; GPU=L |
+|---|---:|---:|---:|---:|---:|
+| Short | 22.45 -> 22.37 / 211.95 `[0.103 -> 0.106; 0.994]` | 19.49 -> 21.03 / 93.74 `[0.207 -> 0.224; 1.078]` | 12.90 -> 13.58 / 74.75 `[0.173 -> 0.182; 1.051]` | 490.3 -> 492.1 / 52.1 | 3/3; 3/3 |
+| 128-token prompt | 27.84 -> 27.96 / 1,385.62 `[0.020 -> 0.020; 1.004]` | 19.28 -> 20.30 / 93.93 `[0.207 -> 0.222; 1.066]` | 3.11 -> 3.17 / 63.61 `[0.049 -> 0.050; 1.016]` | 4,597.8 -> 4,579.1 / 92.6 | 3/3; 0/3 |
+| 512-token prompt | 28.02 -> 28.04 / 1,972.85 `[0.014 -> 0.014; 1.001]` | 19.42 -> 20.91 / 93.53 `[0.207 -> 0.223; 1.078]` | 0.89 -> 0.89 / 38.93 `[0.023 -> 0.023; 1.005]` | 18,271.5 -> 18,260.2 / 259.8 | 3/3; 0/3 |
+| 1,024-token prompt | 27.93 -> 27.98 / 1,971.43 `[0.015 -> 0.014; 1.002]` | 18.80 -> 20.61 / 88.57 `[0.216 -> 0.225; 1.083]` | 0.45 -> 0.45 / 24.06 `[0.020 -> 0.019; 1.004]` | 36,667.8 -> 36,599.2 / 519.7 | 3/3; 3/3 |
+| Sustained decode | 21.28 -> 21.31 / 214.82 `[0.100 -> 0.100; 1.012]` | 19.35 -> 20.91 / 91.11 `[0.215 -> 0.230; 1.078]` | 17.92 -> 19.29 / 85.78 `[0.208 -> 0.226; 1.077]` | 517.1 -> 516.5 / 51.4 | 3/3; 3/3 |
+
 All 15 Ferrum sequences matched the CPU-routing path exactly. Both paths matched llama.cpp in 9/15 cases. First decode command buffers fell from 23 to 1 in every case; dispatches rose from 407 to 429 on the short/128-token cases and 419 to 441 on the longer-prefill cases because the GPU route shader adds one dispatch per sparse layer while eliminating the CPU synchronization boundary. The remaining LFM2.5 gap is substantial: Ferrum/reference median decode is 0.225x and medium/long prefill remains about 0.020x, so this improvement does not clear the campaign gate.
 
 The paired files are `lfm2.5-8b-a1b-gpu-route-guard-baseline.jsonl` and `lfm2.5-8b-a1b-gpu-route-guard-candidate.jsonl`, with their runner logs in `docs/measurements/phase7a/`. An earlier run was interrupted during reference warmup and recorded no rows; its log is retained as `lfm2.5-8b-a1b-gpu-route-guard-interrupted-run.log` and is excluded from these results.
@@ -186,6 +262,16 @@ Status: rejected; the experimental kernel and dispatch control were removed afte
 The candidate passed its M=35, N=64, K=512 reference check with Metal API Validation and GPU Shader Validation enabled. A 1024-token candidate profile confirmed it ran for Qwen3 Q8_0 `q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, and `down_proj`; token-by-token decode continued to use `q8_0_gemv_8rows`.
 
 The release A/B used the pinned Qwen3-0.6B Q8_0 artifact, three interleaved control/candidate pairs for each of the short, 128-, 512-, and 1,024-token prompts plus sustained decode. Candidate/control prefill-throughput medians by prompt length were 1.304x (short, 21 tokens), 1.067x (128), 0.836x (512), and 0.770x (1,024). The 512- and 1,024-token regressions appeared in all three pairs. Median cached decode was 0.999x and median full-generation throughput was 1.012x across the 15 samples. Ferrum's complete generated IDs matched control in 12/15 pairs; the only differences were in the 129-token sustained-decode workload. These results do not justify the consistent medium/long prefill loss, so the path remains removed. The existing direct M=1 GEMV and BF16-staged K=128 TensorOps kernels remain selected.
+
+The internal candidate/control matrix has no llama.cpp rows. Its absolute condition-median rates and first-token latency are shown below; the adjacent archived-runs table later in this journal has the same raw-JSONL values. Rates are tok/s and latency is milliseconds.
+
+| Workload | Prefill tok/s control -> int8 | Cached decode tok/s control -> int8 | Complete generation tok/s control -> int8 | First-token ms control -> int8 |
+|---|---:|---:|---:|---:|
+| Short | 400.06 -> 517.93 | 99.07 -> 98.12 | 77.86 -> 82.15 | 52.80 -> 40.85 |
+| 128-token prompt | 1,811.37 -> 1,950.16 | 98.05 -> 101.10 | 71.69 -> 74.74 | 71.00 -> 65.94 |
+| 512-token prompt | 2,615.74 -> 2,140.01 | 90.96 -> 90.59 | 44.06 -> 38.89 | 196.04 -> 239.59 |
+| 1,024-token prompt | 2,715.79 -> 2,076.97 | 81.11 -> 80.48 | 28.59 -> 23.91 | 377.39 -> 493.35 |
+| Sustained decode | 378.73 -> 457.88 | 95.67 -> 95.40 | 90.34 -> 90.99 | 55.76 -> 46.20 |
 
 Raw A/B, candidate profile, validation output, and runner logs are `qwen3-0.6b-q8_0-native-i8-ab.jsonl`, `qwen3-0.6b-q8_0-native-i8-profile.jsonl`, `qwen3-0.6b-q8_0-native-i8-correctness.log`, and their `*-run.log` files in `docs/measurements/phase7a/`.
 
@@ -206,6 +292,16 @@ At the median, prefill GPU time fell from 18.19s to 4.20s for the 512-token prom
 The correctness tests exercised uneven expert counts, assignment-order restoration, row and output tails, and Q4_K/Q5_K/Q6_K values at M=197, N=65, K=512. Both tests passed with Metal API Validation and GPU Shader Validation enabled; output is `lfm2.5-8b-a1b-expert-tensorops-validation.log`. The full A/B and request matrix are `lfm2.5-8b-a1b-expert-tensorops-ab.jsonl` and `lfm2.5-8b-a1b-expert-tensorops-ab-workloads.jsonl`; per-operation control and candidate captures are under `docs/measurements/phase7a/profiles/` as `lfm2.5-8b-a1b-isolated-profile.jsonl` and `lfm2.5-8b-a1b-expert-tensorops-profile.jsonl`.
 
 At the initial 24-route threshold this was a large LFM prefill improvement, but the short and 128-token cases did not improve. Experiment 6 measures lower route thresholds; the remaining LFM2.5/reference ratio and general small-model gate are still below target.
+
+The internal A/B's absolute rates and first-token latencies are condition medians from its saved JSONL. The ratios above are medians of matched pairs; rates below are tok/s and latency is milliseconds.
+
+| Workload | Prefill tok/s control -> grouped TensorOps | Cached decode tok/s control -> grouped TensorOps | Complete generation tok/s control -> grouped TensorOps | First-token ms control -> grouped TensorOps |
+|---|---:|---:|---:|---:|
+| Short | 22.38 -> 21.66 | 21.09 -> 20.99 | 13.56 -> 13.37 | 491.88 -> 508.06 |
+| 128-token prompt | 27.96 -> 27.86 | 20.85 -> 20.07 | 3.17 -> 3.14 | 4,579.01 -> 4,594.08 |
+| 512-token prompt | 27.95 -> 118.69 | 20.82 -> 20.68 | 0.89 -> 3.31 | 18,316.16 -> 4,314.01 |
+| 1,024-token prompt | 29.38 -> 119.36 | 20.55 -> 20.67 | 0.48 -> 1.81 | 34,858.51 -> 8,579.60 |
+| Sustained decode | 23.71 -> 23.42 | 22.35 -> 21.61 | 20.38 -> 19.96 | 464.24 -> 470.00 |
 
 ## Experiment 6: Lower grouped-expert TensorOps route threshold
 
@@ -1218,3 +1314,43 @@ The release A/B used the pinned LFM2.5-8B-A1B Q4_K_M artifact (revision `49c1483
 The candidate improved cached decode in every workload: absolute condition medians rose by 1.53–2.90 tok/s, and the paired candidate/control ratios ranged from 1.052x to 1.067x. Complete-generation throughput rose by 0.21–1.66 tok/s; control and candidate produced identical IDs in all 25 pairs. Prefill was effectively flat at the 512- and 1,024-token shapes, where grouped MPP already handles eligible routed batches. First-token latency fell by 9.9 ms on the short prompt and by 38.7 ms in sustained decode; longer-prompt deltas were smaller than the total prefill latency. Process RSS and transient prefill peak were identical between variants (RSS 5.26–5.31 GiB; transient peak 4.05–240.03 MiB depending on prompt). Against the saved current-upstream reference, candidate cached decode is 0.288x at 512 tokens and 0.306x at 1,024 tokens, so this local M=1 improvement does not clear the LFM or Phase 7 gate. The remaining LFM gap includes grouped expert MPP work and other M=1 projections; this experiment changes neither.
 
 Raw internal measurements and runner output are `lfm2.5-8b-a1b-expert-q4k16rows-ab.jsonl` and `.run.log`; the saved llama.cpp rows are in `lfm2.5-8b-a1b-expert-q4k8rows-ab.jsonl`. The workload is `lfm2.5-8b-a1b-q4_k_m-workloads.jsonl`. The kernel, selector, and request toggle are in `src/metal/shaders/ops.metal`, `src/metal/mod.rs`, `src/ops/mod.rs`, and `examples/phase55_bench.rs`.
+
+## Experiment 35: Dense Q4_K sixteen-row M=1 GEMV (rejected)
+
+Status: rejected and removed. This was a conventional direct-MSL M=1 GEMV candidate, not a TensorOps kernel. Four adjacent output rows shared each SIMD group's activation loads, with a 16-row threadgroup tile. M=1 remained on direct shaders; it was not sent through `matmul2d`.
+
+The first five-pair A/B enabled the candidate for dense Q4_K output widths `N >= 128` and ran the pinned Qwen2.5-0.5B Q4_K_M and LFM2.5-8B-A1B Q4_K_M artifacts against current official llama.cpp `1ab7e5ad2d4e7295c94c3b966a3e0b70fa365865`. It changed only `q4_k_gemv_16rows`; sparse expert projection settings were held fixed. Qwen's Q4_K down projections have N=896. LFM has dense Q4_K output widths including N=512, 2,048, 6,144, and 7,168; the separate sparse-expert kernel was not part of this candidate. Absolute throughput and latency are condition medians. Ratios in brackets are matched-pair medians. Each rate cell is Ferrum control -> candidate / llama.cpp tok/s, followed by `[control/llama -> candidate/llama; candidate/control]`.
+
+### Qwen2.5-0.5B Q4_K_M, broad `N >= 128` candidate
+
+| Workload | Prefill tok/s C -> 16 / llama | Cached decode tok/s C -> 16 / llama | Complete generation tok/s C -> 16 / llama | First-token ms C -> 16 / llama | IDs C=16; 16=L; C=L |
+|---|---:|---:|---:|---:|---:|
+| Short | 722.99 -> 684.01 / 1,325.96 `[0.537 -> 0.501; 0.964]` | 132.02 -> 122.44 / 198.31 `[0.624 -> 0.617; 0.990]` | 105.58 -> 104.03 / 172.48 `[0.609 -> 0.603; 0.991]` | 29.3 -> 31.1 / 16.1 | 5/5; 0/5; 0/5 |
+| 128-token prompt | 3,218.70 -> 3,232.94 / 6,160.83 `[0.495 -> 0.536; 1.036]` | 124.55 -> 123.98 / 202.25 `[0.609 -> 0.613; 1.017]` | 99.67 -> 101.69 / 169.76 `[0.591 -> 0.592; 1.008]` | 40.1 -> 39.9 / 21.0 | 5/5; 5/5; 5/5 |
+| 512-token prompt | 4,660.94 -> 4,657.46 / 8,551.79 `[0.542 -> 0.545; 0.998]` | 120.18 -> 119.91 / 192.16 `[0.623 -> 0.619; 1.008]` | 68.90 -> 68.76 / 121.65 `[0.567 -> 0.566; 0.998]` | 110.2 -> 110.2 / 60.1 | 5/5; 5/5; 5/5 |
+| 1,024-token prompt | 4,753.58 -> 4,771.07 / 8,007.22 `[0.592 -> 0.596; 1.008]` | 110.19 -> 109.96 / 200.69 `[0.548 -> 0.549; 0.999]` | 46.59 -> 46.57 / 81.47 `[0.572 -> 0.570; 1.006]` | 215.7 -> 214.9 / 128.1 | 5/5; 5/5; 5/5 |
+| Sustained decode | 678.65 -> 678.97 / 1,289.27 `[0.524 -> 0.543; 1.000]` | 120.56 -> 120.41 / 214.69 `[0.562 -> 0.561; 1.003]` | 115.44 -> 115.91 / 197.58 `[0.584 -> 0.590; 1.005]` | 31.2 -> 31.2 / 16.5 | 5/5; 0/5; 0/5 |
+
+### LFM2.5-8B-A1B Q4_K_M, broad `N >= 128` candidate
+
+| Workload | Prefill tok/s C -> 16 / llama | Cached decode tok/s C -> 16 / llama | Complete generation tok/s C -> 16 / llama | First-token ms C -> 16 / llama | IDs C=16; 16=L; C=L |
+|---|---:|---:|---:|---:|---:|
+| Short | 43.62 -> 43.84 / 235.16 `[0.186 -> 0.186; 1.005]` | 31.69 -> 32.32 / 103.22 `[0.306 -> 0.313; 1.021]` | 22.38 -> 22.68 / 82.64 `[0.271 -> 0.275; 1.013]` | 252.4 -> 251.2 / 47.0 | 5/5; 0/5; 0/5 |
+| 128-token prompt | 395.97 -> 395.29 / 1,539.16 `[0.257 -> 0.257; 1.005]` | 31.60 -> 32.16 / 102.36 `[0.309 -> 0.315; 1.021]` | 20.38 -> 20.65 / 69.69 `[0.293 -> 0.297; 1.014]` | 323.5 -> 324.1 / 83.4 | 5/5; 0/5; 0/5 |
+| 512-token prompt | 474.88 -> 483.74 / 2,151.24 `[0.221 -> 0.225; 1.014]` | 30.95 -> 31.56 / 101.52 `[0.306 -> 0.312; 1.020]` | 10.65 -> 10.84 / 42.50 `[0.250 -> 0.255; 1.014]` | 1,078.4 -> 1,058.7 / 238.2 | 5/5; 5/5; 5/5 |
+| 1,024-token prompt | 520.06 -> 513.58 / 2,169.34 `[0.240 -> 0.237; 0.987]` | 30.94 -> 31.46 / 101.59 `[0.305 -> 0.310; 1.017]` | 6.80 -> 6.74 / 26.82 `[0.254 -> 0.251; 0.991]` | 1,969.3 -> 1,994.1 / 472.3 | 5/5; 5/5; 5/5 |
+| Sustained decode | 37.84 -> 43.46 / 233.97 `[0.161 -> 0.186; 1.155]` | 31.42 -> 31.99 / 102.18 `[0.307 -> 0.313; 1.018]` | 29.35 -> 30.14 / 96.68 `[0.303 -> 0.311; 1.027]` | 291.0 -> 253.4 / 47.3 | 5/5; 0/5; 0/5 |
+
+The broad candidate improved LFM cached decode in all five workload medians by 0.52-0.65 tok/s, but Qwen was neutral or slower in four of five workload medians; its short cached decode moved from 132.02 to 122.44 tok/s and first-token latency from 29.3 to 31.1 ms. To test whether the LFM gains belonged to wider output shapes, a second five-pair A/B enabled the candidate only for dense Q4_K `N >= 1,024`. This selector was tested for that run only and was not retained. It used the same LFM2.5 artifact and llama.cpp commit. The table again gives condition-median tok/s and latency, with matched-pair ratios.
+
+| Workload | Prefill tok/s C -> 16 / llama | Cached decode tok/s C -> 16 / llama | Complete generation tok/s C -> 16 / llama | First-token ms C -> 16 / llama | IDs C=16; 16=L; C=L |
+|---|---:|---:|---:|---:|---:|
+| Short | 42.18 -> 42.18 / 225.75 `[0.187 -> 0.186; 0.998]` | 30.55 -> 31.05 / 95.37 `[0.321 -> 0.326; 1.013]` | 21.57 -> 21.74 / 77.27 `[0.279 -> 0.282; 1.010]` | 261.1 -> 261.1 / 48.9 | 5/5; 0/5; 0/5 |
+| 128-token prompt | 372.79 -> 370.77 / 1,385.71 `[0.260 -> 0.252; 0.971]` | 30.09 -> 30.42 / 90.14 `[0.317 -> 0.323; 1.015]` | 19.27 -> 18.70 / 60.90 `[0.299 -> 0.301; 0.997]` | 343.6 -> 345.5 / 92.6 | 5/5; 0/5; 0/5 |
+| 512-token prompt | 436.40 -> 460.80 / 2,050.11 `[0.212 -> 0.224; 1.056]` | 29.57 -> 29.80 / 95.35 `[0.310 -> 0.312; 1.015]` | 9.92 -> 10.36 / 40.29 `[0.245 -> 0.256; 1.045]` | 1,173.5 -> 1,111.4 / 250.0 | 5/5; 5/5; 5/5 |
+| 1,024-token prompt | 499.58 -> 486.02 / 2,009.21 `[0.249 -> 0.243; 0.973]` | 29.83 -> 28.95 / 92.33 `[0.323 -> 0.328; 0.969]` | 6.50 -> 6.30 / 24.86 `[0.262 -> 0.259; 0.969]` | 2,050.0 -> 2,107.2 / 509.9 | 5/5; 5/5; 5/5 |
+| Sustained decode | 33.54 -> 41.06 / 223.95 `[0.150 -> 0.183; 1.256]` | 30.19 -> 30.69 / 94.33 `[0.320 -> 0.325; 1.017]` | 27.84 -> 28.35 / 88.74 `[0.316 -> 0.323; 1.030]` | 328.3 -> 268.2 / 49.3 | 5/5; 0/5; 0/5 |
+
+The narrower candidate gained cached decode on four cases but fell from 29.83 to 28.95 tok/s on the 1,024-token prompt (0.969x paired median); complete generation fell from 6.50 to 6.30 tok/s and first-token latency rose from 2,050.0 to 2,107.2 ms. Control and candidate output IDs matched in all 25 LFM pairs, and sampled process memory was unchanged between variants. This was not a repeatable all-workload win, so the 16-row dense kernel, dispatch toggle, pipeline, and benchmark option were removed. Dense Q4_K M=1 stays on the established 8-row direct MSL path. The retained sparse-expert Q4_K 16-row kernel in Experiment 34 is a separate path with its own measured result. No M=1 case was routed through TensorOps.
+
+Raw rows and run logs for the broad Qwen, broad LFM, and narrowed LFM A/Bs are `qwen2.5-q4_k_m-q4k16gemv-current-ab.{jsonl,run.log}`, `lfm2.5-8b-a1b-q4k16gemv-current-ab.{jsonl,run.log}`, and `lfm2.5-8b-a1b-q4k16gemv-n1024-current-ab.{jsonl,run.log}` in `docs/measurements/phase7a/`. The correctness result for the temporary 1,025-row candidate is from the focused run with Metal API Validation and GPU Shader Validation enabled; the retained code was removed after the A/B disposition.
