@@ -157,6 +157,25 @@ fn prompt_ids(request: &Value) -> Result<Vec<u32>> {
     Ok(ids)
 }
 
+fn phase7a_cpu_preflight() -> Result<()> {
+    let guard = Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/phase7a_cpu_preflight.py");
+    let output = std::process::Command::new("python3")
+        .arg(guard)
+        .arg("--wait")
+        // stdout carries the JSON-lines benchmark protocol to the parent.
+        .output()
+        .map_err(|error| Error::Config(format!("failed to run Phase 7A CPU preflight: {error}")))?;
+    eprint!("{}", String::from_utf8_lossy(&output.stdout));
+    eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        return Err(Error::Config(format!(
+            "Phase 7A CPU preflight failed with status {}",
+            output.status
+        )));
+    }
+    Ok(())
+}
+
 fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<Value> {
     let prompt = prompt_ids(request)?;
     let max_new_tokens = request_usize(request, "max_new_tokens")?;
@@ -566,6 +585,7 @@ fn main() -> Result<()> {
             "usage: phase55_bench GGUF_FILE_OR_MLX_MODEL_DIR".into(),
         ));
     }
+    phase7a_cpu_preflight()?;
     let device = MetalDevice::new()?;
     device.set_profiling(std::env::var_os("FERRUM_MATRIX_PROFILE").is_some());
     if let Ok(value) = std::env::var("FERRUM_Q4_0_GEMV_8ROWS") {

@@ -2306,13 +2306,13 @@ mod qk_tests {
         assert!(!d.use_q4_k_expert_project_16rows_pairs(133, 512));
         d.set_q4_k_expert_project_16rows_pairs(true).unwrap();
         assert!(d.use_q4_k_expert_project_16rows_pairs(133, 512));
-        for columns in [256, 512, 1024, 4096] {
+        for columns in [256, 512, 1024, 1792, 2048, 4096] {
             assert!(d.use_q4_k_expert_project_16rows_pairs(133, columns));
         }
         assert!(!d.use_q4_k_expert_project_16rows(127, 512));
         assert!(!d.use_q4_k_expert_project_16rows(133, 255));
 
-        for columns in [256, 512, 1024, 4096] {
+        for columns in [256, 512, 1024, 1792, 2048, 4096] {
             let (experts, rows_per_expert) = (3, 133);
             let expert_ids = [2usize, 1, 2, 0];
             let packed = packed(
@@ -2396,7 +2396,7 @@ mod qk_tests {
             for (index, (actual, expected)) in output.to_f32().iter().zip(&expected).enumerate() {
                 assert!(
                     (actual - expected).abs() <= 0.06,
-                    "Q4_K expert eight-row index {index}: actual={actual}, expected={expected}"
+                    "Q4_K expert row-pair index {index}: actual={actual}, expected={expected}"
                 );
             }
         }

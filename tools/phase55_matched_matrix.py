@@ -77,6 +77,12 @@ def process_rss_bytes(pid: int) -> int | None:
         return None
 
 
+def cpu_preflight() -> None:
+    """Wait for unrelated host CPU load to clear before one inference sample."""
+    guard = Path(__file__).resolve().parents[1] / "scripts" / "phase7a_cpu_preflight.py"
+    subprocess.run([sys.executable, str(guard), "--wait"], check=True)
+
+
 class JsonLineProcess:
     def __init__(self, command: list[str], env: dict[str, str] | None = None):
         self.launched_at = time.perf_counter()
@@ -302,6 +308,10 @@ def main() -> None:
     if args.ferrum_paired_option and not args.ferrum_exe:
         raise SystemExit("--ferrum-paired-option requires --ferrum-exe and --ferrum-model")
 
+    # Refuse to load model runtimes while unrelated CPU work is active. The
+    # per-request checks below also protect every timed sample in a matrix.
+    cpu_preflight()
+
     paired_option: tuple[str, Any, Any] | None = None
     if args.ferrum_paired_option:
         field, separator, values = args.ferrum_paired_option.partition("=")
@@ -353,6 +363,7 @@ def main() -> None:
             warm_request.update(case_request_options(row))
             for engine_name in pair_order(names, case_index, 0):
                 engine = engines[engine_name]
+                cpu_preflight()
                 if engine_name == "native-mlx-lm":
                     engine.run(warm_request)
                 else:
@@ -376,6 +387,7 @@ def main() -> None:
                     request.update(case_request_options(row))
                     for engine_name in order:
                         engine = engines[engine_name]
+                        cpu_preflight()
                         result = (
                             engine.run(request)
                             if engine_name == "native-mlx-lm"

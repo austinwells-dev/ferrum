@@ -1,0 +1,5 @@
+LFM2.5 Q4_K expert K-split2; retained 16-row pair control; 10 interleaved A/B pairs per workload. Warmups are excluded.
+
+INVALIDATED: JSONDecodeError: Expecting value: line 1 column 1 (char 0)
+
+INVALIDATED: zero timing rows; the startup preflight success message was emitted on the JSON-lines stdout channel and rejected by the driver. Fixed by routing guard diagnostics to stderr.
