@@ -1056,3 +1056,23 @@ The Qwen2.5-0.5B Q5_K_M release A/B used the pinned artifact (SHA-256 `041474553
 The 16-row candidate matched the eight-row control's output IDs in all 25 pairs. Cached decode moved only 0.998-1.004x by workload, with the actual rates changing by -0.3 to +0.6 tok/s; the candidate beat control in 15 of 25 individual comparisons. Complete-generation rates likewise changed by less than 0.6 tok/s per workload, and first-token latency did not move consistently. These are within-run variation rather than a stable gain, so the sixteen-row kernel and its selector were removed. M=1 remains on direct MSL, with no TensorOps route. The Phase 7 decode gate remains unmet.
 
 Raw measurements and the run log are `qwen2.5-q5_k_m-q5_k-16rows-ab.jsonl` and `.run.log`; the source workload is `qwen2.5-q5_k_m-q5_k-16rows-workloads.jsonl`. The profile-first diagnostic and its workload are `profiles/qwen2.5-q5_k_m-current-decode-profile.jsonl`, `.run.log`, and `profiles/qwen2.5-q5_k_m-current-decode-profile-workload.jsonl` in `docs/measurements/phase7a/`.
+
+## Experiment 29: Eight-row-per-SIMD Q5_1 M=1 GEMV (rejected)
+
+Status: rejected and removed from the shipping source. The experiment extended the retained four-row-per-SIMD Q5_1 kernel to eight output rows per SIMD group, reusing each loaded activation fragment across twice as many rows. It remains conventional MSL for M=1; `matmul2d` TensorOps and the standalone Apple Neural Engine/Core ML are not used for this shape.
+
+The short-prompt Qwen2.5 Q5_K_M decode profile attributed 1.073 ms per step to 24 `gate_proj.q5_1_gemv_n4` calls and 1.009 ms to 24 `up_proj.q5_1_gemv_n4` calls. The A/B used the pinned Qwen2.5-0.5B Q5_K_M artifact (SHA-256 `041474553fcabfc2a2d67903f9d2c2e50bd92528e670da4f33b5d0ce6e59fd55`), five interleaved control/candidate/llama.cpp pairs per workload, shared prompt IDs and generation lengths, greedy decoding, BF16 KV, and llama.cpp `84e76d8a23162eca70490da131945ebec1f09bf4`. Both Ferrum variants held the retained `q5_1_gemv_n4` and `q5_k_gemv_8rows` selectors enabled; only `q5_1_gemv_n8` changed from false (control) to true (candidate). The candidate passed the scalar-reference/tail check at N=131, K=512 and N=4,864, K=896 with Metal API and GPU Shader Validation enabled; the log is `q5_1-n8-gemv-validation.log`.
+
+Throughput below is the condition median; ratios are medians of matched per-pair rates. Absolute tok/s for Ferrum control, candidate, and llama.cpp appear before `[control/llama -> candidate/llama; candidate/control]`. First-token latency is milliseconds.
+
+| Workload | Prefill tok/s C (4-row)->K (8-row) / llama `[C/L->K/L; K/C]` | Cached decode tok/s C->K / llama `[C/L->K/L; K/C]` | Complete generation tok/s C->K / llama `[C/L->K/L; K/C]` | First-token ms C->K / llama | IDs C=K; K=L; C=L |
+|---|---:|---:|---:|---:|---:|
+| Short, M=21 | 705.9->715.5 / 1,418.8 `[0.498->0.501; 1.007]` | 137.5->132.6 / 222.1 `[0.613->0.590; 0.965]` | 113.4->109.9 / 189.8 `[0.596->0.582; 0.969]` | 30.05->29.66 / 15.10 | 5/5; 0/5; 0/5 |
+| 128-token prompt | 3,347.3->3,337.1 / 6,835.0 `[0.490->0.488; 0.992]` | 137.9->134.2 / 221.5 `[0.618->0.606; 0.973]` | 107.2->104.9 / 181.8 `[0.591->0.575; 0.974]` | 38.56->38.66 / 18.96 | 5/5; 5/5; 5/5 |
+| 512-token prompt | 5,021.1->5,055.5 / 9,169.6 `[0.551->0.551; 1.007]` | 129.1->123.7 / 211.9 `[0.608->0.583; 0.963]` | 73.5->72.3 / 126.2 `[0.580->0.572; 0.986]` | 102.36->101.60 / 56.06 | 5/5; 5/5; 5/5 |
+| 1,024-token prompt | 5,126.5->5,114.5 / 8,828.6 `[0.580->0.578; 0.999]` | 121.9->117.1 / 218.1 `[0.560->0.538; 0.960]` | 50.3->49.6 / 88.4 `[0.571->0.561; 0.984]` | 200.07->200.55 / 116.22 | 5/5; 5/5; 5/5 |
+| Sustained decode, prompt M=21 | 693.5->693.9 / 1,372.6 `[0.505->0.506; 0.999]` | 133.1->128.4 / 225.3 `[0.591->0.570; 0.968]` | 126.1->122.0 / 210.0 `[0.600->0.581; 0.967]` | 30.58->30.56 / 15.55 | 5/5; 0/5; 0/5 |
+
+The eight-row variant reduced cached decode by 3.7-5.4 tok/s across the five workloads; every workload's paired candidate/control ratio was below 0.974x. Complete-generation rates also fell in all five cases. Prefill stayed within measurement variation, as this kernel is selected only for M=1. Control and candidate IDs matched in all 25 pairs. Because the candidate was consistently slower, it and its selector were removed; production keeps the four-row-per-SIMD direct shader. M=1 remains outside TensorOps. The general Phase 7 performance gate remains unmet.
+
+Raw results and the run log are `qwen2.5-q5_k_m-q5_1-n8-ab.jsonl` and `.run.log`; the source matrix is `qwen2.5-q5_k_m-q5_1-n8-workloads.jsonl` in `docs/measurements/phase7a/`.
