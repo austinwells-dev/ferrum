@@ -285,6 +285,7 @@ pub struct MetalDevice {
     q4_k_gemv_8rows: Cell<bool>,
     q4_k_expert_project_8rows: Cell<bool>,
     q4_k_expert_project_16rows: Cell<bool>,
+    q4_k_expert_project_16rows_pairs: Cell<bool>,
     q6_k_expert_project_8rows: Cell<bool>,
     q5_k_gemv_8rows: Cell<bool>,
     q6_k_gemv_8rows: Cell<bool>,
@@ -345,6 +346,7 @@ impl MetalDevice {
             q4_k_gemv_8rows: Cell::new(true),
             q4_k_expert_project_8rows: Cell::new(true),
             q4_k_expert_project_16rows: Cell::new(true),
+            q4_k_expert_project_16rows_pairs: Cell::new(true),
             q6_k_expert_project_8rows: Cell::new(true),
             q5_k_gemv_8rows: Cell::new(true),
             q6_k_gemv_8rows: Cell::new(true),
@@ -660,6 +662,24 @@ impl MetalDevice {
             && rows >= 128
             && features >= 256
             && features.is_multiple_of(256)
+    }
+    /// Select the measured block-and-pair traversal for direct Q4_K expert GEMV.
+    pub fn set_q4_k_expert_project_16rows_pairs(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q4_K expert pair traversal during execution".into(),
+            ));
+        }
+        self.q4_k_expert_project_16rows_pairs.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q4_k_expert_project_16rows_pairs(
+        &self,
+        rows: usize,
+        features: usize,
+    ) -> bool {
+        self.q4_k_expert_project_16rows_pairs.get()
+            && self.use_q4_k_expert_project_16rows(rows, features)
     }
     /// Select the two-output-row-per-SIMD Q6_K kernel for sparse expert batches.
     pub fn set_q6_k_expert_project_8rows(&self, enabled: bool) -> Result<()> {
@@ -1136,6 +1156,7 @@ impl MetalDevice {
             | "expert_project_q4_k"
             | "expert_project_q4_k_8rows"
             | "expert_project_q4_k_16rows"
+            | "expert_project_q4_k_16rows_pairs"
             | "expert_project_q6_k_8rows"
             | "expert_project_q5_k"
             | "expert_project_q6_k" => (3, 1),
@@ -1638,6 +1659,7 @@ impl MetalDevice {
                 );
             } else if name == "expert_project_q4_k_8rows"
                 || name == "expert_project_q4_k_16rows"
+                || name == "expert_project_q4_k_16rows_pairs"
                 || name == "expert_project_q6_k_8rows"
             {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
@@ -1649,11 +1671,15 @@ impl MetalDevice {
                 }
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: grid[0].div_ceil(if name == "expert_project_q4_k_16rows" {
-                            16
-                        } else {
-                            8
-                        }),
+                        width: grid[0].div_ceil(
+                            if name == "expert_project_q4_k_16rows"
+                                || name == "expert_project_q4_k_16rows_pairs"
+                            {
+                                16
+                            } else {
+                                8
+                            },
+                        ),
                         height: grid[1],
                         depth: 1,
                     },

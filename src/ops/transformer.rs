@@ -2286,7 +2286,7 @@ mod qk_tests {
     }
 
     #[test]
-    fn q4_k_expert_eight_row_projection_reuses_activations_and_covers_tail() {
+    fn q4_k_expert_row_reuse_and_pair_traversal_covers_tail() {
         let d = MetalDevice::new().unwrap();
         assert!(d.use_q4_k_expert_project_8rows(133, 512));
         d.set_moe_expert_tensorops(false).unwrap();
@@ -2301,83 +2301,104 @@ mod qk_tests {
         assert!(!d.use_q4_k_expert_project_16rows(133, 512));
         d.set_q4_k_expert_project_16rows(true).unwrap();
         assert!(d.use_q4_k_expert_project_16rows(133, 512));
+        assert!(d.use_q4_k_expert_project_16rows_pairs(133, 512));
+        d.set_q4_k_expert_project_16rows_pairs(false).unwrap();
+        assert!(!d.use_q4_k_expert_project_16rows_pairs(133, 512));
+        d.set_q4_k_expert_project_16rows_pairs(true).unwrap();
+        assert!(d.use_q4_k_expert_project_16rows_pairs(133, 512));
+        for columns in [256, 512, 1024, 4096] {
+            assert!(d.use_q4_k_expert_project_16rows_pairs(133, columns));
+        }
         assert!(!d.use_q4_k_expert_project_16rows(127, 512));
         assert!(!d.use_q4_k_expert_project_16rows(133, 255));
 
-        let (experts, rows_per_expert, columns) = (3, 133, 512);
-        let expert_ids = [2usize, 1, 2, 0];
-        let packed = packed(
-            &d,
-            experts * rows_per_expert,
-            columns,
-            QuantizationFormat::Q4_K,
-        );
-        let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
-        let values = input(expert_ids.len(), columns);
-        let x = Tensor::from_f32(&d, [expert_ids.len(), columns], DType::BF16, &values).unwrap();
-        let rounded_input = x.to_f32();
-        let metadata = expert_ids
-            .iter()
-            .enumerate()
-            .flat_map(|(assignment, &expert)| {
-                [
-                    f32::from_bits(expert as u32),
-                    f32::from_bits(assignment as u32),
-                    1.0,
-                ]
-            })
-            .collect::<Vec<_>>();
-        let metadata = Tensor::from_f32(&d, [expert_ids.len(), 3], DType::F32, &metadata).unwrap();
-        d.set_q4_k_expert_project_16rows(false).unwrap();
-        d.set_q4_k_expert_project_8rows(false).unwrap();
-        let control = d
-            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
-            .unwrap()
-            .to_f32();
-        d.set_q4_k_expert_project_8rows(true).unwrap();
-        let output = d
-            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
-            .unwrap();
-        assert_eq!(
-            output.to_f32(),
-            control,
-            "optimized order must match control"
-        );
-        d.set_q4_k_expert_project_16rows(true).unwrap();
-        let output = d
-            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
-            .unwrap();
-        assert_eq!(
-            output.to_f32(),
-            control,
-            "sixteen-row reuse must match control and cover the output tail"
-        );
-        let expected = (0..expert_ids.len())
-            .flat_map(|assignment| {
-                (0..rows_per_expert).map({
-                    let rounded_input = &rounded_input;
-                    move |row| {
-                        DType::BF16.round(
-                            (0..columns)
-                                .map(|column| {
-                                    rounded_input[assignment * columns + column]
-                                        * qk_value(
-                                            expert_ids[assignment] * rows_per_expert + row,
-                                            column,
-                                            QuantizationFormat::Q4_K,
-                                        )
-                                })
-                                .sum::<f32>(),
-                        )
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        for (index, (actual, expected)) in output.to_f32().iter().zip(&expected).enumerate() {
-            assert!(
-                (actual - expected).abs() <= 0.06,
-                "Q4_K expert eight-row index {index}: actual={actual}, expected={expected}"
+        for columns in [256, 512, 1024, 4096] {
+            let (experts, rows_per_expert) = (3, 133);
+            let expert_ids = [2usize, 1, 2, 0];
+            let packed = packed(
+                &d,
+                experts * rows_per_expert,
+                columns,
+                QuantizationFormat::Q4_K,
             );
+            let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+            let values = input(expert_ids.len(), columns);
+            let x =
+                Tensor::from_f32(&d, [expert_ids.len(), columns], DType::BF16, &values).unwrap();
+            let rounded_input = x.to_f32();
+            let metadata = expert_ids
+                .iter()
+                .enumerate()
+                .flat_map(|(assignment, &expert)| {
+                    [
+                        f32::from_bits(expert as u32),
+                        f32::from_bits(assignment as u32),
+                        1.0,
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let metadata =
+                Tensor::from_f32(&d, [expert_ids.len(), 3], DType::F32, &metadata).unwrap();
+            d.set_q4_k_expert_project_16rows(false).unwrap();
+            d.set_q4_k_expert_project_8rows(false).unwrap();
+            let control = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap()
+                .to_f32();
+            d.set_q4_k_expert_project_8rows(true).unwrap();
+            let output = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            assert_eq!(
+                output.to_f32(),
+                control,
+                "optimized order must match control"
+            );
+            d.set_q4_k_expert_project_16rows(true).unwrap();
+            let output = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            assert_eq!(
+                output.to_f32(),
+                control,
+                "sixteen-row reuse must match control and cover the output tail"
+            );
+            d.set_q4_k_expert_project_16rows_pairs(true).unwrap();
+            let output = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            assert_eq!(
+                output.to_f32(),
+                control,
+                "block-and-pair traversal must match the scalar control and cover the output tail"
+            );
+            let expected = (0..expert_ids.len())
+                .flat_map(|assignment| {
+                    (0..rows_per_expert).map({
+                        let rounded_input = &rounded_input;
+                        move |row| {
+                            DType::BF16.round(
+                                (0..columns)
+                                    .map(|column| {
+                                        rounded_input[assignment * columns + column]
+                                            * qk_value(
+                                                expert_ids[assignment] * rows_per_expert + row,
+                                                column,
+                                                QuantizationFormat::Q4_K,
+                                            )
+                                    })
+                                    .sum::<f32>(),
+                            )
+                        }
+                    })
+                })
+                .collect::<Vec<_>>();
+            for (index, (actual, expected)) in output.to_f32().iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 0.06,
+                    "Q4_K expert eight-row index {index}: actual={actual}, expected={expected}"
+                );
+            }
         }
     }
 

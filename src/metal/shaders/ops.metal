@@ -741,6 +741,18 @@ inline float q4_k_pair_dot_values(device const uchar* block, float x0, float x1,
     float w1=d*float(scale1)*float(packed>>4)-dmin*float(min1);
     return w0*x0+w1*x1;
 }
+inline float2 q4_k_pair_products(device const uchar* block, float x0, float x1,
+                                  uint chunk, uint lane) {
+    uint group0=chunk*2;
+    uchar packed=block[16+chunk*32+lane];
+    float d=float(*((device const half*)block));
+    float dmin=float(*((device const half*)(block+2)));
+    uint scale0=q4_k_scale(block+4,group0), scale1=q4_k_scale(block+4,group0+1);
+    uint min0=q4_k_minimum(block+4,group0), min1=q4_k_minimum(block+4,group0+1);
+    float w0=d*float(scale0)*float(packed&15)-dmin*float(min0);
+    float w1=d*float(scale1)*float(packed>>4)-dmin*float(min1);
+    return float2(w0*x0,w1*x1);
+}
 inline float q5_k_pair_dot(device const uchar* block, device const uchar* activations,
                             uint column, uint chunk, uint lane, uint dtype) {
     uint group0=chunk*2;
@@ -1717,6 +1729,61 @@ kernel void expert_project_q4_k_16rows(EXPERT_PROJECT_ARGS,
             if(row1<rows) sum1+=x*q4_k_weight(b,packed_row1,column,k);
             if(row2<rows) sum2+=x*q4_k_weight(b,packed_row2,column,k);
             if(row3<rows) sum3+=x*q4_k_weight(b,packed_row3,column,k);
+        }
+    }
+    sum0=simd_sum(sum0);
+    sum1=simd_sum(sum1);
+    sum2=simd_sum(sum2);
+    sum3=simd_sum(sum3);
+    if(lane==0 && assignment<p[1] && expert<experts) {
+        if(row0<rows) store(c,assignment*rows+row0,p[4],sum0);
+        if(row1<rows) store(c,assignment*rows+row1,p[4],sum1);
+        if(row2<rows) store(c,assignment*rows+row2,p[4],sum2);
+        if(row3<rows) store(c,assignment*rows+row3,p[4],sum3);
+    }
+}
+// Pairwise block traversal for sparse expert M=1 GEMV. Walk each Q4_K block
+// as four 64-value pairs and share their activations across four output rows
+// per SIMD group. Add the products separately to preserve increasing K order.
+kernel void expert_project_q4_k_16rows_pairs(EXPERT_PROJECT_ARGS,
+                                             uint tid [[thread_index_in_threadgroup]],
+                                             uint2 group [[threadgroup_position_in_grid]]) {
+    uint assignment=group.y, lane=tid%32, simd=tid/32;
+    uint row0=group.x*16+simd*4;
+    uint row1=row0+1, row2=row0+2, row3=row0+3;
+    uint k=p[2], rows=p[3], experts=p[5], blocks=k/256;
+    uint expert=as_type<uint>(load(m,assignment*3,p[6]));
+    float sum0=0.f, sum1=0.f, sum2=0.f, sum3=0.f;
+    if(assignment<p[1] && expert<experts && row0<rows) {
+        uint packed_row0=expert*rows+row0;
+        uint packed_row1=expert*rows+row1;
+        uint packed_row2=expert*rows+row2;
+        uint packed_row3=expert*rows+row3;
+        for(uint block_index=0;block_index<blocks;block_index++) {
+            device const uchar* block0=b+(packed_row0*blocks+block_index)*144;
+            device const uchar* block1=b+(packed_row1*blocks+block_index)*144;
+            device const uchar* block2=b+(packed_row2*blocks+block_index)*144;
+            device const uchar* block3=b+(packed_row3*blocks+block_index)*144;
+            uint base=block_index*256;
+            for(uint chunk=0;chunk<4;chunk++) {
+                uint column=base+chunk*64;
+                float x0=load(a,assignment*k+column+lane,p[4]);
+                float x1=load(a,assignment*k+column+lane+32,p[4]);
+                float2 products=q4_k_pair_products(block0,x0,x1,chunk,lane);
+                sum0+=products.x; sum0+=products.y;
+                if(row1<rows) {
+                    products=q4_k_pair_products(block1,x0,x1,chunk,lane);
+                    sum1+=products.x; sum1+=products.y;
+                }
+                if(row2<rows) {
+                    products=q4_k_pair_products(block2,x0,x1,chunk,lane);
+                    sum2+=products.x; sum2+=products.y;
+                }
+                if(row3<rows) {
+                    products=q4_k_pair_products(block3,x0,x1,chunk,lane);
+                    sum3+=products.x; sum3+=products.y;
+                }
+            }
         }
     }
     sum0=simd_sum(sum0);
