@@ -185,6 +185,39 @@ kernel void attention_softmax_prefix(ARGS, uint tid [[thread_index_in_threadgrou
     for(uint j=tid;j<end;j+=256) store(c,base+j,p[4],exp(attention_scaled(a,base+j,j,row,p)-mx)/sum);
     for(uint j=end+tid;j<w;j+=256) store(c,base+j,p[4],0.f);
 }
+// Full-prefill prefix softmax: cache up to four logits in per-thread registers,
+// then reuse their exponentials for the denominator and output stores.
+kernel void attention_softmax_prefix_reuse(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[8];
+    uint w=p[1], sequence=p[2], base=row*w, end=p[5]+row%sequence+1;
+    uint lane=tid%32, simd=tid/32;
+    uint j0=tid, j1=tid+256, j2=tid+512, j3=tid+768;
+    float x0=-INFINITY, x1=-INFINITY, x2=-INFINITY, x3=-INFINITY;
+    float mx=-INFINITY;
+    if(j0<end) { x0=attention_scaled(a,base+j0,j0,row,p); mx=max(mx,x0); }
+    if(j1<end) { x1=attention_scaled(a,base+j1,j1,row,p); mx=max(mx,x1); }
+    if(j2<end) { x2=attention_scaled(a,base+j2,j2,row,p); mx=max(mx,x2); }
+    if(j3<end) { x3=attention_scaled(a,base+j3,j3,row,p); mx=max(mx,x3); }
+    mx=simd_max(mx);
+    if(lane==0) partial[simd]=mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx=simd_max(lane<8?partial[lane]:-INFINITY);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float e0=0.f, e1=0.f, e2=0.f, e3=0.f, sum=0.f;
+    if(j0<end) { e0=exp(x0-mx); sum+=e0; }
+    if(j1<end) { e1=exp(x1-mx); sum+=e1; }
+    if(j2<end) { e2=exp(x2-mx); sum+=e2; }
+    if(j3<end) { e3=exp(x3-mx); sum+=e3; }
+    sum=simd_sum(sum);
+    if(lane==0) partial[simd]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum=simd_sum(lane<8?partial[lane]:0.f);
+    if(j0<end) store(c,base+j0,p[4],e0/sum);
+    if(j1<end) store(c,base+j1,p[4],e1/sum);
+    if(j2<end) store(c,base+j2,p[4],e2/sum);
+    if(j3<end) store(c,base+j3,p[4],e3/sum);
+    for(uint j=end+tid;j<w;j+=256) store(c,base+j,p[4],0.f);
+}
 // Adjacent-pair (interleaved) RoPE. The same supplied position applies to all heads.
 kernel void rope(ARGS, uint pair [[thread_position_in_grid]]) {
     uint i=pair*2; if(i>=p[0]) return;

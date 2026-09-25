@@ -268,6 +268,7 @@ pub struct MetalDevice {
     native_matmul: Cell<bool>,
     gguf_mpp_min_rows: Cell<Option<usize>>,
     attention_softmax_prefix: Cell<bool>,
+    attention_softmax_prefix_reuse: Cell<bool>,
     q8_0_mpp_tile_k64: Cell<bool>,
     q8_0_gemv_k_split: Cell<bool>,
     q5_1_mpp_tile_k64: Cell<bool>,
@@ -324,6 +325,7 @@ impl MetalDevice {
             native_matmul: Cell::new(raw.supportsFamily(MTLGPUFamily::Apple7)),
             gguf_mpp_min_rows: Cell::new(None),
             attention_softmax_prefix: Cell::new(true),
+            attention_softmax_prefix_reuse: Cell::new(true),
             q8_0_mpp_tile_k64: Cell::new(true),
             q8_0_gemv_k_split: Cell::new(true),
             q5_1_mpp_tile_k64: Cell::new(true),
@@ -400,6 +402,22 @@ impl MetalDevice {
     }
     pub(crate) fn attention_softmax_prefix(&self, rows: usize, width: usize) -> bool {
         self.attention_softmax_prefix.get() && rows >= 256 && rows == width
+    }
+    /// Enable register reuse for full-prefill prefix softmax rows up to width 1,024.
+    pub fn set_attention_softmax_prefix_reuse(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "attention softmax variant can only change on an idle device".into(),
+            ));
+        }
+        self.attention_softmax_prefix_reuse.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn attention_softmax_prefix_reuse(&self, rows: usize, width: usize) -> bool {
+        self.attention_softmax_prefix.get()
+            && self.attention_softmax_prefix_reuse.get()
+            && (256..=1024).contains(&rows)
+            && rows == width
     }
     /// Select 64-element K tiles for Q8_0 MPP prompt GEMM.
     pub fn set_q8_0_mpp_tile_k64(&self, enabled: bool) -> Result<()> {
@@ -1125,6 +1143,7 @@ impl MetalDevice {
                     | "softmax"
                     | "attention_softmax"
                     | "attention_softmax_prefix"
+                    | "attention_softmax_prefix_reuse"
                     | "attention_context_decode"
             ) {
             256
@@ -1386,6 +1405,7 @@ impl MetalDevice {
                     | "softmax"
                     | "attention_softmax"
                     | "attention_softmax_prefix"
+                    | "attention_softmax_prefix_reuse"
                     | "attention_context_decode"
             ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 256

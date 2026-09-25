@@ -158,6 +158,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let attention_softmax_prefix_reuse = match request.get("attention_softmax_prefix_reuse") {
+        None | Some(Value::Null) => {
+            device.set_attention_softmax_prefix_reuse(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_attention_softmax_prefix_reuse(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field attention_softmax_prefix_reuse must be a boolean".into(),
+            ));
+        }
+    };
     let gguf_mpp_min_rows = match request.get("gguf_mpp_min_rows") {
         None | Some(Value::Null) => device.gguf_mpp_min_rows(),
         Some(value) => {
@@ -403,6 +418,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "pair_order": pair_order,
         "warmup": warmup,
         "attention_softmax_prefix": attention_softmax_prefix,
+        "attention_softmax_prefix_reuse": attention_softmax_prefix_reuse,
         "gguf_mpp_min_rows": gguf_mpp_min_rows,
         "moe_expert_tensorops": expert_tensorops,
         "moe_expert_tensorops_tile_k64": expert_tensorops_tile_k64,

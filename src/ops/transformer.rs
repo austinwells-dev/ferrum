@@ -631,7 +631,9 @@ impl MetalDevice {
         p[2] = index(dims[1])?;
         p[5] = index(offset)?;
         p[7] = scale.to_bits();
-        let kernel = if self.attention_softmax_prefix(dims[1], dims[2]) {
+        let kernel = if self.attention_softmax_prefix_reuse(dims[1], dims[2]) {
+            "attention_softmax_prefix_reuse"
+        } else if self.attention_softmax_prefix(dims[1], dims[2]) {
             "attention_softmax_prefix"
         } else {
             "attention_softmax"
@@ -910,6 +912,7 @@ mod fusion_tests {
     fn attention_softmax_prefix_matches_full_scan_for_causal_tails() {
         let d = MetalDevice::new().unwrap();
         d.set_attention_softmax_prefix(true).unwrap();
+        d.set_attention_softmax_prefix_reuse(false).unwrap();
         for dtype in [DType::F32, DType::F16, DType::BF16] {
             for (s, offset) in [
                 (1, 0),
@@ -952,6 +955,36 @@ mod fusion_tests {
                     "{dtype:?} S={s} P={offset} mismatch={:?}",
                     mismatch.map(|i| (i, actual[i], reference[i]))
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn attention_softmax_prefix_reuse_preserves_results_through_width_1024() {
+        let d = MetalDevice::new().unwrap();
+        d.set_attention_softmax_prefix(true).unwrap();
+        assert!(!d.attention_softmax_prefix_reuse(255, 255));
+        assert!(!d.attention_softmax_prefix_reuse(256, 512));
+        assert!(!d.attention_softmax_prefix_reuse(1025, 1025));
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for sequence in [256, 512, 768, 1024] {
+                let shape = [2, sequence, sequence];
+                let values = crate::reference::deterministic(shape.iter().product());
+                let scores = Tensor::from_f32(&d, shape, dtype, &values).unwrap();
+                d.set_attention_softmax_prefix_reuse(false).unwrap();
+                let control = d
+                    .attention_softmax(&scores, 0, 64f32.sqrt().recip())
+                    .unwrap();
+                assert_eq!(control.metrics.operation, "attention_softmax_prefix");
+                d.set_attention_softmax_prefix_reuse(true).unwrap();
+                let candidate = d
+                    .attention_softmax(&scores, 0, 64f32.sqrt().recip())
+                    .unwrap();
+                assert_eq!(
+                    candidate.metrics.operation,
+                    "attention_softmax_prefix_reuse"
+                );
+                assert_eq!(candidate.tensor.to_f32(), control.tensor.to_f32());
             }
         }
     }
