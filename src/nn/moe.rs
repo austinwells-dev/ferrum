@@ -731,4 +731,27 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn prompt_gpu_router_uses_measured_shape_ranges() {
+        let device = MetalDevice::new().unwrap();
+        assert!(!device.use_moe_gpu_routing(4, 0));
+        assert!(device.use_moe_gpu_routing(4, 1));
+        assert!(device.use_moe_gpu_routing(4, 2));
+        assert!(device.use_moe_gpu_routing(4, 32));
+        for token_count in [33, 64, 128, 256, 511] {
+            assert!(!device.use_moe_gpu_routing(4, token_count));
+        }
+        assert!(device.use_moe_gpu_routing(4, 512));
+        assert!(device.use_moe_gpu_routing(4, 1024));
+        assert!(!device.use_moe_gpu_routing(17, 32));
+        device.set_moe_gpu_routing_prefill(false).unwrap();
+        assert!(device.use_moe_gpu_routing(4, 1));
+        assert!(!device.use_moe_gpu_routing(4, 32));
+        assert!(!device.use_moe_gpu_routing(4, 512));
+        device.set_moe_gpu_routing_prefill(true).unwrap();
+        device.set_moe_gpu_routing(false).unwrap();
+        assert!(!device.use_moe_gpu_routing(4, 1));
+        assert!(!device.use_moe_gpu_routing(4, 32));
+    }
 }

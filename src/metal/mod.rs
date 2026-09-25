@@ -287,6 +287,7 @@ pub struct MetalDevice {
     q5_k_gemv_8rows: Cell<bool>,
     q6_k_gemv_8rows: Cell<bool>,
     moe_gpu_routing: Cell<bool>,
+    moe_gpu_routing_prefill: Cell<bool>,
     moe_expert_tensorops: Cell<bool>,
     moe_expert_tensorops_tile_k64: Cell<bool>,
     moe_expert_tensorops_min_routes_per_expert: Cell<usize>,
@@ -344,6 +345,7 @@ impl MetalDevice {
             q5_k_gemv_8rows: Cell::new(true),
             q6_k_gemv_8rows: Cell::new(true),
             moe_gpu_routing: Cell::new(true),
+            moe_gpu_routing_prefill: Cell::new(true),
             moe_expert_tensorops: Cell::new(true),
             moe_expert_tensorops_tile_k64: Cell::new(true),
             moe_expert_tensorops_min_routes_per_expert: Cell::new(8),
@@ -657,8 +659,21 @@ impl MetalDevice {
         self.moe_gpu_routing.set(enabled);
         Ok(())
     }
+    /// Enable or disable GPU top-k routing on measured prompt shapes.
+    pub fn set_moe_gpu_routing_prefill(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change prompt GPU routing during execution".into(),
+            ));
+        }
+        self.moe_gpu_routing_prefill.set(enabled);
+        Ok(())
+    }
     pub(crate) fn use_moe_gpu_routing(&self, top_k: usize, token_count: usize) -> bool {
-        self.moe_gpu_routing.get() && top_k <= 16 && token_count == 1
+        let measured_prefill_shape = token_count > 1 && (token_count <= 32 || token_count >= 512);
+        self.moe_gpu_routing.get()
+            && top_k <= 16
+            && (token_count == 1 || (self.moe_gpu_routing_prefill.get() && measured_prefill_shape))
     }
     /// Enable grouped TensorOps for sufficiently large quantized expert batches.
     pub fn set_moe_expert_tensorops(&self, enabled: bool) -> Result<()> {

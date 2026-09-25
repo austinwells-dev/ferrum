@@ -8,7 +8,7 @@ mod phase5_common;
 use ferrum::{
     Error, MetalDevice, Result, generation,
     loader::gguf::{GgufFile, MetadataValue},
-    model::{Transformer, lfm2_moe, qwen_gguf},
+    model::{Transformer, granite_moe, lfm2_moe, qwen_gguf},
 };
 use serde_json::{Value, json};
 use std::{
@@ -29,6 +29,24 @@ struct BenchModel {
 
 fn load_model(device: &MetalDevice, path: &Path) -> Result<BenchModel> {
     if path.is_dir() {
+        let config: Value = serde_json::from_slice(
+            &std::fs::read(path.join("config.json"))
+                .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?,
+        )
+        .map_err(|e| Error::Config(format!("{} config.json: {e}", path.display())))?;
+        if config["model_type"] == "granitemoe" {
+            let loaded = granite_moe::load(device, path)?;
+            return Ok(BenchModel {
+                model: loaded.model,
+                format: "BF16 safetensors",
+                repository: "ibm-granite/granite-3.1-1b-a400m-instruct",
+                revision: "0da7a48b0276d500ce5922fd2b33944091fc6c09",
+                source_tensor_bytes: loaded.source_tensor_bytes,
+                quantized_tensor_bytes: 0,
+                tensor_count: loaded.tensor_count,
+                parameter_count: loaded.parameter_count,
+            });
+        }
         let loaded = phase5_common::load(device, path)?;
         return Ok(BenchModel {
             model: loaded.model,
@@ -96,6 +114,9 @@ fn load_model(device: &MetalDevice, path: &Path) -> Result<BenchModel> {
                 parameter_count: loaded.parameter_count,
             })
         }
+        "granitemoe" => Err(Error::Config(
+            "Granite MoE GGUF is not supported by the Phase 5.5 runner; use its official BF16 safetensors directory for internal candidate/control measurements".into(),
+        )),
         other => Err(Error::Config(format!(
             "benchmark GGUF architecture {other:?} is unsupported"
         ))),
@@ -348,6 +369,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let moe_gpu_routing_prefill = match request.get("moe_gpu_routing_prefill") {
+        None | Some(Value::Null) => {
+            device.set_moe_gpu_routing_prefill(false)?;
+            false
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_moe_gpu_routing_prefill(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field moe_gpu_routing_prefill must be a boolean".into(),
+            ));
+        }
+    };
     let expert_tensorops = match request.get("moe_expert_tensorops") {
         None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
         Some(Value::Bool(enabled)) => {
@@ -434,6 +470,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "q5_0_gemv_n4": q5_0_gemv_n4,
         "q5_1_gemv_n4": q5_1_gemv_n4,
         "q5_k_gemv_8rows": q5_k_gemv_8rows,
+        "moe_gpu_routing_prefill": moe_gpu_routing_prefill,
         "model_format": model.format,
         "model_repository": model.repository,
         "model_revision": model.revision,
