@@ -284,6 +284,7 @@ pub struct MetalDevice {
     q4_0_gemv_8rows: Cell<bool>,
     q4_k_gemv_8rows: Cell<bool>,
     q4_k_expert_project_8rows: Cell<bool>,
+    q4_k_expert_project_16rows: Cell<bool>,
     q6_k_expert_project_8rows: Cell<bool>,
     q5_k_gemv_8rows: Cell<bool>,
     q6_k_gemv_8rows: Cell<bool>,
@@ -343,6 +344,7 @@ impl MetalDevice {
             q4_0_gemv_8rows: Cell::new(true),
             q4_k_gemv_8rows: Cell::new(true),
             q4_k_expert_project_8rows: Cell::new(true),
+            q4_k_expert_project_16rows: Cell::new(true),
             q6_k_expert_project_8rows: Cell::new(true),
             q5_k_gemv_8rows: Cell::new(true),
             q6_k_gemv_8rows: Cell::new(true),
@@ -639,6 +641,22 @@ impl MetalDevice {
     }
     pub(crate) fn use_q4_k_expert_project_8rows(&self, rows: usize, features: usize) -> bool {
         self.q4_k_expert_project_8rows.get()
+            && rows >= 128
+            && features >= 256
+            && features.is_multiple_of(256)
+    }
+    /// Select the four-output-row-per-SIMD Q4_K expert kernel.
+    pub fn set_q4_k_expert_project_16rows(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q4_K expert projection during execution".into(),
+            ));
+        }
+        self.q4_k_expert_project_16rows.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q4_k_expert_project_16rows(&self, rows: usize, features: usize) -> bool {
+        self.q4_k_expert_project_16rows.get()
             && rows >= 128
             && features >= 256
             && features.is_multiple_of(256)
@@ -1117,6 +1135,7 @@ impl MetalDevice {
             "expert_project"
             | "expert_project_q4_k"
             | "expert_project_q4_k_8rows"
+            | "expert_project_q4_k_16rows"
             | "expert_project_q6_k_8rows"
             | "expert_project_q5_k"
             | "expert_project_q6_k" => (3, 1),
@@ -1617,7 +1636,10 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if name == "expert_project_q4_k_8rows" || name == "expert_project_q6_k_8rows" {
+            } else if name == "expert_project_q4_k_8rows"
+                || name == "expert_project_q4_k_16rows"
+                || name == "expert_project_q6_k_8rows"
+            {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
                     return Err(Error::Dispatch(
@@ -1627,7 +1649,11 @@ impl MetalDevice {
                 }
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
-                        width: grid[0].div_ceil(8),
+                        width: grid[0].div_ceil(if name == "expert_project_q4_k_16rows" {
+                            16
+                        } else {
+                            8
+                        }),
                         height: grid[1],
                         depth: 1,
                     },

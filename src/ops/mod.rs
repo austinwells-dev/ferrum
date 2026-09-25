@@ -257,6 +257,9 @@ impl MetalDevice {
             );
         }
         let dispatch_name = match ggml_type {
+            12 if self.use_q4_k_expert_project_16rows(rows, features) => {
+                "expert_project_q4_k_16rows"
+            }
             12 if self.use_q4_k_expert_project_8rows(rows, features) => "expert_project_q4_k_8rows",
             14 if self.use_q6_k_expert_project_8rows(rows, features) => "expert_project_q6_k_8rows",
             _ => name,

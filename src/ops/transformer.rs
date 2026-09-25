@@ -2296,6 +2296,13 @@ mod qk_tests {
         assert!(!d.use_q4_k_expert_project_8rows(133, 512));
         d.set_q4_k_expert_project_8rows(true).unwrap();
         assert!(d.use_q4_k_expert_project_8rows(133, 512));
+        assert!(d.use_q4_k_expert_project_16rows(133, 512));
+        d.set_q4_k_expert_project_16rows(false).unwrap();
+        assert!(!d.use_q4_k_expert_project_16rows(133, 512));
+        d.set_q4_k_expert_project_16rows(true).unwrap();
+        assert!(d.use_q4_k_expert_project_16rows(133, 512));
+        assert!(!d.use_q4_k_expert_project_16rows(127, 512));
+        assert!(!d.use_q4_k_expert_project_16rows(133, 255));
 
         let (experts, rows_per_expert, columns) = (3, 133, 512);
         let expert_ids = [2usize, 1, 2, 0];
@@ -2321,6 +2328,7 @@ mod qk_tests {
             })
             .collect::<Vec<_>>();
         let metadata = Tensor::from_f32(&d, [expert_ids.len(), 3], DType::F32, &metadata).unwrap();
+        d.set_q4_k_expert_project_16rows(false).unwrap();
         d.set_q4_k_expert_project_8rows(false).unwrap();
         let control = d
             .expert_project_quantized(&x, &metadata, &weight, columns, experts)
@@ -2334,6 +2342,15 @@ mod qk_tests {
             output.to_f32(),
             control,
             "optimized order must match control"
+        );
+        d.set_q4_k_expert_project_16rows(true).unwrap();
+        let output = d
+            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+            .unwrap();
+        assert_eq!(
+            output.to_f32(),
+            control,
+            "sixteen-row reuse must match control and cover the output tail"
         );
         let expected = (0..expert_ids.len())
             .flat_map(|assignment| {

@@ -1693,6 +1693,43 @@ kernel void expert_project_q4_k_8rows(EXPERT_PROJECT_ARGS,
         if(row1<rows) store(c,assignment*rows+row1,p[4],sum1);
     }
 }
+// Direct sparse-expert fallback: each SIMD group computes four
+// adjacent Q4_K output rows and shares each activation load across them.
+// Four SIMD groups cover sixteen rows per threadgroup; the host selects this
+// variant only for the measured format and shape family.
+kernel void expert_project_q4_k_16rows(EXPERT_PROJECT_ARGS,
+                                       uint tid [[thread_index_in_threadgroup]],
+                                       uint2 group [[threadgroup_position_in_grid]]) {
+    uint assignment=group.y, lane=tid%32, simd=tid/32;
+    uint row0=group.x*16+simd*4;
+    uint row1=row0+1, row2=row0+2, row3=row0+3;
+    uint k=p[2], rows=p[3], experts=p[5];
+    uint expert=as_type<uint>(load(m,assignment*3,p[6]));
+    float sum0=0.f, sum1=0.f, sum2=0.f, sum3=0.f;
+    if(assignment<p[1] && expert<experts && row0<rows) {
+        uint packed_row0=expert*rows+row0;
+        uint packed_row1=expert*rows+row1;
+        uint packed_row2=expert*rows+row2;
+        uint packed_row3=expert*rows+row3;
+        for(uint column=lane;column<k;column+=32) {
+            float x=load(a,assignment*k+column,p[4]);
+            sum0+=x*q4_k_weight(b,packed_row0,column,k);
+            if(row1<rows) sum1+=x*q4_k_weight(b,packed_row1,column,k);
+            if(row2<rows) sum2+=x*q4_k_weight(b,packed_row2,column,k);
+            if(row3<rows) sum3+=x*q4_k_weight(b,packed_row3,column,k);
+        }
+    }
+    sum0=simd_sum(sum0);
+    sum1=simd_sum(sum1);
+    sum2=simd_sum(sum2);
+    sum3=simd_sum(sum3);
+    if(lane==0 && assignment<p[1] && expert<experts) {
+        if(row0<rows) store(c,assignment*rows+row0,p[4],sum0);
+        if(row1<rows) store(c,assignment*rows+row1,p[4],sum1);
+        if(row2<rows) store(c,assignment*rows+row2,p[4],sum2);
+        if(row3<rows) store(c,assignment*rows+row3,p[4],sum3);
+    }
+}
 // Direct sparse expert fallback: reuse each activation fragment across two
 // adjacent Q6_K output rows while preserving the scalar kernel's K order.
 kernel void expert_project_q6_k_8rows(EXPERT_PROJECT_ARGS,
