@@ -280,6 +280,7 @@ pub struct MetalDevice {
     q5_1_gemv_n4: Cell<bool>,
     q4_0_gemv_8rows: Cell<bool>,
     q4_k_gemv_8rows: Cell<bool>,
+    q4_k_expert_project_8rows: Cell<bool>,
     q5_k_gemv_8rows: Cell<bool>,
     q6_k_gemv_8rows: Cell<bool>,
     moe_gpu_routing: Cell<bool>,
@@ -333,6 +334,7 @@ impl MetalDevice {
             q5_1_gemv_n4: Cell::new(true),
             q4_0_gemv_8rows: Cell::new(true),
             q4_k_gemv_8rows: Cell::new(true),
+            q4_k_expert_project_8rows: Cell::new(true),
             q5_k_gemv_8rows: Cell::new(true),
             q6_k_gemv_8rows: Cell::new(true),
             moe_gpu_routing: Cell::new(true),
@@ -551,6 +553,22 @@ impl MetalDevice {
     }
     pub(crate) fn use_q4_k_gemv_8rows(&self, output_rows: usize) -> bool {
         self.q4_k_gemv_8rows.get() && output_rows >= 128
+    }
+    /// Select the two-output-row-per-SIMD Q4_K kernel for sparse expert batches.
+    pub fn set_q4_k_expert_project_8rows(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q4_K expert projection during execution".into(),
+            ));
+        }
+        self.q4_k_expert_project_8rows.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q4_k_expert_project_8rows(&self, rows: usize, features: usize) -> bool {
+        self.q4_k_expert_project_8rows.get()
+            && rows >= 128
+            && features >= 256
+            && features.is_multiple_of(256)
     }
     /// Select the two-output-row-per-SIMD Q5_K M=1 GEMV path.
     pub fn set_q5_k_gemv_8rows(&self, enabled: bool) -> Result<()> {
@@ -995,6 +1013,7 @@ impl MetalDevice {
             "expert_assign_compact" => (2, 3),
             "expert_project"
             | "expert_project_q4_k"
+            | "expert_project_q4_k_8rows"
             | "expert_project_q5_k"
             | "expert_project_q6_k" => (3, 1),
             "expert_project_q4_k_mpp"
@@ -1478,6 +1497,25 @@ impl MetalDevice {
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
                     MTLSize {
                         width: grid[0].div_ceil(4),
+                        height: grid[1],
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if name == "expert_project_q4_k_8rows" {
+                if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
+                {
+                    return Err(Error::Dispatch(
+                        "Q4_K expert projection requires 32-wide SIMD and 128-thread groups".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0].div_ceil(8),
                         height: grid[1],
                         depth: 1,
                     },

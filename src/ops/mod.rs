@@ -256,6 +256,12 @@ impl MetalDevice {
                 input, metadata, weight, experts, features, rows, ggml_type, mpp_name,
             );
         }
+        let dispatch_name = if ggml_type == 12 && self.use_q4_k_expert_project_8rows(rows, features)
+        {
+            "expert_project_q4_k_8rows"
+        } else {
+            name
+        };
         let mut p = [0; 9];
         p[0] = index(shape.numel())?;
         p[1] = index(x[0])?;
@@ -275,7 +281,7 @@ impl MetalDevice {
             .map(|start| start.elapsed())
             .unwrap_or_default();
         let timing = self.dispatch(
-            name,
+            dispatch_name,
             &[
                 input.binding(),
                 weight.matrix().binding(),
@@ -288,7 +294,7 @@ impl MetalDevice {
         )?;
         if let Some(start) = profile_start {
             self.record_profile(
-                name,
+                dispatch_name,
                 start
                     .elapsed()
                     .saturating_sub(self.counters().wait - wait_before),

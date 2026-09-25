@@ -1629,6 +1629,37 @@ void expert_project_quantized_impl(device const uchar* input, device const uchar
 kernel void expert_project_q4_k(EXPERT_PROJECT_ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
     expert_project_quantized_impl(a,b,m,c,p,tid,group);
 }
+
+// Direct sparse expert fallback: each SIMD group computes two adjacent Q4_K
+// output rows and reuses the assignment's activation fragment across them.
+// Four SIMD groups cover eight rows per threadgroup, matching the measured
+// wide Q4_K GEMV schedule without routing one-row work through TensorOps.
+kernel void expert_project_q4_k_8rows(EXPERT_PROJECT_ARGS,
+                                      uint tid [[thread_index_in_threadgroup]],
+                                      uint2 group [[threadgroup_position_in_grid]]) {
+    uint assignment=group.y, lane=tid%32, simd=tid/32;
+    uint row0=group.x*8+simd*2, row1=row0+1;
+    uint k=p[2], rows=p[3], experts=p[5];
+    uint expert=as_type<uint>(load(m,assignment*3,p[6]));
+    float sum00=0.f, sum10=0.f;
+    if(assignment<p[1] && expert<experts && row0<rows) {
+        uint packed_row0=expert*rows+row0;
+        uint packed_row1=expert*rows+row1;
+        // Keep the direct kernel's per-lane increasing-column accumulation
+        // order. Only the activation load is shared between adjacent rows.
+        for(uint column=lane;column<k;column+=32) {
+            float x=load(a,assignment*k+column,p[4]);
+            sum00+=x*q4_k_weight(b,packed_row0,column,k);
+            if(row1<rows) sum10+=x*q4_k_weight(b,packed_row1,column,k);
+        }
+    }
+    float sum0=simd_sum(sum00);
+    float sum1=simd_sum(sum10);
+    if(lane==0 && assignment<p[1] && expert<experts) {
+        if(row0<rows) store(c,assignment*rows+row0,p[4],sum0);
+        if(row1<rows) store(c,assignment*rows+row1,p[4],sum1);
+    }
+}
 kernel void expert_project_q5_k(EXPERT_PROJECT_ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
     expert_project_quantized_impl(a,b,m,c,p,tid,group);
 }
