@@ -211,13 +211,15 @@ Status: retained with a default of 8 average assignments per expert. The thresho
 
 Three interleaved sweeps (24 vs 12, 12 vs 8, and a direct 24 vs 8 confirmation) used the pinned LFM2.5-8B-A1B Q4_K_M artifact, the same five prompts and greedy token counts, and one warmed Ferrum process. Candidate/control order alternated within each of three pairs per workload. The direct 24-vs-8 paired medians were:
 
-| Workload | Prefill throughput 8/24 | Cached decode 8/24 | Full generation 8/24 | Candidate IDs matching saved llama.cpp |
-| --- | ---: | ---: | ---: | ---: |
-| Short | 1.002x | 0.999x | 0.999x | 3 / 3 |
-| 128-token prompt | 12.125x | 1.025x | 4.664x | 0 / 3 |
-| 512-token prompt | 3.536x | 1.009x | 2.545x | 3 / 3 |
-| 1,024-token prompt | 3.717x | 1.000x | 3.013x | 3 / 3 |
-| Sustained decode | 0.998x | 1.000x | 1.001x | 3 / 3 |
+| Workload | Prefill tok/s 24->8 (8/24) | Cached decode tok/s 24->8 (8/24) | Complete generation tok/s 24->8 (8/24) | First-token ms 24->8 | Candidate IDs matching saved llama.cpp |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Short | 22.39->22.45 tok/s (1.002x) | 21.11->21.11 tok/s (0.999x) | 13.59->13.61 tok/s (0.999x) | 491.65->490.23 ms | 3 / 3 |
+| 128-token prompt | 28.35->343.80 tok/s (12.125x) | 20.94->21.03 tok/s (1.025x) | 3.21->14.96 tok/s (4.664x) | 4,515.61->372.62 ms | 0 / 3 |
+| 512-token prompt | 120.38->425.54 tok/s (3.536x) | 20.87->20.62 tok/s (1.009x) | 3.37->8.59 tok/s (2.545x) | 4,253.52->1,203.48 ms | 3 / 3 |
+| 1,024-token prompt | 120.49->446.95 tok/s (3.717x) | 20.68->20.66 tok/s (1.000x) | 1.83->5.50 tok/s (3.013x) | 8,498.59->2,291.36 ms | 3 / 3 |
+| Sustained decode | 22.42->22.40 tok/s (0.998x) | 20.97->20.94 tok/s (1.000x) | 19.50->19.50 tok/s (1.001x) | 490.84->491.36 ms | 3 / 3 |
+
+Rates and latency are condition medians from the saved JSONL; the ratios are medians of matched candidate/control pairs. Values are threshold 24 -> threshold 8, with rates in tok/s and first-token latency in ms. The independent matched llama.cpp matrix below carries Ferrum and llama.cpp absolute rates and their ratios.
 
 At 128 tokens, threshold 8 changes the generated sequence relative to threshold 24, but both first diverge from the saved llama.cpp sequence at generated token 9. At 512 tokens, threshold 8 matches llama.cpp in all three runs; threshold 24 diverges after token 8. Short, 1,024-token, and sustained-decode sequences match both control and reference. The 128-token and 512-token changes arise from selecting BF16 TensorOps for smaller expert batches; no numerical tolerance was changed.
 
@@ -247,13 +249,15 @@ Status: rejected; M32 remains selected. The temporary M16 implementation changed
 
 The current release build ran three paired M32/M16 comparisons for each of the same five LFM2.5-8B-A1B Q4_K_M workloads. Pair order alternated in one warmed Ferrum process. All 15 generated sequences matched exactly between tile sizes. Candidate/control paired median ratios were:
 
-| Workload | Prefill throughput M16/M32 | Cached decode M16/M32 | Full generation M16/M32 | Exact IDs |
-| --- | ---: | ---: | ---: | ---: |
-| Short | 0.999x | 0.998x | 0.997x | 3 / 3 |
-| 128-token prompt | 0.780x | 1.001x | 0.915x | 3 / 3 |
-| 512-token prompt | 0.702x | 0.993x | 0.796x | 3 / 3 |
-| 1,024-token prompt | 0.689x | 1.000x | 0.749x | 3 / 3 |
-| Sustained decode | 0.999x | 1.000x | 1.000x | 3 / 3 |
+| Workload | Prefill tok/s M32->M16 (M16/M32) | Cached decode tok/s M32->M16 (M16/M32) | Full generation tok/s M32->M16 (M16/M32) | First-token ms M32->M16 | Exact IDs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Short | 22.41->22.39 (0.999x) | 21.08->21.11 (0.998x) | 13.60->13.56 (0.997x) | 491.18->491.55 | 3 / 3 |
+| 128-token prompt | 351.74->272.95 (0.780x) | 20.98->20.98 (1.001x) | 15.09->13.81 (0.915x) | 364.18->469.23 | 3 / 3 |
+| 512-token prompt | 431.42->303.02 (0.702x) | 20.76->20.80 (0.993x) | 8.64->6.88 (0.796x) | 1,187.09->1,689.91 | 3 / 3 |
+| 1,024-token prompt | 454.69->312.69 (0.689x) | 20.64->20.71 (1.000x) | 5.59->4.19 (0.749x) | 2,252.36->3,275.09 | 3 / 3 |
+| Sustained decode | 22.42->22.39 (0.999x) | 20.90->20.95 (1.000x) | 19.47->19.50 (1.000x) | 490.89->491.49 | 3 / 3 |
+
+Absolute rates and latency are condition medians from the saved JSONL. Ratios are medians of matched candidate/control pairs. The internal A/B file has no llama.cpp runs; the independent matched matrix above provides Ferrum/reference absolute rates and ratios.
 
 Across all 15 pairs, median prefill, cached-decode, and complete-generation ratios were 0.780x, 1.000x, and 0.915x. The M16 candidate regressed on every medium/long prefill; its largest loss was 31.1% at 1,024 tokens. It left cached decode effectively unchanged. Dispatch counts were equal between variants, and transient peaks were identical per prompt length: 4.05, 34.04, 160.05, and 240.03 MiB. Sampled post-request RSS also stayed within 5.23–5.31 GiB for both variants. These results do not support an adaptive small-route exception, so the M16 code and benchmark control were removed.
 
@@ -275,13 +279,15 @@ Status: rejected; the temporary kernel, dispatch control, and benchmark option w
 
 The native int4 path passed a Q4_0 reference check at M=35, N=65, K=512 with Metal API Validation and GPU Shader Validation enabled. The release A/B used the pinned Qwen2.5-0.5B Q4_0 artifact (SHA-256 `7671c0c304e6ce5a7fc577bcb12aba01e2c155cc2efd29b2213c95b18edaf6ed`), three interleaved control/candidate pairs for each of the short, 128-, 512-, and 1,024-token prompts plus sustained decode. Candidate/control paired median throughput ratios were:
 
-| Workload | Prefill | Cached decode | Full generation | Exact generated IDs |
-| --- | ---: | ---: | ---: | ---: |
-| Short | 0.825x | 1.001x | 0.968x | 3 / 3 |
-| 128-token prompt | 0.658x | 0.993x | 0.901x | 3 / 3 |
-| 512-token prompt | 0.580x | 0.992x | 0.768x | 3 / 3 |
-| 1,024-token prompt | 0.601x | 1.016x | 0.721x | 3 / 3 |
-| Sustained decode | 0.826x | 1.005x | 0.998x | 0 / 3 |
+| Workload | Prefill tok/s control->candidate (candidate/control) | Cached decode tok/s control->candidate (candidate/control) | Full generation tok/s control->candidate (candidate/control) | First-token ms control->candidate | Exact generated IDs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Short | 793.26->652.58 (0.825x) | 127.71->127.75 (1.001x) | 108.89->105.57 (0.968x) | 26.79->32.50 | 3 / 3 |
+| 128-token prompt | 3,714.86->2,460.71 (0.658x) | 128.45->127.48 (0.993x) | 104.23->93.80 (0.901x) | 34.77->52.33 | 3 / 3 |
+| 512-token prompt | 5,155.34->2,991.75 (0.580x) | 121.85->120.92 (0.992x) | 71.12->54.79 (0.768x) | 99.63->171.49 | 3 / 3 |
+| 1,024-token prompt | 4,951.12->2,969.38 (0.601x) | 112.73->113.89 (1.016x) | 47.89->34.51 (0.721x) | 207.15->345.22 | 3 / 3 |
+| Sustained decode | 785.55->649.02 (0.826x) | 123.40->123.96 (1.005x) | 117.89->117.67 (0.998x) | 27.05->32.68 | 0 / 3 |
+
+Absolute rates and latency are condition medians read from the internal A/B JSONL; ratios are medians of matched candidate/control pairs. The internal file has no llama.cpp runs, so the separate matched reference matrix remains the source for llama.cpp rates and Ferrum/reference ratios.
 
 All matched pairs had identical transient prefill peaks. On sustained decode, control and candidate first differed at generated token 64 in each pair. Cached decode was flat, and the 128–1,024-token prefill cases consistently regressed, so the native int4 path was not retained. This supports keeping one-token projections on direct GEMV shaders and the current BF16-staged TensorOps path for eligible batched shapes.
 
