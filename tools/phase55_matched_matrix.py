@@ -35,6 +35,9 @@ def source_cases(path: Path) -> list[dict[str, Any]]:
     cases: dict[str, dict[str, Any]] = {}
     for row in rows:
         case = str(row["case"])
+        request_options = row.get("request_options", {})
+        if not isinstance(request_options, dict):
+            raise ValueError(f"case {case!r} request_options must be an object")
         requested = row.get("max_new_tokens", len(row.get("generated_ids", [])))
         if isinstance(requested, bool) or not isinstance(requested, int) or requested <= 0:
             raise ValueError(f"case {case!r} needs a positive integer max_new_tokens")
@@ -42,12 +45,26 @@ def source_cases(path: Path) -> list[dict[str, Any]]:
         if previous is not None and (
             previous["prompt_ids"] != row["prompt_ids"]
             or previous.get("max_new_tokens", len(previous.get("generated_ids", []))) != requested
+            or previous.get("request_options", {}) != request_options
         ):
-            raise ValueError(f"case {case!r} has inconsistent prompt or output lengths")
+            raise ValueError(f"case {case!r} has inconsistent prompt, output length, or request options")
         cases.setdefault(case, row)
     if not cases:
         raise ValueError("input matrix has no quantized workload rows")
     return list(cases.values())
+
+
+def case_request_options(row: dict[str, Any]) -> dict[str, Any]:
+    options = row.get("request_options", {})
+    if not isinstance(options, dict):
+        raise ValueError(f"case {row.get('case')!r} request_options must be an object")
+    reserved = {"case", "pair", "pair_order", "warmup", "prompt_ids", "max_new_tokens"}
+    collisions = reserved.intersection(options)
+    if collisions:
+        raise ValueError(
+            f"case {row.get('case')!r} request_options override reserved fields: {sorted(collisions)}"
+        )
+    return options
 
 
 def process_rss_bytes(pid: int) -> int | None:
@@ -333,6 +350,7 @@ def main() -> None:
                 "prompt_ids": row["prompt_ids"],
                 "max_new_tokens": 2,
             }
+            warm_request.update(case_request_options(row))
             for engine_name in pair_order(names, case_index, 0):
                 engine = engines[engine_name]
                 if engine_name == "native-mlx-lm":
@@ -355,6 +373,7 @@ def main() -> None:
                         "prompt_ids": prompt,
                         "max_new_tokens": max_tokens,
                     }
+                    request.update(case_request_options(row))
                     for engine_name in order:
                         engine = engines[engine_name]
                         result = (
