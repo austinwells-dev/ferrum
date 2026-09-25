@@ -195,7 +195,10 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         }
     };
     let gguf_mpp_min_rows = match request.get("gguf_mpp_min_rows") {
-        None | Some(Value::Null) => device.gguf_mpp_min_rows(),
+        None | Some(Value::Null) => {
+            device.clear_gguf_mpp_min_rows()?;
+            device.gguf_mpp_min_rows()
+        }
         Some(value) => {
             let rows = value
                 .as_u64()
@@ -204,6 +207,24 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
                     Error::Parameter("request field gguf_mpp_min_rows must be an integer".into())
                 })?;
             device.set_gguf_mpp_min_rows(rows)?;
+            Some(rows)
+        }
+    };
+    let gguf_mpp_q5_1_min_rows = match request.get("gguf_mpp_q5_1_min_rows") {
+        None | Some(Value::Null) => {
+            device.clear_gguf_mpp_q5_1_min_rows()?;
+            device.gguf_mpp_q5_1_min_rows()
+        }
+        Some(value) => {
+            let rows = value
+                .as_u64()
+                .and_then(|rows| usize::try_from(rows).ok())
+                .ok_or_else(|| {
+                    Error::Parameter(
+                        "request field gguf_mpp_q5_1_min_rows must be an integer".into(),
+                    )
+                })?;
+            device.set_gguf_mpp_q5_1_min_rows(rows)?;
             Some(rows)
         }
     };
@@ -456,6 +477,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "attention_softmax_prefix": attention_softmax_prefix,
         "attention_softmax_prefix_reuse": attention_softmax_prefix_reuse,
         "gguf_mpp_min_rows": gguf_mpp_min_rows,
+        "gguf_mpp_q5_1_min_rows": gguf_mpp_q5_1_min_rows,
         "moe_expert_tensorops": expert_tensorops,
         "moe_expert_tensorops_tile_k64": expert_tensorops_tile_k64,
         "moe_expert_tensorops_min_routes_per_expert": expert_tensorops_min_routes,
@@ -472,8 +494,10 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "q5_k_gemv_8rows": q5_k_gemv_8rows,
         "moe_gpu_routing_prefill": moe_gpu_routing_prefill,
         "model_format": model.format,
-        "model_repository": model.repository,
-        "model_revision": model.revision,
+        "model_repository": std::env::var("FERRUM_PHASE7A_MODEL_REPOSITORY")
+            .unwrap_or_else(|_| model.repository.to_owned()),
+        "model_revision": std::env::var("FERRUM_PHASE7A_MODEL_REVISION")
+            .unwrap_or_else(|_| model.revision.to_owned()),
         "prompt_tokens": prompt.len(),
         "generated_tokens": result.tokens.len(),
         "prompt_ids": prompt,

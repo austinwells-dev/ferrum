@@ -22,15 +22,19 @@ impl MetalDevice {
             QuantizationFormat::Q4_0 | QuantizationFormat::Q4_K => 4,
             QuantizationFormat::Q5_K | QuantizationFormat::Q6_K => 8,
             QuantizationFormat::Q8_0 => 12,
-            // Keep unmeasured formats at the existing conservative boundary.
-            QuantizationFormat::Q5_0
-            | QuantizationFormat::Q5_1
-            | QuantizationFormat::MlxAffine4Group64 => 16,
+            // Q5_1 MPP wins from M=8; Q5_0 remains at its unmeasured boundary.
+            QuantizationFormat::Q5_1 => 8,
+            QuantizationFormat::Q5_0 | QuantizationFormat::MlxAffine4Group64 => 16,
         };
         let min_mpp_rows = if weight.format() == QuantizationFormat::MlxAffine4Group64 {
             16
         } else {
-            self.gguf_mpp_min_rows().unwrap_or(automatic_min_mpp_rows)
+            let q5_1_override = (weight.format() == QuantizationFormat::Q5_1)
+                .then(|| self.gguf_mpp_q5_1_min_rows())
+                .flatten();
+            q5_1_override
+                .or_else(|| self.gguf_mpp_min_rows())
+                .unwrap_or(automatic_min_mpp_rows)
         };
         let supports_mpp = ad[0] >= min_mpp_rows
             && ((weight.format() == QuantizationFormat::MlxAffine4Group64
@@ -1376,6 +1380,9 @@ mod q4_0_tests {
         let x = Tensor::from_f32(&d, [1, k], DType::BF16, &values).unwrap();
         let output = d.project_quantized(&x, &weight).unwrap();
         assert_eq!(output.metrics.operation, "q4_0_gemv");
+        assert_eq!(d.gguf_mpp_min_rows(), Some(2));
+        d.clear_gguf_mpp_min_rows().unwrap();
+        assert_eq!(d.gguf_mpp_min_rows(), None);
     }
 
     #[test]
@@ -1647,6 +1654,70 @@ mod q5_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn q5_1_mpp_min_rows_default_only_changes_q5_1_and_keeps_m1_gemv() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let (n, k, m) = (65, 128, 8);
+        assert_eq!(d.gguf_mpp_min_rows(), None);
+        assert_eq!(d.gguf_mpp_q5_1_min_rows(), None);
+
+        let values = input(m, k);
+        let x = Tensor::from_f32(&d, [m, k], DType::BF16, &values).unwrap();
+        for (format, expected_kernel) in [
+            (QuantizationFormat::Q5_1, "q5_1_gemm_mpp"),
+            (QuantizationFormat::Q5_0, "q5_0_gemm"),
+        ] {
+            let weight = packed(&d, n, k, format);
+            let output = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(output.metrics.operation, expected_kernel);
+        }
+        let mut q8_bytes = Vec::with_capacity(n * k / 32 * 34);
+        for _ in 0..n {
+            for _ in 0..k / 32 {
+                q8_bytes.extend_from_slice(&half::f16::from_f32(0.03125).to_bits().to_le_bytes());
+                q8_bytes.extend(std::iter::repeat_n(0u8, 32));
+            }
+        }
+        let q8_weight =
+            QuantizedMatrix::from_reader(&d, n, k, QuantizationFormat::Q8_0, |destination| {
+                destination.copy_from_slice(&q8_bytes);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            d.project_quantized(&x, &q8_weight)
+                .unwrap()
+                .metrics
+                .operation,
+            "q8_0_gemm"
+        );
+
+        d.set_gguf_mpp_q5_1_min_rows(16).unwrap();
+        let q5_1_weight = packed(&d, n, k, QuantizationFormat::Q5_1);
+        assert_eq!(
+            d.project_quantized(&x, &q5_1_weight)
+                .unwrap()
+                .metrics
+                .operation,
+            "q5_1_gemm"
+        );
+        d.clear_gguf_mpp_q5_1_min_rows().unwrap();
+        assert_eq!(d.gguf_mpp_q5_1_min_rows(), None);
+
+        let values = input(1, k);
+        let x = Tensor::from_f32(&d, [1, k], DType::BF16, &values).unwrap();
+        assert_eq!(
+            d.project_quantized(&x, &q5_1_weight)
+                .unwrap()
+                .metrics
+                .operation,
+            "q5_1_gemv"
+        );
     }
 
     #[test]

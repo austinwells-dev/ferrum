@@ -1,0 +1,21 @@
+Error: Config("missing or invalid GGUF metadata tokenizer.ggml.bos_token_id")
+Traceback (most recent call last):
+  File "/Users/austinwells/Documents/ChatGPT/ferrum/tools/phase55_matched_matrix.py", line 359, in main
+    engine.request(warm_request)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^
+  File "/Users/austinwells/Documents/ChatGPT/ferrum/tools/phase55_matched_matrix.py", line 100, in request
+    raise RuntimeError(f"benchmark process ended without a response (status {status})")
+RuntimeError: benchmark process ended without a response (status 1)
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/Users/austinwells/Documents/ChatGPT/ferrum/tools/phase55_matched_matrix.py", line 416, in <module>
+    main()
+    ~~~~^^
+  File "/Users/austinwells/Documents/ChatGPT/ferrum/tools/phase55_matched_matrix.py", line 411, in main
+    process.close()
+    ~~~~~~~~~~~~~^^
+  File "/Users/austinwells/Documents/ChatGPT/ferrum/tools/phase55_matched_matrix.py", line 114, in close
+    raise RuntimeError(f"benchmark process exited with status {status}")
+RuntimeError: benchmark process exited with status 1

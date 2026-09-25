@@ -267,6 +267,7 @@ pub struct MetalDevice {
     arena: Rc<RefCell<Arena>>,
     native_matmul: Cell<bool>,
     gguf_mpp_min_rows: Cell<Option<usize>>,
+    gguf_mpp_q5_1_min_rows: Cell<Option<usize>>,
     attention_softmax_prefix: Cell<bool>,
     attention_softmax_prefix_reuse: Cell<bool>,
     q8_0_mpp_tile_k64: Cell<bool>,
@@ -325,6 +326,7 @@ impl MetalDevice {
             arena: Rc::new(RefCell::new(Arena::default())),
             native_matmul: Cell::new(raw.supportsFamily(MTLGPUFamily::Apple7)),
             gguf_mpp_min_rows: Cell::new(None),
+            gguf_mpp_q5_1_min_rows: Cell::new(None),
             attention_softmax_prefix: Cell::new(true),
             attention_softmax_prefix_reuse: Cell::new(true),
             q8_0_mpp_tile_k64: Cell::new(true),
@@ -387,9 +389,43 @@ impl MetalDevice {
         self.gguf_mpp_min_rows.set(Some(rows));
         Ok(())
     }
+    /// Restore automatic, measured per-format GGUF MPP row thresholds.
+    pub fn clear_gguf_mpp_min_rows(&self) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot clear GGUF MPP row override during execution".into(),
+            ));
+        }
+        self.gguf_mpp_min_rows.set(None);
+        Ok(())
+    }
     /// Returns the explicit GGUF MPP row override, or `None` for automatic dispatch.
     pub fn gguf_mpp_min_rows(&self) -> Option<usize> {
         self.gguf_mpp_min_rows.get()
+    }
+    /// Override only the Q5_1 GGUF MPP row boundary for controlled measurements.
+    pub fn set_gguf_mpp_q5_1_min_rows(&self, rows: usize) -> Result<()> {
+        if self.batching.get() || !(2..=16).contains(&rows) || !self.mpp_projection() {
+            return Err(Error::Parameter(
+                "Q5_1 GGUF MPP minimum rows must be 2..=16 on an idle compatible device".into(),
+            ));
+        }
+        self.gguf_mpp_q5_1_min_rows.set(Some(rows));
+        Ok(())
+    }
+    /// Clear the Q5_1-only boundary override.
+    pub fn clear_gguf_mpp_q5_1_min_rows(&self) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot clear Q5_1 GGUF MPP row override during execution".into(),
+            ));
+        }
+        self.gguf_mpp_q5_1_min_rows.set(None);
+        Ok(())
+    }
+    /// Returns the explicit Q5_1 row override, or `None` for automatic dispatch.
+    pub fn gguf_mpp_q5_1_min_rows(&self) -> Option<usize> {
+        self.gguf_mpp_q5_1_min_rows.get()
     }
     /// Enable or disable prefix-bounded causal softmax for measured full-prefill shapes.
     /// The default is enabled; dispatch uses it only when M equals context width and M>=256.
