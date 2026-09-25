@@ -1361,6 +1361,8 @@ Status: rejected and removed. The candidate kept the accepted M=32 and K=64 expe
 
 Correctness used the existing 197-assignment, three-expert, N=65, K=512 Q4_K and Q6_K cases, which exercise an output tail across the N=32 and N=64 grid widths. Both candidates matched the scalar reference with Metal API Validation and GPU Shader Validation enabled. The five-pair Ferrum A/B used the pinned LFM2.5-8B-A1B Q4_K_M artifact and its saved five-case workload. The saved llama.cpp reference matrix uses the same prompt IDs and generation lengths at official revision `1ab7e5ad2d4e7295c94c3b966a3e0b70fa365865`; its JSONL was reused rather than rerunning llama.cpp.
 
+The short M=11 and sustained-decode cases do not reach this model's expert TensorOps selector threshold of 256 assignment rows (32 experts x 8 routes); they are neighboring-shape controls. The N=32 setting affects only the 128-, 512-, and 1,024-token prefill cases.
+
 Rates are condition medians in tok/s. The first two ratios in each rate cell are condition-median Ferrum/llama.cpp ratios; the final ratio is the median of the five paired N=32/N=64 rates. First-token latency is in milliseconds. `N64=N32` counts exact generated-sequence matches across five pairs.
 
 | Workload | Prefill tok/s N64 -> N32 / llama `[N64/L -> N32/L; N32/N64]` | Cached decode tok/s N64 -> N32 / llama `[N64/L -> N32/L; N32/N64]` | Complete generation tok/s N64 -> N32 / llama `[N64/L -> N32/L; N32/N64]` | First-token ms N64 -> N32 / llama | N64=N32 |
