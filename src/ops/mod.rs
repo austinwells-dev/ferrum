@@ -256,11 +256,10 @@ impl MetalDevice {
                 input, metadata, weight, experts, features, rows, ggml_type, mpp_name,
             );
         }
-        let dispatch_name = if ggml_type == 12 && self.use_q4_k_expert_project_8rows(rows, features)
-        {
-            "expert_project_q4_k_8rows"
-        } else {
-            name
+        let dispatch_name = match ggml_type {
+            12 if self.use_q4_k_expert_project_8rows(rows, features) => "expert_project_q4_k_8rows",
+            14 if self.use_q6_k_expert_project_8rows(rows, features) => "expert_project_q6_k_8rows",
+            _ => name,
         };
         let mut p = [0; 9];
         p[0] = index(shape.numel())?;

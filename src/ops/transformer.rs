@@ -1713,12 +1713,28 @@ mod qk_tests {
     ) -> QuantizedMatrix {
         assert!(matches!(
             format,
-            QuantizationFormat::Q4_K | QuantizationFormat::Q5_K
+            QuantizationFormat::Q4_K | QuantizationFormat::Q5_K | QuantizationFormat::Q6_K
         ));
         let mut bytes = Vec::with_capacity(rows * columns / 256 * format.block_bytes());
         for row in 0..rows {
             for block_index in 0..columns / 256 {
                 let block_start = bytes.len();
+                if format == QuantizationFormat::Q6_K {
+                    for index in 0..128 {
+                        bytes.push(qbyte(row, block_index, index));
+                    }
+                    for index in 0..64 {
+                        bytes.push(qbyte(row + 5, block_index, index));
+                    }
+                    for index in 0..16 {
+                        bytes
+                            .push((((row * 7 + block_index * 3 + index * 5) % 15) as i8 - 7) as u8);
+                    }
+                    let d = 0.015625 + row as f32 * 0.000244140625;
+                    bytes.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
+                    assert_eq!(bytes.len() - block_start, format.block_bytes());
+                    continue;
+                }
                 let (d, dmin) = parameters(format, row, block_index);
                 bytes.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
                 bytes.extend_from_slice(&half::f16::from_f32(dmin).to_bits().to_le_bytes());
@@ -1764,6 +1780,19 @@ mod qk_tests {
         let within = column % 256;
         let group = within / 32;
         let lane = within % 32;
+        if format == QuantizationFormat::Q6_K {
+            let half_block = group / 4;
+            let slice = group % 4;
+            let ql_index = half_block * 64 + (slice & 1) * 32 + lane;
+            let packed = qbyte(row, block, ql_index);
+            let low = if slice < 2 { packed & 15 } else { packed >> 4 };
+            let high = (qbyte(row + 5, block, half_block * 32 + lane) >> (slice * 2)) & 3;
+            let q = i32::from(low | (high << 4)) - 32;
+            let scale_index = half_block * 8 + slice * 2 + lane / 16;
+            let scale = ((row * 7 + block * 3 + scale_index * 5) % 15) as i8 - 7;
+            let d = 0.015625 + row as f32 * 0.000244140625;
+            return d * f32::from(scale) * q as f32;
+        }
         let chunk = within / 64;
         let packed = qbyte(row, block, chunk * 32 + lane);
         let nibble = if group.is_multiple_of(2) {
@@ -2227,6 +2256,83 @@ mod qk_tests {
             assert!(
                 (actual - expected).abs() <= 0.06,
                 "Q4_K expert eight-row index {index}: actual={actual}, expected={expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn q6_k_expert_eight_row_projection_reuses_activations_and_covers_tail() {
+        let d = MetalDevice::new().unwrap();
+        assert!(d.use_q6_k_expert_project_8rows(133, 512));
+        d.set_moe_expert_tensorops(false).unwrap();
+        assert!(!d.use_q6_k_expert_project_8rows(127, 512));
+        assert!(!d.use_q6_k_expert_project_8rows(128, 255));
+        d.set_q6_k_expert_project_8rows(true).unwrap();
+        assert!(d.use_q6_k_expert_project_8rows(133, 512));
+
+        let (experts, rows_per_expert, columns) = (3, 133, 512);
+        let expert_ids = [2usize, 1, 2, 0];
+        let packed = packed(
+            &d,
+            experts * rows_per_expert,
+            columns,
+            QuantizationFormat::Q6_K,
+        );
+        let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+        let values = input(expert_ids.len(), columns);
+        let x = Tensor::from_f32(&d, [expert_ids.len(), columns], DType::BF16, &values).unwrap();
+        let rounded_input = x.to_f32();
+        let metadata = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(assignment, &expert)| {
+                [
+                    f32::from_bits(expert as u32),
+                    f32::from_bits(assignment as u32),
+                    1.0,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let metadata = Tensor::from_f32(&d, [expert_ids.len(), 3], DType::F32, &metadata).unwrap();
+        d.set_q6_k_expert_project_8rows(false).unwrap();
+        let control = d
+            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+            .unwrap()
+            .to_f32();
+        d.set_q6_k_expert_project_8rows(true).unwrap();
+        let output = d
+            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+            .unwrap();
+        assert_eq!(
+            output.to_f32(),
+            control,
+            "optimized order must match control"
+        );
+        let expected = (0..expert_ids.len())
+            .flat_map(|assignment| {
+                (0..rows_per_expert).map({
+                    let rounded_input = &rounded_input;
+                    move |row| {
+                        DType::BF16.round(
+                            (0..columns)
+                                .map(|column| {
+                                    rounded_input[assignment * columns + column]
+                                        * qk_value(
+                                            expert_ids[assignment] * rows_per_expert + row,
+                                            column,
+                                            QuantizationFormat::Q6_K,
+                                        )
+                                })
+                                .sum::<f32>(),
+                        )
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for (index, (actual, expected)) in output.to_f32().iter().zip(&expected).enumerate() {
+            assert!(
+                (actual - expected).abs() <= 0.06,
+                "Q6_K expert eight-row index {index}: actual={actual}, expected={expected}"
             );
         }
     }

@@ -258,6 +258,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let q6_k_expert_project_8rows = match request.get("q6_k_expert_project_8rows") {
+        None | Some(Value::Null) => {
+            device.set_q6_k_expert_project_8rows(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_q6_k_expert_project_8rows(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field q6_k_expert_project_8rows must be a boolean".into(),
+            ));
+        }
+    };
     let q5_k_mpp_tile_k64 = match request.get("q5_k_mpp_tile_k64") {
         None | Some(Value::Null) => {
             device.set_q5_k_mpp_tile_k64(true)?;
@@ -398,6 +413,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "q4_k_mpp_tile_k64": q4_k_mpp_tile_k64,
         "q4_k_mpp_tile_m128": q4_k_mpp_tile_m128,
         "q4_k_expert_project_8rows": q4_k_expert_project_8rows,
+        "q6_k_expert_project_8rows": q6_k_expert_project_8rows,
         "q5_k_mpp_tile_k64": q5_k_mpp_tile_k64,
         "q5_0_gemv_n4": q5_0_gemv_n4,
         "q5_1_gemv_n4": q5_1_gemv_n4,

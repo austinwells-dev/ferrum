@@ -282,6 +282,7 @@ pub struct MetalDevice {
     q4_0_gemv_8rows: Cell<bool>,
     q4_k_gemv_8rows: Cell<bool>,
     q4_k_expert_project_8rows: Cell<bool>,
+    q6_k_expert_project_8rows: Cell<bool>,
     q5_k_gemv_8rows: Cell<bool>,
     q6_k_gemv_8rows: Cell<bool>,
     moe_gpu_routing: Cell<bool>,
@@ -337,6 +338,7 @@ impl MetalDevice {
             q4_0_gemv_8rows: Cell::new(true),
             q4_k_gemv_8rows: Cell::new(true),
             q4_k_expert_project_8rows: Cell::new(true),
+            q6_k_expert_project_8rows: Cell::new(true),
             q5_k_gemv_8rows: Cell::new(true),
             q6_k_gemv_8rows: Cell::new(true),
             moe_gpu_routing: Cell::new(true),
@@ -581,6 +583,22 @@ impl MetalDevice {
     }
     pub(crate) fn use_q4_k_expert_project_8rows(&self, rows: usize, features: usize) -> bool {
         self.q4_k_expert_project_8rows.get()
+            && rows >= 128
+            && features >= 256
+            && features.is_multiple_of(256)
+    }
+    /// Select the two-output-row-per-SIMD Q6_K kernel for sparse expert batches.
+    pub fn set_q6_k_expert_project_8rows(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q6_K expert projection during execution".into(),
+            ));
+        }
+        self.q6_k_expert_project_8rows.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q6_k_expert_project_8rows(&self, rows: usize, features: usize) -> bool {
+        self.q6_k_expert_project_8rows.get()
             && rows >= 128
             && features >= 256
             && features.is_multiple_of(256)
@@ -1030,6 +1048,7 @@ impl MetalDevice {
             "expert_project"
             | "expert_project_q4_k"
             | "expert_project_q4_k_8rows"
+            | "expert_project_q6_k_8rows"
             | "expert_project_q5_k"
             | "expert_project_q6_k" => (3, 1),
             "expert_project_q4_k_mpp"
@@ -1527,11 +1546,12 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
-            } else if name == "expert_project_q4_k_8rows" {
+            } else if name == "expert_project_q4_k_8rows" || name == "expert_project_q6_k_8rows" {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
                 {
                     return Err(Error::Dispatch(
-                        "Q4_K expert projection requires 32-wide SIMD and 128-thread groups".into(),
+                        "quantized expert projection requires 32-wide SIMD and 128-thread groups"
+                            .into(),
                     ));
                 }
                 encoder.dispatchThreadgroups_threadsPerThreadgroup(
