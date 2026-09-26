@@ -672,8 +672,10 @@ impl MetalDevice {
         if !self.owns(a.buffer()) || b.is_some_and(|b| !self.owns(b.buffer())) {
             return Err(Error::DeviceMismatch);
         }
-        let f32_route_metadata = matches!(name, "expert_assign" | "expert_combine")
-            && b.is_some_and(|b| b.dtype() == DType::F32);
+        let f32_route_metadata = matches!(
+            name,
+            "expert_assign" | "expert_combine" | "rope_split_table"
+        ) && b.is_some_and(|b| b.dtype() == DType::F32);
         if b.is_some_and(|b| b.dtype() != a.dtype()) && !f32_route_metadata {
             return Err(Error::DType);
         }

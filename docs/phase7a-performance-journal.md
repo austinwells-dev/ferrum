@@ -2041,3 +2041,72 @@ Flushed profile at 1,024 context: `attention_scores` 44.8 -> 13.6 µs per LFM2.5
 Cached decode improved at 1,024 context by 2.3% (LFM2.5), 6.3% (Qwen2.5), and 8.3% (Qwen3), and on sustained decode by 0.5–3.3%. Prefill uses the TensorOps score path, so its ±1–2% changes are noise. Every pair produced identical IDs.
 
 Against the saved llama.cpp rows, LFM2.5 cached decode is now 84.2 / 96.4 tok/s (0.873x) at 1,024 context and 86.0 / 101.2 tok/s (0.850x) sustained. Together with short context (1.03x after Experiment 59), LFM2.5 meets the 0.85x decode threshold on the measured short, 1,024-token, and sustained workloads; the 512-token workload was not rerun here. Its 512- and 1,024-token prefill (0.65–0.69x) remains below the 0.80x prefill threshold, so the gate is not met.
+
+## Experiment 61: Paired M tiles for dense GGUF TensorOps GEMMs (retained, M>=512 and N>=512)
+
+Status: retained. Toggle: `set_dense_mpp_tile_pairs`, bench field `dense_mpp_tile_pairs`. Output is bit-identical.
+
+This is the dense counterpart of Experiment 58. Each threadgroup of the eleven dense GGUF TensorOps kernels (Q4_0, Q5_0, Q5_1 K128/K64, Q4_K K128/K64, Q5_K K128/K64, Q6_K, Q8_0 K128/K64) can own two consecutive 64-row M tiles. It reuses every dequantized weight tile for both, running the identical 64x64 product on each (flag bit 1).
+
+The 512-token prefill profiles taken after Experiment 60 (`*-512-prefill-op-profile-after-exp60.json`) show the GEMMs at about 60% of Qwen2.5/Qwen3 prefill. A first Qwen2.5 Q4_K_M profile gave two results:
+
+- Q5_0 gate/up improved from 480–497 to 422–429 µs per call.
+- The N=128 k/v projections slowed from 27 to 39–58 µs, because too few threadgroups remained. Output width is therefore gated at N>=512.
+
+The full A/B below, five pairs with the N gate only, also showed 128-token prompts losing 1.3–3.7% while 512- and 1,024-token prompts gained 3.8–8.1%. Pairing is therefore also gated at M>=512 prompt rows.
+
+Tests: `*_tensorops_paired_tiles_are_bit_identical` for every paired kernel (N=517 with a column tail, M=600 or 1,025 to reach each tile variant), and the Q5_0 fast-dequant/pairs combination test. They pass under Metal API and GPU Shader Validation.
+
+Raw: `*-dense-mpp-tile-pairs-ab.jsonl` and `.run.log`. This A/B predates the M gate; with the gate, the short and 128-token rows run the control path.
+
+| Model / workload | Prefill tok/s C->P `[P/C]` | Cached decode tok/s C->P `[P/C]` | Complete generation tok/s C->P `[P/C]` | First-token ms C->P | IDs C=P |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_K_M / Short | 730.6->726.5 `[0.985]` | 165.5->163.6 `[0.987]` | 135.8->134.6 `[0.989]` | 28.7->28.9 | 5/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 3,539.0->3,407.1 `[0.971]` | 162.5->164.8 `[1.022]` | 126.7->126.1 `[0.998]` | 36.2->37.6 | 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 6,314.7->6,549.0 `[1.038]` | 161.1->162.2 `[1.007]` | 92.7->94.3 `[1.014]` | 81.1->78.2 | 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 6,331.2->6,688.4 `[1.065]` | 155.6->155.3 `[0.999]` | 63.7->65.8 `[1.039]` | 161.7->153.1 | 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 725.2->732.9 `[1.011]` | 170.1->170.0 `[1.001]` | 165.8->165.8 `[1.002]` | 29.0->28.7 | 5/5 |
+| Qwen3 Q8_0 / Short | 648.1->648.0 `[0.984]` | 136.6->136.0 `[0.994]` | 113.4->113.4 `[0.996]` | 32.4->32.4 | 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 2,963.0->2,925.8 `[0.987]` | 133.5->134.9 `[1.009]` | 104.6->105.0 `[1.010]` | 43.2->43.8 | 5/5 |
+| Qwen3 Q8_0 / 512-token prompt | 4,685.3->5,028.0 `[1.070]` | 124.5->124.3 `[1.000]` | 68.7->70.7 `[1.026]` | 109.3->101.8 | 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 5,060.5->5,441.7 `[1.074]` | 111.2->111.2 `[1.001]` | 47.1->49.0 `[1.041]` | 202.4->188.2 | 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 656.2->646.1 `[0.975]` | 138.1->138.8 `[1.006]` | 134.6->135.4 `[1.005]` | 32.0->32.5 | 5/5 |
+| Qwen2.5 Q6_K / Short | 741.6->732.4 `[0.992]` | 154.9->154.4 `[1.002]` | 129.0->128.8 `[0.998]` | 28.3->28.7 | 5/5 |
+| Qwen2.5 Q6_K / 128-token prompt | 3,511.7->3,416.0 `[0.963]` | 154.1->152.6 `[0.987]` | 121.3->119.6 `[0.984]` | 36.5->37.5 | 5/5 |
+| Qwen2.5 Q6_K / 512-token prompt | 6,255.5->6,640.7 `[1.063]` | 151.6->150.8 `[0.990]` | 89.1->91.2 `[1.022]` | 81.8->77.1 | 5/5 |
+| Qwen2.5 Q6_K / 1,024-token prompt | 6,196.8->6,696.2 `[1.081]` | 146.1->145.6 `[0.997]` | 61.3->64.1 `[1.045]` | 165.2->152.9 | 5/5 |
+| Qwen2.5 Q6_K / Sustained decode | 729.2->734.9 `[0.999]` | 159.0->159.2 `[1.001]` | 154.8->155.0 `[0.999]` | 28.8->28.6 | 5/5 |
+| LFM2.5 / Short | 99.6->99.5 `[0.999]` | 86.7->86.4 `[1.002]` | 57.9->58.1 `[1.005]` | 110.5->110.6 | 5/5 |
+| LFM2.5 / 128-token prompt | 713.9->732.8 `[1.018]` | 88.3->86.7 `[0.978]` | 47.4->47.6 `[1.007]` | 179.3->174.7 | 5/5 |
+| LFM2.5 / 512-token prompt | 1,369.6->1,424.1 `[1.040]` | 85.1->85.4 `[0.999]` | 30.3->31.0 `[1.027]` | 373.8->359.5 | 5/5 |
+| LFM2.5 / 1,024-token prompt | 1,455.4->1,469.6 `[1.010]` | 84.3->83.8 `[0.995]` | 19.0->19.1 `[0.998]` | 703.6->696.8 | 5/5 |
+| LFM2.5 / Sustained decode | 101.6->102.2 `[0.996]` | 87.4->87.2 `[0.997]` | 82.3->81.9 `[0.997]` | 108.2->107.7 | 5/5 |
+
+At 512 and 1,024 tokens, prefill rose 3.8–6.5% (Qwen2.5 Q4_K_M), 7.0–7.4% (Qwen3 Q8_0), 6.3–8.1% (Qwen2.5 Q6_K), and 1.0–4.0% (LFM2.5 dense layers). Every pair produced identical IDs.
+
+## Experiment 62: Per-execution RoPE cos/sin table (retained)
+
+Status: retained. Toggle: `set_rope_table`, bench field `rope_table`. Output is bit-identical.
+
+`rope_split` computed `pow`, `cos`, and `sin` for every rotated pair. Every q and k rotation in every layer therefore recomputed the same angle table: 56 calls, 4.3 ms of Qwen3's 512-token prefill profile.
+
+Inside a batched execution, the first rotation for a given (offset, rows, head dimension, theta) now dispatches `rope_table`, using `rope_split`'s exact angle expression. Every rotation then reads cos/sin from that table through `rope_split_table`. The table lives until the execution ends. Test: `rope_table_matches_per_element_rotation_bitwise` (F32/F16/BF16, several shapes, nonzero offsets, and shared q/k use), which passes under validation.
+
+In-process A/B, five pairs. Raw: `*-rope-table-ab.jsonl` and `.run.log`.
+
+| Model / workload | Prefill tok/s C->R `[R/C]` | Cached decode tok/s C->R `[R/C]` | Complete generation tok/s C->R `[R/C]` | First-token ms C->R | IDs C=R |
+|---|---:|---:|---:|---:|---:|
+| Qwen3 Q8_0 / Short | 653.7->649.0 `[0.980]` | 136.6->137.8 `[1.009]` | 114.1->114.4 `[0.999]` | 32.1->32.4 | 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 2,962.2->2,975.7 `[1.005]` | 133.3->135.6 `[1.013]` | 104.6->105.8 `[1.006]` | 43.2->43.0 | 5/5 |
+| Qwen3 Q8_0 / 512-token prompt | 5,038.6->5,100.9 `[1.022]` | 124.6->125.8 `[1.011]` | 70.7->71.6 `[1.019]` | 101.6->100.4 | 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 5,464.1->5,565.1 `[1.019]` | 111.2->111.9 `[1.007]` | 49.2->49.8 `[1.013]` | 187.4->184.0 | 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 645.8->649.6 `[0.975]` | 137.9->139.5 `[1.011]` | 134.6->135.9 `[1.009]` | 32.5->32.3 | 5/5 |
+| Qwen2.5 Q4_K_M / Short | 718.7->722.7 `[1.002]` | 164.0->165.0 `[1.007]` | 133.3->135.6 `[1.016]` | 29.2->29.1 | 5/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 3,504.4->3,530.9 `[1.001]` | 164.1->163.9 `[1.002]` | 126.8->126.9 `[0.999]` | 36.5->36.3 | 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 6,495.8->6,545.0 `[0.997]` | 161.1->160.4 `[1.001]` | 93.8->93.4 `[1.003]` | 78.8->78.2 | 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 6,691.5->6,732.2 `[1.004]` | 155.4->155.1 `[0.998]` | 65.9->66.0 `[1.001]` | 153.0->152.1 | 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 727.2->723.0 `[1.016]` | 169.0->170.4 `[1.007]` | 164.8->165.9 `[1.007]` | 28.9->29.0 | 5/5 |
+
+Qwen3 (head dimension 128, 28 layers): 512- and 1,024-token prefill +1.9–2.2%, and cached decode +0.7–1.3%. Qwen2.5 (head dimension 64) is within noise. All 166 tests pass.
+
+Against the saved llama.cpp rows, the current tree's A/B medians give 1,024-token prefill of 6,732 / 8,844 tok/s (0.76x) for Qwen2.5 Q4_K_M, 5,565 / 6,283 (0.89x) for Qwen3, and 6,696 / 9,077 (0.74x) for Qwen2.5 Q6_K. At 512 tokens it is 0.70x, 0.72x, and 0.69x.

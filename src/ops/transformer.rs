@@ -1,5 +1,20 @@
 //! Narrow contiguous copies and transformer operations; no strided views.
 use super::*;
+/// Dense GGUF TensorOps kernels that accept the paired-M-tile flag.
+const DENSE_MPP_PAIRED: &[&str] = &[
+    "q4_0_gemm_mpp",
+    "q5_0_gemm_mpp",
+    "q5_1_gemm_mpp",
+    "q5_1_gemm_mpp_k64",
+    "q4_k_gemm_mpp",
+    "q4_k_gemm_mpp_k64",
+    "q5_k_gemm_mpp",
+    "q5_k_gemm_mpp_k64",
+    "q6_k_gemm_mpp",
+    "q8_0_gemm_mpp",
+    "q8_0_gemm_mpp_k64",
+];
+
 impl MetalDevice {
     pub(crate) fn project_quantized(
         &self,
@@ -161,13 +176,23 @@ impl MetalDevice {
         {
             p[8] = u32::from(self.mpp_fast_dequant());
         }
+        // Paired M tiles: one threadgroup covers two consecutive 64-row tiles.
+        // Narrow outputs and prompts under 512 rows keep single tiles so enough
+        // threadgroups stay resident (measured: 128 rows lose, 512+ gain).
+        let pairs = self.dense_mpp_tile_pairs()
+            && weight.rows() >= 512
+            && ad[0] >= 512
+            && DENSE_MPP_PAIRED.contains(&name);
+        if pairs {
+            p[8] |= 2;
+        }
         self.run_quantized(
             name,
             a,
             weight,
             &[ad[0], weight.rows()],
             p,
-            [weight.rows(), ad[0]],
+            [weight.rows(), if pairs { ad[0].div_ceil(2) } else { ad[0] }],
         )
     }
 
@@ -388,7 +413,54 @@ impl MetalDevice {
         p[5] = index(offset)?;
         p[6] = index(d[2])?;
         p[8] = theta.to_bits();
+        if self.batching_active() && self.rope_table_enabled() {
+            let table = self.rope_table(a, offset, d[0], d[2], theta)?;
+            return self.run(
+                "rope_split_table",
+                a,
+                Some(&table),
+                d,
+                p,
+                [a.numel() / 2, 1],
+            );
+        }
         self.run("rope_split", a, None, d, p, [a.numel() / 2, 1])
+    }
+    /// Cos/sin table for positions `offset..offset+rows`, built once per
+    /// execution and shared by every q/k rotation with the same geometry.
+    fn rope_table(
+        &self,
+        carrier: &Tensor,
+        offset: usize,
+        rows: usize,
+        head_dim: usize,
+        theta: f32,
+    ) -> Result<Tensor> {
+        let key = (offset, rows, head_dim, theta.to_bits());
+        if let Some((cached, table)) = self.rope_table_cache().borrow().as_ref() {
+            if *cached == key {
+                return Ok(table.clone());
+            }
+        }
+        let entries = rows
+            .checked_mul(head_dim / 2)
+            .ok_or_else(|| Error::Shape("RoPE table size overflow".into()))?;
+        let table = Tensor::output(self, &[entries, 2], DType::F32)?;
+        let mut p = [0; 9];
+        p[0] = index(entries)?;
+        p[5] = index(offset)?;
+        p[6] = index(head_dim)?;
+        p[8] = theta.to_bits();
+        self.dispatch(
+            "rope_table",
+            &[carrier.binding(), carrier.binding(), table.binding()],
+            &p,
+            [entries, 1],
+            false,
+        )
+        .map(|_| ())?;
+        *self.rope_table_cache().borrow_mut() = Some((key, table.clone()));
+        Ok(table)
     }
 
     /// Causal depthwise convolution used by LFM2 short-convolution blocks.
@@ -952,6 +1024,50 @@ mod fusion_tests {
         }
     }
     #[test]
+    fn rope_table_matches_per_element_rotation_bitwise() {
+        let d = MetalDevice::new().unwrap();
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            for (rows, q_heads, kv_heads, dim, offset, theta) in [
+                (37, 14, 2, 64, 5, 1_000_000.0f32),
+                (1, 16, 8, 128, 1023, 10_000.0),
+                (130, 32, 8, 64, 0, 1_000_000.0),
+            ] {
+                let q = Tensor::from_f32(
+                    &d,
+                    [rows, q_heads, dim],
+                    dtype,
+                    &crate::reference::deterministic(rows * q_heads * dim),
+                )
+                .unwrap();
+                let k = Tensor::from_f32(
+                    &d,
+                    [rows, kv_heads, dim],
+                    dtype,
+                    &crate::reference::deterministic(rows * kv_heads * dim),
+                )
+                .unwrap();
+                let mut outputs = Vec::new();
+                for table in [false, true] {
+                    d.set_rope_table(table).unwrap();
+                    let execution = d.execution().unwrap();
+                    let rq = d.rope_split(&q, offset, theta).unwrap();
+                    let rk = d.rope_split(&k, offset, theta).unwrap();
+                    let expected = if table {
+                        "rope_split_table"
+                    } else {
+                        "rope_split"
+                    };
+                    assert_eq!(rq.metrics.operation, expected);
+                    assert_eq!(rk.metrics.operation, expected);
+                    execution.finish().unwrap();
+                    outputs.push((bits(&rq.tensor), bits(&rk.tensor)));
+                }
+                assert_eq!(outputs[0], outputs[1], "{dtype:?} rows={rows} dim={dim}");
+            }
+        }
+    }
+    #[test]
     fn vector_bf16_attention_scores_are_bit_identical() {
         let d = MetalDevice::new().unwrap();
         let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
@@ -1323,6 +1439,31 @@ mod q8_0_tests {
     }
 
     #[test]
+    fn q8_0_tensorops_paired_tiles_are_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let check = |weight: &QuantizedMatrix, m: usize, k: usize, kernel: &str| {
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
+            d.set_dense_mpp_tile_pairs(false).unwrap();
+            let control = d.project_quantized(&x, weight).unwrap();
+            assert_eq!(control.metrics.operation, kernel);
+            d.set_dense_mpp_tile_pairs(true).unwrap();
+            let paired = d.project_quantized(&x, weight).unwrap();
+            assert_eq!(
+                bits(&paired.tensor),
+                bits(&control.tensor),
+                "{kernel} M={m}"
+            );
+        };
+        let weight = packed(&d, 517, 384);
+        check(&weight, 200, 384, "q8_0_gemm_mpp");
+        check(&weight, 1025, 384, "q8_0_gemm_mpp_k64");
+    }
+
+    #[test]
     fn q8_0_tensorops_fast_dequant_is_bit_identical() {
         let d = MetalDevice::new().unwrap();
         if !d.mpp_projection() {
@@ -1544,6 +1685,23 @@ mod q4_0_tests {
                 "index {index}: actual={actual}, expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn q4_0_tensorops_paired_tiles_are_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let weight = packed(&d, 517, 384);
+        let x = Tensor::from_f32(&d, [600, 384], DType::BF16, &input(600, 384)).unwrap();
+        d.set_dense_mpp_tile_pairs(false).unwrap();
+        let control = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(control.metrics.operation, "q4_0_gemm_mpp");
+        d.set_dense_mpp_tile_pairs(true).unwrap();
+        let paired = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(bits(&paired.tensor), bits(&control.tensor));
     }
 
     #[test]
@@ -1841,21 +1999,58 @@ mod q5_tests {
     }
 
     #[test]
-    fn q5_0_tensorops_fast_dequant_is_bit_identical() {
+    fn q5_1_tensorops_paired_tiles_are_bit_identical() {
         let d = MetalDevice::new().unwrap();
         if !d.mpp_projection() {
             return;
         }
         let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
-        let (m, n, k) = (37, 133, 384);
-        let weight = packed(&d, n, k, QuantizationFormat::Q5_0);
-        let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
-        d.set_mpp_fast_dequant(false).unwrap();
-        let control = d.project_quantized(&x, &weight).unwrap();
-        assert_eq!(control.metrics.operation, "q5_0_gemm_mpp");
-        d.set_mpp_fast_dequant(true).unwrap();
-        let fast = d.project_quantized(&x, &weight).unwrap();
-        assert_eq!(bits(&fast.tensor), bits(&control.tensor));
+        let check = |weight: &QuantizedMatrix, m: usize, k: usize, kernel: &str| {
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
+            d.set_dense_mpp_tile_pairs(false).unwrap();
+            let control = d.project_quantized(&x, weight).unwrap();
+            assert_eq!(control.metrics.operation, kernel);
+            d.set_dense_mpp_tile_pairs(true).unwrap();
+            let paired = d.project_quantized(&x, weight).unwrap();
+            assert_eq!(
+                bits(&paired.tensor),
+                bits(&control.tensor),
+                "{kernel} M={m}"
+            );
+        };
+        let weight = packed(&d, 517, 384, QuantizationFormat::Q5_1);
+        check(&weight, 200, 384, "q5_1_gemm_mpp");
+        check(&weight, 1025, 384, "q5_1_gemm_mpp_k64");
+        let weight = packed(&d, 517, 384, QuantizationFormat::Q5_0);
+        check(&weight, 600, 384, "q5_0_gemm_mpp");
+    }
+
+    #[test]
+    fn q5_0_tensorops_fast_dequant_and_pairs_are_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for m in [37, 600] {
+            let (n, k) = (133, 384);
+            let weight = packed(&d, n, k, QuantizationFormat::Q5_0);
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
+            d.set_mpp_fast_dequant(false).unwrap();
+            d.set_dense_mpp_tile_pairs(false).unwrap();
+            let control = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(control.metrics.operation, "q5_0_gemm_mpp");
+            for (fast, pairs) in [(true, false), (false, true), (true, true)] {
+                d.set_mpp_fast_dequant(fast).unwrap();
+                d.set_dense_mpp_tile_pairs(pairs).unwrap();
+                let candidate = d.project_quantized(&x, &weight).unwrap();
+                assert_eq!(
+                    bits(&candidate.tensor),
+                    bits(&control.tensor),
+                    "M={m} fast={fast} pairs={pairs}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2852,6 +3047,36 @@ mod qk_tests {
     }
 
     #[test]
+    fn q4_k_and_q5_k_tensorops_paired_tiles_are_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let check = |weight: &QuantizedMatrix, m: usize, k: usize, kernel: &str| {
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
+            d.set_dense_mpp_tile_pairs(false).unwrap();
+            let control = d.project_quantized(&x, weight).unwrap();
+            assert_eq!(control.metrics.operation, kernel);
+            d.set_dense_mpp_tile_pairs(true).unwrap();
+            let paired = d.project_quantized(&x, weight).unwrap();
+            assert_eq!(
+                bits(&paired.tensor),
+                bits(&control.tensor),
+                "{kernel} M={m}"
+            );
+        };
+        let weight = packed(&d, 517, 512, QuantizationFormat::Q4_K);
+        check(&weight, 600, 512, "q4_k_gemm_mpp");
+        d.set_q4_k_mpp_tile_m128(false).unwrap();
+        check(&weight, 1025, 512, "q4_k_gemm_mpp_k64");
+        d.set_q4_k_mpp_tile_m128(true).unwrap();
+        let weight = packed(&d, 517, 512, QuantizationFormat::Q5_K);
+        check(&weight, 600, 512, "q5_k_gemm_mpp");
+        check(&weight, 1025, 512, "q5_k_gemm_mpp_k64");
+    }
+
+    #[test]
     fn q4_k_tensorops_fast_dequant_is_bit_identical() {
         let d = MetalDevice::new().unwrap();
         if !d.mpp_projection() {
@@ -3421,6 +3646,30 @@ mod q6_k_tests {
                 "Q6_K index {index}: actual={actual}, expected={expected}"
             );
         }
+    }
+
+    #[test]
+    fn q6_k_tensorops_paired_tiles_are_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let check = |weight: &QuantizedMatrix, m: usize, k: usize, kernel: &str| {
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
+            d.set_dense_mpp_tile_pairs(false).unwrap();
+            let control = d.project_quantized(&x, weight).unwrap();
+            assert_eq!(control.metrics.operation, kernel);
+            d.set_dense_mpp_tile_pairs(true).unwrap();
+            let paired = d.project_quantized(&x, weight).unwrap();
+            assert_eq!(
+                bits(&paired.tensor),
+                bits(&control.tensor),
+                "{kernel} M={m}"
+            );
+        };
+        let weight = packed(&d, 517, 768);
+        check(&weight, 600, 768, "q6_k_gemm_mpp");
     }
 
     #[test]

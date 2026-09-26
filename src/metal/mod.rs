@@ -100,6 +100,8 @@ impl Arena {
     }
 }
 type WriteRange = (usize, usize, Rc<Cell<Completion>>);
+/// (offset, rows, head_dim, theta bits) and its cos/sin table.
+pub(crate) type RopeTableEntry = ((usize, usize, usize, u32), crate::Tensor);
 pub struct MetalBuffer {
     raw: Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
@@ -255,6 +257,7 @@ impl Drop for Execution<'_> {
         let _ = self.device.flush();
         self.device.batching.set(false);
         self.device.execution_shared_encoder.set(false);
+        self.device.rope_table_cache.borrow_mut().take();
     }
 }
 struct ProfileStageScope<'a> {
@@ -296,6 +299,9 @@ pub struct MetalDevice {
     q4_k_factored: Cell<bool>,
     q6_k_factored: Cell<bool>,
     mpp_fast_dequant: Cell<bool>,
+    dense_mpp_tile_pairs: Cell<bool>,
+    rope_table: Cell<bool>,
+    rope_table_cache: RefCell<Option<RopeTableEntry>>,
     moe_expert_tile_pairs: Cell<bool>,
     moe_routing_temporary_limit: Cell<usize>,
     q4_k_expert_project_8rows: Cell<bool>,
@@ -368,6 +374,9 @@ impl MetalDevice {
             q4_k_factored: Cell::new(true),
             q6_k_factored: Cell::new(true),
             mpp_fast_dequant: Cell::new(true),
+            dense_mpp_tile_pairs: Cell::new(true),
+            rope_table: Cell::new(true),
+            rope_table_cache: RefCell::new(None),
             moe_expert_tile_pairs: Cell::new(true),
             moe_routing_temporary_limit: Cell::new(128 * 1024 * 1024),
             q4_k_expert_project_8rows: Cell::new(true),
@@ -727,6 +736,39 @@ impl MetalDevice {
     }
     pub fn moe_routing_temporary_limit(&self) -> usize {
         self.moe_routing_temporary_limit.get()
+    }
+    /// Share one RoPE cos/sin table across the q/k rotations of an execution.
+    pub fn set_rope_table(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change RoPE table policy during execution".into(),
+            ));
+        }
+        self.rope_table.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn rope_table_enabled(&self) -> bool {
+        self.rope_table.get()
+    }
+    pub(crate) fn rope_table_cache(&self) -> &RefCell<Option<RopeTableEntry>> {
+        &self.rope_table_cache
+    }
+    pub(crate) fn batching_active(&self) -> bool {
+        self.batching.get()
+    }
+    /// Let each dense GGUF TensorOps threadgroup cover two consecutive M tiles,
+    /// sharing each dequantized weight tile.
+    pub fn set_dense_mpp_tile_pairs(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change TensorOps tiling during execution".into(),
+            ));
+        }
+        self.dense_mpp_tile_pairs.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn dense_mpp_tile_pairs(&self) -> bool {
+        self.dense_mpp_tile_pairs.get()
     }
     /// Let each expert TensorOps threadgroup cover two 32-row tiles of one
     /// expert, sharing each dequantized weight tile.

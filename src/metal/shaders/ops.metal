@@ -246,6 +246,23 @@ kernel void causal_mask(ARGS, uint i [[thread_position_in_grid]]) {
     store(c,i,p[4],i%p[1]>p[5]+i/p[1]?-INFINITY:load(a,i,p[4]));
 }
 // Split-half pairing, sequence-major [S,H,D], absolute position offset + token.
+// Per-execution RoPE table: [rows][half][cos,sin] with rope_split's exact
+// angle expression, so table-driven rotation is bit-identical.
+kernel void rope_table(ARGS, uint i [[thread_position_in_grid]]) {
+    uint halfdim=p[6]/2;
+    if(i>=p[0]) return;
+    uint s=i/halfdim, j=i%halfdim;
+    float angle=float(p[5]+s)*pow(as_type<float>(p[8]),-float(2*j)/float(p[6]));
+    ((device float*)c)[2*i]=cos(angle);
+    ((device float*)c)[2*i+1]=sin(angle);
+}
+kernel void rope_split_table(ARGS, uint pair [[thread_position_in_grid]]) {
+    uint halfdim=p[6]/2, head=pair/halfdim, j=pair%halfdim;
+    uint i=head*p[6]+j, t=(head/p[1])*halfdim+j;
+    float co=((device const float*)b)[2*t], si=((device const float*)b)[2*t+1];
+    float x=load(a,i,p[4]), y=load(a,i+halfdim,p[4]);
+    store(c,i,p[4],x*co-y*si); store(c,i+halfdim,p[4],x*si+y*co);
+}
 kernel void rope_split(ARGS, uint pair [[thread_position_in_grid]]) {
     uint halfdim=p[6]/2, head=pair/halfdim, j=pair%halfdim;
     uint i=head*p[6]+j;

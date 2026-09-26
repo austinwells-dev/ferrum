@@ -603,6 +603,36 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let dense_mpp_tile_pairs = match request.get("dense_mpp_tile_pairs") {
+        None | Some(Value::Null) => {
+            device.set_dense_mpp_tile_pairs(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_dense_mpp_tile_pairs(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field dense_mpp_tile_pairs must be a boolean".into(),
+            ));
+        }
+    };
+    let rope_table = match request.get("rope_table") {
+        None | Some(Value::Null) => {
+            device.set_rope_table(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_rope_table(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field rope_table must be a boolean".into(),
+            ));
+        }
+    };
     let expert_tensorops = match request.get("moe_expert_tensorops") {
         None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
         Some(Value::Bool(enabled)) => {
@@ -714,6 +744,8 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "attention_scores_vector": attention_scores_vector,
         "q6_k_factored": q6_k_factored,
         "mpp_fast_dequant": mpp_fast_dequant,
+        "dense_mpp_tile_pairs": dense_mpp_tile_pairs,
+        "rope_table": rope_table,
         "moe_expert_tile_pairs": moe_expert_tile_pairs,
         "moe_routing_temporary_mib": moe_routing_temporary_mib,
         "device_argmax": device_argmax,
