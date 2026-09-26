@@ -93,27 +93,6 @@ kernel void rmsnorm(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[t
     threadgroup_barrier(mem_flags::mem_threadgroup);
     sum=simd_sum(lane<8?partial[lane]:0.f);
     float inv=rsqrt(sum/float(w)+as_type<float>(p[7]));
-    // BF16 midpoint sensitivity: only rows close to a storage rounding boundary
-    // need the legacy ascending sum to preserve the established model path.
-    threadgroup uint ambiguous[8];
-    threadgroup float ordered_inv;
-    uint near=0;
-    if(p[4]==2) for(uint j=tid;j<w;j+=256) {
-        float value=load(a,base+j,p[4])*inv*load(b,j,p[4]);
-        uint fraction=as_type<uint>(value)&65535;
-        near |= uint(abs(int(fraction)-32768)<=8);
-    }
-    near=simd_max(near);
-    if(lane==0) ambiguous[simd]=near;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    near=simd_max(lane<8?ambiguous[lane]:0u);
-    if(near && tid==0) {
-        float ordered=0;
-        for(uint j=0;j<w;j++) {float x=load(a,base+j,p[4]);ordered+=x*x;}
-        ordered_inv=rsqrt(ordered/float(w)+as_type<float>(p[7]));
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if(near) inv=ordered_inv;
     for(uint j=tid;j<w;j+=256) store(c,base+j,p[4],load(a,base+j,p[4])*inv*load(b,j,p[4]));
 
 }

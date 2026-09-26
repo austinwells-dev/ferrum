@@ -1979,3 +1979,42 @@ End-to-end in-process A/B: five interleaved pairs, control = single tiles with 1
 - The 11-token short prompt runs neither change: 44 routes is below the 256-route TensorOps threshold, and it fits in one chunk either way. Its 0.959 median ratio comes from overlapping samples (control 97.7–111.8 tok/s, candidate 97.5–106.6 tok/s).
 - Output IDs matched control in every pair.
 - Median transient prefill peaks were unchanged or lower (512: 255.9 -> 254.5 MiB; 1,024: 255.4 -> 252.6 MiB), because the 256 MiB arena flush already dominates. Sampled RSS stayed at about 5.3 GiB.
+
+## Experiment 59: Parallel RMSNorm without the BF16 midpoint fallback (retained by decision)
+
+Status: retained, as an explicit trade-off. The `rmsnorm` kernel previously checked every BF16 output. If any value fell within eight F32 low-bit units of a BF16 rounding midpoint, thread 0 recomputed the row's sum of squares serially in ascending order, so the result matched the original ordered reduction exactly. That fires on about 40% of 2,048-wide rows, and its dependent 2,048-step add chain cost 32–39 µs per call (Experiment 53). Before this change, that was 2.4 of 12.7 ms of summed LFM2.5 decode GPU time, about 10% of Qwen2.5's, and 6% of LFM2.5's 512-token prefill. The fallback is removed; every row uses the 256-thread parallel sum of squares.
+
+**Effect on reference tests.** The GGUF parity tests (Qwen3 Q8_0, LFM2.5 Q4_K_M against llama.cpp) are unchanged. Three BF16 Transformers-reference tests changed:
+
+- **Granite 3.1 MoE, step 5, and LFM2.5-8B-A1B BF16, step 7.** Ferrum now produces an exact BF16 logit tie between the reference token and another token (27.5 = 27.5 and 36.75 = 36.75), and argmax selects the lower ID. The reference's own top-two margins there are 0.25, two and one BF16 steps. The tests now accept a different token only when the reference's top two are within two BF16 steps and Ferrum scores the reference token within one step of its choice. They then continue on the reference token, so every later step and the cache replay are still checked.
+- **Qwen2.5-0.5B BF16.** One selected logit at step 2 deviated 0.516 from the reference (next largest 0.422), and the test's empirical 0.5 bound became 0.55. Greedy tokens, text, and EOS still match.
+
+Validation: all 159 tests, and the library suite under Metal API and GPU Shader Validation.
+
+A/B: five interleaved pairs per workload, control = build of `9065ead` (with the fallback), via `tools/phase7a_binary_ab.py`. The llama.cpp references are the saved 1ab7e5a rows. Raw: `*-rmsnorm-parallel-vs-9065ead.jsonl` and `.run.log`.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5-8B-A1B Q4_K_M / Short | 96.6->106.0 / 215.6 `[0.448->0.492; 1.075]` | 77.1->89.2 / 86.4 `[0.893->1.033; 1.160]` | 53.1->59.9 / 72.5 `[0.733->0.826; 1.102]` | 113.9->103.8 / 51.2 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 709.0->752.1 / 1,511.1 `[0.469->0.498; 1.063]` | 75.1->89.5 / 98.2 `[0.766->0.912; 1.183]` | 43.2->46.9 / 67.5 `[0.640->0.695; 1.099]` | 180.5->170.2 / 84.9 | 0/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 1,325.7->1,372.9 / 2,108.3 `[0.629->0.651; 1.024]` | 70.1->82.7 / 97.5 `[0.719->0.848; 1.174]` | 27.7->30.3 / 41.2 `[0.672->0.735; 1.082]` | 386.2->372.9 / 243.1 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 1,403.0->1,442.3 / 2,141.5 `[0.655->0.673; 1.017]` | 69.4->80.6 / 96.4 `[0.719->0.836; 1.160]` | 17.8->18.6 / 25.8 `[0.690->0.720; 1.047]` | 729.9->710.0 / 478.4 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 95.2->108.1 / 233.7 `[0.407->0.462; 1.104]` | 72.4->85.4 / 101.2 `[0.716->0.844; 1.167]` | 68.3->80.0 / 95.7 `[0.713->0.836; 1.153]` | 115.5->101.8 / 47.3 | 0/5; 0/5; 5/5 |
+| Qwen2.5 Q4_K_M / Short | 641.8->710.6 / 1,406.7 `[0.456->0.505; 1.110]` | 148.4->155.5 / 238.8 `[0.622->0.651; 1.052]` | 121.2->129.1 / 197.5 `[0.614->0.654; 1.061]` | 32.7->29.6 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 3,173.2->3,413.6 / 6,989.8 `[0.454->0.488; 1.043]` | 146.1->154.7 / 230.7 `[0.633->0.671; 1.056]` | 113.2->121.3 / 187.6 `[0.603->0.647; 1.048]` | 40.3->37.5 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 5,985.9->6,058.5 / 9,336.9 `[0.641->0.649; 1.018]` | 143.2->153.1 / 233.5 `[0.614->0.656; 1.060]` | 84.8->88.4 / 133.5 `[0.635->0.662; 1.042]` | 85.5->84.5 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 5,986.3->6,266.6 / 8,844.2 `[0.677->0.709; 1.027]` | 133.3->142.6 / 236.5 `[0.564->0.603; 1.067]` | 57.7->60.8 / 90.0 `[0.641->0.676; 1.042]` | 171.1->163.4 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 654.4->732.8 / 1,385.7 `[0.472->0.529; 1.144]` | 151.6->161.7 / 244.3 `[0.620->0.662; 1.080]` | 147.5->158.2 / 221.8 `[0.665->0.713; 1.087]` | 32.1->28.7 / 15.4 | 0/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / Short | 563.4->644.8 / 1,258.3 `[0.448->0.512; 1.165]` | 114.4->127.2 / 164.5 `[0.695->0.773; 1.112]` | 95.6->107.7 / 143.8 `[0.665->0.749; 1.121]` | 37.3->32.6 / 17.0 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 2,644.9->2,821.7 / 6,001.2 `[0.441->0.470; 1.092]` | 110.1->123.7 / 163.8 `[0.673->0.755; 1.123]` | 86.5->96.1 / 138.8 `[0.623->0.692; 1.113]` | 48.4->45.4 / 21.6 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / 512-token prompt | 4,403.6->4,793.2 / 7,099.6 `[0.620->0.675; 1.077]` | 103.9->115.6 / 154.9 `[0.671->0.746; 1.112]` | 60.8->66.8 / 95.2 `[0.639->0.702; 1.090]` | 116.3->106.8 / 72.4 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 4,748.0->5,142.9 / 6,283.2 `[0.756->0.819; 1.085]` | 91.3->100.9 / 143.3 `[0.637->0.704; 1.106]` | 41.9->45.5 / 61.1 `[0.686->0.745; 1.096]` | 215.7->199.1 / 163.2 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 561.5->653.2 / 1,241.8 `[0.452->0.526; 1.168]` | 115.7->128.5 / 164.7 `[0.703->0.780; 1.112]` | 112.7->125.6 / 157.4 `[0.716->0.798; 1.115]` | 37.4->32.1 / 17.2 | 0/5; 0/5; 0/5 |
+
+[exited with code 0]
+
+Cached decode rose 16–18% for LFM2.5, 5–8% for Qwen2.5 Q4_K_M, and 11–12% for Qwen3 Q8_0. Prefill rose 2–17%.
+
+LFM2.5 short-prompt decode reached 89.2 tok/s against llama.cpp's 86.4 (1.033x), the first workload where Ferrum decodes faster than the pinned llama.cpp build. LFM2.5 decode is now 0.84–1.03x across workloads, and Qwen3's 1,024-token prefill is 0.819x. No format yet meets every threshold of the gate: LFM2.5's 512-token, 1,024-token, and sustained decode are 0.836–0.848x, and prefill is below 0.80x elsewhere.
+
+**Fidelity cost.** Against llama.cpp's saved sequences, LFM2.5 sustained decode previously matched all 129 tokens and now diverges at generated index 46. The LFM2.5 128-token case diverges at index 8 instead of 9. Every other workload diverges at the same index as control or not at all.

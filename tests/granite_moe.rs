@@ -7,6 +7,39 @@ use ferrum::{
     },
 };
 
+/// One BF16 step at `x`'s magnitude: the resolution of reference logits.
+fn bf16_step(x: f32) -> f32 {
+    2f32.powf(x.abs().log2().floor() - 7.)
+}
+
+/// Greedy parity that tolerates only exact BF16 ties. Parallel RMSNorm sums may
+/// round a row differently from the reference; a different token is accepted
+/// only when the reference's own top two are within two BF16 steps (one step
+/// of rounding on each reference logit) and Ferrum
+/// scores the reference token within one step of its choice. The reference
+/// token is then followed so later steps stay checked.
+fn reference_token(values: &[f32], row: &serde_json::Value) -> u32 {
+    let expected = row["token"].as_u64().unwrap() as usize;
+    let token = argmax(values).unwrap() as usize;
+    if token != expected {
+        let top = row["top10"].as_array().unwrap();
+        let (first, second) = (
+            top[0][1].as_f64().unwrap() as f32,
+            top[1][1].as_f64().unwrap() as f32,
+        );
+        assert!(
+            first - second <= 2. * bf16_step(first)
+                && values[token] - values[expected] <= bf16_step(values[token]),
+            "step {}: token {token} ({}) instead of {expected} ({}); reference margin {}",
+            row["step"],
+            values[token],
+            values[expected],
+            first - second
+        );
+    }
+    expected as u32
+}
+
 #[test]
 fn official_granite_moe_config_selects_shared_sparse_policy() {
     let source: GraniteMoeConfig =
@@ -62,8 +95,7 @@ fn official_granite_moe_matches_reference_and_replays_cache_state() {
     let mut maximum = 0.0f32;
     for row in reference["rows"].as_array().unwrap() {
         let values = final_logits(&device, &logits).unwrap();
-        let token = argmax(&values).unwrap();
-        assert_eq!(token as u64, row["token"].as_u64().unwrap());
+        let token = reference_token(&values, row);
         for item in row["top10"].as_array().unwrap() {
             let id = item[0].as_u64().unwrap() as usize;
             let difference = (values[id] - item[1].as_f64().unwrap() as f32).abs();

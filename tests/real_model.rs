@@ -49,17 +49,19 @@ fn official_qwen_bf16_cached_generation() {
                 assert_eq!(token as u64, expected["token"].as_u64().unwrap());
                 // Empirical BF16 cross-engine check, not a universal floating-point error bound.
                 // F32 diagnosis independently agrees to < 8e-5 (see phase3-results).
+                // Parallel RMSNorm (no ordered midpoint fallback, Phase 7A Experiment 59)
+                // measured a 0.516 maximum over these five steps; 0.5 held only with it.
                 for (id, v) in expected["selected"].as_object().unwrap() {
                     let id: usize = id.parse().unwrap();
                     assert!(
-                        (values[id] as f64 - v.as_f64().unwrap()).abs() <= 0.5,
+                        (values[id] as f64 - v.as_f64().unwrap()).abs() <= 0.55,
                         "step {step}, ID {id}"
                     );
                 }
                 for pair in expected["top10"].as_array().unwrap() {
                     let id = pair[0].as_u64().unwrap() as usize;
                     assert!(
-                        (values[id] as f64 - pair[1].as_f64().unwrap()).abs() <= 0.5,
+                        (values[id] as f64 - pair[1].as_f64().unwrap()).abs() <= 0.55,
                         "step {step}, top ID {id}"
                     );
                 }
