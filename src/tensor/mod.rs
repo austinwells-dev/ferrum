@@ -177,7 +177,8 @@ impl Tensor {
     ) -> Result<Self> {
         let shape = Shape::new(dims)?;
         let layout = Layout::contiguous(&shape)?;
-        let mut storage = device.allocate(shape.byte_size(dtype)?)?;
+        // Readers load model weights, which stay resident for the model's life.
+        let mut storage = device.allocate_resident(shape.byte_size(dtype)?)?;
         storage.with_bytes_mut(fill)?;
         Ok(Self {
             storage: Rc::new(storage),
@@ -301,7 +302,7 @@ impl PackedStorage {
         if byte_len == 0 {
             return Err(Error::Shape("packed storage must be nonempty".into()));
         }
-        let mut storage = device.allocate(byte_len)?;
+        let mut storage = device.allocate_resident(byte_len)?;
         storage.with_bytes_mut(fill)?;
         Ok(Self {
             storage: Rc::new(storage),

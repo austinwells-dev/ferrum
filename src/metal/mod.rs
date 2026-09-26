@@ -109,9 +109,14 @@ pub struct MetalBuffer {
     ready: RefCell<Option<Rc<Cell<Completion>>>>,
     writes: RefCell<Vec<WriteRange>>,
     arena: Option<Rc<RefCell<Arena>>>,
+    resident: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
 }
 impl Drop for MetalBuffer {
     fn drop(&mut self) {
+        if let Some(set) = &self.resident {
+            set.removeAllocation(ProtocolObject::from_ref(&*self.raw));
+            set.commit();
+        }
         if let Some(arena) = &self.arena {
             let mut arena = arena.borrow_mut();
             let bytes = self.raw.length();
@@ -260,6 +265,82 @@ impl Drop for Execution<'_> {
         self.device.rope_table_cache.borrow_mut().take();
     }
 }
+/// Background residency keep-alive. It holds only the (Send + Sync) command
+/// queue and a no-op pipeline: while real work was submitted within `window`,
+/// it executes one empty dispatch every `interval`, which re-applies the
+/// queue's residency set and keeps weight residency through short idle gaps.
+struct KeepAlive {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_use: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    started: Instant,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+impl KeepAlive {
+    fn start(
+        queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+        pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+        interval: Duration,
+        window: Duration,
+    ) -> Self {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let last_use = Arc::new(AtomicU64::new(0));
+        let started = Instant::now();
+        let thread = {
+            let (stop, last_use) = (stop.clone(), last_use.clone());
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    std::thread::park_timeout(interval);
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let now = started.elapsed().as_millis() as u64;
+                    let last = last_use.load(Ordering::Relaxed);
+                    if last != 0 && now.saturating_sub(last) < window.as_millis() as u64 {
+                        autoreleasepool(|_| {
+                            if let Some(command) = queue.commandBuffer()
+                                && let Some(encoder) = command.computeCommandEncoder()
+                            {
+                                encoder.setComputePipelineState(&pipeline);
+                                let one = MTLSize {
+                                    width: 1,
+                                    height: 1,
+                                    depth: 1,
+                                };
+                                encoder.dispatchThreadgroups_threadsPerThreadgroup(one, one);
+                                encoder.endEncoding();
+                                command.commit();
+                            }
+                        });
+                    }
+                }
+            })
+        };
+        Self {
+            stop,
+            last_use,
+            started,
+            thread: Some(thread),
+        }
+    }
+    fn touch(&self) {
+        let now = self.started.elapsed().as_millis().max(1) as u64;
+        self.last_use
+            .store(now, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+impl Drop for KeepAlive {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            thread.thread().unpark();
+            let _ = thread.join();
+        }
+    }
+}
 struct ProfileStageScope<'a> {
     stage: &'a Cell<Option<&'static str>>,
     previous: Option<&'static str>,
@@ -302,6 +383,10 @@ pub struct MetalDevice {
     dense_mpp_tile_pairs: Cell<bool>,
     rope_table: Cell<bool>,
     arena_epoch_reuse: Cell<bool>,
+    resident_weights: Cell<bool>,
+    keep_alive: RefCell<Option<KeepAlive>>,
+    residency: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
+    residency_dirty: Cell<bool>,
     rope_table_cache: RefCell<Option<RopeTableEntry>>,
     moe_expert_tile_pairs: Cell<bool>,
     moe_routing_temporary_limit: Cell<usize>,
@@ -336,7 +421,19 @@ pub struct MetalDevice {
     builtins: RefCell<HashMap<&'static str, Rc<ComputePipeline>>>,
 }
 impl MetalDevice {
+    /// Default device: weights stay in a queue residency set and a keep-alive
+    /// heartbeat (500 ms, for 3 minutes after the last submission) keeps that
+    /// residency applied across short idle gaps. See Phase 7A Experiment 64.
     pub fn new() -> Result<Self> {
+        let device = Self::without_keep_alive()?;
+        device.set_residency_keep_alive(Some((
+            Duration::from_millis(500),
+            Duration::from_secs(180),
+        )))?;
+        Ok(device)
+    }
+    /// A device with no background keep-alive thread.
+    pub fn without_keep_alive() -> Result<Self> {
         let raw = MTLCreateSystemDefaultDevice()
             .ok_or_else(|| Error::Initialization("no default GPU".into()))?;
         if !raw.hasUnifiedMemory() {
@@ -345,6 +442,18 @@ impl MetalDevice {
         let queue = raw
             .newCommandQueue()
             .ok_or_else(|| Error::Initialization("command queue creation failed".into()))?;
+        // Model weights join one residency set attached to the queue and kept
+        // resident, so a submission after an idle period does not re-wire
+        // gigabytes of weight allocations before it can start.
+        let residency = {
+            let descriptor = MTLResidencySetDescriptor::new();
+            // SAFETY: a capacity hint has no memory-safety preconditions.
+            unsafe { descriptor.setInitialCapacity(1024) };
+            raw.newResidencySetWithDescriptor_error(&descriptor).ok()
+        };
+        if let Some(set) = &residency {
+            queue.addResidencySet(set);
+        }
         Ok(Self {
             profile_stage: Cell::new(None),
             #[cfg(test)]
@@ -378,6 +487,10 @@ impl MetalDevice {
             dense_mpp_tile_pairs: Cell::new(true),
             rope_table: Cell::new(true),
             arena_epoch_reuse: Cell::new(true),
+            resident_weights: Cell::new(true),
+            keep_alive: RefCell::new(None),
+            residency,
+            residency_dirty: Cell::new(false),
             rope_table_cache: RefCell::new(None),
             moe_expert_tile_pairs: Cell::new(true),
             moe_routing_temporary_limit: Cell::new(128 * 1024 * 1024),
@@ -739,6 +852,39 @@ impl MetalDevice {
     pub fn moe_routing_temporary_limit(&self) -> usize {
         self.moe_routing_temporary_limit.get()
     }
+    /// Keep weight allocations made after this call in the resident queue set.
+    pub fn set_resident_weights(&self, enabled: bool) {
+        self.resident_weights.set(enabled);
+    }
+    pub fn resident_weights(&self) -> bool {
+        self.resident_weights.get() && self.residency.is_some()
+    }
+    /// Keep weight residency warm between requests: an empty command buffer is
+    /// committed every `interval` while real work ran within `window`. `None`
+    /// stops the keep-alive thread.
+    pub fn set_residency_keep_alive(&self, schedule: Option<(Duration, Duration)>) -> Result<()> {
+        let next = match schedule {
+            Some((interval, window)) => {
+                let pipeline = self.builtin("keep_alive")?.raw.clone();
+                let keep_alive = KeepAlive::start(self.queue.clone(), pipeline, interval, window);
+                keep_alive.touch();
+                Some(keep_alive)
+            }
+            None => None,
+        };
+        *self.keep_alive.borrow_mut() = next;
+        Ok(())
+    }
+    /// Zeroed shared storage for model weights, added to the resident set.
+    pub(crate) fn allocate_resident(&self, bytes: usize) -> Result<MetalBuffer> {
+        let mut buffer = self.allocate(bytes)?;
+        if let (true, Some(set)) = (self.resident_weights.get(), &self.residency) {
+            set.addAllocation(ProtocolObject::from_ref(&*buffer.raw));
+            self.residency_dirty.set(true);
+            buffer.resident = Some(set.clone());
+        }
+        Ok(buffer)
+    }
     /// Recycle transient storage retired earlier in the current encoding epoch.
     pub fn set_arena_epoch_reuse(&self, enabled: bool) -> Result<()> {
         if self.batching.get() {
@@ -1083,6 +1229,9 @@ impl MetalDevice {
         if let Some(encoder) = &submission.encoder {
             encoder.endEncoding();
         }
+        if let Some(keep_alive) = self.keep_alive.borrow().as_ref() {
+            keep_alive.touch();
+        }
         submission.command.commit();
         submission.command.waitUntilCompleted();
         let mut counters = self.counters.get();
@@ -1232,6 +1381,7 @@ impl MetalDevice {
             ready: RefCell::new(None),
             writes: RefCell::new(Vec::new()),
             arena: None,
+            resident: None,
         })
     }
     /// Only fully overwritten trusted kernel outputs use the bounded transient arena.
@@ -1285,6 +1435,7 @@ impl MetalDevice {
                 ready: RefCell::new(None),
                 writes: RefCell::new(Vec::new()),
                 arena: None,
+                resident: None,
             }
         } else {
             arena.make_room(length);
@@ -1567,6 +1718,12 @@ impl MetalDevice {
         autoreleasepool(|_| {
             let start = Instant::now();
             if self.pending.borrow().is_none() {
+                if self.residency_dirty.replace(false)
+                    && let Some(set) = &self.residency
+                {
+                    set.commit();
+                    set.requestResidency();
+                }
                 let command = self
                     .queue
                     .commandBuffer()

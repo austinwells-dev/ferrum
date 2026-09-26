@@ -761,6 +761,8 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "mpp_fast_dequant": mpp_fast_dequant,
         "dense_mpp_tile_pairs": dense_mpp_tile_pairs,
         "rope_table": rope_table,
+        "resident_weights": device.resident_weights(),
+        "keep_alive": std::env::var("FERRUM_KEEP_ALIVE").as_deref() != Ok("0"),
         "arena_epoch_reuse": arena_epoch_reuse,
         "moe_expert_tile_pairs": moe_expert_tile_pairs,
         "moe_routing_temporary_mib": moe_routing_temporary_mib,
@@ -877,6 +879,18 @@ fn main() -> Result<()> {
             }
         };
         device.set_mlx_affine4_gemv_quad(enabled)?;
+    }
+    if let Ok(value) = std::env::var("FERRUM_RESIDENT_WEIGHTS") {
+        let enabled = match value.as_str() {
+            "1" | "true" => true,
+            "0" | "false" => false,
+            _ => return Err(Error::Parameter("invalid FERRUM_RESIDENT_WEIGHTS".into())),
+        };
+        device.set_resident_weights(enabled);
+    }
+    // MetalDevice::new starts the residency keep-alive; FERRUM_KEEP_ALIVE=0 stops it.
+    if std::env::var("FERRUM_KEEP_ALIVE").as_deref() == Ok("0") {
+        device.set_residency_keep_alive(None)?;
     }
     if let Ok(value) = std::env::var("FERRUM_BATCH_LIMIT") {
         let limit = value

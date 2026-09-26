@@ -226,7 +226,7 @@ and ranked Phase 4 recommendations.
 
 ## Phase 4 current execution and storage model
 
-`MetalDevice` owns a single queue and an internal execution guard. Public tensor operations submit and wait synchronously. Transformer forward instead encodes separate tracked-hazard compute encoders into a bounded command buffer, default 1,024 dispatches. The measured model uses 603 dispatches and one completion boundary per forward. Limits 1/64/256/1024/8192 were measured; larger batches than 1024 did not improve the initial control. No broad threading or unsafe Send/Sync was introduced.
+`MetalDevice` owns a single queue and an internal execution guard. Public tensor operations submit and wait synchronously. Transformer forward instead encodes separate tracked-hazard compute encoders into a bounded command buffer, default 1,024 dispatches. The measured model uses 603 dispatches and one completion boundary per forward. Limits 1/64/256/1024/8192 were measured; larger batches than 1024 did not improve the initial control. No broad threading or unsafe Send/Sync was introduced. Since Phase 7A Experiment 64, `MetalDevice::new()` keeps model weights in a queue residency set. It also starts one background keep-alive thread, holding only the `Send + Sync` command queue and a no-op pipeline, which dispatches an empty kernel every 500 ms for up to 3 minutes after the last submission so weight residency survives short idle gaps. `MetalDevice::without_keep_alive()` omits it.
 
 Phase 7B encoder policy: a transformer forward opens its execution scope with
 `execution_with_shared_encoder(!has_sparse_moe)`. For dense models, one compute

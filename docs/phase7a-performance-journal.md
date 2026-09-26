@@ -2182,3 +2182,36 @@ Decode changed by 0–3%, and IDs matched in every pair.
 - **At 1,024 tokens**, Qwen2.5 Q4_K_M (0.884x), Qwen3 (0.961x), and Qwen2.5 Q6_K (0.862x) meet the prefill threshold.
 - **At 512 tokens**, the same three models are 0.735–0.784x.
 - **Qwen decode** remains 0.66–0.85x.
+
+## Experiment 64: Weight residency set with a dispatching keep-alive (retained)
+
+Status: retained as the `MetalDevice::new()` default. `MetalDevice::without_keep_alive()` and `set_residency_keep_alive(None)` disable the heartbeat. Bench environment switches: `FERRUM_RESIDENT_WEIGHTS` and `FERRUM_KEEP_ALIVE`.
+
+**Diagnosis.** Each benchmark request follows a CPU preflight idle of several seconds. After that idle, Ferrum paid a large pre-execution latency: prefill `wait - gpu` of about 30 ms for LFM2.5 short prompts (up to 60 ms at 128 and 1,024 tokens) and about 6 ms for Qwen2.5. Back-to-back (warm) requests paid about 0.2 ms, and decode immediately after prefill paid 0.25 ms. The cost scaled with weight bytes (5.1 GB versus 0.4 GB), which is consistent with GPU residency of the weight allocations being re-established after idle. llama.cpp's saved rows, measured after the same preflight, do not show it.
+
+**Variants tested** (LFM2.5 unless noted; five pairs each):
+
+1. **Residency set only** (`requestResidency` once): every weight allocation (`PackedStorage` and `Tensor::from_reader`) joins one `MTLResidencySet` attached to the queue, committed and resident-requested before the next submission. `wait - gpu` fell from 31.5 to 1.2 ms, but the first command buffer of each request then blocked encoding for about 50 ms while the set was made resident again. The short prompt worsened (first token 107.9 -> 127.7 ms). Qwen2.5 was neutral. Raw: `*-residency-request-only-ab.jsonl`.
+2. **Keep-alive committing empty command buffers** every 500 ms: no effect (`wait - gpu` 29.9 -> 29.5 ms). Combined with the set, the 47 ms encode block remained. Raw: `*-keepalive-empty-cb-ab.jsonl`.
+3. **Keep-alive dispatching a no-op kernel** (`keep_alive`, one threadgroup) every 500 ms: alone, small (`wait - gpu` 33.0 -> 27.9 ms).
+4. **Residency set plus the dispatching keep-alive: retained.** Each heartbeat executes on the queue, re-applying its residency set, so no request pays re-wiring. `wait - gpu` fell to 0.4 ms (short), 5.3 ms (128), 3.1 ms (512), and 12.0 ms (1,024), with no encode block.
+
+The keep-alive thread holds only the command queue and pipeline state, both `Send + Sync` in objc2-metal, and a shared atomic last-use timestamp. No unsafe `Send`/`Sync` is introduced. It heartbeats only within 3 minutes of the last real submission (llama.cpp's policy), parks between beats, and stops immediately when the device drops. The library suite still runs in 0.19 s.
+
+Validation: all 167 tests, the library suite under Metal API and GPU Shader Validation, and clippy with only the pre-existing warnings.
+
+Retained configuration (variant 4) against the committed baseline. llama.cpp references are the saved 1ab7e5a rows. Raw: `lfm2.5-8b-a1b-residency-keepalive-dispatch-ab.jsonl` and `.run.log`.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5-8B-A1B Q4_K_M / Short | 115.7->143.7 / 215.6 `[0.537->0.667; 1.245]` | 87.6->87.5 / 86.4 `[1.014->1.013; 0.997]` | 61.1->65.6 / 72.5 `[0.843->0.905; 1.081]` | 95.1->76.6 / 51.2 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 784.5->1,044.4 / 1,511.1 `[0.519->0.691; 1.331]` | 87.8->87.7 / 98.2 `[0.894->0.894; 1.002]` | 49.2->55.8 / 67.5 `[0.729->0.827; 1.135]` | 163.2->122.6 / 84.9 | 5/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 1,762.7->1,861.6 / 2,108.3 `[0.836->0.883; 1.053]` | 87.0->86.8 / 97.5 `[0.892->0.890; 1.000]` | 35.7->36.9 / 41.2 `[0.867->0.895; 1.031]` | 290.5->275.0 / 243.1 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 1,776.9->1,859.7 / 2,141.5 `[0.830->0.868; 1.052]` | 84.9->86.0 / 96.4 `[0.881->0.892; 1.013]` | 22.2->23.2 / 25.8 `[0.861->0.899; 1.042]` | 576.3->550.6 / 478.4 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 113.5->145.4 / 233.7 `[0.486->0.622; 1.299]` | 88.5->88.5 / 101.2 `[0.875->0.875; 1.001]` | 83.7->84.9 / 95.7 `[0.875->0.887; 1.015]` | 96.9->75.7 / 47.3 | 5/5; 0/5; 0/5 |
+
+**LFM2.5 results:**
+
+- Prefill rose 24.5% at the short prompt, 33.1% at 128 tokens, and 5.2–5.3% at 512 and 1,024 tokens. Short first-token latency went from 95.1 to 76.6 ms (llama.cpp: 51.2 ms).
+- 512/1,024-token prefill is now 0.88x / 0.87x llama.cpp, and decode is 0.87–1.01x.
+- Short and 128-token prefill are 0.67x and 0.69x; the remaining gap is GPU work (75 ms for 11 tokens, dominated by per-assignment expert GEMV).

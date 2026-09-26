@@ -9,7 +9,7 @@ description = "An independent Rust and Metal tensor runtime for Apple Silicon"
 half = "2.7.1"
 objc2 = "0.6.4"
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSString", "NSError"] }
-objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLBuffer", "MTLResource", "MTLComputePipeline", "MTLLibrary", "MTLTypes", "MTLAllocation", "objc2-core-foundation"] }
+objc2-metal = { version = "0.3.2", default-features = false, features = ["std", "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder", "MTLComputeCommandEncoder", "MTLBuffer", "MTLResource", "MTLComputePipeline", "MTLLibrary", "MTLTypes", "MTLAllocation", "MTLResidencySet", "objc2-core-foundation"] }
 rand = "0.9"
 rand_chacha = "0.9"
 safetensors = "0.8.0"

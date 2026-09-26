@@ -246,6 +246,8 @@ kernel void causal_mask(ARGS, uint i [[thread_position_in_grid]]) {
     store(c,i,p[4],i%p[1]>p[5]+i/p[1]?-INFINITY:load(a,i,p[4]));
 }
 // Split-half pairing, sequence-major [S,H,D], absolute position offset + token.
+// Residency heartbeat: executes on the queue without touching memory.
+kernel void keep_alive(uint i [[thread_position_in_grid]]) {}
 // Per-execution RoPE table: [rows][half][cos,sin] with rope_split's exact
 // angle expression, so table-driven rotation is bit-identical.
 kernel void rope_table(ARGS, uint i [[thread_position_in_grid]]) {
