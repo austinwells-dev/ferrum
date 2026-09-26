@@ -437,10 +437,10 @@ impl MetalDevice {
         theta: f32,
     ) -> Result<Tensor> {
         let key = (offset, rows, head_dim, theta.to_bits());
-        if let Some((cached, table)) = self.rope_table_cache().borrow().as_ref() {
-            if *cached == key {
-                return Ok(table.clone());
-            }
+        if let Some((cached, table)) = self.rope_table_cache().borrow().as_ref()
+            && *cached == key
+        {
+            return Ok(table.clone());
         }
         let entries = rows
             .checked_mul(head_dim / 2)
