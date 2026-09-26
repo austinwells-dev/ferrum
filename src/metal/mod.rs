@@ -292,6 +292,8 @@ pub struct MetalDevice {
     q5_1_gemv_n4: Cell<bool>,
     q4_0_gemv_8rows: Cell<bool>,
     q4_k_gemv_8rows: Cell<bool>,
+    q4_k_factored: Cell<bool>,
+    q6_k_factored: Cell<bool>,
     q4_k_expert_project_8rows: Cell<bool>,
     q4_k_expert_project_16rows: Cell<bool>,
     q4_k_expert_project_16rows_pairs: Cell<bool>,
@@ -358,6 +360,8 @@ impl MetalDevice {
             q5_1_gemv_n4: Cell::new(true),
             q4_0_gemv_8rows: Cell::new(true),
             q4_k_gemv_8rows: Cell::new(true),
+            q4_k_factored: Cell::new(true),
+            q6_k_factored: Cell::new(true),
             q4_k_expert_project_8rows: Cell::new(true),
             q4_k_expert_project_16rows: Cell::new(true),
             q4_k_expert_project_16rows_pairs: Cell::new(true),
@@ -661,6 +665,32 @@ impl MetalDevice {
     }
     pub(crate) fn use_q4_k_gemv_8rows(&self, output_rows: usize) -> bool {
         self.q4_k_gemv_8rows.get() && output_rows >= 128
+    }
+    /// Select factored-scale Q4_K M=1 kernels (dense GEMV and sparse experts).
+    pub fn set_q4_k_factored(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q4_K GEMV during execution".into(),
+            ));
+        }
+        self.q4_k_factored.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q4_k_factored(&self, features: usize) -> bool {
+        self.q4_k_factored.get() && features >= 256 && features.is_multiple_of(256)
+    }
+    /// Select factored-scale Q6_K M=1 kernels (dense GEMV and sparse experts).
+    pub fn set_q6_k_factored(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q6_K GEMV during execution".into(),
+            ));
+        }
+        self.q6_k_factored.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn use_q6_k_factored(&self, features: usize) -> bool {
+        self.q6_k_factored.get() && features >= 256 && features.is_multiple_of(256)
     }
     /// Select the two-output-row-per-SIMD Q4_K kernel for sparse expert batches.
     pub fn set_q4_k_expert_project_8rows(&self, enabled: bool) -> Result<()> {
@@ -1242,6 +1272,8 @@ impl MetalDevice {
             | "expert_project_q4_k_8rows"
             | "expert_project_q4_k_16rows"
             | "expert_project_q4_k_16rows_pairs"
+            | "expert_project_q4_k_factored"
+            | "expert_project_q6_k_factored"
             | "expert_project_q6_k_8rows"
             | "expert_project_q5_k"
             | "expert_project_q6_k" => (3, 1),
@@ -1366,6 +1398,8 @@ impl MetalDevice {
                 | "q8_0_gemv_k_split"
                 | "q4_0_gemv_8rows"
                 | "q4_k_gemv_8rows"
+                | "q4_k_gemv_factored"
+                | "q6_k_gemv_factored"
                 | "q5_k_gemv_8rows"
                 | "q6_k_gemv_8rows"
                 | "q4_0_gemv"
@@ -1749,7 +1783,9 @@ impl MetalDevice {
                     | "q8_0_gemv_k_split"
                     | "q4_0_gemv_8rows"
                     | "q4_k_gemv_8rows"
+                    | "q4_k_gemv_factored"
                     | "q6_k_gemv_8rows"
+                    | "q6_k_gemv_factored"
                     | "mlx_affine4_gemv"
             ) {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
@@ -1762,6 +1798,8 @@ impl MetalDevice {
                     MTLSize {
                         width: grid[0].div_ceil(if matches!(name, "q8_0_gemv_k_split") {
                             2
+                        } else if matches!(name, "q4_k_gemv_factored" | "q6_k_gemv_factored") {
+                            16
                         } else if matches!(
                             name,
                             "q8_0_gemv_8rows"
@@ -1840,6 +1878,8 @@ impl MetalDevice {
             } else if name == "expert_project_q4_k_8rows"
                 || name == "expert_project_q4_k_16rows"
                 || name == "expert_project_q4_k_16rows_pairs"
+                || name == "expert_project_q4_k_factored"
+                || name == "expert_project_q6_k_factored"
                 || name == "expert_project_q6_k_8rows"
             {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
@@ -1854,6 +1894,8 @@ impl MetalDevice {
                         width: grid[0].div_ceil(
                             if name == "expert_project_q4_k_16rows"
                                 || name == "expert_project_q4_k_16rows_pairs"
+                                || name == "expert_project_q4_k_factored"
+                                || name == "expert_project_q6_k_factored"
                             {
                                 16
                             } else {

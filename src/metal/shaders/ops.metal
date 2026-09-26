@@ -840,6 +840,87 @@ kernel void q4_k_gemv_8rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint
     if(lane==0 && row0<p[3]) store(c,row0,p[4],sum0);
     if(lane==0 && row1<p[3]) store(c,row1,p[4],sum1);
 }
+// Factored Q4_K M=1 dot products after llama.cpp's kernel_mul_mv_q4_K (MIT):
+// lanes split into four block streams of eight; each lane owns 32 values of a
+// block, reads packed nibbles as 16-bit words, decodes the block scales once,
+// and applies d*scale and dmin*min per 32-value group rather than per weight.
+// `rows` rows starting at packed row `first` share one set of activations.
+template<uint R>
+inline void q4_k_factored_rows(device const uchar* a, uint abase, uint dtype,
+                               device const uchar* w, uint first, uint rows,
+                               uint blocks, uint lane, thread float* out) {
+    uint ix=lane/8, it=lane%8, iq=it/4, ir=it%4;
+    float sums[R];
+    for(uint r=0;r<R;r++) sums[r]=0.f;
+    for(uint ib=ix;ib<blocks;ib+=4) {
+        uint y0=abase+ib*256+64*iq+8*ir;
+        float yl[16], yh[16];
+        float4 sumy=0.f;
+        for(uint i=0;i<8;i++) {
+            yl[i]=load(a,y0+i,dtype);       sumy[0]+=yl[i];
+            yl[i+8]=load(a,y0+32+i,dtype);  sumy[1]+=yl[i+8];
+            yh[i]=load(a,y0+128+i,dtype);   sumy[2]+=yh[i];
+            yh[i+8]=load(a,y0+160+i,dtype); sumy[3]+=yh[i+8];
+        }
+        for(uint r=0;r<R;r++) {
+            if(r>=rows) break;
+            device const uchar* block=w+(ulong(first+r)*blocks+ib)*144;
+            device const ushort* sc=(device const ushort*)(block+4)+iq;
+            device const ushort* q1=(device const ushort*)(block+16)+16*iq+4*ir;
+            device const ushort* q2=q1+32;
+            ushort sc16[4];
+            sc16[0]=sc[0]&0x3f3f;
+            sc16[1]=sc[2]&0x3f3f;
+            sc16[2]=((sc[4]>>0)&0x0f0f)|((sc[0]&0xc0c0)>>2);
+            sc16[3]=((sc[4]>>4)&0x0f0f)|((sc[2]&0xc0c0)>>2);
+            thread const uchar* sc8=(thread const uchar*)sc16;
+            float4 acc1=0.f, acc2=0.f;
+            for(uint i=0;i<4;i++) {
+                ushort w1=q1[i], w2=q2[i];
+                acc1[0]+=yl[2*i+0]*float(w1&0x000F);
+                acc1[1]+=yl[2*i+1]*float(w1&0x0F00);
+                acc1[2]+=yl[2*i+8]*float(w1&0x00F0);
+                acc1[3]+=yl[2*i+9]*float(w1&0xF000);
+                acc2[0]+=yh[2*i+0]*float(w2&0x000F);
+                acc2[1]+=yh[2*i+1]*float(w2&0x0F00);
+                acc2[2]+=yh[2*i+8]*float(w2&0x00F0);
+                acc2[3]+=yh[2*i+9]*float(w2&0xF000);
+            }
+            float d=float(*((device const half*)block));
+            float dmin=float(*((device const half*)(block+2)));
+            sums[r]+=d*((acc1[0]+acc1[1]/256.f)*float(sc8[0])
+                        +(acc1[2]+acc1[3]/256.f)*float(sc8[1])/16.f
+                        +(acc2[0]+acc2[1]/256.f)*float(sc8[4])
+                        +(acc2[2]+acc2[3]/256.f)*float(sc8[5])/16.f)
+                    -dmin*(sumy[0]*float(sc8[2])+sumy[1]*float(sc8[3])
+                          +sumy[2]*float(sc8[6])+sumy[3]*float(sc8[7]));
+        }
+    }
+    for(uint r=0;r<R;r++) out[r]=simd_sum(sums[r]);
+}
+// Dense M=1: four rows per SIMD group, sixteen rows per 128-thread group.
+kernel void q4_k_gemv_factored(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, row0=group*16+(tid/32)*4, n=p[3];
+    if(row0>=n) return;
+    float out[4];
+    q4_k_factored_rows<4>(a,0,p[4],b,row0,min(4u,n-row0),p[2]/256,lane,out);
+    if(lane==0) for(uint r=0;r<min(4u,n-row0);r++) store(c,row0+r,p[4],out[r]);
+}
+// Sparse experts: four rows per SIMD group, sixteen rows per 128-thread group.
+kernel void expert_project_q4_k_factored(EXPERT_PROJECT_ARGS,
+                                         uint tid [[thread_index_in_threadgroup]],
+                                         uint2 group [[threadgroup_position_in_grid]]) {
+    uint assignment=group.y, lane=tid%32;
+    uint row0=group.x*16+(tid/32)*4;
+    uint k=p[2], rows=p[3], experts=p[5];
+    if(assignment>=p[1] || row0>=rows) return;
+    uint expert=as_type<uint>(load(m,assignment*3,p[6]));
+    if(expert>=experts) return;
+    uint valid=min(4u,rows-row0);
+    float out[4];
+    q4_k_factored_rows<4>(a,assignment*k,p[4],b,expert*rows+row0,valid,k/256,lane,out);
+    if(lane==0) for(uint r=0;r<valid;r++) store(c,assignment*rows+row0+r,p[4],out[r]);
+}
 kernel void q4_k_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
     uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;
     uint k=p[2], chunks=k/32;
@@ -1125,6 +1206,71 @@ kernel void q6_k_gemv_8rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint
     float sum1=simd_sum((sum10+sum11)+(sum12+sum13));
     if(lane==0 && row0<p[3]) store(c,row0,p[4],sum0);
     if(lane==0 && row1<p[3]) store(c,row1,p[4],sum1);
+}
+// Factored Q6_K M=1 dot products after llama.cpp's kernel_mul_mv_q6_K (MIT):
+// sixteen lanes cover one 256-value block (two block streams per SIMD group);
+// each lane owns four adjacent values in each of four 32-value slices and
+// applies the signed slice scales and block d once per slice sum.
+template<uint R>
+inline void q6_k_factored_rows(device const uchar* a, uint abase, uint dtype,
+                               device const uchar* w, uint first, uint rows,
+                               uint blocks, uint lane, thread float* out) {
+    uint t=lane/2, ix=lane%2, ip=t/8, il=t%8, l0=4*il;
+    uint is=8*ip+l0/16, yo=128*ip+l0, qlo=64*ip+l0, qho=128+32*ip+l0;
+    float sums[R];
+    for(uint r=0;r<R;r++) sums[r]=0.f;
+    for(uint ib=ix;ib<blocks;ib+=2) {
+        uint y0=abase+ib*256+yo;
+        float y[16];
+        for(uint l=0;l<4;l++) {
+            y[l]=load(a,y0+l,dtype);
+            y[l+4]=load(a,y0+l+32,dtype);
+            y[l+8]=load(a,y0+l+64,dtype);
+            y[l+12]=load(a,y0+l+96,dtype);
+        }
+        for(uint r=0;r<R;r++) {
+            if(r>=rows) break;
+            device const uchar* block=w+(ulong(first+r)*blocks+ib)*210;
+            device const uchar* q1=block+qlo;
+            device const uchar* q2=q1+32;
+            device const uchar* qh=block+qho;
+            device const char* sc=(device const char*)(block+192)+is;
+            float4 acc=0.f;
+            for(uint l=0;l<4;l++) {
+                uchar lo1=q1[l], lo2=q2[l], hi=qh[l];
+                acc[0]+=y[l]   *float(int((lo1&15)|((hi&0x03)<<4))-32);
+                acc[1]+=y[l+4] *float(int((lo2&15)|((hi&0x0C)<<2))-32);
+                acc[2]+=y[l+8] *float(int((lo1>>4)|((hi&0x30)))-32);
+                acc[3]+=y[l+12]*float(int((lo2>>4)|((hi&0xC0)>>2))-32);
+            }
+            float d=float(*((device const half*)(block+208)));
+            sums[r]+=d*(acc[0]*float(sc[0])+acc[1]*float(sc[2])+acc[2]*float(sc[4])+acc[3]*float(sc[6]));
+        }
+    }
+    for(uint r=0;r<R;r++) out[r]=simd_sum(sums[r]);
+}
+// Dense M=1: four rows per SIMD group, sixteen rows per 128-thread group.
+kernel void q6_k_gemv_factored(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, row0=group*16+(tid/32)*4, n=p[3];
+    if(row0>=n) return;
+    float out[4];
+    q6_k_factored_rows<4>(a,0,p[4],b,row0,min(4u,n-row0),p[2]/256,lane,out);
+    if(lane==0) for(uint r=0;r<min(4u,n-row0);r++) store(c,row0+r,p[4],out[r]);
+}
+// Sparse experts: four rows per SIMD group, sixteen rows per 128-thread group.
+kernel void expert_project_q6_k_factored(EXPERT_PROJECT_ARGS,
+                                         uint tid [[thread_index_in_threadgroup]],
+                                         uint2 group [[threadgroup_position_in_grid]]) {
+    uint assignment=group.y, lane=tid%32;
+    uint row0=group.x*16+(tid/32)*4;
+    uint k=p[2], rows=p[3], experts=p[5];
+    if(assignment>=p[1] || row0>=rows) return;
+    uint expert=as_type<uint>(load(m,assignment*3,p[6]));
+    if(expert>=experts) return;
+    uint valid=min(4u,rows-row0);
+    float out[4];
+    q6_k_factored_rows<4>(a,assignment*k,p[4],b,expert*rows+row0,valid,k/256,lane,out);
+    if(lane==0) for(uint r=0;r<valid;r++) store(c,assignment*rows+row0+r,p[4],out[r]);
 }
 kernel void q6_k_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {
     uint lane=tid%32, simd=tid/32, row=group.x*4+simd, batch=group.y*4;

@@ -95,7 +95,9 @@ impl MetalDevice {
             }
             (QuantizationFormat::Q5_1, false, false) => "q5_1_gemm",
             (QuantizationFormat::Q4_K, true, _) => {
-                if self.use_q4_k_gemv_8rows(weight.rows()) {
+                if self.use_q4_k_factored(weight.columns()) {
+                    "q4_k_gemv_factored"
+                } else if self.use_q4_k_gemv_8rows(weight.rows()) {
                     "q4_k_gemv_8rows"
                 } else {
                     "q4_k_gemv"
@@ -127,7 +129,9 @@ impl MetalDevice {
             }
             (QuantizationFormat::Q5_K, false, false) => "q5_k_gemm",
             (QuantizationFormat::Q6_K, true, _) => {
-                if self.use_q6_k_gemv_8rows(weight.rows()) {
+                if self.use_q6_k_factored(weight.columns()) {
+                    "q6_k_gemv_factored"
+                } else if self.use_q6_k_gemv_8rows(weight.rows()) {
                     "q6_k_gemv_8rows"
                 } else {
                     "q6_k_gemv"
@@ -2090,6 +2094,7 @@ mod qk_tests {
     #[test]
     fn q4_k_eight_row_gemv_reuses_activations_and_covers_output_tail() {
         let d = MetalDevice::new().unwrap();
+        d.set_q4_k_factored(false).unwrap();
         assert!(!d.use_q4_k_gemv_8rows(127));
         d.set_q4_k_gemv_8rows(true).unwrap();
         let (n, k) = (133, 512);
@@ -2411,6 +2416,7 @@ mod qk_tests {
     #[test]
     fn q4_k_expert_row_reuse_and_pair_traversal_covers_tail() {
         let d = MetalDevice::new().unwrap();
+        d.set_q4_k_factored(false).unwrap();
         assert!(d.use_q4_k_expert_project_8rows(133, 512));
         d.set_moe_expert_tensorops(false).unwrap();
         assert!(!d.use_q4_k_expert_project_8rows(127, 512));
@@ -2522,12 +2528,53 @@ mod qk_tests {
                     "Q4_K expert row-pair index {index}: actual={actual}, expected={expected}"
                 );
             }
+            // Factored scales reorder the f32 sum; results stay within BF16 rounding.
+            d.set_q4_k_factored(true).unwrap();
+            let factored = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap()
+                .to_f32();
+            d.set_q4_k_factored(false).unwrap();
+            for (index, ((actual, control), expected)) in
+                factored.iter().zip(&control).zip(&expected).enumerate()
+            {
+                assert!(
+                    (actual - expected).abs() <= 0.06
+                        && (actual - control).abs() <= control.abs().max(1.) / 128.,
+                    "Q4_K factored expert index {index}: actual={actual}, control={control}, expected={expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q4_k_factored_gemv_matches_reference_across_blocks_and_row_tails() {
+        let d = MetalDevice::new().unwrap();
+        assert!(d.use_q4_k_factored(256));
+        assert!(!d.use_q4_k_factored(384));
+        for (n, k) in [(1, 256), (7, 512), (133, 1024), (130, 2048), (9, 4864)] {
+            let weight = packed(&d, n, k, QuantizationFormat::Q4_K);
+            let values = input(1, k);
+            let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+            let output = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(output.metrics.operation, "q4_k_gemv_factored");
+            let reference = expected(&values, 1, n, k, QuantizationFormat::Q4_K);
+            for (index, (actual, reference)) in
+                output.tensor.to_f32().iter().zip(reference).enumerate()
+            {
+                assert!(
+                    (actual - reference).abs()
+                        <= 1e-4 * reference.abs().max(1.) * (k as f32 / 256.),
+                    "factored GEMV N={n} K={k} index {index}: actual={actual}, expected={reference}"
+                );
+            }
         }
     }
 
     #[test]
     fn q6_k_expert_eight_row_projection_reuses_activations_and_covers_tail() {
         let d = MetalDevice::new().unwrap();
+        d.set_q6_k_factored(false).unwrap();
         assert!(d.use_q6_k_expert_project_8rows(133, 512));
         d.set_moe_expert_tensorops(false).unwrap();
         assert!(!d.use_q6_k_expert_project_8rows(127, 512));
@@ -2598,6 +2645,21 @@ mod qk_tests {
             assert!(
                 (actual - expected).abs() <= 0.06,
                 "Q6_K expert eight-row index {index}: actual={actual}, expected={expected}"
+            );
+        }
+        // Factored slice scales reorder the f32 sum; results stay within BF16 rounding.
+        d.set_q6_k_factored(true).unwrap();
+        let factored = d
+            .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+            .unwrap()
+            .to_f32();
+        for (index, ((actual, control), expected)) in
+            factored.iter().zip(&control).zip(&expected).enumerate()
+        {
+            assert!(
+                (actual - expected).abs() <= 0.06
+                    && (actual - control).abs() <= control.abs().max(1.) / 128.,
+                "Q6_K factored expert index {index}: actual={actual}, control={control}, expected={expected}"
             );
         }
     }
@@ -3020,6 +3082,7 @@ mod q6_k_tests {
     #[test]
     fn q6_k_eight_row_gemv_reuses_activations_and_covers_output_tail() {
         let d = MetalDevice::new().unwrap();
+        d.set_q6_k_factored(false).unwrap();
         assert!(!d.use_q6_k_gemv_8rows(127));
         let (n, k) = (133, 512);
         assert!(d.use_q6_k_gemv_8rows(n));
@@ -3035,6 +3098,29 @@ mod q6_k_tests {
                 (actual - reference).abs() <= 0.02,
                 "eight-row GEMV index {index}: actual={actual}, expected={reference}"
             );
+        }
+    }
+
+    #[test]
+    fn q6_k_factored_gemv_matches_reference_across_blocks_and_row_tails() {
+        let d = MetalDevice::new().unwrap();
+        assert!(d.use_q6_k_factored(256));
+        assert!(!d.use_q6_k_factored(384));
+        for (n, k) in [(1, 256), (7, 512), (133, 1792), (9, 2048)] {
+            let weight = packed(&d, n, k);
+            let values = input(1, k);
+            let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+            let output = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(output.metrics.operation, "q6_k_gemv_factored");
+            let reference = expected(&values, 1, n, k);
+            for (index, (actual, reference)) in
+                output.tensor.to_f32().iter().zip(reference).enumerate()
+            {
+                assert!(
+                    (actual - reference).abs() <= 0.02,
+                    "factored GEMV N={n} K={k} index {index}: actual={actual}, expected={reference}"
+                );
+            }
         }
     }
 
@@ -3095,6 +3181,7 @@ mod q6_k_tests {
     #[test]
     fn q6_k_expert_projection_uses_assignment_metadata() {
         let d = MetalDevice::new().unwrap();
+        d.set_q6_k_factored(false).unwrap();
         let (experts, rows_per_expert, columns) = (3, 5, 512);
         let expert_ids = [2usize, 1, 2, 0];
         let packed = packed(&d, experts * rows_per_expert, columns);
