@@ -241,9 +241,12 @@ kernel, because the measured M5 shared encoder slowed LFM2.5 short prefill.
 `set_shared_encoder` and `set_concurrent_dispatch` are measurement toggles. See
 Phase 7A journal Experiments 46–47.
 
-Chunked sparse-MoE execution (routing temporaries above 16 MiB) copies each
+Chunked sparse-MoE execution copies each
 chunk's combined output into one preallocated device tensor. It has no host
-readback or completion boundary per chunk.
+readback or completion boundary per chunk. Chunks bound routing temporaries
+to 16 MiB for dense experts and to the device's `moe_routing_temporary_limit`
+(default 128 MiB) for quantized experts, whose TensorOps tiles benefit from
+more routed rows per expert.
 
 A `Submission` retains its command buffer and every bound raw buffer until completion. Completion states are Encoding/Completed/Failed. Finishing checks command-buffer status before publishing the staged cache; guard drop drains partial work on error or unwind. Each allocation tracks write ranges and their completion epochs. Mapping checks the requested logical byte range, so a failed suffix cannot invalidate a previously published KV prefix. Pending/failed output cannot be mapped. Failed storage is not recycled. Tests inject late encoding and completion failures and verify publication, retry, mapping and lifetime behavior.
 

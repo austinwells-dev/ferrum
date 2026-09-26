@@ -295,6 +295,8 @@ pub struct MetalDevice {
     q4_k_factored: Cell<bool>,
     q6_k_factored: Cell<bool>,
     mpp_fast_dequant: Cell<bool>,
+    moe_expert_tile_pairs: Cell<bool>,
+    moe_routing_temporary_limit: Cell<usize>,
     q4_k_expert_project_8rows: Cell<bool>,
     q4_k_expert_project_16rows: Cell<bool>,
     q4_k_expert_project_16rows_pairs: Cell<bool>,
@@ -364,6 +366,8 @@ impl MetalDevice {
             q4_k_factored: Cell::new(true),
             q6_k_factored: Cell::new(true),
             mpp_fast_dequant: Cell::new(true),
+            moe_expert_tile_pairs: Cell::new(true),
+            moe_routing_temporary_limit: Cell::new(128 * 1024 * 1024),
             q4_k_expert_project_8rows: Cell::new(true),
             q4_k_expert_project_16rows: Cell::new(true),
             q4_k_expert_project_16rows_pairs: Cell::new(true),
@@ -693,6 +697,35 @@ impl MetalDevice {
     }
     pub(crate) fn mpp_fast_dequant(&self) -> bool {
         self.mpp_fast_dequant.get()
+    }
+    /// Bound per-chunk routing temporaries for quantized MoE experts; larger
+    /// chunks give each expert more routed rows per TensorOps pass. Dense
+    /// experts keep the 16 MiB Phase 6 bound.
+    pub fn set_moe_routing_temporary_limit(&self, bytes: usize) -> Result<()> {
+        if self.batching.get() || bytes == 0 {
+            return Err(Error::Parameter(
+                "MoE routing limit must be positive and set on an idle device".into(),
+            ));
+        }
+        self.moe_routing_temporary_limit.set(bytes);
+        Ok(())
+    }
+    pub fn moe_routing_temporary_limit(&self) -> usize {
+        self.moe_routing_temporary_limit.get()
+    }
+    /// Let each expert TensorOps threadgroup cover two 32-row tiles of one
+    /// expert, sharing each dequantized weight tile.
+    pub fn set_moe_expert_tile_pairs(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change expert TensorOps tiling during execution".into(),
+            ));
+        }
+        self.moe_expert_tile_pairs.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn moe_expert_tile_pairs(&self) -> bool {
+        self.moe_expert_tile_pairs.get()
     }
     /// Select factored-scale Q6_K M=1 kernels (dense GEMV and sparse experts).
     pub fn set_q6_k_factored(&self, enabled: bool) -> Result<()> {

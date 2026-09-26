@@ -411,7 +411,8 @@ impl MetalDevice {
         mpp_params[5] = index(experts)?;
         mpp_params[6] = DType::F32 as u32;
         mpp_params[7] = ggml_type;
-        mpp_params[8] = u32::from(self.mpp_fast_dequant());
+        let pairs = self.moe_expert_tile_pairs();
+        mpp_params[8] = u32::from(self.mpp_fast_dequant()) | (u32::from(pairs) << 1);
         let mpp_timing = self.dispatch(
             name,
             &[
@@ -423,7 +424,15 @@ impl MetalDevice {
                 output.binding(),
             ],
             &mpp_params,
-            [rows, assignments],
+            // The dispatcher launches ceil(grid/32) row tiles; pairs need half.
+            [
+                rows,
+                if pairs {
+                    assignments.div_ceil(2)
+                } else {
+                    assignments
+                },
+            ],
             false,
         )?;
 

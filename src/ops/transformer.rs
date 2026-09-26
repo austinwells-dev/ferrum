@@ -2841,14 +2841,22 @@ mod qk_tests {
         for k64 in [false, true] {
             d.set_moe_expert_tensorops_tile_k64(k64).unwrap();
             d.set_mpp_fast_dequant(false).unwrap();
+            d.set_moe_expert_tile_pairs(false).unwrap();
             let control = d
                 .expert_project_quantized(&x, &metadata, &weight, columns, experts)
                 .unwrap();
-            d.set_mpp_fast_dequant(true).unwrap();
-            let candidate = d
-                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
-                .unwrap();
-            assert_eq!(bits(&candidate), bits(&control), "k64={k64}");
+            for (fast, pairs) in [(true, false), (false, true), (true, true)] {
+                d.set_mpp_fast_dequant(fast).unwrap();
+                d.set_moe_expert_tile_pairs(pairs).unwrap();
+                let candidate = d
+                    .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                    .unwrap();
+                assert_eq!(
+                    bits(&candidate),
+                    bits(&control),
+                    "k64={k64} fast={fast} pairs={pairs}"
+                );
+            }
         }
     }
 
@@ -3391,14 +3399,22 @@ mod q6_k_tests {
         for k64 in [false, true] {
             d.set_moe_expert_tensorops_tile_k64(k64).unwrap();
             d.set_mpp_fast_dequant(false).unwrap();
+            d.set_moe_expert_tile_pairs(false).unwrap();
             let control = d
                 .expert_project_quantized(&x, &metadata, &weight, columns, experts)
                 .unwrap();
-            d.set_mpp_fast_dequant(true).unwrap();
-            let fast = d
-                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
-                .unwrap();
-            assert_eq!(bits(&fast), bits(&control), "k64={k64}");
+            for (fast, pairs) in [(true, false), (false, true), (true, true)] {
+                d.set_mpp_fast_dequant(fast).unwrap();
+                d.set_moe_expert_tile_pairs(pairs).unwrap();
+                let candidate = d
+                    .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                    .unwrap();
+                assert_eq!(
+                    bits(&candidate),
+                    bits(&control),
+                    "k64={k64} fast={fast} pairs={pairs}"
+                );
+            }
         }
     }
 

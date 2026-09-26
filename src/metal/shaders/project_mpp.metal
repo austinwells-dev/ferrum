@@ -1080,8 +1080,13 @@ void expert_project_k_mpp_impl(
     uint k=p[2], n=p[3], experts=p[5], type=p[7];
     uint expert=group.z;
     if(expert>=experts) return;
-    uint count=counts[expert], base=bases[expert], m_tile=group.y*TILE_M;
+    // Flag 2: each threadgroup owns two consecutive 32-row tiles of one expert
+    // and reuses every dequantized weight tile for both; each tile still runs
+    // the identical 32x64 TensorOps product.
+    bool pair=(p[8]&2)!=0;
+    uint count=counts[expert], base=bases[expert], m_tile=group.y*TILE_M*(pair?2:1);
     if(m_tile>=count) return;
+    bool second=pair && m_tile+TILE_M<count;
     uint padded_rows=((count+TILE_M-1)/TILE_M)*TILE_M;
     uint blocks=k/256;
     uint bytes_per_block=type==12?144:(type==13?176:210);
@@ -1097,6 +1102,7 @@ void expert_project_k_mpp_impl(
         matmul2d_descriptor::mode::multiply_accumulate);
     matmul2d<desc,execution_simdgroups<4>> op;
     auto result=op.template get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
+    auto result1=op.template get_destination_cooperative_tensor<decltype(left),decltype(B),float>();
     uint k_tiles=(k+TILE_K-1)/TILE_K;
     for(uint kt=0;kt<k_tiles;kt++) {
         if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1123,6 +1129,10 @@ void expert_project_k_mpp_impl(
         auto right=B;
         auto left_k=A.slice(int(kt*TILE_K),int(m_tile));
         op.run(left_k,right,result);
+        if(second) {
+            auto left_k1=A.slice(int(kt*TILE_K),int(m_tile+TILE_M));
+            op.run(left_k1,right,result1);
+        }
     }
     for(uint i=0;i<result.get_capacity();i++) {
         auto coord=result.get_multidimensional_index(i);
@@ -1130,6 +1140,17 @@ void expert_project_k_mpp_impl(
         if(row<count && column<n) {
             uint assignment=assignment_ids[base+row];
             float x=result[i]; uint bits=as_type<uint>(x);
+            output[assignment*n+column]=isnan(x)
+                ?ushort((bits>>16)|0x40)
+                :ushort((bits+0x7fff+((bits>>16)&1))>>16);
+        }
+    }
+    if(second) for(uint i=0;i<result1.get_capacity();i++) {
+        auto coord=result1.get_multidimensional_index(i);
+        uint column=group.x*TILE_N+coord[0], row=m_tile+TILE_M+coord[1];
+        if(row<count && column<n) {
+            uint assignment=assignment_ids[base+row];
+            float x=result1[i]; uint bits=as_type<uint>(x);
             output[assignment*n+column]=isnan(x)
                 ?ushort((bits>>16)|0x40)
                 :ushort((bits+0x7fff+((bits>>16)&1))>>16);

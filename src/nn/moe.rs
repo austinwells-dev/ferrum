@@ -8,6 +8,9 @@ use std::{
     time::{Duration, Instant},
 };
 
+/// Routing-temporary bound for dense (BF16/F16/F32) experts. Quantized experts
+/// use the device's larger `moe_routing_temporary_limit` so TensorOps tiles see
+/// more routed rows per expert (Phase 7A Experiment 58).
 const ROUTING_TEMPORARY_LIMIT: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -245,9 +248,11 @@ impl SparseMoe {
                 )
             })
             .ok_or_else(|| Error::Shape("expert temporary size overflow".into()))?;
-        let chunk_tokens = (ROUTING_TEMPORARY_LIMIT / bytes_per_token)
-            .max(1)
-            .min(dims[0]);
+        let routing_limit = match self.input_experts {
+            ExpertMatrix::Quantized(_) => device.moe_routing_temporary_limit(),
+            ExpertMatrix::Dense(_) => ROUTING_TEMPORARY_LIMIT,
+        };
+        let chunk_tokens = (routing_limit / bytes_per_token).max(1).min(dims[0]);
         let chunks = dims[0].div_ceil(chunk_tokens);
         let output_elements = dims[0]
             .checked_mul(self.hidden_size)

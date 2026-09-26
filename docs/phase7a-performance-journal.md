@@ -1942,3 +1942,40 @@ In-process A/B, five interleaved pairs per workload, control = previous decoders
 | Qwen3 Q8_0 / Sustained decode | 356.6->592.9 / 1,241.8 `[0.287->0.477; 1.659]` | 121.9->121.1 / 164.7 `[0.740->0.735; 0.995]` | 116.2->118.2 / 157.4 `[0.738->0.751; 1.020]` | 58.9->35.4 / 17.2 | 5/5; 0/5; 0/5 |
 
 Prefill rises 2.19–2.53x for LFM2.5 at 128–1,024 tokens, 1.32–1.42x for Qwen2.5 Q4_K_M, 1.40–1.50x for Qwen2.5 Q6_K, and 1.51–1.67x for Qwen3 Q8_0. Cached decode is unchanged, since it uses M=1 GEMV. Every pair produced identical IDs. First-token latency on the LFM2.5 1,024-token prompt fell from 1,964 to 781 ms. Against llama.cpp, 512- and 1,024-token prefill is now 0.56–0.61x for LFM2.5 (0.47x at 128 tokens), 0.65–0.72x for Qwen2.5 Q4_K_M and Q6_K, and 0.65–0.80x for Qwen3. Qwen3's 1,024-token prompt reaches 0.802x, the first workload at the 0.80x prefill threshold; the others remain below it, and no format meets the full gate.
+
+## Experiment 58: Paired expert TensorOps tiles and larger quantized-MoE chunks (retained)
+
+Status: retained. Toggles: `set_moe_expert_tile_pairs` (bench field `moe_expert_tile_pairs`) and `set_moe_routing_temporary_limit` (bench field `moe_routing_temporary_mib`). The default routing limit is 128 MiB for quantized experts. Dense (BF16/F16/F32) experts keep the documented 16 MiB Phase 6 bound.
+
+After Experiment 57, the grouped Q4_K expert input projection ran at about 4.7 TFLOPS, against about 15.6 TFLOPS for the dense Q4_K TensorOps GEMM. Each expert threadgroup still decodes a full weight tile for only 32 routed rows. Experiment 8 showed that a larger `matmul2d` M tile (M=64) changes outputs, so the descriptor stays 32x64.
+
+**Paired tiles.** Each threadgroup instead owns two consecutive 32-row tiles of one expert, decodes each weight tile once, and runs the identical 32x64 product on both row blocks. A second tile is skipped when the expert has at most 32 routes. Tests extend the Q4_K and Q6_K expert bit-identity checks to every combination of the fast decoder and paired tiles (K=64 and K=128, uneven segments, row tails), with identical output bits. They pass under Metal API and GPU Shader Validation.
+
+**Larger chunks.** Pairing only helps experts with more than 32 routes in a chunk. Under the 16 MiB routing bound, LFM2.5 prompts split into chunks of about 200 tokens, which is about 21 routes per expert. Raising the bound for quantized experts gives each expert more rows per TensorOps pass. The bound applies only to quantized experts: dense experts do not use TensorOps and gain nothing, and the Granite MoE parity test keeps asserting the 16 MiB peak on its 256+-token prompt.
+
+Flushed prefill profiles (summed GPU ms, LFM2.5):
+
+| Configuration | 512 tokens | 1,024 tokens |
+|---|---:|---:|
+| Single tiles, 16 MiB | 327.4 | 599.5 |
+| Paired tiles, 16 MiB | 309.1 | 556.6 |
+| Paired tiles, 64 MiB | 263.3 | 519.0 |
+| Paired tiles, 128 MiB | 262.3 | 495.5 |
+
+End-to-end in-process A/B: five interleaved pairs, control = single tiles with 16 MiB, candidate = paired tiles with 128 MiB. Raw: `lfm2.5-8b-a1b-expert-tile-pairs-chunk128-ab.jsonl` and `.run.log`.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5-8B-A1B Q4_K_M / Short | 104.6->100.8 / 215.6 `[0.485->0.468; 0.959]` | 77.8->77.5 / 86.4 `[0.900->0.897; 0.996]` | 54.8->53.8 / 72.5 `[0.756->0.742; 0.981]` | 105.1->109.1 / 51.2 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 716.4->727.0 / 1,511.1 `[0.474->0.481; 1.011]` | 75.9->76.3 / 98.2 `[0.774->0.777; 1.000]` | 43.7->44.2 / 67.5 `[0.648->0.655; 1.007]` | 178.7->176.1 / 84.9 | 5/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 1,159.3->1,407.0 / 2,108.3 `[0.550->0.667; 1.221]` | 74.5->74.5 / 97.5 `[0.764->0.764; 1.000]` | 25.8->29.4 / 41.2 `[0.626->0.712; 1.142]` | 441.7->363.9 / 243.1 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 1,272.4->1,467.8 / 2,141.5 `[0.594->0.685; 1.155]` | 73.1->72.8 / 96.4 `[0.758->0.755; 0.996]` | 16.6->18.5 / 25.8 `[0.644->0.719; 1.120]` | 804.8->697.6 / 478.4 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 101.5->104.0 / 233.7 `[0.434->0.445; 1.005]` | 76.6->76.6 / 101.2 `[0.757->0.757; 1.000]` | 72.5->72.6 / 95.7 `[0.758->0.759; 1.000]` | 108.4->105.7 / 47.3 | 5/5; 5/5; 5/5 |
+
+**Results:**
+
+- 512- and 1,024-token prefill rose 22.1% and 15.5%. Against llama.cpp this is 0.550 -> 0.667x and 0.594 -> 0.685x.
+- First-token latency fell from 441.7 to 363.9 ms and from 804.8 to 697.6 ms.
+- The 11-token short prompt runs neither change: 44 routes is below the 256-route TensorOps threshold, and it fits in one chunk either way. Its 0.959 median ratio comes from overlapping samples (control 97.7–111.8 tok/s, candidate 97.5–106.6 tok/s).
+- Output IDs matched control in every pair.
+- Median transient prefill peaks were unchanged or lower (512: 255.9 -> 254.5 MiB; 1,024: 255.4 -> 252.6 MiB), because the 256 MiB arena flush already dominates. Sampled RSS stayed at about 5.3 GiB.

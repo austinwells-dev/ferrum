@@ -562,6 +562,32 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let moe_expert_tile_pairs = match request.get("moe_expert_tile_pairs") {
+        None | Some(Value::Null) => {
+            device.set_moe_expert_tile_pairs(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_moe_expert_tile_pairs(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field moe_expert_tile_pairs must be a boolean".into(),
+            ));
+        }
+    };
+    let moe_routing_temporary_mib = match request.get("moe_routing_temporary_mib") {
+        None | Some(Value::Null) => 128,
+        Some(value) => value
+            .as_u64()
+            .map(|v| v as usize)
+            .filter(|v| *v > 0)
+            .ok_or_else(|| {
+                Error::Parameter("request field moe_routing_temporary_mib must be positive".into())
+            })?,
+    };
+    device.set_moe_routing_temporary_limit(moe_routing_temporary_mib * 1024 * 1024)?;
     let expert_tensorops = match request.get("moe_expert_tensorops") {
         None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
         Some(Value::Bool(enabled)) => {
@@ -672,6 +698,8 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "q4_k_factored": q4_k_factored,
         "q6_k_factored": q6_k_factored,
         "mpp_fast_dequant": mpp_fast_dequant,
+        "moe_expert_tile_pairs": moe_expert_tile_pairs,
+        "moe_routing_temporary_mib": moe_routing_temporary_mib,
         "device_argmax": device_argmax,
         "moe_chunk_device_copy": moe_chunk_device_copy,
         "attention_context_decode_wide": attention_context_decode_wide,
