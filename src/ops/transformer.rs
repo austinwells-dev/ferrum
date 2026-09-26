@@ -515,6 +515,30 @@ impl MetalDevice {
 }
 
 impl MetalDevice {
+    /// Row-wise greedy selection: `[rows, 2]` F32 carrier holding u32 bits for
+    /// the first maximal index and a non-finite flag.
+    pub(crate) fn argmax_rows(&self, logits: &Tensor) -> Result<Tensor> {
+        let dims = logits.shape().dimensions();
+        if dims.len() != 2 || dims.contains(&0) || dims[1] > u32::MAX as usize {
+            return Err(Error::Shape("argmax requires nonempty [rows,width]".into()));
+        }
+        if !self.owns(logits.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
+        let output = Tensor::output(self, &[dims[0], 2], DType::F32)?;
+        let mut p = [0; 9];
+        p[0] = index(logits.numel())?;
+        p[1] = index(dims[1])?;
+        p[4] = logits.dtype() as u32;
+        self.dispatch(
+            "argmax_rows",
+            &[logits.binding(), logits.binding(), output.binding()],
+            &p,
+            [dims[0], 1],
+            false,
+        )?;
+        Ok(output)
+    }
     /// Internal append-only KV write. Caller reserves an unpublished suffix before
     /// calling; no published tensor may cover the destination range.
     pub(crate) fn write_kv(&self, source: &Tensor, suffix: &Tensor) -> Result<()> {
@@ -662,7 +686,23 @@ impl MetalDevice {
         }
         let dims = [a[1], a[0], b[2]];
         let n = crate::tensor::Shape::new(dims)?.numel();
-        if a[1] == 1
+        // The 1,024-thread kernel replaces the scalar path below 128 positions and,
+        // above it, wins only while (head, column tile) groups underfill the GPU.
+        let wide_groups = b[2]
+            .div_ceil(32)
+            .checked_mul(a[0])
+            .ok_or_else(|| Error::Shape("decode context grid overflow".into()))?;
+        if self.attention_context_decode_wide() && a[1] == 1 && (b[0] < 128 || wide_groups < 64) {
+            let groups = wide_groups;
+            self.run(
+                "attention_context_decode_wide",
+                probs,
+                Some(v),
+                &dims,
+                p,
+                [groups, 1],
+            )
+        } else if a[1] == 1
             && b[0] >= 128
             && b[0] <= u32::MAX as usize - 8
             && b[2] <= u32::MAX as usize - 32
@@ -851,6 +891,89 @@ mod fusion_tests {
                     (2e-3, 2e-3)
                 };
                 crate::reference::check(&y.to_f32(), &expected, atol, rtol).unwrap();
+            }
+        }
+    }
+    #[test]
+    fn argmax_rows_matches_host_ties_tails_and_nonfinite_flags() {
+        let d = MetalDevice::new().unwrap();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for width in [1, 7, 255, 256, 257, 151_936] {
+                let rows = 3;
+                let mut values: Vec<f32> = crate::reference::deterministic(rows * width)
+                    .iter()
+                    .map(|x| (x * 8.).round() / 8.)
+                    .collect();
+                // Row 1: an exact tie at a later index must lose to the earlier one.
+                if width > 3 {
+                    values[width + 1] = 100.;
+                    values[width + width - 1] = 100.;
+                }
+                let logits = Tensor::from_f32(&d, [rows, width], dtype, &values).unwrap();
+                let selected = d.argmax_rows(&logits).unwrap().to_f32();
+                let rounded = logits.to_f32();
+                for row in 0..rows {
+                    let expected =
+                        crate::generation::argmax(&rounded[row * width..(row + 1) * width])
+                            .unwrap();
+                    assert_eq!(
+                        selected[row * 2].to_bits(),
+                        expected,
+                        "{dtype:?} {width} {row}"
+                    );
+                    assert_eq!(selected[row * 2 + 1].to_bits(), 0);
+                }
+            }
+            let mut values = vec![0.5f32; 300];
+            values[299] = f32::NAN;
+            let logits = Tensor::from_f32(&d, [1, 300], dtype, &values).unwrap();
+            assert_eq!(d.argmax_rows(&logits).unwrap().to_f32()[1].to_bits(), 1);
+            values[299] = f32::INFINITY;
+            let logits = Tensor::from_f32(&d, [1, 300], dtype, &values).unwrap();
+            assert_eq!(d.argmax_rows(&logits).unwrap().to_f32()[1].to_bits(), 1);
+        }
+    }
+    #[test]
+    fn wide_decode_context_matches_existing_kernels() {
+        let d = MetalDevice::new().unwrap();
+        for dtype in [DType::BF16, DType::F16, DType::F32] {
+            let (atol, rtol) = match dtype {
+                DType::BF16 => (1.6e-2, 1e-2),
+                DType::F16 => (2e-3, 2e-3),
+                DType::F32 => (1e-5, 1e-5),
+            };
+            // GQA groups 7, 2, 1 and 10; odd widths; short (scalar) and long (partitioned) controls.
+            for (heads, kv, width, t) in [
+                (14, 2, 64, 1),
+                (14, 2, 64, 1025),
+                (16, 8, 128, 37),
+                (6, 6, 80, 300),
+                (20, 2, 33, 129),
+            ] {
+                let q = Tensor::from_f32(
+                    &d,
+                    [1, heads, width],
+                    dtype,
+                    &crate::reference::deterministic(heads * width),
+                )
+                .unwrap();
+                let k = Tensor::from_f32(
+                    &d,
+                    [t, kv, width],
+                    dtype,
+                    &crate::reference::deterministic(t * kv * width),
+                )
+                .unwrap();
+                let scores = d.attention_scores(&q, &k).unwrap().tensor;
+                let probs = d
+                    .attention_softmax(&scores, t - 1, (width as f32).sqrt().recip())
+                    .unwrap()
+                    .tensor;
+                d.set_attention_context_decode_wide(false).unwrap();
+                let slow = d.attention_context(&probs, &k).unwrap().tensor;
+                d.set_attention_context_decode_wide(true).unwrap();
+                let fast = d.attention_context(&probs, &k).unwrap().tensor;
+                crate::reference::check(&fast.to_f32(), &slow.to_f32(), atol, rtol).unwrap();
             }
         }
     }

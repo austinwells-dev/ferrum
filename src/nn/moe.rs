@@ -252,7 +252,16 @@ impl SparseMoe {
         let output_elements = dims[0]
             .checked_mul(self.hidden_size)
             .ok_or_else(|| Error::Shape("expert output size overflow".into()))?;
-        let mut all_outputs = Vec::with_capacity(output_elements);
+        // Chunks bound routing temporaries only; their outputs stay on Metal so
+        // later chunks and layers encode without a host readback boundary.
+        let device_output = (chunks > 1 && device.moe_chunk_device_copy())
+            .then(|| Tensor::output(device, &[dims[0], self.hidden_size], hidden.dtype()))
+            .transpose()?;
+        let mut all_outputs = Vec::with_capacity(if device_output.is_some() {
+            0
+        } else {
+            output_elements
+        });
         let mut total_stats = MoeStats::default();
 
         for chunk_start in (0..dims[0]).step_by(chunk_tokens) {
@@ -351,12 +360,22 @@ impl SparseMoe {
                 self.stats.set(accumulated);
                 return Ok(combined);
             }
+            if let Some(output) = &device_output {
+                device.write_kv(
+                    &combined,
+                    &output.view(chunk_start * self.hidden_size, [count, self.hidden_size])?,
+                )?;
+                continue;
+            }
             device.synchronize()?;
             all_outputs.extend(combined.to_f32());
         }
         let mut accumulated = self.stats.get();
         accumulated.merge(total_stats);
         self.stats.set(accumulated);
+        if let Some(output) = device_output {
+            return Ok(output);
+        }
         Tensor::from_f32(
             device,
             [dims[0], self.hidden_size],
@@ -439,6 +458,68 @@ mod tests {
     use super::{ExpertMatrix, MoeRoutingPolicy, ROUTING_TEMPORARY_LIMIT, SparseMoe};
     use crate::model::architecture::MoeScoringFunction;
     use crate::{DType, MetalDevice, Tensor};
+
+    #[test]
+    fn chunked_outputs_assemble_on_device_like_host_readback() {
+        let device = MetalDevice::new().unwrap();
+        let (experts, hidden, intermediate, tokens) = (3, 4096, 64, 300);
+        let weights = |len: usize, seed: usize| {
+            crate::reference::deterministic(len + seed)[seed..]
+                .iter()
+                .map(|x| x * 0.05)
+                .collect::<Vec<_>>()
+        };
+        let moe = SparseMoe::new(
+            &device,
+            Tensor::from_f32(
+                &device,
+                [experts, hidden],
+                DType::F32,
+                &weights(experts * hidden, 1),
+            )
+            .unwrap(),
+            ExpertMatrix::Dense(
+                Tensor::from_f32(
+                    &device,
+                    [experts, 2 * intermediate, hidden],
+                    DType::F32,
+                    &weights(experts * 2 * intermediate * hidden, 2),
+                )
+                .unwrap(),
+            ),
+            ExpertMatrix::Dense(
+                Tensor::from_f32(
+                    &device,
+                    [experts, hidden, intermediate],
+                    DType::F32,
+                    &weights(experts * hidden * intermediate, 3),
+                )
+                .unwrap(),
+            ),
+            MoeRoutingPolicy::softmax(experts, 2),
+            None,
+        )
+        .unwrap();
+        // About 83 KB of routing temporaries per token forces two chunks.
+        assert!(tokens * 2 * ((2 * hidden + 3 * intermediate) * 4 + 12) > ROUTING_TEMPORARY_LIMIT);
+        let input = Tensor::from_f32(
+            &device,
+            [tokens, hidden],
+            DType::F32,
+            &weights(tokens * hidden, 4),
+        )
+        .unwrap();
+        device.set_moe_chunk_device_copy(false).unwrap();
+        let host = moe.forward(&device, &input).unwrap().to_f32();
+        device.set_moe_chunk_device_copy(true).unwrap();
+        let assembled = moe.forward(&device, &input).unwrap().to_f32();
+        assert_eq!(host.len(), tokens * hidden);
+        assert!(
+            host.iter()
+                .zip(&assembled)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
 
     #[test]
     fn grouped_experts_preserve_long_token_indices_and_match_cpu() {

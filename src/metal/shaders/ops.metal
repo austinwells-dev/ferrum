@@ -1959,6 +1959,52 @@ kernel void attention_context_decode(ARGS, uint tid [[thread_index_in_threadgrou
     }
 }
 
+// M=1 context: one 1,024-thread group per (query head, 32-column tile). Thirty-two
+// SIMD groups stride the sequence; partials reduce in fixed order.
+kernel void attention_context_decode_wide(ARGS, uint tid [[thread_index_in_threadgroup]], uint group_id [[threadgroup_position_in_grid]]) {
+    uint d=p[6], tiles=(d+31)/32, h=group_id/tiles, col=(group_id%tiles)*32+tid%32;
+    uint part=tid/32, kv=h/(p[3]/p[5]);
+    float sum=0;
+    if(col<d) for(uint t=part;t<p[2];t+=32)
+        sum+=load(a,h*p[2]+t,p[4])*load(b,(t*p[5]+kv)*d+col,p[4]);
+    threadgroup float partial[1024];
+    partial[tid]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid<32 && col<d) {
+        sum=0;
+        for(uint j=0;j<32;j++) sum+=partial[j*32+tid];
+        store(c,h*d+col,p[4],sum);
+    }
+}
+// Greedy selection per row: first index of the maximum (matching host argmax)
+// plus a non-finite flag. Output is two u32 words per row.
+kernel void argmax_rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float best_value[32];
+    threadgroup uint best_index[32], bad_any[32];
+    uint w=p[1], base=row*w, lane=tid%32, simd=tid/32;
+    float best=-INFINITY; uint index=0xffffffffu, bad=0;
+    for(uint j=tid;j<w;j+=1024) {
+        float x=load(a,base+j,p[4]);
+        bad|=uint(!isfinite(x));
+        if(x>best || index==0xffffffffu) { best=x; index=j; }
+    }
+    for(uint offset=16;offset>0;offset/=2) {
+        float other=simd_shuffle_down(best,offset);
+        uint other_index=simd_shuffle_down(index,offset);
+        if(other>best || (other==best && other_index<index)) { best=other; index=other_index; }
+    }
+    bad=simd_max(bad);
+    if(lane==0) { best_value[simd]=best; best_index[simd]=index; bad_any[simd]=bad; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid==0) {
+        for(uint s=1;s<32;s++) {
+            if(best_value[s]>best || (best_value[s]==best && best_index[s]<index)) { best=best_value[s]; index=best_index[s]; }
+            bad|=bad_any[s];
+        }
+        ((device uint*)c)[row*2]=index;
+        ((device uint*)c)[row*2+1]=bad;
+    }
+}
 // Preserve the SiLU output's storage rounding before the gated multiply.
 kernel void silu_mul(ARGS, uint i [[thread_position_in_grid]]) {
     if(i>=p[0]) return;

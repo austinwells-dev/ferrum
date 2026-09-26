@@ -89,7 +89,8 @@ fn official_granite_moe_matches_reference_and_replays_cache_state() {
         stats.assignments,
         (ids.len() + generated.len() - 1) * 24 * 8
     );
-    assert!(stats.active_experts > 0);
+    // GPU routing keeps selections on Metal and does not count distinct experts.
+    assert!(!stats.active_experts_known || stats.active_experts > 0);
     assert!(stats.peak_temporary_bytes < 16 * 1024 * 1024);
 
     let mut branch_a = original.clone();

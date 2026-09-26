@@ -86,6 +86,12 @@ fn official_qwen_bf16_cached_generation() {
             * c.head_dim
             * 2
     );
+    // On-device greedy selection yields the same IDs and stop behavior.
+    let greedy =
+        generation::generate_greedy(&d, &model, &ids, 16, &tok.eos_ids, |_| Ok(())).unwrap();
+    assert_eq!(greedy.tokens, r.tokens);
+    assert_eq!(greedy.stop, r.stop);
+    assert_eq!(greedy.kv_bytes, r.kv_bytes);
     let text = tok.tokenizer.decode(&emitted).unwrap();
     assert!(text.starts_with("Hello! How can I "));
     assert!(text.ends_with("you today?"));

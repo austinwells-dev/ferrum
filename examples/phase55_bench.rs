@@ -308,7 +308,10 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         }
     };
     let q4_k_mpp_tile_m128 = match request.get("q4_k_mpp_tile_m128") {
-        None | Some(Value::Null) => true,
+        None | Some(Value::Null) => {
+            device.set_q4_k_mpp_tile_m128(true)?;
+            true
+        }
         Some(Value::Bool(enabled)) => {
             device.set_q4_k_mpp_tile_m128(*enabled)?;
             *enabled
@@ -426,8 +429,8 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
     };
     let q5_k_gemv_8rows = match request.get("q5_k_gemv_8rows") {
         None | Some(Value::Null) => {
-            device.set_q5_k_gemv_8rows(false)?;
-            false
+            device.set_q5_k_gemv_8rows(true)?;
+            true
         }
         Some(Value::Bool(enabled)) => {
             device.set_q5_k_gemv_8rows(*enabled)?;
@@ -441,8 +444,8 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
     };
     let moe_gpu_routing_prefill = match request.get("moe_gpu_routing_prefill") {
         None | Some(Value::Null) => {
-            device.set_moe_gpu_routing_prefill(false)?;
-            false
+            device.set_moe_gpu_routing_prefill(true)?;
+            true
         }
         Some(Value::Bool(enabled)) => {
             device.set_moe_gpu_routing_prefill(*enabled)?;
@@ -451,6 +454,66 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         Some(_) => {
             return Err(Error::Parameter(
                 "request field moe_gpu_routing_prefill must be a boolean".into(),
+            ));
+        }
+    };
+    let shared_encoder = match request.get("shared_encoder") {
+        None | Some(Value::Null) => {
+            device.set_shared_encoder(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_shared_encoder(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field shared_encoder must be a boolean".into(),
+            ));
+        }
+    };
+    let concurrent_dispatch = match request.get("concurrent_dispatch") {
+        None | Some(Value::Null) => {
+            device.set_concurrent_dispatch(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_concurrent_dispatch(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field concurrent_dispatch must be a boolean".into(),
+            ));
+        }
+    };
+    let attention_context_decode_wide = match request.get("attention_context_decode_wide") {
+        None | Some(Value::Null) => {
+            device.set_attention_context_decode_wide(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_attention_context_decode_wide(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field attention_context_decode_wide must be a boolean".into(),
+            ));
+        }
+    };
+    let moe_chunk_device_copy = match request.get("moe_chunk_device_copy") {
+        None | Some(Value::Null) => {
+            device.set_moe_chunk_device_copy(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_moe_chunk_device_copy(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field moe_chunk_device_copy must be a boolean".into(),
             ));
         }
     };
@@ -498,16 +561,32 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         return Err(Error::Parameter("max_new_tokens must be positive".into()));
     }
 
+    let device_argmax = match request.get("device_argmax") {
+        None | Some(Value::Null) => true,
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field device_argmax must be a boolean".into(),
+            ));
+        }
+    };
+
     let start = std::time::Instant::now();
-    let result = generation::generate(
-        device,
-        &model.model,
-        &prompt,
-        max_new_tokens,
-        &[],
-        generation::argmax,
-        |_| Ok(()),
-    )?;
+    let result = if device_argmax {
+        generation::generate_greedy(device, &model.model, &prompt, max_new_tokens, &[], |_| {
+            Ok(())
+        })?
+    } else {
+        generation::generate(
+            device,
+            &model.model,
+            &prompt,
+            max_new_tokens,
+            &[],
+            generation::argmax,
+            |_| Ok(()),
+        )?
+    };
     let generation_ms = start.elapsed().as_secs_f64() * 1000.0;
     let mut decode_ms = result
         .decode
@@ -544,6 +623,11 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "q5_1_gemv_n4": q5_1_gemv_n4,
         "q5_k_gemv_8rows": q5_k_gemv_8rows,
         "moe_gpu_routing_prefill": moe_gpu_routing_prefill,
+        "shared_encoder": shared_encoder,
+        "device_argmax": device_argmax,
+        "moe_chunk_device_copy": moe_chunk_device_copy,
+        "attention_context_decode_wide": attention_context_decode_wide,
+        "concurrent_dispatch": concurrent_dispatch,
         "model_format": model.format,
         "model_repository": std::env::var("FERRUM_PHASE7A_MODEL_REPOSITORY")
             .unwrap_or_else(|_| model.repository.to_owned()),

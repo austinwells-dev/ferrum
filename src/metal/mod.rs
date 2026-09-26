@@ -229,6 +229,13 @@ pub type Profile = std::collections::BTreeMap<String, ProfileEntry>;
 /// No tensor carrying this epoch may be mapped until successful completion.
 struct Submission {
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+    // With a shared encoder, one compute encoder spans the epoch (serial, or
+    // concurrent with explicit barriers); otherwise each kernel gets its own.
+    encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
+    // Concurrent encoders need explicit ordering: byte ranges touched since the
+    // last buffer barrier. Retained resources keep addresses unique per epoch.
+    reads: Vec<(usize, usize, usize)>,
+    writes: Vec<(usize, usize, usize)>,
     resources: Vec<Retained<ProtocolObject<dyn MTLBuffer>>>,
     ready: Rc<Cell<Completion>>,
     dispatches: usize,
@@ -247,6 +254,7 @@ impl Drop for Execution<'_> {
     fn drop(&mut self) {
         let _ = self.device.flush();
         self.device.batching.set(false);
+        self.device.execution_shared_encoder.set(false);
     }
 }
 struct ProfileStageScope<'a> {
@@ -270,6 +278,7 @@ pub struct MetalDevice {
     gguf_mpp_q5_1_min_rows: Cell<Option<usize>>,
     attention_softmax_prefix: Cell<bool>,
     attention_softmax_prefix_reuse: Cell<bool>,
+    attention_context_decode_wide: Cell<bool>,
     q8_0_mpp_tile_k64: Cell<bool>,
     q8_0_gemv_k_split: Cell<bool>,
     q5_1_mpp_tile_k64: Cell<bool>,
@@ -294,6 +303,10 @@ pub struct MetalDevice {
     moe_expert_tensorops: Cell<bool>,
     moe_expert_tensorops_tile_k64: Cell<bool>,
     moe_expert_tensorops_min_routes_per_expert: Cell<usize>,
+    shared_encoder: Cell<bool>,
+    execution_shared_encoder: Cell<bool>,
+    moe_chunk_device_copy: Cell<bool>,
+    concurrent_dispatch: Cell<bool>,
     reference_math: Cell<bool>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
@@ -331,6 +344,7 @@ impl MetalDevice {
             gguf_mpp_q5_1_min_rows: Cell::new(None),
             attention_softmax_prefix: Cell::new(true),
             attention_softmax_prefix_reuse: Cell::new(true),
+            attention_context_decode_wide: Cell::new(true),
             q8_0_mpp_tile_k64: Cell::new(true),
             q8_0_gemv_k_split: Cell::new(true),
             q5_1_mpp_tile_k64: Cell::new(true),
@@ -355,6 +369,10 @@ impl MetalDevice {
             moe_expert_tensorops: Cell::new(true),
             moe_expert_tensorops_tile_k64: Cell::new(true),
             moe_expert_tensorops_min_routes_per_expert: Cell::new(8),
+            shared_encoder: Cell::new(true),
+            execution_shared_encoder: Cell::new(false),
+            moe_chunk_device_copy: Cell::new(true),
+            concurrent_dispatch: Cell::new(true),
             reference_math: Cell::new(false),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
@@ -460,6 +478,19 @@ impl MetalDevice {
             && self.attention_softmax_prefix_reuse.get()
             && (256..=1024).contains(&rows)
             && rows == width
+    }
+    /// Select the 1,024-thread M=1 attention context kernel for all widths.
+    pub fn set_attention_context_decode_wide(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "attention decode variant can only change on an idle device".into(),
+            ));
+        }
+        self.attention_context_decode_wide.set(enabled);
+        Ok(())
+    }
+    pub fn attention_context_decode_wide(&self) -> bool {
+        self.attention_context_decode_wide.get()
     }
     /// Select 64-element K tiles for Q8_0 MPP prompt GEMM.
     pub fn set_q8_0_mpp_tile_k64(&self, enabled: bool) -> Result<()> {
@@ -793,6 +824,47 @@ impl MetalDevice {
     pub fn moe_expert_tensorops_min_routes_per_expert(&self) -> usize {
         self.moe_expert_tensorops_min_routes_per_expert.get()
     }
+    /// Assemble chunked MoE outputs on Metal instead of through host readback.
+    pub fn set_moe_chunk_device_copy(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change MoE chunk assembly during execution".into(),
+            ));
+        }
+        self.moe_chunk_device_copy.set(enabled);
+        Ok(())
+    }
+    pub fn moe_chunk_device_copy(&self) -> bool {
+        self.moe_chunk_device_copy.get()
+    }
+    /// Encode each command buffer's kernels through one compute encoder when the
+    /// execution scope allows it (see `execution_with_shared_encoder`).
+    pub fn set_shared_encoder(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change compute encoder policy during execution".into(),
+            ));
+        }
+        self.shared_encoder.set(enabled);
+        Ok(())
+    }
+    pub fn shared_encoder(&self) -> bool {
+        self.shared_encoder.get()
+    }
+    /// Let independent kernels in the shared encoder overlap; dependent
+    /// buffer ranges are ordered with memory barriers.
+    pub fn set_concurrent_dispatch(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change dispatch concurrency during execution".into(),
+            ));
+        }
+        self.concurrent_dispatch.set(enabled);
+        Ok(())
+    }
+    pub fn concurrent_dispatch(&self) -> bool {
+        self.concurrent_dispatch.get()
+    }
     /// Select the multi-SIMD split-K BF16 GEMV for large aligned rows.
     pub fn set_split_k_gemv(&self, enabled: bool) -> Result<()> {
         if self.batching.get() {
@@ -840,10 +912,20 @@ impl MetalDevice {
         self.batch_limit.set(limit);
         Ok(())
     }
+    #[cfg(test)]
     pub(crate) fn execution(&self) -> Result<Execution<'_>> {
+        self.execution_with_shared_encoder(true)
+    }
+    /// Begin an execution scope. `shared_encoder` lets this scope use the
+    /// device's shared/concurrent encoder policy; false keeps one encoder per kernel.
+    pub(crate) fn execution_with_shared_encoder(
+        &self,
+        shared_encoder: bool,
+    ) -> Result<Execution<'_>> {
         if self.batching.replace(true) {
             return Err(Error::Dispatch("nested execution".into()));
         }
+        self.execution_shared_encoder.set(shared_encoder);
         Ok(Execution { device: self })
     }
     fn flush(&self) -> Result<()> {
@@ -851,6 +933,9 @@ impl MetalDevice {
             return Ok(());
         };
         let start = Instant::now();
+        if let Some(encoder) = &submission.encoder {
+            encoder.endEncoding();
+        }
         submission.command.commit();
         submission.command.waitUntilCompleted();
         let mut counters = self.counters.get();
@@ -1227,7 +1312,9 @@ impl MetalDevice {
         }
         debug_assert!(params[4] <= 2);
         let p = self.builtin(name)?;
-        let required = if tiled
+        let required = if matches!(name, "attention_context_decode_wide" | "argmax_rows") {
+            1024
+        } else if tiled
             || matches!(
                 name,
                 "rmsnorm"
@@ -1236,7 +1323,8 @@ impl MetalDevice {
                     | "attention_softmax_prefix"
                     | "attention_softmax_prefix_reuse"
                     | "attention_context_decode"
-            ) {
+            )
+        {
             256
         } else if matches!(
             name,
@@ -1316,6 +1404,9 @@ impl MetalDevice {
                     .ok_or_else(|| Error::Dispatch("command buffer creation failed".into()))?;
                 *self.pending.borrow_mut() = Some(Submission {
                     command,
+                    encoder: None,
+                    reads: Vec::new(),
+                    writes: Vec::new(),
                     resources: Vec::new(),
                     ready: Rc::new(Cell::new(Completion::Encoding)),
                     dispatches: 0,
@@ -1325,10 +1416,59 @@ impl MetalDevice {
             let submission = pending
                 .as_mut()
                 .ok_or_else(|| Error::Dispatch("missing submission".into()))?;
-            let command = &submission.command;
-            let encoder = command
-                .computeCommandEncoder()
-                .ok_or_else(|| Error::Dispatch("compute encoder creation failed".into()))?;
+            let shared = self.shared_encoder.get() && self.execution_shared_encoder.get();
+            let concurrent = shared && self.concurrent_dispatch.get();
+            if submission.encoder.is_none() {
+                let encoder = if concurrent {
+                    submission
+                        .command
+                        .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+                } else {
+                    submission.command.computeCommandEncoder()
+                };
+                submission.encoder =
+                    Some(encoder.ok_or_else(|| {
+                        Error::Dispatch("compute encoder creation failed".into())
+                    })?);
+            }
+            if concurrent {
+                let range = |(b, offset, length): &(&MetalBuffer, usize, usize)| {
+                    (
+                        Retained::as_ptr(&b.raw) as *const () as usize,
+                        *offset,
+                        offset + length,
+                    )
+                };
+                let overlaps =
+                    |set: &[(usize, usize, usize)], (id, start, end): (usize, usize, usize)| {
+                        set.iter()
+                            .any(|&(other, s, e)| other == id && start < e && s < end)
+                    };
+                let hazard = buffers[..input_count]
+                    .iter()
+                    .any(|b| overlaps(&submission.writes, range(b)))
+                    || buffers[input_count..].iter().any(|b| {
+                        overlaps(&submission.writes, range(b))
+                            || overlaps(&submission.reads, range(b))
+                    });
+                if hazard {
+                    if let Some(encoder) = &submission.encoder {
+                        encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+                    }
+                    submission.reads.clear();
+                    submission.writes.clear();
+                }
+                submission
+                    .reads
+                    .extend(buffers[..input_count].iter().map(range));
+                submission
+                    .writes
+                    .extend(buffers[input_count..].iter().map(range));
+            }
+            let encoder = submission
+                .encoder
+                .as_ref()
+                .ok_or_else(|| Error::Dispatch("missing compute encoder".into()))?;
             encoder.setComputePipelineState(&p.raw);
             // SAFETY: crate-private callers validate dimensions, dtypes and lengths against the
             // embedded kernel ABI. Buffers stay alive through completion; params is copied by Metal.
@@ -1425,6 +1565,46 @@ impl MetalDevice {
                     },
                     MTLSize {
                         width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if name == "argmax_rows" {
+                if p.raw.threadExecutionWidth() != 32
+                    || p.raw.maxTotalThreadsPerThreadgroup() < 1024
+                {
+                    return Err(Error::Dispatch(
+                        "argmax requires 32-wide SIMD and 1,024-thread groups".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0],
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 1024,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if name == "attention_context_decode_wide" {
+                if p.raw.threadExecutionWidth() != 32
+                    || p.raw.maxTotalThreadsPerThreadgroup() < 1024
+                {
+                    return Err(Error::Dispatch(
+                        "decode attention requires 32-wide SIMD and 1,024-thread groups".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0],
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 1024,
                         height: 1,
                         depth: 1,
                     },
@@ -1758,7 +1938,10 @@ impl MetalDevice {
                     },
                 );
             }
-            encoder.endEncoding();
+            if !shared {
+                encoder.endEncoding();
+                submission.encoder = None;
+            }
             submission
                 .resources
                 .extend(buffers.iter().map(|(b, _, _)| b.raw.clone()));

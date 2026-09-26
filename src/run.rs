@@ -480,15 +480,10 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         o.sampling
     );
     if o.warmup && o.max_new > 0 {
-        let _ = generation::generate(
-            d,
-            &model,
-            &ids,
-            o.max_new.min(2),
-            &tok.eos_ids,
-            generation::argmax,
-            |_| Ok(()),
-        )?;
+        let _ =
+            generation::generate_greedy(d, &model, &ids, o.max_new.min(2), &tok.eos_ids, |_| {
+                Ok(())
+            })?;
         let _ = model.take_moe_stats();
     }
     d.set_profiling(o.profile);
@@ -498,30 +493,36 @@ pub fn run(d: &MetalDevice) -> Result<()> {
     let mut stdout = io::stdout().lock();
     let ioerr = |e: io::Error| Error::Parameter(format!("stdout: {e}"));
     let generation_started = Instant::now();
-    let r = generation::generate(
-        d,
-        &model,
-        &ids,
-        o.max_new,
-        &tok.eos_ids,
-        |logits| sampler.sample(logits),
-        |id| {
-            if !tok.tokenizer.is_defined(id) {
-                return Err(Error::Tokenizer(format!(
-                    "generated undefined padded vocabulary ID {id}"
-                )));
-            }
-            if let Some(fragment) = stream
-                .step(id)
-                .map_err(|e| Error::Tokenizer(e.to_string()))?
-            {
-                emitted.push_str(&fragment);
-                stdout.write_all(fragment.as_bytes()).map_err(ioerr)?;
-                stdout.flush().map_err(ioerr)?;
-            }
-            Ok(())
-        },
-    )?;
+    let emit = |id: u32| {
+        if !tok.tokenizer.is_defined(id) {
+            return Err(Error::Tokenizer(format!(
+                "generated undefined padded vocabulary ID {id}"
+            )));
+        }
+        if let Some(fragment) = stream
+            .step(id)
+            .map_err(|e| Error::Tokenizer(e.to_string()))?
+        {
+            emitted.push_str(&fragment);
+            stdout.write_all(fragment.as_bytes()).map_err(ioerr)?;
+            stdout.flush().map_err(ioerr)?;
+        }
+        Ok(())
+    };
+    // Temperature zero is exact argmax; select it on Metal without logits readback.
+    let r = if o.sampling.temperature == 0. {
+        generation::generate_greedy(d, &model, &ids, o.max_new, &tok.eos_ids, emit)?
+    } else {
+        generation::generate(
+            d,
+            &model,
+            &ids,
+            o.max_new,
+            &tok.eos_ids,
+            |logits| sampler.sample(logits),
+            emit,
+        )?
+    };
     let generation_wall = generation_started.elapsed();
     let moe_stats = model.take_moe_stats();
     // Flush any final incomplete byte sequence using the tokenizer's documented

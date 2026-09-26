@@ -90,7 +90,8 @@ fn official_lfm2_moe_q4_gguf_matches_llama_cpp_and_replays_hybrid_state() {
         stats.assignments,
         (prompt_ids.len() + generated.len() - 1) * 22 * 4
     );
-    assert!(stats.active_experts > 0);
+    // GPU routing keeps selections on Metal and does not count distinct experts.
+    assert!(!stats.active_experts_known || stats.active_experts > 0);
     assert!(stats.peak_temporary_bytes < 16 * 1024 * 1024);
     println!(
         "LFM2-MoE Q4_K_M assignments={} active_expert_visits={} peak_routing_temporary_bytes={}",

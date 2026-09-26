@@ -87,6 +87,9 @@ pub struct Transformer {
     config: ModelConfig,
     policy: ArchitecturePolicy,
     weight_bytes: usize,
+    // Measured on M5: dense models gain from one shared concurrent encoder per
+    // forward; sparse-MoE models lose prefill latency, so they keep one per kernel.
+    shared_encoder: bool,
 }
 impl Transformer {
     pub fn from_weights(d: &MetalDevice, config: ModelConfig, w: &Weights) -> Result<Self> {
@@ -142,7 +145,11 @@ impl Transformer {
             weight_bytes += layer.operator.weight_bytes() + layer.feed_forward.weight_bytes();
         }
 
+        let shared_encoder = !layers
+            .iter()
+            .any(|layer| matches!(layer.feed_forward, weights::FeedForward::Sparse(_)));
         Ok(Self {
+            shared_encoder,
             embedding,
             layers,
             final_norm,
@@ -218,8 +225,28 @@ impl Transformer {
         tokens: &[u32],
     ) -> Result<(Tensor, KvCache)> {
         let mut cache = self.new_cache()?;
-        let logits = self.forward_impl(d, tokens, &mut cache, None, true)?;
+        let logits = self.forward_impl(d, tokens, &mut cache, None, true, false)?;
         Ok((logits, cache))
+    }
+    /// Greedy prefill: final-position argmax selected on Metal in the same
+    /// submission. Returns the `[1,2]` carrier from `argmax_rows`.
+    pub(crate) fn forward_prefill_argmax(
+        &self,
+        d: &MetalDevice,
+        tokens: &[u32],
+    ) -> Result<(Tensor, KvCache)> {
+        let mut cache = self.new_cache()?;
+        let selected = self.forward_impl(d, tokens, &mut cache, None, true, true)?;
+        Ok((selected, cache))
+    }
+    /// Greedy decode step with on-device argmax; see `forward_prefill_argmax`.
+    pub(crate) fn forward_decode_argmax(
+        &self,
+        d: &MetalDevice,
+        token: u32,
+        cache: &mut KvCache,
+    ) -> Result<Tensor> {
+        self.forward_impl(d, &[token], cache, None, true, true)
     }
     /// One new token, returning [1,vocab]; an empty cache is also supported.
     pub fn forward_decode(
@@ -238,7 +265,7 @@ impl Transformer {
         cache: &mut KvCache,
         trace: Option<&mut Trace>,
     ) -> Result<Tensor> {
-        self.forward_impl(d, tokens, cache, trace, false)
+        self.forward_impl(d, tokens, cache, trace, false, false)
     }
     fn forward_impl(
         &self,
@@ -247,6 +274,7 @@ impl Transformer {
         cache: &mut KvCache,
         mut trace: Option<&mut Trace>,
         last_only: bool,
+        argmax: bool,
     ) -> Result<Tensor> {
         if tokens.is_empty() {
             return Err(Error::Parameter(
@@ -278,7 +306,7 @@ impl Transformer {
                 });
             }
         }
-        let execution = d.execution()?;
+        let execution = d.execution_with_shared_encoder(self.shared_encoder)?;
         let mut staged = cache.clone();
         let mut x = self.embedding.forward(d, tokens)?;
         if self.policy.embedding_multiplier != 1. {
@@ -305,6 +333,11 @@ impl Transformer {
             d.scale(&logits, self.policy.logits_divisor.recip())?.tensor
         };
         record(&mut trace, "logits", &logits);
+        let logits = if argmax {
+            d.argmax_rows(&logits)?
+        } else {
+            logits
+        };
         staged.set_sequence_len(offset + tokens.len())?;
         execution.finish()?;
         *cache = staged;

@@ -98,6 +98,44 @@ pub fn counter_delta(
         arena_high_water: b.arena_high_water,
     }
 }
+/// Read one `argmax_rows` carrier row, rejecting non-finite logits like `argmax`.
+fn selected_token(selected: &Tensor) -> Result<u32> {
+    let words = selected.to_f32();
+    if words.len() != 2 {
+        return Err(Error::Shape("argmax carrier must be [1,2]".into()));
+    }
+    if words[1].to_bits() != 0 {
+        return Err(Error::Parameter(
+            "argmax requires nonempty finite vocabulary logits".into(),
+        ));
+    }
+    Ok(words[0].to_bits())
+}
+/// Greedy generation with argmax selected on Metal inside each forward
+/// submission; only the chosen ID is read back. Token-for-token equivalent to
+/// `generate(..., argmax, ...)`.
+pub fn generate_greedy(
+    d: &MetalDevice,
+    model: &crate::model::Transformer,
+    prompt: &[u32],
+    max_new: usize,
+    eos: &[u32],
+    emit: impl FnMut(u32) -> Result<()>,
+) -> Result<Generation> {
+    generate_impl(
+        d,
+        model,
+        prompt,
+        max_new,
+        eos,
+        Selection::<fn(&[f32]) -> Result<u32>>::Device,
+        emit,
+    )
+}
+enum Selection<F> {
+    Host(F),
+    Device,
+}
 /// The callback sees non-EOS IDs only. It may buffer incomplete UTF-8 sequences.
 pub fn generate(
     d: &MetalDevice,
@@ -105,7 +143,26 @@ pub fn generate(
     prompt: &[u32],
     max_new: usize,
     eos: &[u32],
-    mut select: impl FnMut(&[f32]) -> Result<u32>,
+    select: impl FnMut(&[f32]) -> Result<u32>,
+    emit: impl FnMut(u32) -> Result<()>,
+) -> Result<Generation> {
+    generate_impl(
+        d,
+        model,
+        prompt,
+        max_new,
+        eos,
+        Selection::Host(select),
+        emit,
+    )
+}
+fn generate_impl<F: FnMut(&[f32]) -> Result<u32>>(
+    d: &MetalDevice,
+    model: &crate::model::Transformer,
+    prompt: &[u32],
+    max_new: usize,
+    eos: &[u32],
+    mut selection: Selection<F>,
     mut emit: impl FnMut(u32) -> Result<()>,
 ) -> Result<Generation> {
     use std::time::{Duration, Instant};
@@ -137,15 +194,26 @@ pub fn generate(
     let start = Instant::now();
     d.reset_transient_peak();
     let before = d.counters();
-    let (logits, mut cache) = model.forward_prefill_last(d, prompt)?;
+    // Host selection keeps the final logits row; device selection keeps the ID.
+    let (mut values, mut chosen, mut cache) = match selection {
+        Selection::Host(_) => {
+            let (logits, cache) = model.forward_prefill_last(d, prompt)?;
+            (final_logits(d, &logits)?, 0, cache)
+        }
+        Selection::Device => {
+            let (selected, cache) = model.forward_prefill_argmax(d, prompt)?;
+            (Vec::new(), selected_token(&selected)?, cache)
+        }
+    };
     result.prefill = start.elapsed();
-    let mut values = final_logits(d, &logits)?;
-    drop(logits);
     result.prefill_counters = counter_delta(before, d.counters());
     result.prefill_profile = d.take_profile();
     for step in 0..max_new {
         let sampling_start = Instant::now();
-        let token = select(&values)?;
+        let token = match &mut selection {
+            Selection::Host(select) => select(&values)?,
+            Selection::Device => chosen,
+        };
         result.sampling += sampling_start.elapsed();
         if token as usize >= model.config().vocab_size {
             return Err(Error::Token {
@@ -168,8 +236,15 @@ pub fn generate(
         d.reset_transient_peak();
         let before = d.counters();
         let start = Instant::now();
-        let logits = model.forward_decode(d, token, &mut cache)?;
-        values = final_logits(d, &logits)?;
+        match selection {
+            Selection::Host(_) => {
+                let logits = model.forward_decode(d, token, &mut cache)?;
+                values = final_logits(d, &logits)?;
+            }
+            Selection::Device => {
+                chosen = selected_token(&model.forward_decode_argmax(d, token, &mut cache)?)?;
+            }
+        }
         result.decode.push(start.elapsed());
         result.decode_profiles.push(d.take_profile());
         result
