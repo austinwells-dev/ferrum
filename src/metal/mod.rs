@@ -279,6 +279,7 @@ pub struct MetalDevice {
     attention_softmax_prefix: Cell<bool>,
     attention_softmax_prefix_reuse: Cell<bool>,
     attention_context_decode_wide: Cell<bool>,
+    attention_scores_vector: Cell<bool>,
     q8_0_mpp_tile_k64: Cell<bool>,
     q8_0_gemv_k_split: Cell<bool>,
     q5_1_mpp_tile_k64: Cell<bool>,
@@ -350,6 +351,7 @@ impl MetalDevice {
             attention_softmax_prefix: Cell::new(true),
             attention_softmax_prefix_reuse: Cell::new(true),
             attention_context_decode_wide: Cell::new(true),
+            attention_scores_vector: Cell::new(true),
             q8_0_mpp_tile_k64: Cell::new(true),
             q8_0_gemv_k_split: Cell::new(true),
             q5_1_mpp_tile_k64: Cell::new(true),
@@ -501,6 +503,19 @@ impl MetalDevice {
     }
     pub fn attention_context_decode_wide(&self) -> bool {
         self.attention_context_decode_wide.get()
+    }
+    /// Use four-wide BF16 loads in the scalar attention score kernel.
+    pub fn set_attention_scores_vector(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "attention score variant can only change on an idle device".into(),
+            ));
+        }
+        self.attention_scores_vector.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn attention_scores_vector(&self) -> bool {
+        self.attention_scores_vector.get()
     }
     /// Select 64-element K tiles for Q8_0 MPP prompt GEMM.
     pub fn set_q8_0_mpp_tile_k64(&self, enabled: bool) -> Result<()> {

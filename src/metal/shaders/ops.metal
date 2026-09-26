@@ -264,7 +264,20 @@ kernel void embedding_gather(ARGS, uint i [[thread_position_in_grid]]) {
 kernel void attention_scores(ARGS, uint i [[thread_position_in_grid]]) {
     uint t=i%p[2], s=(i/p[2])%p[1], h=i/(p[1]*p[2]);
     uint kv=h/(p[3]/p[5]); float sum=0;
-    for(uint j=0;j<p[6];j++) sum+=load(a,(s*p[3]+h)*p[6]+j,p[4])*load(b,(t*p[5]+kv)*p[6]+j,p[4]);
+    uint qa=(s*p[3]+h)*p[6], ka=(t*p[5]+kv)*p[6];
+    if(p[8]==1) {
+        // BF16 with head dimension divisible by four: four-wide loads, same
+        // ascending accumulation order as the scalar loop below.
+        device const ushort4* q4=(device const ushort4*)a+qa/4;
+        device const ushort4* k4=(device const ushort4*)b+ka/4;
+        for(uint j=0;j<p[6]/4;j++) {
+            ushort4 qv=q4[j], kv4=k4[j];
+            sum+=as_type<float>(uint(qv.x)<<16)*as_type<float>(uint(kv4.x)<<16);
+            sum+=as_type<float>(uint(qv.y)<<16)*as_type<float>(uint(kv4.y)<<16);
+            sum+=as_type<float>(uint(qv.z)<<16)*as_type<float>(uint(kv4.z)<<16);
+            sum+=as_type<float>(uint(qv.w)<<16)*as_type<float>(uint(kv4.w)<<16);
+        }
+    } else for(uint j=0;j<p[6];j++) sum+=load(a,qa+j,p[4])*load(b,ka+j,p[4]);
     store(c,i,p[4],sum);
 }
 kernel void attention_mask(ARGS, uint i [[thread_position_in_grid]]) {

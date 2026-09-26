@@ -2018,3 +2018,26 @@ Cached decode rose 16–18% for LFM2.5, 5–8% for Qwen2.5 Q4_K_M, and 11–12% 
 LFM2.5 short-prompt decode reached 89.2 tok/s against llama.cpp's 86.4 (1.033x), the first workload where Ferrum decodes faster than the pinned llama.cpp build. LFM2.5 decode is now 0.84–1.03x across workloads, and Qwen3's 1,024-token prefill is 0.819x. No format yet meets every threshold of the gate: LFM2.5's 512-token, 1,024-token, and sustained decode are 0.836–0.848x, and prefill is below 0.80x elsewhere.
 
 **Fidelity cost.** Against llama.cpp's saved sequences, LFM2.5 sustained decode previously matched all 129 tokens and now diverges at generated index 46. The LFM2.5 128-token case diverges at index 8 instead of 9. Every other workload diverges at the same index as control or not at all.
+
+## Experiment 60: Four-wide BF16 loads in the M=1 attention score kernel (retained)
+
+Status: retained. Toggle: `set_attention_scores_vector`, bench field `attention_scores_vector`. Output is bit-identical.
+
+After Experiment 59, LFM2.5 decode reached 1.03x llama.cpp at short context but only 0.836–0.848x at the long-context workloads. The flushed 1,024-context profile (`lfm2.5-8b-a1b-1024-decode-op-profile.json`) attributed 44.3 µs per layer to the scalar `attention_scores` kernel, which serves M=1 since Experiment 48's GQA scores kernel was rejected. That kernel has one thread per (head, position), each loading its query and key rows one BF16 element at a time through the generic `load`.
+
+The candidate reads both rows as `ushort4` when the tensor is BF16, the head dimension is divisible by four, and both view offsets are 8-byte aligned. It accumulates the four products in the same ascending order as the scalar loop; other cases take the scalar loop. Test `vector_bf16_attention_scores_are_bit_identical` covers GQA groups 4, 7, 1, and 2, head dimensions 64, 80, 128, and 33 (scalar fallback), aligned and row-offset key views, and an unaligned query view. It requires identical output bits and passes under Metal API and GPU Shader Validation. All 160 tests pass.
+
+Flushed profile at 1,024 context: `attention_scores` 44.8 -> 13.6 µs per LFM2.5 attention layer. In-process A/B, five pairs, 1,024-token and sustained workloads. Raw: `*-attention-scores-vector-ab.jsonl` (with `.run.log`).
+
+| Model / workload | Prefill tok/s C->V `[V/C]` | Cached decode tok/s C->V `[V/C]` | Complete generation tok/s C->V `[V/C]` | First-token ms C->V | IDs C=V |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5 / 1,024-token prompt | 1,492.4->1,471.4 `[0.986]` | 82.3->84.2 `[1.023]` | 19.3->19.1 `[0.993]` | 686.2->695.9 | 5/5 |
+| LFM2.5 / Sustained decode | 105.6->104.8 `[1.013]` | 85.9->86.0 `[1.005]` | 80.9->80.7 `[1.005]` | 104.2->105.0 | 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 6,389.3->6,415.9 `[1.005]` | 143.0->151.9 `[1.063]` | 62.0->63.8 `[1.029]` | 160.3->159.6 | 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 743.7->710.3 `[0.982]` | 162.6->166.9 `[1.033]` | 160.3->163.7 `[1.032]` | 28.2->29.6 | 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 5,224.8->5,200.6 `[0.998]` | 100.5->109.3 `[1.083]` | 46.0->47.5 `[1.034]` | 196.0->196.9 | 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 648.2->639.0 `[0.986]` | 134.0->135.5 `[1.013]` | 129.5->132.3 `[1.028]` | 32.4->32.9 | 5/5 |
+
+Cached decode improved at 1,024 context by 2.3% (LFM2.5), 6.3% (Qwen2.5), and 8.3% (Qwen3), and on sustained decode by 0.5–3.3%. Prefill uses the TensorOps score path, so its ±1–2% changes are noise. Every pair produced identical IDs.
+
+Against the saved llama.cpp rows, LFM2.5 cached decode is now 84.2 / 96.4 tok/s (0.873x) at 1,024 context and 86.0 / 101.2 tok/s (0.850x) sustained. Together with short context (1.03x after Experiment 59), LFM2.5 meets the 0.85x decode threshold on the measured short, 1,024-token, and sustained workloads; the 512-token workload was not rerun here. Its 512- and 1,024-token prefill (0.65–0.69x) remains below the 0.80x prefill threshold, so the gate is not met.

@@ -588,6 +588,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             })?,
     };
     device.set_moe_routing_temporary_limit(moe_routing_temporary_mib * 1024 * 1024)?;
+    let attention_scores_vector = match request.get("attention_scores_vector") {
+        None | Some(Value::Null) => {
+            device.set_attention_scores_vector(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_attention_scores_vector(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field attention_scores_vector must be a boolean".into(),
+            ));
+        }
+    };
     let expert_tensorops = match request.get("moe_expert_tensorops") {
         None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
         Some(Value::Bool(enabled)) => {
@@ -696,6 +711,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "moe_gpu_routing_prefill": moe_gpu_routing_prefill,
         "shared_encoder": shared_encoder,
         "q4_k_factored": q4_k_factored,
+        "attention_scores_vector": attention_scores_vector,
         "q6_k_factored": q6_k_factored,
         "mpp_fast_dequant": mpp_fast_dequant,
         "moe_expert_tile_pairs": moe_expert_tile_pairs,

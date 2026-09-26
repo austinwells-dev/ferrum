@@ -635,6 +635,14 @@ impl MetalDevice {
                 [b[0], rows],
             )
         } else {
+            // Four-wide BF16 loads need 8-byte aligned rows: head dimension and
+            // both tensor offsets divisible by four elements.
+            let vector = q.dtype() == DType::BF16
+                && self.attention_scores_vector()
+                && a[2].is_multiple_of(4)
+                && q.binding().1.is_multiple_of(8)
+                && k.binding().1.is_multiple_of(8);
+            p[8] = u32::from(vector);
             self.run("attention_scores", q, Some(k), &dims, p, [n, 1])
         }
     }
@@ -941,6 +949,65 @@ mod fusion_tests {
             values[299] = f32::INFINITY;
             let logits = Tensor::from_f32(&d, [1, 300], dtype, &values).unwrap();
             assert_eq!(d.argmax_rows(&logits).unwrap().to_f32()[1].to_bits(), 1);
+        }
+    }
+    #[test]
+    fn vector_bf16_attention_scores_are_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for (heads, kv, width, t) in [
+            (32, 8, 64, 1025),
+            (14, 2, 64, 37),
+            (6, 6, 80, 5),
+            (16, 8, 128, 300),
+            (4, 2, 33, 9),
+        ] {
+            let q = Tensor::from_f32(
+                &d,
+                [1, heads, width],
+                DType::BF16,
+                &crate::reference::deterministic(heads * width),
+            )
+            .unwrap();
+            let k = Tensor::from_f32(
+                &d,
+                [t + 1, kv, width],
+                DType::BF16,
+                &crate::reference::deterministic((t + 1) * kv * width),
+            )
+            .unwrap();
+            // Aligned view and one offset by a single row (still 8-byte aligned when width%4==0),
+            // plus an unaligned two-element offset that must fall back to the scalar loop.
+            for (start, rows) in [(0, t), (kv * width, t)] {
+                let k = k.view(start, [rows, kv, width]).unwrap();
+                d.set_attention_scores_vector(false).unwrap();
+                let scalar = d.attention_scores(&q, &k).unwrap().tensor;
+                d.set_attention_scores_vector(true).unwrap();
+                let vector = d.attention_scores(&q, &k).unwrap().tensor;
+                assert_eq!(
+                    bits(&vector),
+                    bits(&scalar),
+                    "H={heads} KV={kv} D={width} T={t}"
+                );
+            }
+            let flat = Tensor::from_f32(
+                &d,
+                [heads * width + 2],
+                DType::BF16,
+                &crate::reference::deterministic(heads * width + 2),
+            )
+            .unwrap();
+            let q_unaligned = flat.view(2, [1, heads, width]).unwrap();
+            let k0 = k.view(0, [t, kv, width]).unwrap();
+            d.set_attention_scores_vector(false).unwrap();
+            let scalar = d.attention_scores(&q_unaligned, &k0).unwrap().tensor;
+            d.set_attention_scores_vector(true).unwrap();
+            let vector = d.attention_scores(&q_unaligned, &k0).unwrap().tensor;
+            assert_eq!(
+                bits(&vector),
+                bits(&scalar),
+                "unaligned H={heads} D={width}"
+            );
         }
     }
     #[test]
