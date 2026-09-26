@@ -294,6 +294,7 @@ pub struct MetalDevice {
     q4_k_gemv_8rows: Cell<bool>,
     q4_k_factored: Cell<bool>,
     q6_k_factored: Cell<bool>,
+    mpp_fast_dequant: Cell<bool>,
     q4_k_expert_project_8rows: Cell<bool>,
     q4_k_expert_project_16rows: Cell<bool>,
     q4_k_expert_project_16rows_pairs: Cell<bool>,
@@ -362,6 +363,7 @@ impl MetalDevice {
             q4_k_gemv_8rows: Cell::new(true),
             q4_k_factored: Cell::new(true),
             q6_k_factored: Cell::new(true),
+            mpp_fast_dequant: Cell::new(true),
             q4_k_expert_project_8rows: Cell::new(true),
             q4_k_expert_project_16rows: Cell::new(true),
             q4_k_expert_project_16rows_pairs: Cell::new(true),
@@ -678,6 +680,19 @@ impl MetalDevice {
     }
     pub(crate) fn use_q4_k_factored(&self, features: usize) -> bool {
         self.q4_k_factored.get() && features >= 256 && features.is_multiple_of(256)
+    }
+    /// Decode Q4_K/Q6_K/Q8_0/Q5_0 TensorOps weight tiles one block or chunk per work item.
+    pub fn set_mpp_fast_dequant(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change TensorOps dequantization during execution".into(),
+            ));
+        }
+        self.mpp_fast_dequant.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn mpp_fast_dequant(&self) -> bool {
+        self.mpp_fast_dequant.get()
     }
     /// Select factored-scale Q6_K M=1 kernels (dense GEMV and sparse experts).
     pub fn set_q6_k_factored(&self, enabled: bool) -> Result<()> {

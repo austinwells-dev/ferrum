@@ -38,6 +38,54 @@ kernel void project_mpp(device bfloat* a [[buffer(0)]],
 // Q8_0 weights are expanded only into a 64x128 threadgroup tile immediately
 // before MPP consumes it. Each packed weight tile is reused across 64 prompt
 // rows and remains packed in model storage.
+// Q8_0 / Q5_0 rows into a [64 rows][TILE_K] bf16 tile, one 32-value block per
+// work item: the block scale (and Q5_0 high-bit word) is read once per block.
+// Per-value formulas match the per-value decoders exactly.
+template<uint TILE_K>
+inline void q8_0_dequant_tile(device const uchar* weights, uint bytes_per_row,
+                              uint n, uint col0, uint k0, uint k,
+                              threadgroup bfloat* dst, uint tid) {
+    constexpr uint BLOCKS=TILE_K/32;
+    for(uint item=tid;item<64*BLOCKS;item+=128) {
+        uint block_local=item%BLOCKS, out_col=item/BLOCKS;
+        uint column=col0+out_col, source_k=k0+block_local*32;
+        threadgroup bfloat* out=dst+out_col*TILE_K+block_local*32;
+        if(column<n && source_k<k) {
+            device const uchar* qblock=weights+column*bytes_per_row+(source_k/32)*34;
+            float scale=float(*((device const half*)qblock));
+            device const char* q=(device const char*)(qblock+2);
+            for(uint j=0;j<32;j++) out[j]=bfloat(scale*float(q[j]));
+        } else {
+            for(uint j=0;j<32;j++) out[j]=bfloat(0.0f);
+        }
+    }
+}
+template<uint TILE_K>
+inline void q5_0_dequant_tile(device const uchar* weights, uint bytes_per_row,
+                              uint n, uint col0, uint k0, uint k,
+                              threadgroup bfloat* dst, uint tid) {
+    constexpr uint BLOCKS=TILE_K/32;
+    for(uint item=tid;item<64*BLOCKS;item+=128) {
+        uint block_local=item%BLOCKS, out_col=item/BLOCKS;
+        uint column=col0+out_col, source_k=k0+block_local*32;
+        threadgroup bfloat* out=dst+out_col*TILE_K+block_local*32;
+        if(column<n && source_k<k) {
+            device const uchar* block=weights+column*bytes_per_row+(source_k/32)*22;
+            float d=float(*((device const half*)block));
+            uint qh=uint(block[2])|(uint(block[3])<<8)|(uint(block[4])<<16)|(uint(block[5])<<24);
+            for(uint j=0;j<16;j++) {
+                uchar qs=block[6+j];
+                int q0=int(qs&15)+int(((qh>>j)&1)<<4)-16;
+                int q1=int(qs>>4)+int(((qh>>(j+16))&1)<<4)-16;
+                out[j]=bfloat(d*float(q0));
+                out[16+j]=bfloat(d*float(q1));
+            }
+        } else {
+            for(uint j=0;j<32;j++) out[j]=bfloat(0.0f);
+        }
+    }
+}
+
 kernel void q8_0_gemm_mpp(device bfloat* a [[buffer(0)]],
                           device const uchar* packed [[buffer(1)]],
                           device ushort* c [[buffer(2)]],
@@ -60,7 +108,9 @@ kernel void q8_0_gemm_mpp(device bfloat* a [[buffer(0)]],
     int k_tiles=(k+TILE_K-1)/TILE_K;
     for(int kt=0;kt<k_tiles;kt++) {
         if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint i=tid;i<uint(TILE_N*TILE_K);i+=128) {
+        if(p[8]&1) q8_0_dequant_tile<TILE_K>(packed,uint(blocks)*34,uint(n),group.x*TILE_N,
+                                        uint(kt*TILE_K),uint(k),dequantized,tid);
+        else for(uint i=tid;i<uint(TILE_N*TILE_K);i+=128) {
             uint out_col=i/TILE_K, in_col=i%TILE_K;
             int channel=int(group.x)*TILE_N+int(out_col);
             int source_k=kt*TILE_K+int(in_col);
@@ -113,7 +163,9 @@ kernel void q8_0_gemm_mpp_k64(device bfloat* a [[buffer(0)]],
     int k_tiles=(k+TILE_K-1)/TILE_K;
     for(int kt=0;kt<k_tiles;kt++) {
         if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint i=tid;i<uint(TILE_N*TILE_K);i+=128) {
+        if(p[8]&1) q8_0_dequant_tile<TILE_K>(packed,uint(blocks)*34,uint(n),group.x*TILE_N,
+                                        uint(kt*TILE_K),uint(k),dequantized,tid);
+        else for(uint i=tid;i<uint(TILE_N*TILE_K);i+=128) {
             uint out_col=i/TILE_K, in_col=i%TILE_K;
             int channel=int(group.x)*TILE_N+int(out_col);
             int source_k=kt*TILE_K+int(in_col);
@@ -224,7 +276,9 @@ kernel void q5_0_gemm_mpp(device bfloat* a [[buffer(0)]],
     int k_tiles=(k+TILE_K-1)/TILE_K;
     for(int kt=0;kt<k_tiles;kt++) {
         if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+        if(p[8]&1) q5_0_dequant_tile<TILE_K>(packed,uint(blocks)*22,uint(n),group.x*TILE_N,
+                                        uint(kt*TILE_K),uint(k),dequantized,tid);
+        else for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
             uint out_col=i/(TILE_K/2), packed_index=i%(TILE_K/2);
             uint block_in_tile=packed_index/16, byte_in_block=packed_index%16;
             int channel=int(group.x)*TILE_N+int(out_col);
@@ -332,6 +386,37 @@ inline uint qk4_min_mpp(device const uchar* scales, uint group) {
     return uint(scales[group+4]>>4) | (uint(scales[group]>>6)<<4);
 }
 
+// Q4_K rows into a [64 rows][TILE_K] bf16 tile. Each work item owns 16 packed
+// bytes of one row's 64-value chunk and decodes that chunk's two scale/minimum
+// pairs once. Values are (d*scale)*q-(dmin*min), the per-value formula's order.
+template<uint TILE_K>
+inline void q4_k_dequant_tile(device const uchar* weights, uint bytes_per_row,
+                              uint n, uint col0, uint k0, uint k,
+                              threadgroup bfloat* dst, uint tid) {
+    constexpr uint CHUNKS=TILE_K/64;
+    for(uint item=tid;item<64*CHUNKS*2;item+=128) {
+        uint half16=item&1, rest=item>>1, chunk_local=rest%CHUNKS, out_col=rest/CHUNKS;
+        uint column=col0+out_col, source_k=k0+chunk_local*64;
+        threadgroup bfloat* out=dst+out_col*TILE_K+chunk_local*64+half16*16;
+        if(column<n && source_k<k) {
+            device const uchar* block=weights+column*bytes_per_row+(source_k>>8)*144;
+            uint g0=((source_k&255)>>6)*2;
+            float d=float(*((device const half*)block));
+            float dmin=float(*((device const half*)(block+2)));
+            float s0=d*float(qk4_scale_mpp(block+4,g0)), s1=d*float(qk4_scale_mpp(block+4,g0+1));
+            float m0=dmin*float(qk4_min_mpp(block+4,g0)), m1=dmin*float(qk4_min_mpp(block+4,g0+1));
+            device const uchar* q=block+16+(g0/2)*32+half16*16;
+            for(uint j=0;j<16;j++) {
+                uchar b=q[j];
+                out[j]=bfloat(s0*float(b&15)-m0);
+                out[32+j]=bfloat(s1*float(b>>4)-m1);
+            }
+        } else {
+            for(uint j=0;j<16;j++) { out[j]=bfloat(0.0f); out[32+j]=bfloat(0.0f); }
+        }
+    }
+}
+
 kernel void q4_k_gemm_mpp(device bfloat* a [[buffer(0)]],
                           device const uchar* packed [[buffer(1)]],
                           device ushort* c [[buffer(2)]],
@@ -354,7 +439,9 @@ kernel void q4_k_gemm_mpp(device bfloat* a [[buffer(0)]],
     int k_tiles=(k+TILE_K-1)/TILE_K;
     for(int kt=0;kt<k_tiles;kt++) {
         if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+        if(p[8]&1) q4_k_dequant_tile<TILE_K>(packed,uint(blocks)*144,uint(n),group.x*TILE_N,
+                                            uint(kt*TILE_K),uint(k),dequantized,tid);
+        else for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
             uint out_col=i/(TILE_K/2), pair_index=i%(TILE_K/2);
             uint half_tile=pair_index/32, lane=pair_index%32;
             int channel=int(group.x)*TILE_N+int(out_col);
@@ -416,7 +503,9 @@ kernel void q4_k_gemm_mpp_k64(device bfloat* a [[buffer(0)]],
     int k_tiles=(k+TILE_K-1)/TILE_K;
     for(int kt=0;kt<k_tiles;kt++) {
         if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+        if(p[8]&1) q4_k_dequant_tile<TILE_K>(packed,uint(blocks)*144,uint(n),group.x*TILE_N,
+                                            uint(kt*TILE_K),uint(k),dequantized,tid);
+        else for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
             uint out_col=i/(TILE_K/2), lane=i%(TILE_K/2);
             int channel=int(group.x)*TILE_N+int(out_col);
             int source_k=kt*TILE_K+int(lane);
@@ -479,7 +568,9 @@ kernel void q4_k_gemm_mpp_k64_m128(device bfloat* a [[buffer(0)]],
     int k_tiles=(k+TILE_K-1)/TILE_K;
     for(int kt=0;kt<k_tiles;kt++) {
         if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+        if(p[8]&1) q4_k_dequant_tile<TILE_K>(packed,uint(blocks)*144,uint(n),group.x*TILE_N,
+                                            uint(kt*TILE_K),uint(k),dequantized,tid);
+        else for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
             uint out_col=i/(TILE_K/2), lane=i%(TILE_K/2);
             int channel=int(group.x)*TILE_N+int(out_col);
             int source_k=kt*TILE_K+int(lane);
@@ -834,6 +925,41 @@ inline float q6_k_weight_mpp(device const uchar* weights, uint row, uint column,
     return d*float(scale)*float(q);
 }
 
+// Q6_K rows into a [64 rows][TILE_K] bf16 tile. A 64-aligned chunk is two
+// adjacent 32-value slices of one half-block; each work item owns 16 lanes of
+// one row, so both slices use one signed scale each. Values are (d*scale)*q.
+template<uint TILE_K>
+inline void q6_k_dequant_tile(device const uchar* weights, uint bytes_per_row,
+                              uint n, uint col0, uint k0, uint k,
+                              threadgroup bfloat* dst, uint tid) {
+    constexpr uint CHUNKS=TILE_K/64;
+    for(uint item=tid;item<64*CHUNKS*2;item+=128) {
+        uint half16=item&1, rest=item>>1, chunk_local=rest%CHUNKS, out_col=rest/CHUNKS;
+        uint column=col0+out_col, source_k=k0+chunk_local*64;
+        threadgroup bfloat* out=dst+out_col*TILE_K+chunk_local*64+half16*16;
+        if(column<n && source_k<k) {
+            device const uchar* block=weights+column*bytes_per_row+(source_k>>8)*210;
+            uint t=(source_k&255)>>6, half_block=t>>1, s0=(t&1)*2;
+            float d=float(*((device const half*)(block+208)));
+            device const char* scales=(device const char*)(block+192+half_block*8+half16);
+            float d0=d*float(scales[s0*2]), d1=d*float(scales[(s0+1)*2]);
+            device const uchar* ql=block+half_block*64+half16*16;
+            device const uchar* qh=block+128+half_block*32+half16*16;
+            for(uint j=0;j<16;j++) {
+                uchar lo0=ql[j], lo1=ql[32+j], hi=qh[j];
+                uint n0=s0==0?uint(lo0&15):uint(lo0>>4);
+                uint n1=s0==0?uint(lo1&15):uint(lo1>>4);
+                int q0=int(n0|(((uint(hi)>>(s0*2))&3)<<4))-32;
+                int q1=int(n1|(((uint(hi)>>((s0+1)*2))&3)<<4))-32;
+                out[j]=bfloat(d0*float(q0));
+                out[32+j]=bfloat(d1*float(q1));
+            }
+        } else {
+            for(uint j=0;j<16;j++) { out[j]=bfloat(0.0f); out[32+j]=bfloat(0.0f); }
+        }
+    }
+}
+
 kernel void q6_k_gemm_mpp(device bfloat* a [[buffer(0)]],
                           device const uchar* packed [[buffer(1)]],
                           device ushort* c [[buffer(2)]],
@@ -858,7 +984,9 @@ kernel void q6_k_gemm_mpp(device bfloat* a [[buffer(0)]],
         // A ql byte carries two Q6_K values 64 positions apart. Decode them
         // together so each lane fetches ql/qh once and shares their bit-plane
         // extraction across the pair.
-        for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
+        if(p[8]&1) q6_k_dequant_tile<TILE_K>(packed,(uint(k)>>8)*210,uint(n),group.x*TILE_N,
+                                            uint(kt*TILE_K),uint(k),dequantized,tid);
+        else for(uint i=tid;i<uint(TILE_N*(TILE_K/2));i+=128) {
             uint out_col=i/(TILE_K/2), byte_index=i%(TILE_K/2);
             uint slice=byte_index/32, lane=byte_index%32;
             int channel=int(group.x)*TILE_N+int(out_col);
@@ -972,7 +1100,11 @@ void expert_project_k_mpp_impl(
     uint k_tiles=(k+TILE_K-1)/TILE_K;
     for(uint kt=0;kt<k_tiles;kt++) {
         if(kt>0) threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint i=tid;i<TILE_N*TILE_K;i+=128) {
+        if(type==12 && (p[8]&1)) q4_k_dequant_tile<TILE_K>(expert_weights,bytes_per_row,n,
+                                                           group.x*TILE_N,kt*TILE_K,k,dequantized,tid);
+        else if(type==14 && (p[8]&1)) q6_k_dequant_tile<TILE_K>(expert_weights,bytes_per_row,n,
+                                                                group.x*TILE_N,kt*TILE_K,k,dequantized,tid);
+        else for(uint i=tid;i<TILE_N*TILE_K;i+=128) {
             uint out_col=i/TILE_K, in_col=i%TILE_K;
             uint column=group.x*TILE_N+out_col, source_k=kt*TILE_K+in_col;
             bfloat value=bfloat(0.0f);

@@ -411,6 +411,7 @@ impl MetalDevice {
         mpp_params[5] = index(experts)?;
         mpp_params[6] = DType::F32 as u32;
         mpp_params[7] = ggml_type;
+        mpp_params[8] = u32::from(self.mpp_fast_dequant());
         let mpp_timing = self.dispatch(
             name,
             &[

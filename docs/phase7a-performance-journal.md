@@ -1894,3 +1894,51 @@ With the factored kernels in place, the remaining LFM2.5 decode profile (12.67 m
 - Expert outputs: 2.16 ms.
 
 The `rmsnorm` fallback is now about 19% of the summed LFM2.5 decode profile and remains an open design decision.
+
+## Experiment 57: Block-wise TensorOps weight-tile decoding (retained)
+
+Status: retained for the dense Q4_K (K=128, K=64, K=64/M=128), Q6_K, Q8_0 (K=128, K=64), and Q5_0 TensorOps GEMMs, and for the Q4_K/Q6_K grouped-expert TensorOps projections. Toggle: `set_mpp_fast_dequant`, bench field `mpp_fast_dequant`. Output is **bit-identical** to the previous decoders.
+
+A flushed profile of LFM2.5's 512-token prefill (`lfm2.5-8b-a1b-512-prefill-op-profile-before-fast-dequant.json`, 947.5 ms summed GPU) attributed 82% to the grouped-expert TensorOps projections. The expert Q4_K input projection ran at about 1.2 TFLOPS (66 calls at 8.28 ms), against about 6.2 TFLOPS for the dense Q4_K TensorOps GEMM in the same model.
+
+The TensorOps kernels spend most of their time dequantizing GGUF weights into bf16 threadgroup tiles, and each decoded tile is reused by only 32 (expert) or 64 (dense) prompt rows. The existing decoders worked on one or two values per iteration. Each iteration reloaded the block's half-precision scale (plus, for K-quants, the 6-bit scale and minimum decode, and for Q5_0 the high-bit bytes). The expert decoder also branched on format per value.
+
+The new decoders give each work item a whole unit, decode its parameters once, and emit the values in a short loop:
+
+- **Q4_K and Q6_K:** 16 packed bytes of one row's 64-value chunk, which is two 32-value groups sharing one scale/minimum (Q4_K) or signed scale (Q6_K) per group.
+- **Q8_0 and Q5_0:** one whole 32-value block, with Q5_0's high-bit word assembled once.
+
+Each value keeps the exact per-value formula and operand order: `(d*scale)*q-(dmin*min)`, `(d*scale)*q`, `scale*q`, and `d*q`.
+
+Tests: `q4_k_tensorops_fast_dequant_is_bit_identical` (all three dense Q4_K tiles plus the expert path at K=128 and K=64, uneven segments, and row tails), `q6_k_tensorops_fast_dequant_is_bit_identical`, `q8_0_tensorops_fast_dequant_is_bit_identical`, and `q5_0_tensorops_fast_dequant_is_bit_identical`. They require identical output bits between the old and new decoders and pass under Metal API and GPU Shader Validation. The full 159-test suite, including every local model parity test, passes.
+
+Flushed LFM2.5 512-token prefill profile: summed GPU 986.5 -> 314.1 ms. Expert Q4_K input 8.76 -> 2.12 ms per call, expert Q6_K output 2.98 -> 1.52 ms, expert Q4_K output 4.52 -> 1.11 ms, and dense Q4_K GEMM 2.10 -> 0.82 ms. Qwen2.5 Q6_K dense Q6_K GEMM went from 865 to 496 µs.
+
+**Rejected alongside:** a flattened expert-tile grid indexed the 32-row-padded segment space instead of launching `experts x ceil(assignments/32)` tiles, most of which exit immediately. It changed nothing measurable (summed 960.3 -> 971.1 ms without the new decoder, 364.2 -> 371.5 ms with it) and was removed.
+
+In-process A/B, five interleaved pairs per workload, control = previous decoders. Cells list control->candidate / llama.cpp and `[control/llama -> candidate/llama; median paired candidate/control]`, using the saved 1ab7e5a references. Raw: `*-mpp-fast-dequant-ab.jsonl` and `.run.log`.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5-8B-A1B Q4_K_M / Short | 90.8->103.8 / 215.6 `[0.421->0.482; 1.155]` | 77.4->77.6 / 86.4 `[0.895->0.898; 1.001]` | 51.8->54.4 / 72.5 `[0.714->0.751; 1.052]` | 121.1->105.9 / 51.2 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 332.8->714.5 / 1,511.1 `[0.220->0.473; 2.193]` | 76.2->76.3 / 98.2 `[0.776->0.778; 1.004]` | 28.6->43.8 / 67.5 `[0.424->0.649; 1.541]` | 384.6->179.1 / 84.9 | 5/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 465.0->1,176.6 / 2,108.3 `[0.221->0.558; 2.531]` | 74.3->74.5 / 97.5 `[0.762->0.764; 1.002]` | 12.9->26.1 / 41.2 `[0.313->0.634; 2.024]` | 1,101.1->435.2 / 243.1 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 521.5->1,310.7 / 2,141.5 `[0.244->0.612; 2.503]` | 73.0->72.9 / 96.4 `[0.757->0.756; 0.998]` | 7.7->17.0 / 25.8 `[0.301->0.659; 2.190]` | 1,963.6->781.3 / 478.4 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 93.9->96.4 / 233.7 `[0.402->0.412; 1.017]` | 77.0->77.1 / 101.2 `[0.761->0.762; 1.002]` | 72.4->72.6 / 95.7 `[0.756->0.758; 1.002]` | 117.1->114.1 / 47.3 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Short | 487.5->690.7 / 1,406.7 `[0.347->0.491; 1.416]` | 154.7->153.0 / 238.8 `[0.648->0.641; 0.986]` | 115.8->126.3 / 197.5 `[0.586->0.640; 1.092]` | 43.1->30.4 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 2,434.8->3,360.8 / 6,989.8 `[0.348->0.481; 1.378]` | 151.4->152.4 / 230.7 `[0.656->0.660; 1.009]` | 106.7->118.3 / 187.6 `[0.569->0.631; 1.104]` | 52.6->38.1 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 4,358.5->6,186.8 / 9,336.9 `[0.467->0.663; 1.415]` | 151.5->151.4 / 233.5 `[0.649->0.648; 1.002]` | 74.3->88.7 / 133.5 `[0.557->0.665; 1.185]` | 117.5->82.8 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 4,813.1->6,344.2 / 8,844.2 `[0.544->0.717; 1.316]` | 140.6->141.1 / 236.5 `[0.595->0.597; 1.003]` | 51.7->61.3 / 90.0 `[0.574->0.681; 1.182]` | 212.8->161.4 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 486.6->680.0 / 1,385.7 `[0.351->0.491; 1.390]` | 158.4->158.7 / 244.3 `[0.648->0.650; 1.003]` | 151.4->154.1 / 221.8 `[0.683->0.695; 1.017]` | 43.2->30.9 / 15.4 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q6_K / Short | 454.5->683.4 / 1,478.6 `[0.307->0.462; 1.504]` | 142.2->141.5 / 199.1 `[0.714->0.710; 0.992]` | 107.5->119.3 / 173.9 `[0.618->0.686; 1.113]` | 46.2->30.7 / 14.5 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 128-token prompt | 2,248.3->3,298.3 / 7,068.9 `[0.318->0.467; 1.467]` | 142.6->141.3 / 201.8 `[0.707->0.700; 0.989]` | 100.5->111.3 / 168.2 `[0.598->0.662; 1.123]` | 56.9->38.8 / 18.4 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 512-token prompt | 4,228.0->6,305.8 / 9,643.1 `[0.438->0.654; 1.486]` | 141.9->140.6 / 203.2 `[0.699->0.692; 0.993]` | 71.8->85.8 / 125.0 `[0.574->0.686; 1.188]` | 121.1->81.2 / 53.4 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 1,024-token prompt | 4,504.7->6,325.2 / 9,077.0 `[0.496->0.697; 1.404]` | 133.6->133.3 / 197.2 `[0.677->0.676; 0.997]` | 48.5->59.7 / 86.3 `[0.562->0.691; 1.229]` | 227.3->161.9 / 113.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / Sustained decode | 455.1->678.6 / 1,451.0 `[0.314->0.468; 1.491]` | 147.7->147.0 / 202.7 `[0.729->0.725; 0.995]` | 140.8->142.4 / 191.2 `[0.736->0.745; 1.015]` | 46.1->30.9 / 14.7 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / Short | 357.4->600.2 / 1,258.3 `[0.284->0.477; 1.672]` | 120.3->119.9 / 164.5 `[0.731->0.729; 0.994]` | 88.8->100.7 / 143.8 `[0.618->0.700; 1.133]` | 58.8->35.0 / 17.0 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 1,694.6->2,764.2 / 6,001.2 `[0.282->0.461; 1.631]` | 119.4->116.8 / 163.8 `[0.729->0.713; 0.983]` | 80.5->93.2 / 138.8 `[0.580->0.671; 1.156]` | 75.5->46.3 / 21.6 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / 512-token prompt | 2,932.7->4,584.9 / 7,099.6 `[0.413->0.646; 1.559]` | 109.8->110.0 / 154.9 `[0.709->0.710; 0.991]` | 51.5->62.5 / 95.2 `[0.541->0.657; 1.222]` | 174.6->111.7 / 72.4 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 3,343.9->5,041.6 / 6,283.2 `[0.532->0.802; 1.508]` | 96.5->96.4 / 143.3 `[0.674->0.673; 0.998]` | 35.0->44.5 / 61.1 `[0.573->0.727; 1.267]` | 306.2->203.1 / 163.2 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 356.6->592.9 / 1,241.8 `[0.287->0.477; 1.659]` | 121.9->121.1 / 164.7 `[0.740->0.735; 0.995]` | 116.2->118.2 / 157.4 `[0.738->0.751; 1.020]` | 58.9->35.4 / 17.2 | 5/5; 0/5; 0/5 |
+
+Prefill rises 2.19–2.53x for LFM2.5 at 128–1,024 tokens, 1.32–1.42x for Qwen2.5 Q4_K_M, 1.40–1.50x for Qwen2.5 Q6_K, and 1.51–1.67x for Qwen3 Q8_0. Cached decode is unchanged, since it uses M=1 GEMV. Every pair produced identical IDs. First-token latency on the LFM2.5 1,024-token prompt fell from 1,964 to 781 ms. Against llama.cpp, medium and long prefill are now about 0.53–0.61x for LFM2.5, 0.63–0.72x for Qwen2.5, and 0.65–0.80x for Qwen3. That is still below the 0.80x prefill gate except at Qwen3's 1,024-token prompt.

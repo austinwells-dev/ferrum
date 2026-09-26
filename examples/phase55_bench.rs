@@ -547,6 +547,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let mpp_fast_dequant = match request.get("mpp_fast_dequant") {
+        None | Some(Value::Null) => {
+            device.set_mpp_fast_dequant(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_mpp_fast_dequant(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field mpp_fast_dequant must be a boolean".into(),
+            ));
+        }
+    };
     let expert_tensorops = match request.get("moe_expert_tensorops") {
         None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
         Some(Value::Bool(enabled)) => {
@@ -656,6 +671,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "shared_encoder": shared_encoder,
         "q4_k_factored": q4_k_factored,
         "q6_k_factored": q6_k_factored,
+        "mpp_fast_dequant": mpp_fast_dequant,
         "device_argmax": device_argmax,
         "moe_chunk_device_copy": moe_chunk_device_copy,
         "attention_context_decode_wide": attention_context_decode_wide,

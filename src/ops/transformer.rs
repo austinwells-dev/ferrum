@@ -155,6 +155,12 @@ impl MetalDevice {
             }
             (QuantizationFormat::MlxAffine4Group64, false, false) => "mlx_affine4_gemm",
         };
+        if name.starts_with("q4_k_gemm_mpp")
+            || name.starts_with("q8_0_gemm_mpp")
+            || matches!(name, "q6_k_gemm_mpp" | "q5_0_gemm_mpp")
+        {
+            p[8] = u32::from(self.mpp_fast_dequant());
+        }
         self.run_quantized(
             name,
             a,
@@ -1250,6 +1256,29 @@ mod q8_0_tests {
     }
 
     #[test]
+    fn q8_0_tensorops_fast_dequant_is_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        // K=128 tile below 512 rows; K=64 tile at 513 rows; column and row tails.
+        for (m, n, k, kernel) in [
+            (37, 133, 384, "q8_0_gemm_mpp"),
+            (513, 65, 384, "q8_0_gemm_mpp_k64"),
+        ] {
+            let weight = packed(&d, n, k);
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
+            d.set_mpp_fast_dequant(false).unwrap();
+            let control = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(control.metrics.operation, kernel);
+            d.set_mpp_fast_dequant(true).unwrap();
+            let fast = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(bits(&fast.tensor), bits(&control.tensor), "{kernel}");
+        }
+    }
+
+    #[test]
     fn q8_0_mpp_gemm_dequantizes_only_a_tiled_weight_block() {
         let d = MetalDevice::new().unwrap();
         if !d.mpp_projection() {
@@ -1742,6 +1771,24 @@ mod q5_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn q5_0_tensorops_fast_dequant_is_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let (m, n, k) = (37, 133, 384);
+        let weight = packed(&d, n, k, QuantizationFormat::Q5_0);
+        let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
+        d.set_mpp_fast_dequant(false).unwrap();
+        let control = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(control.metrics.operation, "q5_0_gemm_mpp");
+        d.set_mpp_fast_dequant(true).unwrap();
+        let fast = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(bits(&fast.tensor), bits(&control.tensor));
     }
 
     #[test]
@@ -2738,6 +2785,74 @@ mod qk_tests {
     }
 
     #[test]
+    fn q4_k_tensorops_fast_dequant_is_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        // Dense: K=128 tile (M=37), K=64 tile (M=1,025 without M128), and K=64/M128.
+        for (m, n, k, m128) in [
+            (37, 133, 512, true),
+            (1025, 65, 512, false),
+            (1025, 65, 512, true),
+        ] {
+            d.set_q4_k_mpp_tile_m128(m128).unwrap();
+            let weight = packed(&d, n, k, QuantizationFormat::Q4_K);
+            let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
+            d.set_mpp_fast_dequant(false).unwrap();
+            let control = d.project_quantized(&x, &weight).unwrap();
+            assert!(control.metrics.operation.starts_with("q4_k_gemm_mpp"));
+            d.set_mpp_fast_dequant(true).unwrap();
+            let fast = d.project_quantized(&x, &weight).unwrap();
+            assert_eq!(fast.metrics.operation, control.metrics.operation);
+            assert_eq!(
+                bits(&fast.tensor),
+                bits(&control.tensor),
+                "M={m} N={n} K={k}"
+            );
+        }
+        d.set_q4_k_mpp_tile_m128(true).unwrap();
+        // Experts: uneven segments (one expert above one 32-row tile) and a row tail.
+        let (assignments, experts, rows_per_expert, columns) = (197, 3, 133, 512);
+        let expert_ids = (0..assignments)
+            .map(|a| if a % 5 == 0 { 0 } else { 1 + a % 2 })
+            .collect::<Vec<_>>();
+        let x = Tensor::from_f32(
+            &d,
+            [assignments, columns],
+            DType::BF16,
+            &input(assignments, columns),
+        )
+        .unwrap();
+        let metadata = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(a, &e)| [f32::from_bits(e as u32), f32::from_bits(a as u32), 1.0])
+            .collect::<Vec<_>>();
+        let metadata = Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata).unwrap();
+        let packed = packed(
+            &d,
+            experts * rows_per_expert,
+            columns,
+            QuantizationFormat::Q4_K,
+        );
+        let weight = QuantizedExpertMatrix::new(packed, experts, rows_per_expert).unwrap();
+        for k64 in [false, true] {
+            d.set_moe_expert_tensorops_tile_k64(k64).unwrap();
+            d.set_mpp_fast_dequant(false).unwrap();
+            let control = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            d.set_mpp_fast_dequant(true).unwrap();
+            let candidate = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            assert_eq!(bits(&candidate), bits(&control), "k64={k64}");
+        }
+    }
+
+    #[test]
     fn q4_k_expert_tensorops_k64_matches_reference() {
         let d = MetalDevice::new().unwrap();
         if !d.mpp_projection() {
@@ -3230,6 +3345,60 @@ mod q6_k_tests {
                 (actual - expected).abs() <= 0.12,
                 "Q6_K index {index}: actual={actual}, expected={expected}"
             );
+        }
+    }
+
+    #[test]
+    fn q6_k_tensorops_fast_dequant_is_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        if !d.mpp_projection() {
+            return;
+        }
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let (m, n, k) = (37, 133, 768);
+        let weight = packed(&d, n, k);
+        let x = Tensor::from_f32(&d, [m, k], DType::BF16, &input(m, k)).unwrap();
+        d.set_mpp_fast_dequant(false).unwrap();
+        let control = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(control.metrics.operation, "q6_k_gemm_mpp");
+        d.set_mpp_fast_dequant(true).unwrap();
+        let fast = d.project_quantized(&x, &weight).unwrap();
+        assert_eq!(bits(&fast.tensor), bits(&control.tensor));
+
+        let (assignments, experts, rows_per_expert, columns) = (197, 3, 133, 768);
+        let expert_ids = (0..assignments)
+            .map(|a| if a % 5 == 0 { 0 } else { 1 + a % 2 })
+            .collect::<Vec<_>>();
+        let x = Tensor::from_f32(
+            &d,
+            [assignments, columns],
+            DType::BF16,
+            &input(assignments, columns),
+        )
+        .unwrap();
+        let metadata = expert_ids
+            .iter()
+            .enumerate()
+            .flat_map(|(a, &e)| [f32::from_bits(e as u32), f32::from_bits(a as u32), 1.0])
+            .collect::<Vec<_>>();
+        let metadata = Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata).unwrap();
+        let weight = QuantizedExpertMatrix::new(
+            packed(&d, experts * rows_per_expert, columns),
+            experts,
+            rows_per_expert,
+        )
+        .unwrap();
+        for k64 in [false, true] {
+            d.set_moe_expert_tensorops_tile_k64(k64).unwrap();
+            d.set_mpp_fast_dequant(false).unwrap();
+            let control = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            d.set_mpp_fast_dequant(true).unwrap();
+            let fast = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            assert_eq!(bits(&fast), bits(&control), "k64={k64}");
         }
     }
 
