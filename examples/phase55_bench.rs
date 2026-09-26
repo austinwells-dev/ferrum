@@ -633,6 +633,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let arena_epoch_reuse = match request.get("arena_epoch_reuse") {
+        None | Some(Value::Null) => {
+            device.set_arena_epoch_reuse(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_arena_epoch_reuse(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field arena_epoch_reuse must be a boolean".into(),
+            ));
+        }
+    };
     let expert_tensorops = match request.get("moe_expert_tensorops") {
         None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
         Some(Value::Bool(enabled)) => {
@@ -746,6 +761,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "mpp_fast_dequant": mpp_fast_dequant,
         "dense_mpp_tile_pairs": dense_mpp_tile_pairs,
         "rope_table": rope_table,
+        "arena_epoch_reuse": arena_epoch_reuse,
         "moe_expert_tile_pairs": moe_expert_tile_pairs,
         "moe_routing_temporary_mib": moe_routing_temporary_mib,
         "device_argmax": device_argmax,

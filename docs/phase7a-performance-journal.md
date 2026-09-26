@@ -2110,3 +2110,75 @@ In-process A/B, five pairs. Raw: `*-rope-table-ab.jsonl` and `.run.log`.
 Qwen3 (head dimension 128, 28 layers): 512- and 1,024-token prefill +1.9–2.2%, and cached decode +0.7–1.3%. Qwen2.5 (head dimension 64) is within noise. All 166 tests pass.
 
 Against the saved llama.cpp rows, the current tree's A/B medians give 1,024-token prefill of 6,732 / 8,844 tok/s (0.76x) for Qwen2.5 Q4_K_M, 5,565 / 6,283 (0.89x) for Qwen3, and 6,696 / 9,077 (0.74x) for Qwen2.5 Q6_K. At 512 tokens it is 0.70x, 0.72x, and 0.69x.
+
+## Experiment 63: Transient arena reuse within the encoding epoch (retained)
+
+Status: retained. Toggle: `set_arena_epoch_reuse`, bench field `arena_epoch_reuse`. Outputs are unchanged.
+
+**Diagnosis.** Batched prefill counters from Experiments 61–62 show wall time well above GPU time. At 1,024 tokens:
+
+| Model | Prefill | GPU | Command buffers |
+|---|---:|---:|---:|
+| Qwen2.5 | 152.1 ms | 123.4 ms | 14 |
+| LFM2.5 | 696.8 ms | 501.4 ms | 23 |
+
+The transient peak sat at the 256 MiB live budget in every long prompt. Allocation counters explained most of the gap: Qwen2.5 allocated 262 MiB of fresh buffers (13.8 ms) at 512 tokens and 496 MiB (26.6 ms) at 1,024; LFM2.5 allocated 2.1 GiB (110 ms) at 1,024.
+
+The arena recycled a buffer only after its command buffer had *completed*. Within one long forward epoch, every intermediate therefore needed fresh, zero-filled storage until the budget forced a flush and a completion wait.
+
+**Change.** `allocate_output` now also reuses storage retired earlier in the *current* epoch (same completion flag as the open submission). This is safe under the runtime's ordering rules:
+
+- The retired tensor has no owner, so no later dispatch reads its old contents.
+- Every earlier reader is ordered before the new writer: the serial encoder executes in order, the concurrent encoder inserts a write-after-read buffer barrier from its range tracking (Experiment 47), and Metal's tracked hazards order separate encoders.
+
+A reused pending buffer stays counted as live until its epoch completes, so live-byte accounting is unchanged.
+
+**Tests.**
+
+- `epoch_reuse_orders_rewrites_after_pending_reads` runs a 64-step chain under both serial and concurrent encoders, dropping each tensor right after its last read is encoded. It checks every value and that reuse occurred within one command buffer.
+- `bounded_epochs_preserve_live_dependency_chain` now keeps its intermediates alive, so it still exercises budget-bounded epochs.
+- All 108 library tests pass under Metal API and GPU Shader Validation, and all 167 tests pass.
+
+A/B: five interleaved pairs, control = completed-only reuse. The llama.cpp references are the saved 1ab7e5a rows. Raw: `*-arena-epoch-reuse-ab.jsonl` and `.run.log`.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5-8B-A1B Q4_K_M / Short | 107.0->104.4 / 215.6 `[0.497->0.484; 0.999]` | 86.4->87.4 / 86.4 `[0.999->1.011; 1.015]` | 59.2->59.1 / 72.5 `[0.816->0.815; 1.008]` | 102.8->105.3 / 51.2 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 750.7->775.8 / 1,511.1 `[0.497->0.513; 1.021]` | 87.1->87.5 / 98.2 `[0.888->0.892; 1.003]` | 47.9->48.8 / 67.5 `[0.710->0.724; 1.011]` | 170.5->165.0 / 84.9 | 5/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 1,463.0->1,712.5 / 2,108.3 `[0.694->0.812; 1.176]` | 86.0->86.6 / 97.5 `[0.882->0.889; 1.007]` | 31.6->35.0 / 41.2 `[0.766->0.850; 1.113]` | 350.0->299.0 / 243.1 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 1,489.6->1,729.9 / 2,141.5 `[0.696->0.808; 1.167]` | 84.3->85.5 / 96.4 `[0.874->0.886; 1.010]` | 19.3->21.9 / 25.8 `[0.750->0.850; 1.131]` | 687.4->592.0 / 478.4 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 106.0->109.7 / 233.7 `[0.454->0.470; 1.032]` | 87.3->88.3 / 101.2 `[0.863->0.873; 1.009]` | 82.1->83.3 / 95.7 `[0.858->0.870; 1.013]` | 103.7->100.2 / 47.3 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / Short | 729.5->741.7 / 1,406.7 `[0.519->0.527; 1.010]` | 165.8->166.6 / 238.8 `[0.694->0.698; 1.004]` | 135.8->137.4 / 197.5 `[0.688->0.696; 1.014]` | 28.8->28.3 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 3,478.3->3,777.4 / 6,989.8 `[0.498->0.540; 1.086]` | 164.6->165.3 / 230.7 `[0.713->0.716; 1.005]` | 126.5->131.6 / 187.6 `[0.675->0.702; 1.034]` | 36.8->33.9 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 6,518.3->6,989.0 / 9,336.9 `[0.698->0.749; 1.077]` | 162.9->161.2 / 233.5 `[0.698->0.691; 0.986]` | 94.4->97.7 / 133.5 `[0.707->0.732; 1.039]` | 78.5->73.3 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 6,716.5->7,822.4 / 8,844.2 `[0.759->0.884; 1.185]` | 155.9->156.6 / 236.5 `[0.659->0.662; 1.006]` | 66.2->72.4 / 90.0 `[0.735->0.804; 1.104]` | 152.5->130.9 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 720.9->745.0 / 1,385.7 `[0.520->0.538; 1.027]` | 170.7->171.6 / 244.3 `[0.699->0.702; 1.000]` | 166.3->167.2 / 221.8 `[0.750->0.754; 1.003]` | 29.1->28.2 / 15.4 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / Short | 643.7->670.4 / 1,258.3 `[0.512->0.533; 1.038]` | 137.1->140.0 / 164.5 `[0.833->0.851; 1.022]` | 113.5->116.8 / 143.8 `[0.790->0.812; 1.029]` | 32.6->31.3 / 17.0 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 2,996.4->3,184.8 / 6,001.2 `[0.499->0.531; 1.071]` | 135.2->137.4 / 163.8 `[0.825->0.839; 1.017]` | 105.5->109.0 / 138.8 `[0.761->0.786; 1.052]` | 42.7->40.2 / 21.6 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / 512-token prompt | 5,109.9->5,568.8 / 7,099.6 `[0.720->0.784; 1.092]` | 125.6->127.1 / 154.9 `[0.811->0.821; 1.012]` | 71.4->74.8 / 95.2 `[0.750->0.786; 1.045]` | 100.2->91.9 / 72.4 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 5,555.2->6,040.1 / 6,283.2 `[0.884->0.961; 1.087]` | 111.8->113.4 / 143.3 `[0.780->0.792; 1.018]` | 49.7->52.7 / 61.1 `[0.814->0.862; 1.059]` | 184.3->169.5 / 163.2 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 647.5->679.6 / 1,241.8 `[0.521->0.547; 1.082]` | 139.8->141.5 / 164.7 `[0.849->0.859; 1.012]` | 136.7->138.6 / 157.4 `[0.869->0.881; 1.015]` | 32.4->30.9 / 17.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q6_K / Short | 727.9->752.3 / 1,478.6 `[0.492->0.509; 1.029]` | 156.7->159.3 / 199.1 `[0.787->0.800; 1.028]` | 129.5->133.5 / 173.9 `[0.744->0.768; 1.036]` | 28.8->27.9 / 14.5 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q6_K / 128-token prompt | 3,531.1->3,769.8 / 7,068.9 `[0.500->0.533; 1.057]` | 154.7->156.7 / 201.8 `[0.766->0.776; 1.004]` | 122.0->124.9 / 168.2 `[0.726->0.742; 1.022]` | 36.3->34.0 / 18.4 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 512-token prompt | 6,656.1->7,084.8 / 9,643.1 `[0.690->0.735; 1.073]` | 152.4->153.1 / 203.2 `[0.750->0.754; 1.001]` | 91.7->95.4 / 125.0 `[0.734->0.763; 1.043]` | 76.9->72.3 / 53.4 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 1,024-token prompt | 6,780.9->7,826.7 / 9,077.0 `[0.747->0.862; 1.166]` | 147.0->148.1 / 197.2 `[0.746->0.751; 1.006]` | 64.6->70.7 / 86.3 `[0.749->0.819; 1.106]` | 151.0->130.8 / 113.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / Sustained decode | 726.9->749.0 / 1,451.0 `[0.501->0.516; 1.041]` | 159.7->160.8 / 202.7 `[0.788->0.793; 1.007]` | 155.5->156.9 / 191.2 `[0.813->0.821; 1.011]` | 28.9->28.0 / 14.7 | 5/5; 0/5; 0/5 |
+
+
+**Results.** Prefill rose at 512 and 1,024 tokens:
+
+| Model | 512 tokens | 1,024 tokens |
+|---|---:|---:|
+| LFM2.5 | +17.6% | +16.7% |
+| Qwen2.5 Q4_K_M | +7.7% | +18.5% |
+| Qwen3 | +9.2% | +8.7% |
+| Qwen2.5 Q6_K | +7.3% | +16.6% |
+
+Decode changed by 0–3%, and IDs matched in every pair.
+
+**Gate status.**
+
+- **LFM2.5-8B-A1B Q4_K_M** meets the decode and medium/long prefill thresholds against the saved llama.cpp rows: prefill 0.812x (512) and 0.808x (1,024), cached decode 0.873–1.011x. Its short (11-token) and 128-token prefill are 0.48x and 0.51x. Those remain the routine-workload exception that keeps the gate open.
+- **At 1,024 tokens**, Qwen2.5 Q4_K_M (0.884x), Qwen3 (0.961x), and Qwen2.5 Q6_K (0.862x) meet the prefill threshold.
+- **At 512 tokens**, the same three models are 0.735–0.784x.
+- **Qwen decode** remains 0.66–0.85x.

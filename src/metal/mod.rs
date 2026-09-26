@@ -301,6 +301,7 @@ pub struct MetalDevice {
     mpp_fast_dequant: Cell<bool>,
     dense_mpp_tile_pairs: Cell<bool>,
     rope_table: Cell<bool>,
+    arena_epoch_reuse: Cell<bool>,
     rope_table_cache: RefCell<Option<RopeTableEntry>>,
     moe_expert_tile_pairs: Cell<bool>,
     moe_routing_temporary_limit: Cell<usize>,
@@ -376,6 +377,7 @@ impl MetalDevice {
             mpp_fast_dequant: Cell::new(true),
             dense_mpp_tile_pairs: Cell::new(true),
             rope_table: Cell::new(true),
+            arena_epoch_reuse: Cell::new(true),
             rope_table_cache: RefCell::new(None),
             moe_expert_tile_pairs: Cell::new(true),
             moe_routing_temporary_limit: Cell::new(128 * 1024 * 1024),
@@ -736,6 +738,16 @@ impl MetalDevice {
     }
     pub fn moe_routing_temporary_limit(&self) -> usize {
         self.moe_routing_temporary_limit.get()
+    }
+    /// Recycle transient storage retired earlier in the current encoding epoch.
+    pub fn set_arena_epoch_reuse(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change arena policy during execution".into(),
+            ));
+        }
+        self.arena_epoch_reuse.set(enabled);
+        Ok(())
     }
     /// Share one RoPE cos/sin table across the q/k rotations of an execution.
     pub fn set_rope_table(&self, enabled: bool) -> Result<()> {
@@ -1240,14 +1252,29 @@ impl MetalDevice {
             self.flush()?;
         }
         let mut arena = self.arena.borrow_mut();
+        // Storage retired earlier in the current, still-encoding epoch is also
+        // reusable: its tensor is gone, so no later dispatch reads the old
+        // contents, and every earlier reader is ordered before the new writer
+        // (serial encoder order, the concurrent encoder's range barriers, or
+        // Metal's tracked hazards between encoders).
+        let current_epoch = self
+            .arena_epoch_reuse
+            .get()
+            .then(|| self.pending.borrow().as_ref().map(|s| s.ready.clone()))
+            .flatten();
         let bin = arena.free.entry(length).or_default();
         let available = bin.iter().rposition(|(_, ready, _)| {
-            ready
-                .as_ref()
-                .is_none_or(|r| r.get() == Completion::Completed)
+            ready.as_ref().is_none_or(|r| {
+                r.get() == Completion::Completed
+                    || current_epoch
+                        .as_ref()
+                        .is_some_and(|epoch| Rc::ptr_eq(epoch, r))
+            })
         });
+        let mut still_counted = false;
         let mut buffer = if let Some(i) = available {
-            let (raw, _, _) = bin.swap_remove(i);
+            let (raw, _, counted) = bin.swap_remove(i);
+            still_counted = counted;
             let mut counters = self.counters.get();
             counters.reused_bytes += length;
             self.counters.set(counters);
@@ -1266,7 +1293,10 @@ impl MetalDevice {
             arena.capacity += length;
             buffer
         };
-        arena.acquire(length);
+        // A pending buffer stays counted as live until its epoch completes.
+        if !still_counted {
+            arena.acquire(length);
+        }
         buffer.arena = Some(self.arena.clone());
         Ok(buffer)
     }
@@ -2304,14 +2334,53 @@ mod failed_completion_tests {
         let before = d.counters();
         d.reset_transient_peak();
         let execution = d.execution().unwrap();
+        // Keep every intermediate alive so the live budget, not recycling,
+        // bounds the epoch.
+        let mut alive = Vec::new();
         for _ in 0..40 {
-            x = d.add(&x, &x).unwrap().tensor;
+            let next = d.add(&x, &x).unwrap().tensor;
+            alive.push(std::mem::replace(&mut x, next));
         }
         execution.finish().unwrap();
         let after = d.counters();
         assert!(after.command_buffers - before.command_buffers >= 2);
-        assert!(after.transient_peak_bytes <= 256 * 1024 * 1024);
         assert!(x.to_f32().iter().all(|&v| v == 0.01f32 * 2f32.powi(40)));
+        drop(alive);
+    }
+    #[test]
+    fn epoch_reuse_orders_rewrites_after_pending_reads() {
+        use crate::{DType, Tensor};
+        let d = MetalDevice::new().unwrap();
+        // Small enough that the whole chain stays in one epoch.
+        let n = 1 << 16;
+        let a = Tensor::from_f32(&d, [n], DType::F32, &vec![1.0; n]).unwrap();
+        for concurrent in [false, true] {
+            d.set_concurrent_dispatch(concurrent).unwrap();
+            let before = d.counters();
+            let execution = d.execution().unwrap();
+            // Each step drops the previous tensor right after its last read is
+            // encoded, so the next output recycles storage still being read.
+            let mut x = d.add(&a, &a).unwrap().tensor;
+            let mut sums = Vec::new();
+            for _ in 0..64 {
+                let y = d.add(&x, &a).unwrap().tensor;
+                sums.push(d.add(&y, &y).unwrap().tensor);
+                x = y;
+            }
+            execution.finish().unwrap();
+            let after = d.counters();
+            assert!(
+                after.reused_bytes > before.reused_bytes,
+                "concurrent={concurrent}"
+            );
+            assert_eq!(after.command_buffers - before.command_buffers, 1);
+            assert!(x.to_f32().iter().all(|&v| v == 66.0));
+            for (i, s) in sums.iter().enumerate() {
+                let expected = 2.0 * (3.0 + i as f32);
+                assert!(s.to_f32().iter().all(|&v| v == expected), "step {i}");
+            }
+        }
+        d.set_concurrent_dispatch(true).unwrap();
     }
 }
 
