@@ -1,0 +1,8 @@
+[2026-09-25T19:11:25.025329+00:00] model load
+CPU preflight passed: peak total 127.9% of one core; largest process 43.9% of one core.
+[2026-09-25T19:11:34.284763+00:00] warmup inference
+CPU preflight passed: peak total 128.4% of one core; largest process 42.8% of one core.
+[2026-09-25T19:11:38.550751+00:00] traced cached-decode inference
+CPU preflight passed: peak total 142.9% of one core; largest process 46.0% of one core.
+[2026-09-25T19:11:44.231342+00:00] traced cached-decode inference
+CPU preflight passed: peak total 155.2% of one core; largest process 47.8% of one core.

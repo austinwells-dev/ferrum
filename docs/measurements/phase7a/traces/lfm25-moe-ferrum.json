@@ -1,0 +1,142 @@
+{
+  "runtime": "ferrum",
+  "model_path": "/Users/austinwells/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q4_K_M.gguf",
+  "workload_path": "docs/measurements/phase7a/lfm2.5-8b-a1b-q4_k_m-workloads.jsonl",
+  "trace_path": "docs/measurements/phase7a/traces/lfm25-moe-ferrum.trace",
+  "trace_process_pid": 30242,
+  "trace_start_utc": "2026-09-25T19:21:39.852893+00:00",
+  "trace_end_utc": "2026-09-25T19:21:40.167246+00:00",
+  "request_wall_ms": 314.3158750026487,
+  "request": {
+    "attention_softmax_prefix": true,
+    "attention_softmax_prefix_reuse": true,
+    "case": "trace-short",
+    "decode_aggregate_tps": 31.92661170245049,
+    "decode_counters": [
+      {
+        "allocated_bytes": 4,
+        "allocation_time": {
+          "nanos": 6917,
+          "secs": 0
+        },
+        "allocations": 1,
+        "arena_capacity": 8559360,
+        "arena_high_water": 8559360,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 429,
+        "encode": {
+          "nanos": 1192183,
+          "secs": 0
+        },
+        "gpu": {
+          "nanos": 29516500,
+          "secs": 0
+        },
+        "reused_bytes": 3857152,
+        "transient_live_bytes": 557056,
+        "transient_peak_bytes": 4152064,
+        "wait": {
+          "nanos": 29868292,
+          "secs": 0
+        }
+      }
+    ],
+    "decode_median_ms": 31.321833,
+    "decode_ms": [
+      31.321833
+    ],
+    "decode_profiles": [
+      {}
+    ],
+    "decode_tps": 31.92661170245049,
+    "first_token_ms": 282.595208,
+    "generated_ids": [
+      124901,
+      207
+    ],
+    "generated_tokens": 2,
+    "generation_ms": 314.157375,
+    "generation_tps": 6.366236030588173,
+    "gguf_mpp_min_rows": null,
+    "gguf_mpp_q5_1_min_rows": null,
+    "kv_active_bytes": 147456,
+    "kv_reserved_bytes": 3145728,
+    "model_format": "GGUF",
+    "model_repository": "LiquidAI/LFM2.5-8B-A1B-GGUF",
+    "model_revision": "49c14831707011e64d70b2ebd8462ba08d608434",
+    "moe_expert_tensorops": true,
+    "moe_expert_tensorops_min_routes_per_expert": 8,
+    "moe_expert_tensorops_tile_k64": true,
+    "moe_gpu_routing_prefill": false,
+    "moe_shared_token_input": false,
+    "packed_quantized_bytes": 5140709376,
+    "pair": 0,
+    "pair_order": "traced",
+    "parameter_count": 8467856128,
+    "prefill_counters": {
+      "allocated_bytes": 3378572,
+      "allocation_time": {
+        "nanos": 619832,
+        "secs": 0
+      },
+      "allocations": 53,
+      "arena_capacity": 8559360,
+      "arena_high_water": 8559360,
+      "command_buffers": 23,
+      "completion_waits": 23,
+      "dispatches": 407,
+      "encode": {
+        "nanos": 1731211,
+        "secs": 0
+      },
+      "gpu": {
+        "nanos": 238024417,
+        "secs": 0
+      },
+      "reused_bytes": 53237760,
+      "transient_live_bytes": 294912,
+      "transient_peak_bytes": 4244480,
+      "wait": {
+        "nanos": 278918878,
+        "secs": 0
+      }
+    },
+    "prefill_ms": 282.342041,
+    "prefill_profile": {},
+    "prefill_tps": 38.95983736973836,
+    "prompt_ids": [
+      124894,
+      124899,
+      5922,
+      207,
+      35808,
+      9,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+    ],
+    "prompt_tokens": 11,
+    "q4_k_expert_project_16rows": true,
+    "q4_k_expert_project_16rows_pairs": true,
+    "q4_k_expert_project_8rows": true,
+    "q4_k_mpp_tile_k64": true,
+    "q4_k_mpp_tile_m128": true,
+    "q5_0_gemv_n4": true,
+    "q5_1_gemv_n4": true,
+    "q5_1_mpp_tile_k64": true,
+    "q5_k_gemv_8rows": false,
+    "q5_k_mpp_tile_k64": true,
+    "q6_k_expert_project_8rows": true,
+    "q8_0_gemv_k_split": true,
+    "q8_0_mpp_tile_k64": true,
+    "retained_weight_bytes": 5144019200,
+    "runtime": "ferrum",
+    "sampling_ms": 0.395874,
+    "source_tensor_bytes": 5147326208,
+    "tensor_count": 256,
+    "warmup": false
+  }
+}

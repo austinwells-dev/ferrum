@@ -201,6 +201,13 @@ F64 temperature/top-k/top-p probabilities and seeded ChaCha8 selection. It does
 not call a CPU transformer or external engine. CPU reference code is confined
 to explicit validation tools/tests.
 
+`generate_greedy` (Phase 7B) is the greedy fast path. The model encodes a
+row-argmax kernel in the same submission as the forward pass, after logits
+scaling. The kernel takes the first maximal index, matching `argmax`, and
+flags non-finite logits, which the host rejects exactly as `argmax` does.
+Only the selected ID is read back. `ferrum run` uses it at temperature 0;
+sampling still receives the full final row.
+
 The `run` CLI composes these pieces, loads local files, drops source weights after
 construction, uses tokenizers' incremental decoder for Unicode-safe text, and
 reports model load, construction, tokenization, prefill, first selection, per-step
@@ -220,6 +227,23 @@ and ranked Phase 4 recommendations.
 ## Phase 4 current execution and storage model
 
 `MetalDevice` owns a single queue and an internal execution guard. Public tensor operations submit and wait synchronously. Transformer forward instead encodes separate tracked-hazard compute encoders into a bounded command buffer, default 1,024 dispatches. The measured model uses 603 dispatches and one completion boundary per forward. Limits 1/64/256/1024/8192 were measured; larger batches than 1024 did not improve the initial control. No broad threading or unsafe Send/Sync was introduced.
+
+Phase 7B encoder policy: a transformer forward opens its execution scope with
+`execution_with_shared_encoder(!has_sparse_moe)`. For dense models, one compute
+encoder spans each command buffer and uses the concurrent dispatch type. The
+submission records the (buffer, byte range) reads and writes since the last
+barrier. A dispatch whose inputs overlap pending writes, or whose outputs overlap
+pending reads or writes, first encodes `memoryBarrierWithScope(Buffers)`.
+Retained resources keep buffer identities unique for the epoch, and the arena
+recycles only completed storage, so address reuse cannot hide a dependency.
+Models with sparse-MoE layers, and public operations, keep one encoder per
+kernel, because the measured M5 shared encoder slowed LFM2.5 short prefill.
+`set_shared_encoder` and `set_concurrent_dispatch` are measurement toggles. See
+Phase 7A journal Experiments 46–47.
+
+Chunked sparse-MoE execution (routing temporaries above 16 MiB) copies each
+chunk's combined output into one preallocated device tensor. It has no host
+readback or completion boundary per chunk.
 
 A `Submission` retains its command buffer and every bound raw buffer until completion. Completion states are Encoding/Completed/Failed. Finishing checks command-buffer status before publishing the staged cache; guard drop drains partial work on error or unwind. Each allocation tracks write ranges and their completion epochs. Mapping checks the requested logical byte range, so a failed suffix cannot invalidate a previously published KV prefix. Pending/failed output cannot be mapped. Failed storage is not recycled. Tests inject late encoding and completion failures and verify publication, retry, mapping and lifetime behavior.
 

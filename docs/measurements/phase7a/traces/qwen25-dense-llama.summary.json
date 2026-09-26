@@ -1,0 +1,206 @@
+{
+  "name": "qwen25-dense-llama",
+  "runtime": "llama.cpp",
+  "device": "MacBook Pro",
+  "target_process": "phase55_llama_matrix",
+  "trace_duration_s": 4.932262,
+  "request_start_offset_ms": 4660.181,
+  "request_duration_ms": 32.63433399843052,
+  "request": {
+    "prefill_ms": 25.211333,
+    "decode_ms": [
+      6.657708
+    ],
+    "first_token_ms": 25.514333,
+    "generation_ms": 32.465208,
+    "prefill_tps": 832.9587332807829,
+    "decode_tps": 150.20184123425057,
+    "generation_tps": 61.60441048152226,
+    "generated_ids": [
+      9707,
+      0
+    ]
+  },
+  "application_intervals": [
+    {
+      "start_ms": 4660.726,
+      "duration_ms": 0.233,
+      "frame": "1",
+      "kind": "command_buffer",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4660.734,
+      "duration_ms": 0.22,
+      "frame": "",
+      "kind": "encoder",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4660.966,
+      "duration_ms": 1.762,
+      "frame": "2",
+      "kind": "command_buffer",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4660.97,
+      "duration_ms": 1.753,
+      "frame": "",
+      "kind": "encoder",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4662.765,
+      "duration_ms": 0.047,
+      "frame": "3",
+      "kind": "command_buffer",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4686.24,
+      "duration_ms": 0.161,
+      "frame": "4",
+      "kind": "command_buffer",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4686.244,
+      "duration_ms": 0.155,
+      "frame": "",
+      "kind": "encoder",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4686.405,
+      "duration_ms": 1.316,
+      "frame": "5",
+      "kind": "command_buffer",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4686.408,
+      "duration_ms": 1.31,
+      "frame": "",
+      "kind": "encoder",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4687.742,
+      "duration_ms": 0.016,
+      "frame": "6",
+      "kind": "command_buffer",
+      "event": "Encoding"
+    }
+  ],
+  "submission_events": [
+    {
+      "start_ms": 4660.726,
+      "durations_ms": [
+        0.233,
+        0.22
+      ],
+      "event": "CommandBufferSubmission"
+    },
+    {
+      "start_ms": 4660.966,
+      "durations_ms": [
+        1.762,
+        1.753
+      ],
+      "event": "CommandBufferSubmission"
+    },
+    {
+      "start_ms": 4662.765,
+      "durations_ms": [
+        0.047,
+        0.042
+      ],
+      "event": "CommandBufferSubmission"
+    },
+    {
+      "start_ms": 4686.24,
+      "durations_ms": [
+        0.161,
+        0.155
+      ],
+      "event": "CommandBufferSubmission"
+    },
+    {
+      "start_ms": 4686.405,
+      "durations_ms": [
+        1.316,
+        1.31
+      ],
+      "event": "CommandBufferSubmission"
+    },
+    {
+      "start_ms": 4687.742,
+      "durations_ms": [
+        0.016,
+        0.012
+      ],
+      "event": "CommandBufferSubmission"
+    }
+  ],
+  "gpu_frames": {
+    "Frame 1": {
+      "intervals": 1,
+      "busy_ms_sum": 5.61,
+      "span_ms": 5.61,
+      "start_ms": 4662.492,
+      "end_ms": 4668.101
+    },
+    "Frame 2": {
+      "intervals": 1,
+      "busy_ms_sum": 17.089,
+      "span_ms": 17.089,
+      "start_ms": 4668.103,
+      "end_ms": 4685.192
+    },
+    "Frame 3": {
+      "intervals": 1,
+      "busy_ms_sum": 0.006,
+      "span_ms": 0.006,
+      "start_ms": 4685.192,
+      "end_ms": 4685.198
+    },
+    "Frame 4": {
+      "intervals": 1,
+      "busy_ms_sum": 0.261,
+      "span_ms": 0.261,
+      "start_ms": 4686.546,
+      "end_ms": 4686.806
+    },
+    "Frame 5": {
+      "intervals": 1,
+      "busy_ms_sum": 4.271,
+      "span_ms": 4.271,
+      "start_ms": 4687.862,
+      "end_ms": 4692.132
+    },
+    "Frame 6": {
+      "intervals": 1,
+      "busy_ms_sum": 0.006,
+      "span_ms": 0.006,
+      "start_ms": 4692.133,
+      "end_ms": 4692.139
+    }
+  },
+  "gpu_idle_gaps_ms": [
+    0.002,
+    0.0,
+    1.348,
+    1.055,
+    0.0
+  ],
+  "driver_event_rows": 122,
+  "driver_event_categories": {
+    "other": 2,
+    "wire": 120
+  },
+  "resource_allocation_rows": 4,
+  "resource_size_entries": 4,
+  "resource_sizes_kib_median": 608.0,
+  "resource_sizes_kib_sum_rows": 2432.0
+}

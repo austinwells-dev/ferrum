@@ -1,0 +1,152 @@
+{
+  "runtime": "ferrum",
+  "model_path": "/Users/austinwells/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct-GGUF/snapshots/9217f5db79a29953eb74d5343926648285ec7e67/qwen2.5-0.5b-instruct-q4_k_m.gguf",
+  "workload_path": "docs/measurements/phase7a/qwen2.5-q4k-workloads.jsonl",
+  "trace_path": "docs/measurements/phase7a/traces/qwen25-dense-ferrum.trace",
+  "trace_process_pid": 29740,
+  "trace_start_utc": "2026-09-25T19:11:48.438651+00:00",
+  "trace_end_utc": "2026-09-25T19:11:48.500277+00:00",
+  "request_wall_ms": 61.59379199380055,
+  "request": {
+    "attention_softmax_prefix": true,
+    "attention_softmax_prefix_reuse": true,
+    "case": "trace-short",
+    "decode_aggregate_tps": 94.5187088441912,
+    "decode_counters": [
+      {
+        "allocated_bytes": 4,
+        "allocation_time": {
+          "nanos": 11417,
+          "secs": 0
+        },
+        "allocations": 1,
+        "arena_capacity": 37996544,
+        "arena_high_water": 37996544,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 531,
+        "encode": {
+          "nanos": 2107091,
+          "secs": 0
+        },
+        "gpu": {
+          "nanos": 7503875,
+          "secs": 0
+        },
+        "reused_bytes": 2279424,
+        "transient_live_bytes": 524288,
+        "transient_peak_bytes": 2279424,
+        "wait": {
+          "nanos": 8054500,
+          "secs": 0
+        }
+      }
+    ],
+    "decode_median_ms": 10.579916,
+    "decode_ms": [
+      10.579916
+    ],
+    "decode_profiles": [
+      {}
+    ],
+    "decode_tps": 94.5187088441912,
+    "first_token_ms": 50.283458,
+    "generated_ids": [
+      9707,
+      0
+    ],
+    "generated_tokens": 2,
+    "generation_ms": 61.407999999999994,
+    "generation_tps": 32.56904637832204,
+    "gguf_mpp_min_rows": null,
+    "gguf_mpp_q5_1_min_rows": null,
+    "kv_active_bytes": 270336,
+    "kv_reserved_bytes": 3145728,
+    "model_format": "GGUF",
+    "model_repository": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+    "model_revision": "9217f5db79a29953eb74d5343926648285ec7e67",
+    "moe_expert_tensorops": true,
+    "moe_expert_tensorops_min_routes_per_expert": 8,
+    "moe_expert_tensorops_tile_k64": true,
+    "moe_gpu_routing_prefill": false,
+    "moe_shared_token_input": false,
+    "packed_quantized_bytes": 485166080,
+    "pair": 0,
+    "pair_order": "traced",
+    "parameter_count": 630167424,
+    "prefill_counters": {
+      "allocated_bytes": 3145812,
+      "allocation_time": {
+        "nanos": 640126,
+        "secs": 0
+      },
+      "allocations": 49,
+      "arena_capacity": 37996544,
+      "arena_high_water": 37996544,
+      "command_buffers": 1,
+      "completion_waits": 1,
+      "dispatches": 531,
+      "encode": {
+        "nanos": 1858797,
+        "secs": 0
+      },
+      "gpu": {
+        "nanos": 38531625,
+        "secs": 0
+      },
+      "reused_bytes": 37027840,
+      "transient_live_bytes": 0,
+      "transient_peak_bytes": 37027840,
+      "wait": {
+        "nanos": 47060958,
+        "secs": 0
+      }
+    },
+    "prefill_ms": 49.832665999999996,
+    "prefill_profile": {},
+    "prefill_tps": 421.4103255081717,
+    "prompt_ids": [
+      151644,
+      8948,
+      198,
+      2610,
+      525,
+      264,
+      10950,
+      17847,
+      13,
+      151645,
+      198,
+      151644,
+      872,
+      198,
+      9707,
+      0,
+      151645,
+      198,
+      151644,
+      77091,
+      198
+    ],
+    "prompt_tokens": 21,
+    "q4_k_expert_project_16rows": true,
+    "q4_k_expert_project_16rows_pairs": true,
+    "q4_k_expert_project_8rows": true,
+    "q4_k_mpp_tile_k64": true,
+    "q4_k_mpp_tile_m128": true,
+    "q5_0_gemv_n4": true,
+    "q5_1_gemv_n4": true,
+    "q5_1_mpp_tile_k64": true,
+    "q5_k_gemv_8rows": false,
+    "q5_k_mpp_tile_k64": true,
+    "q6_k_expert_project_8rows": true,
+    "q8_0_gemv_k_split": true,
+    "q8_0_mpp_tile_k64": true,
+    "retained_weight_bytes": 485309184,
+    "runtime": "ferrum",
+    "sampling_ms": 0.687124,
+    "source_tensor_bytes": 485452288,
+    "tensor_count": 291,
+    "warmup": false
+  }
+}

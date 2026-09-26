@@ -1,0 +1,2 @@
+CPU preflight passed: peak total 127.3% of one core; largest process 40.4% of one core.
+phase55_bench ready: format=GGUF weights=485309184 packed=485166080 tensors=291

@@ -1,0 +1,78 @@
+CPU preflight passed: peak total 217.7% of one core; largest process 46.9% of one core.
+CPU preflight passed: peak total 207.0% of one core; largest process 49.4% of one core.
+CPU preflight passed: peak total 207.1% of one core; largest process 49.4% of one core.
+phase55_bench ready: format=GGUF weights=633364480 packed=633233408 tensors=310
+phase55_bench ready: format=GGUF weights=633364480 packed=633233408 tensors=310
+CPU preflight passed: peak total 154.6% of one core; largest process 46.9% of one core.
+CPU preflight passed: peak total 147.6% of one core; largest process 43.9% of one core.
+CPU preflight passed: peak total 196.8% of one core; largest process 54.4% of one core.
+CPU preflight passed: peak total 192.5% of one core; largest process 51.0% of one core.
+CPU preflight passed: peak total 185.5% of one core; largest process 53.4% of one core.
+CPU preflight passed: peak total 118.7% of one core; largest process 39.9% of one core.
+CPU preflight passed: peak total 111.2% of one core; largest process 39.9% of one core.
+CPU preflight passed: peak total 126.2% of one core; largest process 35.9% of one core.
+CPU preflight passed: peak total 104.5% of one core; largest process 36.0% of one core.
+CPU preflight passed: peak total 93.3% of one core; largest process 39.4% of one core.
+CPU preflight passed: peak total 91.8% of one core; largest process 35.9% of one core.
+CPU preflight passed: peak total 124.7% of one core; largest process 37.9% of one core.
+CPU preflight passed: peak total 106.7% of one core; largest process 40.4% of one core.
+CPU preflight passed: peak total 109.2% of one core; largest process 38.9% of one core.
+CPU preflight passed: peak total 122.2% of one core; largest process 39.9% of one core.
+CPU preflight passed: peak total 118.7% of one core; largest process 38.9% of one core.
+CPU preflight passed: peak total 112.7% of one core; largest process 36.9% of one core.
+CPU preflight passed: peak total 117.2% of one core; largest process 41.4% of one core.
+CPU preflight passed: peak total 117.2% of one core; largest process 37.9% of one core.
+CPU preflight passed: peak total 134.8% of one core; largest process 39.4% of one core.
+CPU preflight passed: peak total 118.2% of one core; largest process 38.4% of one core.
+CPU preflight passed: peak total 114.7% of one core; largest process 35.4% of one core.
+CPU preflight passed: peak total 109.7% of one core; largest process 36.9% of one core.
+CPU preflight passed: peak total 105.2% of one core; largest process 35.4% of one core.
+CPU preflight passed: peak total 122.7% of one core; largest process 37.4% of one core.
+CPU preflight passed: peak total 107.2% of one core; largest process 35.4% of one core.
+CPU preflight passed: peak total 113.7% of one core; largest process 37.9% of one core.
+CPU preflight passed: peak total 125.2% of one core; largest process 36.9% of one core.
+CPU preflight passed: peak total 113.2% of one core; largest process 37.4% of one core.
+CPU preflight passed: peak total 114.2% of one core; largest process 35.9% of one core.
+CPU preflight passed: peak total 116.7% of one core; largest process 37.9% of one core.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 361.6% of one core; limit 220.0%).
+   73.8% of one core  /System/Library/Frameworks/Contacts.framework/Support/contactsd
+   38.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   29.9% of one core  /System/Library/Frameworks/AddressBook.framework/Versions/A/Helpers/AddressBookSourceSync.app/Contents/MacOS/AddressBookSourceSync
+   21.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   19.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight passed: peak total 109.2% of one core; largest process 35.9% of one core.
+CPU preflight passed: peak total 107.7% of one core; largest process 35.4% of one core.
+CPU preflight passed: peak total 113.2% of one core; largest process 37.4% of one core.
+CPU preflight passed: peak total 110.2% of one core; largest process 36.4% of one core.
+CPU preflight passed: peak total 138.6% of one core; largest process 42.9% of one core.
+CPU preflight passed: peak total 100.7% of one core; largest process 34.9% of one core.
+CPU preflight passed: peak total 135.2% of one core; largest process 37.4% of one core.
+CPU preflight passed: peak total 142.6% of one core; largest process 37.4% of one core.
+CPU preflight passed: peak total 115.7% of one core; largest process 36.4% of one core.
+CPU preflight passed: peak total 92.0% of one core; largest process 34.5% of one core.
+CPU preflight passed: peak total 119.2% of one core; largest process 41.9% of one core.
+CPU preflight passed: peak total 106.7% of one core; largest process 33.4% of one core.
+CPU preflight passed: peak total 86.8% of one core; largest process 32.9% of one core.
+CPU preflight passed: peak total 80.3% of one core; largest process 31.9% of one core.
+CPU preflight passed: peak total 67.8% of one core; largest process 24.4% of one core.
+CPU preflight passed: peak total 72.8% of one core; largest process 27.4% of one core.
+CPU preflight passed: peak total 76.3% of one core; largest process 30.4% of one core.
+CPU preflight passed: peak total 76.3% of one core; largest process 29.9% of one core.
+CPU preflight passed: peak total 77.8% of one core; largest process 29.4% of one core.
+CPU preflight passed: peak total 73.8% of one core; largest process 27.4% of one core.
+CPU preflight passed: peak total 87.3% of one core; largest process 35.4% of one core.
+CPU preflight passed: peak total 166.1% of one core; largest process 39.4% of one core.
+CPU preflight passed: peak total 146.6% of one core; largest process 37.9% of one core.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 179.0% of one core; limit 220.0%).
+  101.2% of one core  /usr/libexec/duetexpertd
+   28.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   12.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+    5.5% of one core  /System/Library/CoreServices/MenuBarAgent.app/Contents/MacOS/MenuBarAgent
+Waiting 10s before checking again.
+CPU preflight passed: peak total 73.8% of one core; largest process 26.4% of one core.
+CPU preflight passed: peak total 84.8% of one core; largest process 32.9% of one core.
+CPU preflight passed: peak total 77.8% of one core; largest process 30.4% of one core.
+CPU preflight passed: peak total 99.4% of one core; largest process 36.5% of one core.
+CPU preflight passed: peak total 76.8% of one core; largest process 25.4% of one core.

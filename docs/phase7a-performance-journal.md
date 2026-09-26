@@ -1543,3 +1543,217 @@ The focused shared-input projection test passed with Metal API Validation and GP
 The output IDs were identical between control and candidate in all 50 pairs. Decode dispatches fell by 22/token, while the median per-token GPU time was effectively unchanged at 29.718 ms for control and 29.694 ms for the candidate. CPU encode time changed from 0.166 to 0.158 ms/token and wait time from 29.933 to 29.915 ms/token. The strongest paired cached-decode result was 1.006x on the 1,024-token case; sustained cached decode was 1.001x, and sustained complete generation was 1.001x. This does not approach the 5% retention bar, and the tiny copy path was not material to total work. The shared-input selector, API toggle, shader branches, benchmark option, and focused test were removed. Production retains the existing activation assignment copy and grouped projection dispatches. The result changes the next priority to whole-token runtime/scheduling trace; it does not justify another expert tile or split-factor variant.
 
 Raw A/B rows and runner output are `lfm2.5-8b-a1b-expert-shared-token-input-ab.jsonl` and `.run.log` under `docs/measurements/phase7a/`.
+
+## Phase 7B: runtime scheduling and host-boundary pass (Experiments 45–53)
+
+This pass followed Experiment 44's conclusion that the next priority was whole-token scheduling rather than another expert tile. It measured the runtime around the kernels (encoders, barriers, host readbacks, and small serial kernels) before changing GPU arithmetic. Every change was measured against the prior production path with interleaved control/candidate pairs, through the Phase 7A CPU preflight, on the same pinned artifacts and workload files as the 1ab7e5a refresh.
+
+**Retention rule for this pass.** Changes were retained when every workload showed a consistent paired improvement (or was neutral) with identical control/candidate output IDs, and removed otherwise. Several retained changes are individually below the campaign's 5% bar; this is a deliberate departure, recorded here so it is not mistaken for meeting that bar. Their combined effect is measured directly against `b5529c7` in the combined result below.
+
+Measurement notes:
+
+- The in-process A/Bs used `tools/phase55_matched_matrix.py --ferrum-paired-option`. A/Bs that need a different process (a load-time setting, or the pristine `b5529c7` build) used the new `tools/phase7a_binary_ab.py`, which interleaves two `phase55_bench` processes with per-side request fields or environment. Journal tables come from the new `tools/phase7a_ab_table.py`.
+- During these sessions the desktop UI (WindowServer and an Electron GPU process) competed for the GPU. Short-prompt prefill ran about 490–510 tok/s in both control and candidate, versus 742.6 tok/s in the stored 1ab7e5a Qwen2.5 Q4_K_M matrix. Paired candidate/control ratios are unaffected. Cross-session ratios against the saved llama.cpp rows understate Ferrum, and llama.cpp was not rerun.
+- Several short isolation A/Bs discarded runner stderr, so only their JSONL is retained. This is noted per file below.
+
+Correction to an earlier review estimate: an Instruments trace (`docs/measurements/phase7a/traces/qwen25-dense-ferrum.summary.json`) showed 2.1 ms of CPU encoding per Qwen2.5 decode token. Untraced benchmark counters show about 0.18 ms, so the trace inflates encoding. The real decode gap is GPU time spread across hundreds of small dependent kernels, which is what this pass targets.
+
+A flushed per-operation profile (`FERRUM_BATCH_LIMIT=1`) of a Qwen2.5 Q4_K_M decode token at a 1,024-token context (8.31 ms summed GPU) showed four things:
+
+- Decode attention was 17.6% of GPU time: 0.92 ms `attention_context_decode` plus 0.55 ms scalar `attention_scores`, across 24 layers.
+- The lm_head Q8_0 GEMV runs at about 112 GB/s, close to peak.
+- The "Q4_K_M" artifact runs most projections as Q5_0, because 896 is not divisible by 256.
+- Host logits handling (a 151,936-entry f32 readback plus CPU argmax and finite scan) cost about 0.5 ms per token outside the GPU.
+
+The corresponding LFM2.5-8B-A1B profile (26.85 ms) is dominated by expert GEMVs. `rmsnorm` is 7.1% there (Experiment 53).
+
+## Experiment 45: Benchmark harness defaults (fixed)
+
+When a request omitted `q5_k_gemv_8rows` or `moe_gpu_routing_prefill`, `examples/phase55_bench.rs` turned the setting **off**, although both are production defaults (retained in Experiments 21 and 30). When `q4_k_mpp_tile_m128` was omitted, the harness reported `true` without resetting the device, so a reused device could keep an earlier `false`. Every Ferrum row in the seven `*-llama1ab7e5a-current.jsonl` matrices records `q5_k_gemv_8rows: false` and `moe_gpu_routing_prefill: false`. The current-upstream refresh therefore ran with those two production paths disabled, which affects Qwen2.5 Q5_K_M decode and LFM prompt routing. Omitted fields now select and record the production default. New request fields in this pass follow the same rule. The b5529c7 control in the combined result passes both settings explicitly, so it measures the old production path.
+
+## Experiment 46: One compute encoder per command buffer (retained for dense models)
+
+Status: retained with a per-model policy (see Experiment 47). Previously every dispatch created and ended its own `MTLComputeCommandEncoder`, which meant 531 encoders per Qwen2.5 decode token. The candidate keeps one serial encoder in the pending submission and ends it at commit. Serial dispatch order preserves every producer/consumer dependency. Toggle: `MetalDevice::set_shared_encoder`, bench field `shared_encoder`.
+
+Qwen2.5 Q4_K_M, five pairs, control = per-kernel encoders. The session was loaded (control short-prompt prefill 430.7 tok/s). Raw: `qwen2.5-q4_k_m-shared-encoder-ab.jsonl` and `.run.log`.
+
+| Workload | Prefill tok/s C->S `[S/C]` | Cached decode tok/s C->S `[S/C]` | Complete generation tok/s C->S `[S/C]` | First-token ms C->S | IDs C=S |
+|---|---:|---:|---:|---:|---:|
+| Short | 430.7->457.2 `[1.015]` | 104.6->111.0 `[1.064]` | 82.4->87.8 `[1.047]` | 49.2->46.4 | 5/5 |
+| 128-token prompt | 2,192.4->2,128.9 `[0.987]` | 111.6->110.7 `[1.016]` | 82.1->80.8 `[1.005]` | 58.9->60.6 | 5/5 |
+| 512-token prompt | 4,198.4->4,005.8 `[0.995]` | 133.2->126.2 `[0.999]` | 68.7->66.9 `[0.988]` | 122.3->128.4 | 5/5 |
+| 1,024-token prompt | 4,740.1->4,754.6 `[1.003]` | 124.6->126.3 `[1.014]` | 48.1->48.7 `[1.006]` | 216.4->215.7 | 5/5 |
+| Sustained decode | 439.9->472.3 `[1.070]` | 135.8->137.0 `[1.011]` | 126.8->128.2 `[1.015]` | 48.2->44.9 | 5/5 |
+
+CPU encode time fell about 40% (0.20 -> 0.12 ms/token on long prompts). GPU time per token was unchanged. On its own this is a ~1% effect in a noisy session. It is retained because it is required for Experiment 47.
+
+## Experiment 47: Concurrent dispatch with range-tracked barriers (retained for dense models)
+
+Status: retained for models without sparse-MoE layers. The shared encoder is created with `MTLDispatchTypeConcurrent`. The submission records the byte ranges (buffer identity, offset, length) read and written since the last barrier. Before each dispatch, a read-after-write, write-after-read, or write-after-write overlap inserts `memoryBarrierWithScope(Buffers)` and clears the sets. Independent kernels, such as the q/k/v and gate/up projections that read the same activation, can then overlap. Buffers retained by the epoch keep their addresses unique until completion, and the arena only reuses completed storage. Toggle: `set_concurrent_dispatch`, bench field `concurrent_dispatch`.
+
+Validation covered all unit tests with Metal API Validation and GPU Shader Validation enabled, plus every local model parity test with concurrency forced on for all models: Qwen2.5 BF16 (including the 128-token lifetime stress), Qwen3 0.6B/1.7B BF16 and Q8_0 GGUF, Granite 4, Granite MoE, OLMo 2, LFM2.5-230M, LFM2.5-8B-A1B BF16, and Q4_K_M GGUF.
+
+Qwen2.5 Q4_K_M, five pairs, control = shared serial encoder. Raw: `qwen2.5-q4_k_m-concurrent-dispatch-ab.jsonl` and `.run.log`.
+
+| Workload | Prefill tok/s C->N `[N/C]` | Cached decode tok/s C->N `[N/C]` | Complete generation tok/s C->N `[N/C]` | First-token ms C->N | IDs C=N |
+|---|---:|---:|---:|---:|---:|
+| Short | 498.2->506.6 `[1.020]` | 139.5->139.5 `[0.999]` | 104.1->105.5 `[1.015]` | 42.7->41.9 | 5/5 |
+| 128-token prompt | 2,479.3->2,515.5 `[1.015]` | 140.1->139.9 `[1.010]` | 99.0->96.7 `[1.009]` | 52.1->51.4 | 5/5 |
+| 512-token prompt | 4,419.8->4,427.1 `[1.006]` | 137.3->138.8 `[1.006]` | 71.2->71.5 `[1.012]` | 116.3->116.1 | 5/5 |
+| 1,024-token prompt | 4,773.2->4,865.4 `[1.020]` | 125.7->127.1 `[1.017]` | 48.8->49.5 `[1.013]` | 214.9->210.8 | 5/5 |
+| Sustained decode | 499.8->508.5 `[1.020]` | 135.1->138.5 `[1.025]` | 125.7->128.0 `[1.017]` | 42.5->41.7 | 5/5 |
+
+GPU time per decode token fell a consistent ~3% (e.g. sustained 6.71 -> 6.47 ms). Barrier tracking adds about 0.08 ms/token of CPU encode. On Qwen3 Q8_0 at a 1,024-token context the effect was +0.8% decode and +2.5% prefill (`qwen3-0.6b-q8_0-1024-concurrent-dispatch-ab.jsonl`, JSONL only).
+
+**Sparse-MoE policy.** A first combined run against `b5529c7` showed LFM2.5-8B-A1B short prefill 14% slower. Isolation (JSONL only) showed that the shared serial encoder alone costs LFM short prefill 6.1% (`lfm2.5-8b-a1b-short-shared-encoder-ab.jsonl`). Concurrency on top of it recovers 1.4% (`lfm2.5-8b-a1b-short-concurrent-ab.jsonl`). GPU execution time was identical in every mode (about 222 ms). The loss is non-GPU time between commit and completion, 37 ms with per-kernel encoders versus 53–57 ms with one encoder. A full LFM A/B of per-kernel encoders versus shared+concurrent (`lfm2.5-8b-a1b-encoder-mode-ab.jsonl`, four pairs, JSONL only) was net negative on every workload:
+
+| Workload | Prefill tok/s K->C `[C/K]` | Cached decode tok/s K->C `[C/K]` | Complete generation tok/s K->C `[C/K]` | First-token ms K->C | IDs |
+|---|---:|---:|---:|---:|---:|
+| Short | 42.1->38.5 `[0.922]` | 35.5->35.4 `[0.998]` | 23.9->23.1 `[0.969]` | 261.6->285.4 | 4/4 |
+| 128-token prompt | 315.2->311.9 `[0.982]` | 35.0->34.2 `[0.977]` | 19.7->19.4 `[0.982]` | 406.1->410.4 | 4/4 |
+| 512-token prompt | 452.2->452.1 `[0.979]` | 34.0->33.1 `[0.970]` | 10.6->10.6 `[0.974]` | 1,132.2->1,132.5 | 4/4 |
+| 1,024-token prompt | 529.3->528.9 `[0.992]` | 34.6->34.5 `[0.998]` | 7.0->7.0 `[0.991]` | 1,934.8->1,936.1 | 4/4 |
+| Sustained decode | 41.8->37.6 `[0.899]` | 35.5->35.4 `[0.998]` | 33.4->33.0 `[0.990]` | 263.0->292.9 | 4/4 |
+
+`Transformer` therefore opens its execution scope with `execution_with_shared_encoder(!has_sparse_moe)`. Dense models use the shared concurrent encoder, and models with sparse-MoE layers keep one encoder per kernel, which is the pre-7B behavior. A residency set was tested as an explanation for the commit gap and did not remove it (Experiment 52). The cause of the MoE gap is not established.
+
+## Experiment 48: Wide M=1 attention context kernel (retained, shape-gated); GQA scores kernel (rejected)
+
+Status: context kernel retained. The companion scores kernel was rejected and removed.
+
+Experiment 48 tested two kernels. `attention_scores_decode` used one SIMD group per cached K row and computed every query head in its GQA group from one K load. `attention_context_decode_wide` uses one 1,024-thread group per (query head, 32-column tile), with 32 SIMD partitions over positions and a fixed-order partial reduction. Both accumulate in f32 and keep the existing bf16 storage-rounding boundaries; only the summation order changes, as in Experiment 23.
+
+Rejected intermediate designs, from flushed per-op profiles at Qwen2.5 1,024 context:
+
+- A GQA-sharing context kernel with four threadgroups per layer took 64.6 µs, against 38.2 µs for the control.
+- A scores kernel with query heads staged in 16 KB of threadgroup memory took 26–28 µs, against 22.8 µs for the control, because the staging capped occupancy.
+
+The final scores kernel was still slower than the scalar control on both models (27.7 vs 22.8 µs on Qwen2.5 and 63.2 vs 49.4 µs on Qwen3; profiles `qwen3-0.6b-q8_0-decode-attention-v1-op-profile-{control,candidate}.json`). A Qwen3 1,024-context A/B with both kernels showed −2.9% decode (`qwen3-0.6b-q8_0-decode-attention-v1-1024-ab.jsonl`). The scores kernel was removed.
+
+The context kernel cut Qwen2.5 per-layer context time from 38.2 to 22.7 µs. It also replaces the fully scalar `attention_context` path that decode previously used below 128 positions. Ungated, it cost LFM 1.1% decode at 1,024 context (`lfm2.5-8b-a1b-1024-context-wide-ungated-ab.jsonl`). The selector is therefore M=1 with either fewer than 128 positions, or fewer than 64 (head, column-tile) groups, where the old 256-thread kernel underfills the GPU. The groups are 28 for Qwen2.5 and 64 for Qwen3 and LFM2.5. Toggle: `set_attention_context_decode_wide`, bench field `attention_context_decode_wide`. Test: `wide_decode_context_matches_existing_kernels`, covering GQA groups 7, 2, 1, and 10, widths 33, 64, 80, and 128, and F32/F16/BF16, also run under shader validation.
+
+Gated A/B, control = previous context selection. Raw: `qwen2.5-q4_k_m-context-decode-wide-ab.jsonl`, `lfm2.5-8b-a1b-context-decode-wide-ab.jsonl` (JSONL only).
+
+| Model / workload | Prefill tok/s C->W `[W/C]` | Cached decode tok/s C->W `[W/C]` | Complete generation tok/s C->W `[W/C]` | First-token ms C->W | IDs C=W |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 / 1,024-token prompt | 4,845.6->4,839.4 `[0.999]` | 127.9->133.8 `[1.046]` | 50.2->50.8 `[1.013]` | 211.3->211.6 | 5/5 |
+| Qwen2.5 / Sustained decode | 492.0->488.4 `[0.996]` | 139.5->149.2 `[1.070]` | 134.5->142.8 `[1.062]` | 42.7->43.0 | 0/5 |
+| LFM2.5 / 1,024-token prompt | 543.6->551.2 `[1.014]` | 34.9->34.8 `[0.997]` | 7.2->7.3 `[1.011]` | 1,883.8->1,857.6 | 4/4 |
+| LFM2.5 / Sustained decode | 42.7->43.4 `[1.015]` | 35.3->35.4 `[1.003]` | 33.2->33.4 `[1.004]` | 257.6->253.8 | 0/4 |
+
+The 128-token sustained sequences change because the summation order changes. They do not change fidelity. Against the saved llama.cpp sustained reference, control and candidate first diverge at the same generated index in every pair (index 14 for Qwen2.5, index 29 for LFM2.5), so the new kernel only alters the trajectory after both have already left the reference.
+
+## Experiment 49: MoE chunk outputs assembled on Metal (retained)
+
+When routing temporaries force more than one chunk (about 200 tokens per chunk for LFM2.5), `SparseMoe::forward` previously synchronized, read each chunk's combined output to host f32, and re-uploaded the concatenation. That added one completion wait per chunk per MoE layer. The candidate allocates the `[tokens, hidden]` output once and writes each chunk into its row range with the existing append-copy kernel. It adds no host boundary, and routing temporaries stay bounded by the 256 MiB arena flush. Toggle: `set_moe_chunk_device_copy`, bench field `moe_chunk_device_copy`. Test: `chunked_outputs_assemble_on_device_like_host_readback` forces two chunks and requires bit-identical output. LFM2.5 prefill command buffers fell from 67 to 13 at 512 tokens and from 112 to 26 at 1,024. Raw: `lfm2.5-8b-a1b-moe-chunk-device-copy-ab.jsonl` and `.run.log`.
+
+| Workload | Prefill tok/s C->D `[D/C]` | Cached decode tok/s C->D `[D/C]` | Complete generation tok/s C->D `[D/C]` | First-token ms C->D | IDs C=D |
+|---|---:|---:|---:|---:|---:|
+| 512-token prompt | 475.4->483.8 `[1.006]` | 35.0->35.0 `[1.000]` | 11.0->11.2 `[1.004]` | 1,077.3->1,058.6 | 3/3 |
+| 1,024-token prompt | 534.2->541.2 `[1.007]` | 34.4->34.5 `[1.000]` | 7.1->7.2 `[1.005]` | 1,917.0->1,892.3 | 3/3 |
+
+## Experiment 50: Fused gate+up projection (rejected)
+
+The candidate stacked same-format quantized gate and up rows into one `[2I, K]` matrix at load time. GGUF blocks never span rows, so this is an exact byte concatenation. One projection then fed the existing `expert_silu_mul` kernel. A unit test confirmed bit-identical output for M=1 and M=37. Decode was flat, because concurrent dispatch already overlaps the two projections. Prefill at 512 and 1,024 tokens was 1.7% slower in every pair. All code was removed, and QKV fusion was not attempted for the same reason. Raw: `qwen2.5-q4_k_m-fused-gate-up-ab.jsonl` and `.run.log`.
+
+| Workload | Prefill tok/s C->F `[F/C]` | Cached decode tok/s C->F `[F/C]` | Complete generation tok/s C->F `[F/C]` | IDs |
+|---|---:|---:|---:|---:|
+| Short | 506.3->510.3 `[1.010]` | 147.2->146.5 `[1.001]` | 108.4->108.0 `[1.003]` | 5/5 |
+| 128-token prompt | 2,499.8->2,490.6 `[0.999]` | 144.3->144.8 `[1.000]` | 102.1->101.5 `[0.994]` | 5/5 |
+| 512-token prompt | 4,441.8->4,370.8 `[0.983]` | 140.3->140.4 `[1.001]` | 72.1->71.2 `[0.986]` | 5/5 |
+| 1,024-token prompt | 4,842.2->4,781.5 `[0.983]` | 129.1->129.3 `[1.002]` | 49.8->49.4 `[0.991]` | 5/5 |
+| Sustained decode | 505.8->505.6 `[0.991]` | 150.3->150.4 `[1.002]` | 139.0->139.2 `[1.001]` | 5/5 |
+
+## Experiment 51: On-device greedy argmax (retained)
+
+`argmax_rows` is a 1,024-thread row reduction. It selects the first maximal index (matching the host `generation::argmax` tie rule) and sets a non-finite flag, so the host rejects non-finite logits exactly as before. The model encodes it in the same submission as the forward pass, after logits scaling. `generation::generate_greedy` reads back 8 bytes per token instead of the full vocabulary row. The bench uses it by default (field `device_argmax`). `ferrum run` uses it at temperature 0, and `generate(select)` is unchanged for sampling.
+
+Tests:
+
+- `argmax_rows_matches_host_ties_tails_and_nonfinite_flags` covers widths 1 to 151,936, deliberate ties, all dtypes, NaN, and infinity.
+- `real_model` now asserts that `generate_greedy` produces the same tokens, stop reason, and KV bytes as `generate(argmax)` on Qwen2.5 BF16.
+
+A first 256-thread version added 0.11 ms of GPU time per token, so its decode rate was 0.5% lower (`qwen2.5-q4_k_m-device-argmax-256-ab.jsonl`). The retained 1,024-thread version:
+
+| Workload | Prefill tok/s C->A `[A/C]` | Cached decode tok/s C->A `[A/C]` | Complete generation tok/s C->A `[A/C]` | First-token ms C->A | IDs C=A |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 / Short | 503.5->508.8 `[1.011]` | 146.0->145.7 `[1.004]` | 107.9->112.6 `[1.044]` | 42.1->41.3 | 5/5 |
+| Qwen2.5 / Sustained decode | 505.9->506.3 `[1.002]` | 150.1->151.1 `[1.006]` | 138.9->145.0 `[1.044]` | 41.9->41.5 | 5/5 |
+| LFM2.5 / 1,024-token prompt | 533.1->540.3 `[1.004]` | 33.7->34.4 `[1.009]` | 7.0->7.2 `[1.005]` | 1,920.9->1,895.4 | 4/4 |
+
+Raw: `qwen2.5-q4_k_m-device-argmax-ab.jsonl` and `.run.log`, `lfm2.5-8b-a1b-1024-device-argmax-ab.jsonl` (JSONL only). Most of the gain is the removed host argmax and finite scan (about 0.25 ms/token on Qwen's 151,936-entry vocabulary). The cached-decode timer previously also included the full-row f32 conversion.
+
+## Experiment 52: Queue residency set for weights (rejected)
+
+The Instruments traces showed about 5x more driver wiring events for Ferrum than for llama.cpp. The candidate added every weight allocation (`PackedStorage` and `Tensor::from_reader`) to one `MTLResidencySet` attached to the queue. Two A/Bs varied residency at load time with an environment toggle.
+
+- **Qwen2.5 Q4_K_M, five pairs:** no consistent effect. Short decode was −4.1% with a noisy range, and the other workloads were within ±0.7%.
+- **LFM2.5, four pairs:** short prefill and decode were −1% and −1.8%, and the 128-token prompt was +6% with pairs spanning 0.95–1.11.
+
+The per-token difference between completion wait and GPU time was unchanged (about 0.28 ms for Qwen, and 67 ms on the short LFM prefill). Residency setup is not the steady-state cost, and the code was removed. Raw: `qwen2.5-q4_k_m-residency-set-ab.jsonl` and `.run.log`, `lfm2.5-8b-a1b-residency-set-ab.jsonl` (JSONL only).
+
+## Experiment 53: `rmsnorm` exactness fallback (unrolled loads rejected; cost measured, decision pending)
+
+In the LFM2.5 decode profile, `rmsnorm` takes 32.4 µs per call across 61 calls, or 1.98 ms (7.4%) of the 26.9 ms token. For bf16, when any output lands within 8 ulps of a rounding midpoint (about 40% of 2,048-wide rows), thread 0 recomputes the legacy ascending sum over the whole row, so the result matches the established path exactly. A candidate issued the serial sum's loads 16 at a time without changing the accumulation order.
+
+Byte comparison of 3,392 bf16 rows (8.8 MB, widths 64 to 4,864) against the `b5529c7` shader was identical. The profile, however, was unchanged at 32.4 µs, because the 2,048-step dependent add chain is the cost, not the loads. The candidate was removed.
+
+For reference, disabling the fallback (a measurement only, not committed) cuts `rmsnorm` from 1.98 to 0.32 ms per LFM token, about 6% of decode GPU time (`lfm2.5-8b-a1b-rmsnorm-no-fallback-op-profile.json`). The trade-off is occasional bf16 rounding changes relative to the established path, so it is left as an explicit decision rather than an optimization.
+
+Also measured and not pursued: folding `lfm2_split3` into `lfm2_short_conv` (0.2% of the LFM decode token), and CPU router sorting and trace-name formatting (below measurement resolution).
+
+## Phase 7B combined result versus `b5529c7`
+
+The control is a pristine `b5529c7` build with `q5_k_gemv_8rows` and `moe_gpu_routing_prefill` passed explicitly, so it runs the old production path. The candidate is the Phase 7B tree. Both use `tools/phase7a_binary_ab.py` with five interleaved pairs per workload. Saved llama.cpp references come from the 1ab7e5a matrices, official commit `1ab7e5ad2d4e7295c94c3b966a3e0b70fa365865`, and were not rerun. Each cell lists Ferrum control -> candidate / llama.cpp in tok/s, then `[control/llama -> candidate/llama; median paired candidate/control]`. First-token latency is in milliseconds. `IDs` gives candidate=control, then candidate=llama.cpp, then control=llama.cpp.
+
+Short-prompt cross-session ratios are depressed by this session's GPU contention; see the measurement notes above.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_K_M / Short | 492.0->508.9 / 1,406.7 `[0.350->0.362; 1.034]` | 137.2->144.9 / 238.8 `[0.575->0.607; 1.055]` | 103.4->112.0 / 197.5 `[0.523->0.567; 1.082]` | 43.2->41.3 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 2,448.5->2,515.2 / 6,989.8 `[0.350->0.360; 1.033]` | 139.6->145.7 / 230.7 `[0.605->0.631; 1.042]` | 98.6->105.3 / 187.6 `[0.526->0.561; 1.073]` | 52.8->50.9 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 4,397.9->4,463.1 / 9,336.9 `[0.471->0.478; 1.013]` | 136.0->142.4 / 233.5 `[0.583->0.610; 1.044]` | 70.8->73.6 / 133.5 `[0.530->0.551; 1.046]` | 116.8->114.7 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 4,786.4->4,807.3 / 8,844.2 `[0.541->0.544; 1.016]` | 124.1->133.5 / 236.5 `[0.525->0.565; 1.079]` | 48.7->50.7 / 90.0 `[0.541->0.563; 1.047]` | 214.3->213.0 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 483.5->489.0 / 1,385.7 `[0.349->0.353; 1.008]` | 133.8->142.9 / 244.3 `[0.548->0.585; 1.075]` | 124.2->137.5 / 221.8 `[0.560->0.620; 1.107]` | 43.9->42.9 / 15.4 | 0/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / Short | 336.8->363.6 / 1,258.3 `[0.268->0.289; 1.075]` | 115.9->120.2 / 164.5 `[0.705->0.730; 1.035]` | 82.7->89.2 / 143.8 `[0.575->0.620; 1.076]` | 62.9->57.8 / 17.0 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 1,590.5->1,710.0 / 6,001.2 `[0.265->0.285; 1.076]` | 116.5->118.4 / 163.8 `[0.711->0.723; 1.019]` | 75.9->80.8 / 138.8 `[0.547->0.582; 1.064]` | 81.0->74.9 / 21.6 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / 512-token prompt | 2,854.6->2,957.3 / 7,099.6 `[0.402->0.417; 1.034]` | 107.6->110.2 / 154.9 `[0.695->0.712; 1.024]` | 50.0->52.0 / 95.2 `[0.525->0.546; 1.040]` | 179.7->173.1 / 72.4 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 3,277.7->3,349.5 / 6,283.2 `[0.522->0.533; 1.024]` | 94.6->96.5 / 143.3 `[0.660->0.673; 1.019]` | 34.0->35.1 / 61.1 `[0.556->0.574; 1.027]` | 312.7->305.7 / 163.2 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 337.8->359.6 / 1,241.8 `[0.272->0.290; 1.063]` | 113.8->121.6 / 164.7 `[0.691->0.738; 1.068]` | 105.9->116.0 / 157.4 `[0.673->0.737; 1.094]` | 62.6->58.4 / 17.2 | 5/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / Short | 41.7->41.6 / 215.6 `[0.193->0.193; 0.997]` | 35.5->35.4 / 86.4 `[0.410->0.409; 1.000]` | 23.7->23.8 / 72.5 `[0.327->0.328; 1.003]` | 264.3->264.5 / 51.2 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 322.4->324.5 / 1,511.1 `[0.213->0.215; 1.000]` | 35.8->35.8 / 98.2 `[0.364->0.364; 0.999]` | 20.1->20.2 / 67.5 `[0.297->0.299; 1.005]` | 397.3->394.5 / 84.9 | 5/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 470.9->473.1 / 2,108.3 `[0.223->0.224; 1.005]` | 35.1->35.1 / 97.5 `[0.360->0.360; 1.001]` | 11.0->11.1 / 41.2 `[0.267->0.268; 1.005]` | 1,087.7->1,082.2 / 243.1 | 5/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 527.5->536.7 / 2,141.5 `[0.246->0.251; 1.014]` | 35.0->35.0 / 96.4 `[0.363->0.363; 1.001]` | 7.0->7.1 / 25.8 `[0.272->0.276; 1.013]` | 1,941.3->1,908.1 / 478.4 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 42.5->41.8 / 233.7 `[0.182->0.179; 0.980]` | 35.4->35.5 / 101.2 `[0.350->0.351; 1.003]` | 33.1->33.4 / 95.7 `[0.346->0.349; 1.008]` | 259.1->263.2 / 47.3 | 0/5; 0/5; 0/5 |
+
+Qwen2.5 Q4_K_M improved on every workload:
+
+- Cached decode: +4.2% to +7.9%.
+- Complete generation: +4.6% to +10.7%.
+- Prefill: +0.8% to +3.4%.
+
+Qwen3 Q8_0 also improved on every workload:
+
+- Cached decode: +1.9% to +6.8%.
+- Complete generation: +2.7% to +9.4%.
+- Prefill: +2.4% to +7.6%.
+
+LFM2.5-8B-A1B, which keeps per-kernel encoders, is essentially neutral:
+
+- Cached decode: −0.1% to +0.3%.
+- Complete generation: +0.3% to +1.3%.
+- Prefill: +0.5% to +1.4% for the 512- and 1,024-token prompts, from the MoE chunk and argmax changes. The short-prompt and sustained medians were −0.3% and −2.0%, with pairs spanning both sides of 1.0.
+
+Candidate and control IDs matched in every pair except the sustained-decode sequences. There, candidate and control diverge from llama.cpp at the same index, as described under Experiment 48; Qwen3's sustained IDs matched in all five pairs. The Qwen2.5 run predates the Experiment 48 gate, which does not change Qwen2.5's path (28 groups), and the Qwen3 and LFM runs use the final gated tree.
+
+Raw rows and runner logs are `qwen2.5-q4_k_m-phase7b-vs-b5529c7.jsonl`, `qwen3-0.6b-q8_0-phase7b-vs-b5529c7.jsonl`, `lfm2.5-8b-a1b-phase7b-vs-b5529c7.jsonl`, and the matching `.run.log` files.
+
+Validation for the retained tree:
+
+- `cargo test --release -- --include-ignored` passes 153 tests with every local model checkpoint.
+- The library suite passes under Metal API Validation and GPU Shader Validation.
+- `cargo clippy --all-targets` reports only the four warnings already present at `b5529c7`.
+
+The three MoE parity tests (Granite MoE, LFM2.5 BF16, LFM2.5 GGUF) previously failed at `b5529c7` on `assert!(stats.active_experts > 0)`, which GPU routing (Experiment 30) no longer satisfies. That assertion now applies only when active experts are counted, so the later cache-branch replay checks in those tests run again.
+
+No measured format meets the Phase 7 gate. The large Qwen targets remain locked.

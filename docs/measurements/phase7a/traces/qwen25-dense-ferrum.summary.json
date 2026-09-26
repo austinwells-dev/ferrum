@@ -1,0 +1,158 @@
+{
+  "name": "qwen25-dense-ferrum",
+  "runtime": "ferrum",
+  "device": "MacBook Pro",
+  "target_process": "phase55_bench",
+  "trace_duration_s": 20.819386,
+  "request_start_offset_ms": 4748.651,
+  "request_duration_ms": 61.59379199380055,
+  "request": {
+    "prefill_ms": 49.832665999999996,
+    "decode_ms": [
+      10.579916
+    ],
+    "first_token_ms": 50.283458,
+    "generation_ms": 61.407999999999994,
+    "prefill_tps": 421.4103255081717,
+    "decode_tps": 94.5187088441912,
+    "generation_tps": 32.56904637832204,
+    "generated_ids": [
+      9707,
+      0
+    ],
+    "prefill_counters": {
+      "allocated_bytes": 3145812,
+      "allocation_time": {
+        "nanos": 640126,
+        "secs": 0
+      },
+      "allocations": 49,
+      "arena_capacity": 37996544,
+      "arena_high_water": 37996544,
+      "command_buffers": 1,
+      "completion_waits": 1,
+      "dispatches": 531,
+      "encode": {
+        "nanos": 1858797,
+        "secs": 0
+      },
+      "gpu": {
+        "nanos": 38531625,
+        "secs": 0
+      },
+      "reused_bytes": 37027840,
+      "transient_live_bytes": 0,
+      "transient_peak_bytes": 37027840,
+      "wait": {
+        "nanos": 47060958,
+        "secs": 0
+      }
+    },
+    "decode_counters": [
+      {
+        "allocated_bytes": 4,
+        "allocation_time": {
+          "nanos": 11417,
+          "secs": 0
+        },
+        "allocations": 1,
+        "arena_capacity": 37996544,
+        "arena_high_water": 37996544,
+        "command_buffers": 1,
+        "completion_waits": 1,
+        "dispatches": 531,
+        "encode": {
+          "nanos": 2107091,
+          "secs": 0
+        },
+        "gpu": {
+          "nanos": 7503875,
+          "secs": 0
+        },
+        "reused_bytes": 2279424,
+        "transient_live_bytes": 524288,
+        "transient_peak_bytes": 2279424,
+        "wait": {
+          "nanos": 8054500,
+          "secs": 0
+        }
+      }
+    ]
+  },
+  "application_intervals": [
+    {
+      "start_ms": 4748.925,
+      "duration_ms": 2.673,
+      "frame": "1",
+      "kind": "command_buffer",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4748.93,
+      "duration_ms": 0.044,
+      "frame": "",
+      "kind": "encoder",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4799.177,
+      "duration_ms": 2.339,
+      "frame": "2",
+      "kind": "command_buffer",
+      "event": "Encoding"
+    },
+    {
+      "start_ms": 4799.181,
+      "duration_ms": 0.015,
+      "frame": "",
+      "kind": "encoder",
+      "event": "Encoding"
+    }
+  ],
+  "submission_events": [
+    {
+      "start_ms": 4748.925,
+      "durations_ms": [
+        2.673,
+        0.044
+      ],
+      "event": "CommandBufferSubmission"
+    },
+    {
+      "start_ms": 4799.177,
+      "durations_ms": [
+        2.339,
+        0.015
+      ],
+      "event": "CommandBufferSubmission"
+    }
+  ],
+  "gpu_frames": {
+    "Frame 1": {
+      "intervals": 2,
+      "busy_ms_sum": 38.496,
+      "span_ms": 38.532,
+      "start_ms": 4760.046,
+      "end_ms": 4798.578
+    },
+    "Frame 2": {
+      "intervals": 2,
+      "busy_ms_sum": 7.386,
+      "span_ms": 7.504,
+      "start_ms": 4801.859,
+      "end_ms": 4809.363
+    }
+  },
+  "gpu_idle_gaps_ms": [
+    3.281
+  ],
+  "driver_event_rows": 708,
+  "driver_event_categories": {
+    "other": 48,
+    "wire": 660
+  },
+  "resource_allocation_rows": 100,
+  "resource_size_entries": 100,
+  "resource_sizes_kib_median": 64.0,
+  "resource_sizes_kib_sum_rows": 6656.0
+}

@@ -1,0 +1,55 @@
+{
+  "runtime": "llama.cpp",
+  "model_path": "/Users/austinwells/.cache/huggingface/hub/models--LiquidAI--LFM2.5-8B-A1B-GGUF/snapshots/49c14831707011e64d70b2ebd8462ba08d608434/LFM2.5-8B-A1B-Q4_K_M.gguf",
+  "workload_path": "docs/measurements/phase7a/lfm2.5-8b-a1b-q4_k_m-workloads.jsonl",
+  "trace_path": "docs/measurements/phase7a/traces/lfm25-moe-llama.trace",
+  "trace_process_pid": 30340,
+  "trace_start_utc": "2026-09-25T19:22:10.125238+00:00",
+  "trace_end_utc": "2026-09-25T19:22:10.198623+00:00",
+  "request_wall_ms": 73.3356669661589,
+  "request": {
+    "case": "trace-short",
+    "command_buffer_count": null,
+    "decode_aggregate_tps": 84.94643065716681,
+    "decode_median_ms": 11.772125,
+    "decode_ms": [
+      11.772125
+    ],
+    "decode_tps": 84.94643065716681,
+    "dispatch_count": null,
+    "first_token_ms": 61.019042,
+    "generated_ids": [
+      124901,
+      207
+    ],
+    "generated_tokens": 2,
+    "generation_ms": 73.080209,
+    "generation_tps": 27.36719047970977,
+    "kv_context_capacity_tokens": 4096,
+    "kv_type": "bf16",
+    "llama_version": "0.5.0-dev",
+    "model_format": "GGUF",
+    "pair": 0,
+    "pair_order": "traced",
+    "prefill_ms": 60.728875,
+    "prefill_tps": 181.1329454069419,
+    "process_max_rss_bytes": 5332008960,
+    "prompt_ids": [
+      124894,
+      124899,
+      5922,
+      207,
+      35808,
+      9,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+    ],
+    "prompt_tokens": 11,
+    "runtime": "llama.cpp",
+    "sampling_ms": 0.578042,
+    "warmup": false
+  }
+}

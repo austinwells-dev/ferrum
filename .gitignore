@@ -5,3 +5,5 @@
 /.venv-reference/
 *.safetensors
 __pycache__/
+# Raw Instruments bundles (hundreds of MB); summaries and logs are committed.
+docs/measurements/phase7a/traces/*.trace/
