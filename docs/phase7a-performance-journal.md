@@ -1757,3 +1757,140 @@ Validation for the retained tree:
 The three MoE parity tests (Granite MoE, LFM2.5 BF16, LFM2.5 GGUF) previously failed at `b5529c7` on `assert!(stats.active_experts > 0)`, which GPU routing (Experiment 30) no longer satisfies. That assertion now applies only when active experts are counted, so the later cache-branch replay checks in those tests run again.
 
 No measured format meets the Phase 7 gate. The large Qwen targets remain locked.
+
+## Experiment 54: Factored-scale Q4_K M=1 kernels (retained)
+
+Status: retained for dense M=1 Q4_K GEMV and sparse-expert Q4_K projection whenever K is a multiple of 256. Toggle: `set_q4_k_factored`, bench field `q4_k_factored`.
+
+A comparison of bandwidths located the problem. In the LFM2.5 decode profile, the retained expert kernel (`expert_project_q4_k_16rows_pairs`) read 16.5 MB per layer (4 experts × 3,584 rows × 2,048 columns of Q4_K) in 530 µs, about 31 GB/s. The dense Q4_K GEMV in the same model reached about 80 GB/s. The Q4_K kernels were compute-bound. Every lane decoded 6-bit scales and minimums per weight, formed `d*scale*q - dmin*min` per weight, and loaded one quantized byte per lane.
+
+The candidate ports the algorithm of llama.cpp's `kernel_mul_mv_q4_K` (MIT; credited in the shader) as `q4_k_factored_rows<R>`:
+
+- Lanes split into four block streams of eight.
+- Each lane owns 32 values of a block and reads packed nibbles as 16-bit words.
+- It decodes the block's eight scales and minimums once with the `kmask` bit tricks.
+- It applies `d*scale` and `dmin*min` per 32-value group, using a per-group activation sum for the minimum term.
+
+This leaves about one FMA per weight. The f32 summation order changes, as in Experiment 23. It is used by `q4_k_gemv_factored` and `expert_project_q4_k_factored`, both at four rows per SIMD group (Experiment 56).
+
+Tests:
+
+- `q4_k_factored_gemv_matches_reference_across_blocks_and_row_tails` covers N = 1, 7, 130, 133, and 9, with K from 256 to 4,864.
+- The existing expert row-reuse test checks the factored projection against the scalar reference and the old kernel, within bf16 rounding.
+- Both pass under Metal API and GPU Shader Validation.
+- All 155 model/unit tests pass, including the LFM2.5 Q4_K_M GGUF parity test against its llama.cpp reference.
+
+Profile effect for LFM2.5, per layer: expert input 530 -> 142 µs (about 116 GB/s), Q4_K expert output 273 -> 92 µs, and dense Q4_K GEMV 88 -> 62 µs. In-process A/B, five pairs, control = previous Q4_K kernels. Raw: `lfm2.5-8b-a1b-q4_k-factored-ab.jsonl`, `qwen2.5-q4_k_m-q4_k-factored-ab.jsonl`, and matching `.run.log` files. This A/B used the two-row dense variant.
+
+| Model / workload | Prefill tok/s C->F `[F/C]` | Cached decode tok/s C->F `[F/C]` | Complete generation tok/s C->F `[F/C]` | First-token ms C->F | IDs C=F |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5 / Short | 41.1->76.6 `[1.875]` | 35.5->62.9 `[1.774]` | 23.7->42.8 `[1.811]` | 267.5->143.7 | 5/5 |
+| LFM2.5 / 128-token prompt | 321.2->319.2 `[0.995]` | 35.7->63.1 `[1.767]` | 20.1->25.9 `[1.290]` | 398.6->401.0 | 5/5 |
+| LFM2.5 / 512-token prompt | 473.7->470.8 `[0.989]` | 35.0->62.4 `[1.785]` | 11.0->12.6 `[1.140]` | 1,080.8->1,087.5 | 0/5 |
+| LFM2.5 / 1,024-token prompt | 531.5->529.1 `[0.997]` | 35.0->61.9 `[1.772]` | 7.0->7.7 `[1.091]` | 1,926.6->1,935.2 | 5/5 |
+| LFM2.5 / Sustained decode | 41.6->74.9 `[1.809]` | 35.5->62.6 `[1.767]` | 33.3->59.0 `[1.773]` | 264.4->146.9 | 0/5 |
+| Qwen2.5 Q4_K_M / Short | 486.7->486.6 `[1.004]` | 144.2->148.0 `[1.032]` | 110.1->111.8 `[1.013]` | 43.1->43.2 | 5/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 2,422.6->2,372.7 `[0.984]` | 144.6->147.7 `[1.017]` | 103.9->104.1 `[1.014]` | 52.8->53.9 | 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 4,332.8->4,335.4 `[0.991]` | 142.5->145.6 `[1.016]` | 73.0->73.4 `[1.007]` | 118.2->118.1 | 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 4,801.9->4,800.0 `[1.000]` | 133.3->135.7 `[1.018]` | 50.6->50.9 `[1.006]` | 213.3->213.3 | 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 489.2->475.1 `[0.973]` | 148.9->151.9 `[1.020]` | 142.2->144.9 `[1.019]` | 42.9->44.2 | 0/5 |
+
+Short prompts (M=11) and 128-token routes take the direct expert kernel in prefill too, which is why short prefill nearly doubles.
+
+**Fidelity.** Output changed on the LFM 512-token and sustained cases and the Qwen2.5 sustained case. Against the saved llama.cpp sequences:
+
+- The LFM candidate now matches llama.cpp exactly on the 512-token case (control diverged at generated index 8).
+- It also matches on the full 128-token sustained sequence (control diverged at index 29), since its arithmetic now follows llama.cpp's.
+- On Qwen2.5 sustained, control and candidate both leave llama.cpp at index 14, and differ from each other only at index 82.
+
+## Experiment 55: Factored-scale Q6_K M=1 kernels (retained)
+
+Status: retained for dense M=1 Q6_K GEMV (including LFM2.5's lm_head) and sparse-expert Q6_K projection. Toggle: `set_q6_k_factored`, bench field `q6_k_factored`.
+
+This is the same approach as Experiment 54, porting llama.cpp's `kernel_mul_mv_q6_K` as `q6_k_factored_rows<R>`:
+
+- Sixteen lanes cover one 256-value block, with two block streams per SIMD group.
+- Each lane owns four adjacent values in each of four 32-value slices.
+- The signed slice scale and block d are applied once per slice sum.
+
+Test: `q6_k_factored_gemv_matches_reference_across_blocks_and_row_tails`, plus a factored check in the Q6_K expert test. The pinned Qwen2.5 Q6_K artifact was reverified: SHA-256 `2f82233630c349ccf6b8daccf48f9a7865713d9f08a2eadfa456cebe9b97c7f5`.
+
+Profile effect on LFM2.5: Q6_K expert output 225 -> 135 µs per layer, and lm_head 2.34 -> 1.97 ms. The in-process A/B below used the two-row variants on top of Experiment 54. Raw: `lfm2.5-8b-a1b-q6_k-factored-ab.jsonl`, `qwen2.5-q6_k-q6_k-factored-ab.jsonl`, and `.run.log` files.
+
+| Model / workload | Prefill tok/s C->F `[F/C]` | Cached decode tok/s C->F `[F/C]` | Complete generation tok/s C->F `[F/C]` | First-token ms C->F | IDs C=F |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5 / Short | 74.3->80.3 `[1.074]` | 63.2->69.5 `[1.101]` | 42.3->46.3 `[1.092]` | 148.0->136.9 | 5/5 |
+| LFM2.5 / 128-token prompt | 313.0->315.1 `[1.007]` | 63.4->68.7 `[1.085]` | 25.7->26.5 `[1.030]` | 409.0->406.2 | 0/5 |
+| LFM2.5 / 512-token prompt | 469.3->467.9 `[1.002]` | 62.7->67.3 `[1.077]` | 12.6->12.8 `[1.016]` | 1,091.0->1,094.3 | 5/5 |
+| LFM2.5 / 1,024-token prompt | 525.3->529.8 `[1.003]` | 62.1->66.1 `[1.065]` | 7.6->7.7 `[1.011]` | 1,949.3->1,933.0 | 5/5 |
+| LFM2.5 / Sustained decode | 73.6->79.5 `[1.080]` | 62.8->69.3 `[1.103]` | 59.1->64.9 `[1.097]` | 149.4->138.3 | 5/5 |
+| Qwen2.5 Q6_K / Short | 444.7->436.6 `[0.983]` | 136.2->138.3 `[1.012]` | 103.0->103.8 `[1.009]` | 47.2->48.1 | 5/5 |
+| Qwen2.5 Q6_K / 128-token prompt | 2,155.6->2,147.2 `[1.036]` | 134.2->137.4 `[1.023]` | 95.6->96.7 `[1.025]` | 59.4->59.6 | 5/5 |
+| Qwen2.5 Q6_K / 512-token prompt | 4,161.6->4,181.9 `[1.021]` | 134.7->137.1 `[1.013]` | 69.1->70.1 `[1.022]` | 123.0->122.4 | 5/5 |
+| Qwen2.5 Q6_K / 1,024-token prompt | 4,456.0->4,388.0 `[1.000]` | 128.5->130.9 `[1.021]` | 47.5->47.4 `[1.006]` | 229.8->233.4 | 5/5 |
+| Qwen2.5 Q6_K / Sustained decode | 460.4->451.6 `[0.907]` | 141.6->144.3 `[1.018]` | 135.5->137.9 `[1.014]` | 45.6->46.5 | 5/5 |
+
+Qwen2.5 Q6_K short and sustained prefill samples were bimodal, at about 450 or about 502 tok/s, in both control and candidate (GPU contention). Short prefill runs only one M=1 GEMV, the lm_head, which is faster, so those medians are not attributed to the kernel. Output IDs matched control in 45 of 50 pairs. The 128-token LFM case changed at the index where both variants already leave llama.cpp (index 9).
+
+## Experiment 56: Rows per SIMD group for factored kernels (four retained)
+
+Flushed per-operation profiles (`*-short-decode-op-profile-*-factored.json`) compared rows per SIMD group.
+
+- **One row per SIMD group** (tried for narrow outputs, to double threadgroups) was slower on the Qwen2.5 down projections: Q6_K 49.7 -> 61.5 µs, Q4_K 44.7 -> 56.8 µs. It was removed.
+- **Four rows per SIMD group** (sixteen per threadgroup) was faster everywhere:
+  - Qwen2.5 down projections: Q6_K 49.7 -> 43.6 µs, Q4_K 44.7 -> 34.8 µs.
+  - LFM2.5 dense Q4_K: 61.4 -> 46.3 µs.
+  - LFM2.5 lm_head: 1.96 -> 1.62 ms (about 133 GB/s).
+  - LFM2.5 Q6_K expert output: 135 -> 104 µs.
+  - Summed LFM2.5 decode GPU time: 14.06 -> 12.67 ms.
+- **Eight rows** for the Q4_K expert was neutral: input 142.7 -> 147.0 µs and output 93.3 -> 82.1 µs, with the same 12.67 ms total. It was not retained.
+
+Dense and expert factored kernels therefore use four rows per SIMD group.
+
+## Factored-kernel combined result versus `169bd48`
+
+The control is the pushed Phase 7B checkpoint `169bd48`. The candidate has Experiments 54–56. Five interleaved pairs per workload, via `tools/phase7a_binary_ab.py`. llama.cpp references are the saved 1ab7e5a rows (official `1ab7e5ad2d4e7295c94c3b966a3e0b70fa365865`), not rerun. Cells use the combined-result format above. Raw: `*-factored-vs-169bd48.jsonl` and `.run.log`.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5-8B-A1B Q4_K_M / Short | 44.2->91.3 / 215.6 `[0.205->0.423; 2.088]` | 35.5->77.7 / 86.4 `[0.411->0.899; 2.188]` | 24.4->52.1 / 72.5 `[0.336->0.719; 2.147]` | 248.8->120.5 / 51.2 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 339.5->337.9 / 1,511.1 `[0.225->0.224; 0.995]` | 35.8->76.7 / 98.2 `[0.364->0.781; 2.146]` | 20.6->29.0 / 67.5 `[0.305->0.429; 1.403]` | 377.0->378.8 / 84.9 | 0/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 487.5->484.1 / 2,108.3 `[0.231->0.230; 0.992]` | 35.1->74.8 / 97.5 `[0.360->0.767; 2.135]` | 11.3->13.4 / 41.2 `[0.273->0.324; 1.183]` | 1,050.2->1,057.7 / 243.1 | 0/5; 5/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 549.3->541.3 / 2,141.5 `[0.256->0.253; 0.988]` | 35.0->73.5 / 96.4 `[0.363->0.762; 2.100]` | 7.3->8.0 / 25.8 `[0.282->0.311; 1.103]` | 1,864.3->1,891.6 / 478.4 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 43.6->89.4 / 233.7 `[0.187->0.383; 2.073]` | 35.5->77.4 / 101.2 `[0.351->0.765; 2.181]` | 33.5->72.6 / 95.7 `[0.350->0.758; 2.169]` | 252.1->123.0 / 47.3 | 0/5; 5/5; 0/5 |
+| Qwen2.5 Q4_K_M / Short | 485.7->492.1 / 1,406.7 `[0.345->0.350; 1.011]` | 141.7->150.8 / 238.8 `[0.593->0.631; 1.063]` | 108.9->114.5 / 197.5 `[0.552->0.580; 1.051]` | 43.2->42.7 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 2,400.2->2,430.4 / 6,989.8 `[0.343->0.348; 1.010]` | 141.8->149.1 / 230.7 `[0.614->0.646; 1.051]` | 102.3->106.8 / 187.6 `[0.545->0.569; 1.044]` | 53.3->52.7 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 4,377.2->4,355.7 / 9,336.9 `[0.469->0.467; 0.995]` | 139.5->149.6 / 233.5 `[0.598->0.641; 1.070]` | 72.4->74.2 / 133.5 `[0.543->0.556; 1.026]` | 117.0->117.5 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 4,786.7->4,768.9 / 8,844.2 `[0.541->0.539; 0.999]` | 134.0->141.3 / 236.5 `[0.567->0.597; 1.054]` | 50.6->51.4 / 90.0 `[0.562->0.571; 1.017]` | 213.9->214.7 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 491.0->488.6 / 1,385.7 `[0.354->0.353; 0.989]` | 148.7->157.8 / 244.3 `[0.609->0.646; 1.061]` | 142.1->150.9 / 221.8 `[0.641->0.680; 1.061]` | 42.8->43.0 / 15.4 | 0/5; 0/5; 0/5 |
+| Qwen2.5 Q6_K / Short | 451.3->453.4 / 1,478.6 `[0.305->0.307; 1.005]` | 136.3->141.1 / 199.1 `[0.685->0.709; 1.034]` | 103.7->106.7 / 173.9 `[0.596->0.613; 1.028]` | 46.5->46.3 / 14.5 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 128-token prompt | 2,242.2->2,228.6 / 7,068.9 `[0.317->0.315; 0.994]` | 135.0->141.0 / 201.8 `[0.669->0.699; 1.045]` | 97.0->99.3 / 168.2 `[0.577->0.591; 1.023]` | 57.1->57.4 / 18.4 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 512-token prompt | 4,238.7->4,245.0 / 9,643.1 `[0.440->0.440; 1.006]` | 134.5->140.6 / 203.2 `[0.662->0.692; 1.046]` | 69.8->71.5 / 125.0 `[0.558->0.572; 1.026]` | 120.8->120.6 / 53.4 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 1,024-token prompt | 4,506.4->4,515.9 / 9,077.0 `[0.496->0.498; 1.004]` | 128.5->134.2 / 197.2 `[0.652->0.680; 1.047]` | 47.9->48.7 / 86.3 `[0.555->0.564; 1.020]` | 227.2->226.8 / 113.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / Sustained decode | 448.9->452.0 / 1,451.0 `[0.309->0.311; 0.995]` | 141.8->148.4 / 202.7 `[0.699->0.732; 1.047]` | 135.6->141.3 / 191.2 `[0.709->0.739; 1.042]` | 46.8->46.5 / 14.7 | 5/5; 0/5; 0/5 |
+
+**LFM2.5-8B-A1B Q4_K_M:**
+
+- Cached decode rose from 35.5 to 77.7 tok/s on the short workload, ×2.10–×2.19 across all five workloads. Against llama.cpp this moves decode from about 0.36x to 0.76–0.90x.
+- Short prefill and sustained generation roughly doubled.
+- 128-, 512-, and 1,024-token prefill medians were 0.5–1.2% lower. Those prompts run TensorOps GEMM paths that this round did not change, so the small decrease is recorded, not explained.
+
+**Qwen2.5:**
+
+- Q4_K_M decode improved 5.1–7.0% (its Q4_K and Q6_K down projections).
+- Q6_K decode improved 3.4–4.7%.
+- Prefill changed by ±1%.
+
+Qwen3-0.6B Q8_0 uses none of these kernels.
+
+The LFM2.5 short and 1,024-token decode ratios (0.899x and 0.762x) are the closest Ferrum has come to the 0.85x decode gate. Medium and long prefill (0.22–0.25x) remain far from the 0.80x prefill gate, so the gate is still not met.
+
+With the factored kernels in place, the remaining LFM2.5 decode profile (12.67 ms summed) is:
+
+- Q4_K expert input: 3.14 ms.
+- `rmsnorm`: 2.40 ms, dominated by the exactness fallback of Experiment 53.
+- Dense Q4_K: 1.67 ms.
+- lm_head: 1.61 ms.
+- Expert outputs: 2.16 ms.
+
+The `rmsnorm` fallback is now about 19% of the summed LFM2.5 decode profile and remains an open design decision.

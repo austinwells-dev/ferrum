@@ -1,0 +1,477 @@
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 196.0% of one core; limit 220.0%).
+   88.8% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit A3B52735-C951-41C2-BF71-BC003C57D034
+   46.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   15.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /System/Library/PrivateFrameworks/TCC.framework/Support/tccd
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 323.7% of one core; limit 220.0%).
+  102.7% of one core  /usr/libexec/spotlightknowledged.updater -u
+  101.2% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit A3B52735-C951-41C2-BF71-BC003C57D034
+   45.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   18.0% of one core  /usr/sbin/cfprefsd agent
+Waiting 10s before checking again.
+CPU preflight passed: peak total 119.7% of one core; largest process 45.4% of one core.
+Waiting 10s before checking again.
+Waiting 10s before checking again.
+CPU preflight passed: peak total 123.7% of one core; largest process 44.4% of one core.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 190.5% of one core; limit 220.0%).
+   88.8% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit A3B52735-C951-41C2-BF71-BC003C57D034
+   45.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   15.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    7.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /System/Library/CoreServices/MenuBarAgent.app/Contents/MacOS/MenuBarAgent
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 310.7% of one core; limit 220.0%).
+  101.2% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit A3B52735-C951-41C2-BF71-BC003C57D034
+   93.3% of one core  /usr/libexec/spotlightknowledged.updater -u
+   44.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   16.5% of one core  /usr/sbin/cfprefsd agent
+Waiting 10s before checking again.
+Waiting 10s before checking again.
+CPU preflight passed: peak total 123.7% of one core; largest process 44.4% of one core.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 190.0% of one core; limit 220.0%).
+   88.8% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit A3B52735-C951-41C2-BF71-BC003C57D034
+   45.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   15.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    7.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /System/Library/CoreServices/MenuBarAgent.app/Contents/MacOS/MenuBarAgent
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 311.2% of one core; limit 220.0%).
+  101.2% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit A3B52735-C951-41C2-BF71-BC003C57D034
+   93.3% of one core  /usr/libexec/spotlightknowledged.updater -u
+   44.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   16.5% of one core  /usr/sbin/cfprefsd agent
+phase55_bench ready: format=GGUF weights=5144019200 packed=5140709376 tensors=256
+phase55_bench ready: format=GGUF weights=5144019200 packed=5140709376 tensors=256
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 200.5% of one core; limit 220.0%).
+   98.7% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorWaterNet 80FF61AF-4919-4CDE-B6B3-D9670B6F9CC7
+   43.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   18.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    5.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight passed: peak total 96.3% of one core; largest process 37.9% of one core.
+CPU preflight passed: peak total 95.8% of one core; largest process 41.9% of one core.
+CPU preflight passed: peak total 82.8% of one core; largest process 37.4% of one core.
+CPU preflight passed: peak total 136.7% of one core; largest process 42.4% of one core.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 202.5% of one core; limit 220.0%).
+   99.7% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSheepSwap 6C0FF776-3179-47BD-AA78-5041D4716573
+   43.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    5.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 200.0% of one core; limit 220.0%).
+   99.2% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSheepSwap 6C0FF776-3179-47BD-AA78-5041D4716573
+   44.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   16.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    5.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 190.5% of one core; limit 220.0%).
+   99.2% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorMRTv3 1DBC5195-CBDA-46F3-BE63-A2FC8B9F4A58
+   38.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   16.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   10.0% of one core  /Users/austinwells/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude --output-format stream-json --verbose --input-format stream-json --effort
+    8.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight passed: peak total 204.0% of one core; largest process 69.8% of one core.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 205.0% of one core; limit 220.0%).
+   93.3% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorAdload 080DF1AB-527D-4F0E-902E-960273D35F85
+   47.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 202.0% of one core; limit 220.0%).
+   98.7% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorAdload 080DF1AB-527D-4F0E-902E-960273D35F85
+   45.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   15.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /System/Library/CoreServices/MenuBarAgent.app/Contents/MacOS/MenuBarAgent
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 196.5% of one core; limit 220.0%).
+   98.7% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorAdload 080DF1AB-527D-4F0E-902E-960273D35F85
+   41.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 190.0% of one core; limit 220.0%).
+  101.7% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorAdload 080DF1AB-527D-4F0E-902E-960273D35F85
+   43.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   18.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    5.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 195.0% of one core; limit 220.0%).
+   99.2% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorSnowDrift 90CDD647-DB4D-4E31-9DF5-2EC6290D3013
+   41.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   18.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 190.5% of one core; limit 220.0%).
+  100.7% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit 99076D0D-5FFA-4E5E-899A-37F504873688
+   40.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   17.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    5.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 193.5% of one core; limit 220.0%).
+   99.2% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit 99076D0D-5FFA-4E5E-899A-37F504873688
+   42.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 203.0% of one core; limit 220.0%).
+   99.2% of one core  /Library/Apple/System/Library/CoreServices/XProtect.app/Contents/MacOS/XProtectRemediatorPirrit 99076D0D-5FFA-4E5E-899A-37F504873688
+   42.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   10.9% of one core  /usr/libexec/trustd
+    8.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight passed: peak total 86.6% of one core; largest process 38.8% of one core.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 432.3% of one core; limit 220.0%).
+  141.3% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   95.0% of one core  /usr/libexec/spotlightknowledged.updater -u
+   51.2% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   28.4% of one core  /usr/libexec/PerfPowerServices
+   19.9% of one core  /usr/libexec/runningboardd
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 389.0% of one core; limit 220.0%).
+  200.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   74.1% of one core  /usr/libexec/spotlightknowledged.updater -u
+   42.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   20.4% of one core  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+   17.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 322.4% of one core; limit 220.0%).
+  209.4% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   49.7% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   24.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 319.9% of one core; limit 220.0%).
+  207.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   49.7% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   24.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 341.8% of one core; limit 220.0%).
+  204.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    8.0% of one core  /usr/libexec/transparencyd
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 322.9% of one core; limit 220.0%).
+  208.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   26.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+   20.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 323.9% of one core; limit 220.0%).
+  205.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   49.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   22.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   12.4% of one core  /usr/libexec/spotlightknowledged.updater -u
+    9.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 315.2% of one core; limit 220.0%).
+  205.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.0% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   23.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 312.4% of one core; limit 220.0%).
+  206.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   46.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   17.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 313.9% of one core; limit 220.0%).
+  201.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   49.7% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   22.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 322.4% of one core; limit 220.0%).
+  208.4% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   21.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    8.5% of one core  /sbin/launchd
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 313.4% of one core; limit 220.0%).
+  207.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   47.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   20.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 317.4% of one core; limit 220.0%).
+  206.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   47.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   18.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    8.5% of one core  /sbin/launchd
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 313.4% of one core; limit 220.0%).
+  199.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   50.2% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   21.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 317.9% of one core; limit 220.0%).
+  207.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   49.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   23.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    8.5% of one core  /sbin/launchd
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 319.9% of one core; limit 220.0%).
+  206.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   20.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 320.4% of one core; limit 220.0%).
+  206.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   49.7% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   20.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 311.9% of one core; limit 220.0%).
+  201.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   47.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   23.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 310.4% of one core; limit 220.0%).
+  207.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   22.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 319.0% of one core; limit 220.0%).
+  211.8% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   46.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   18.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 310.4% of one core; limit 220.0%).
+  207.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   20.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 318.4% of one core; limit 220.0%).
+  200.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   27.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+   20.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 315.9% of one core; limit 220.0%).
+  207.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   21.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 311.9% of one core; limit 220.0%).
+  205.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   47.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   18.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 320.4% of one core; limit 220.0%).
+  206.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   22.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.0% of one core  /Users/austinwells/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude --output-format stream-json --verbose --input-format stream-json --effort
+    9.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 328.8% of one core; limit 220.0%).
+  207.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   49.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   22.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 333.8% of one core; limit 220.0%).
+  210.4% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   47.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   21.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   17.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    9.0% of one core  /Users/austinwells/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude --output-format stream-json --verbose --input-format stream-json --effort
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 315.4% of one core; limit 220.0%).
+  209.4% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   47.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   18.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    9.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    7.5% of one core  /Users/austinwells/Library/Application Support/Claude/claude-code/2.1.281/claude.app/Contents/MacOS/claude --output-format stream-json --verbose --input-format stream-json --effort
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 343.8% of one core; limit 220.0%).
+  206.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   32.8% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   24.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 346.7% of one core; limit 220.0%).
+  199.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   48.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   29.4% of one core  /usr/libexec/spotlightknowledged.updater -u
+   21.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   12.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 300.0% of one core; limit 220.0%).
+  208.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   28.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   18.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+    6.5% of one core  /usr/libexec/gamed
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 295.0% of one core; limit 220.0%).
+  204.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   33.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   19.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.5% of one core  /sbin/launchd
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 300.5% of one core; limit 220.0%).
+  208.4% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   37.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   22.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    6.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 306.5% of one core; limit 220.0%).
+  206.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   40.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   22.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    8.5% of one core  /sbin/launchd
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 304.0% of one core; limit 220.0%).
+  207.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   30.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   16.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    6.5% of one core  /usr/libexec/sysmond
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 309.9% of one core; limit 220.0%).
+  212.9% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   37.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   21.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   12.4% of one core  /Applications/Claude.app/Contents/MacOS/Claude
+    6.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 291.0% of one core; limit 220.0%).
+  202.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   34.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   20.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    6.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 300.5% of one core; limit 220.0%).
+  208.4% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   34.8% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   21.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+    6.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 280.6% of one core; limit 220.0%).
+  201.0% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   26.4% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   15.9% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    6.5% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+    5.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 306.4% of one core; limit 220.0%).
+  207.4% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+   40.3% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   24.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+    7.0% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+    6.0% of one core  /Applications/Hammerspoon.app/Contents/MacOS/Hammerspoon
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 323.7% of one core; limit 220.0%).
+  198.5% of one core  /System/Library/PrivateFrameworks/MediaAnalysis.framework/Versions/A/mediaanalysisd
+  129.7% of one core  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/corespotlightd
+   42.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   14.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   14.5% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+Waiting 10s before checking again.
+CPU preflight passed: peak total 66.8% of one core; largest process 26.9% of one core.
+CPU preflight passed: peak total 89.8% of one core; largest process 32.4% of one core.
+CPU preflight passed: peak total 83.3% of one core; largest process 36.9% of one core.
+CPU preflight passed: peak total 68.3% of one core; largest process 27.4% of one core.
+CPU preflight passed: peak total 75.3% of one core; largest process 32.4% of one core.
+CPU preflight passed: peak total 81.3% of one core; largest process 34.4% of one core.
+CPU preflight passed: peak total 71.8% of one core; largest process 29.9% of one core.
+CPU preflight passed: peak total 88.3% of one core; largest process 37.9% of one core.
+CPU preflight passed: peak total 99.2% of one core; largest process 26.4% of one core.
+CPU preflight passed: peak total 83.3% of one core; largest process 33.9% of one core.
+CPU preflight passed: peak total 83.8% of one core; largest process 25.4% of one core.
+CPU preflight passed: peak total 102.7% of one core; largest process 33.9% of one core.
+CPU preflight passed: peak total 80.8% of one core; largest process 34.9% of one core.
+CPU preflight passed: peak total 66.3% of one core; largest process 26.9% of one core.
+CPU preflight passed: peak total 82.8% of one core; largest process 31.4% of one core.
+CPU preflight passed: peak total 91.8% of one core; largest process 39.9% of one core.
+CPU preflight passed: peak total 69.8% of one core; largest process 28.9% of one core.
+CPU preflight passed: peak total 131.7% of one core; largest process 33.4% of one core.
+CPU preflight passed: peak total 68.3% of one core; largest process 25.4% of one core.
+CPU preflight passed: peak total 73.8% of one core; largest process 31.9% of one core.
+CPU preflight passed: peak total 76.8% of one core; largest process 33.4% of one core.
+CPU preflight passed: peak total 82.3% of one core; largest process 23.4% of one core.
+CPU preflight passed: peak total 92.8% of one core; largest process 37.9% of one core.
+CPU preflight passed: peak total 84.3% of one core; largest process 34.9% of one core.
+CPU preflight passed: peak total 81.3% of one core; largest process 30.9% of one core.
+CPU preflight passed: peak total 72.8% of one core; largest process 26.9% of one core.
+CPU preflight passed: peak total 74.3% of one core; largest process 28.4% of one core.
+CPU preflight passed: peak total 75.8% of one core; largest process 29.9% of one core.
+CPU preflight passed: peak total 77.8% of one core; largest process 32.9% of one core.
+CPU preflight passed: peak total 82.3% of one core; largest process 31.4% of one core.
+CPU preflight passed: peak total 86.3% of one core; largest process 35.4% of one core.
+CPU preflight passed: peak total 93.8% of one core; largest process 39.4% of one core.
+CPU preflight passed: peak total 99.7% of one core; largest process 33.4% of one core.
+CPU preflight passed: peak total 62.8% of one core; largest process 23.4% of one core.
+CPU preflight passed: peak total 75.3% of one core; largest process 29.4% of one core.
+CPU preflight passed: peak total 82.8% of one core; largest process 34.9% of one core.
+CPU preflight passed: peak total 87.3% of one core; largest process 32.9% of one core.
+CPU preflight passed: peak total 83.3% of one core; largest process 34.9% of one core.
+CPU preflight passed: peak total 89.3% of one core; largest process 30.9% of one core.
+CPU preflight passed: peak total 70.8% of one core; largest process 28.4% of one core.
+CPU preflight passed: peak total 87.3% of one core; largest process 35.9% of one core.
+CPU preflight passed: peak total 103.7% of one core; largest process 40.9% of one core.
+CPU preflight passed: peak total 71.3% of one core; largest process 29.4% of one core.
+CPU preflight passed: peak total 90.3% of one core; largest process 35.9% of one core.
+CPU preflight passed: peak total 95.8% of one core; largest process 37.4% of one core.
+CPU preflight passed: peak total 88.8% of one core; largest process 29.9% of one core.
+CPU preflight passed: peak total 84.8% of one core; largest process 34.9% of one core.
+CPU preflight passed: peak total 91.8% of one core; largest process 36.9% of one core.
+CPU preflight passed: peak total 80.3% of one core; largest process 32.9% of one core.
+CPU preflight passed: peak total 68.3% of one core; largest process 24.4% of one core.
+CPU preflight passed: peak total 79.3% of one core; largest process 30.4% of one core.
+CPU preflight passed: peak total 77.3% of one core; largest process 28.4% of one core.
+CPU preflight passed: peak total 76.1% of one core; largest process 30.8% of one core.
