@@ -1792,7 +1792,8 @@ impl MetalDevice {
                 "{name}: unsupported threadgroup configuration"
             )));
         }
-        self.encode_dispatch(&p, &buffers, inputs.len(), params, |encoder| {
+        let start = self.profiling.get().then(Instant::now);
+        let timing = self.encode_dispatch(&p, &buffers, inputs.len(), params, |encoder| {
             // SAFETY: the length is bounded by the device's 32 KiB threadgroup limit.
             if threadgroup_bytes > 0 {
                 unsafe { encoder.setThreadgroupMemoryLength_atIndex(threadgroup_bytes, 0) };
@@ -1804,8 +1805,11 @@ impl MetalDevice {
             };
             encoder.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(threads));
             Ok(())
-        })
-        .map(|_| ())
+        })?;
+        if let Some(start) = start {
+            self.record_profile(name, start.elapsed(), Duration::ZERO, 0, &timing);
+        }
+        Ok(())
     }
     pub(crate) fn owns(&self, buffer: &MetalBuffer) -> bool {
         Rc::ptr_eq(&self.owner, &buffer.owner)

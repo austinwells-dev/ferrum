@@ -745,7 +745,7 @@ void mm_impl(constant ProjArgs & a, device const char * w, device const float * 
     auto tB = tensor((device float *)x, dextents<int32_t, 2>(K, N), array<int, 2>({1, int(a.x_stride)}));
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
-            MM_NRB, MM_NRA, MM_NK, false, true, false,
+            MM_NRB, MM_NRA, MM_NK, false, true, true,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
     auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
@@ -1036,6 +1036,7 @@ struct AttnPrepArgs {
     float theta;
     float eps;
     uint cache_stride; // elements between cached positions (kv_heads*head_dim)
+    float q_scale;     // softmax scale folded into the F16 query
 };
 
 // Query heads: rmsnorm + partial NEOX RoPE of q (first half of each [q|gate]
@@ -1046,7 +1047,7 @@ kernel void h_attn_prep(constant AttnPrepArgs & p [[buffer(7)]],
                         device const float * qg [[buffer(0)]], device const float * k [[buffer(1)]],
                         device const float * v [[buffer(2)]], device const float * q_norm [[buffer(3)]],
                         device const float * k_norm [[buffer(4)]],
-                        device float * q_out [[buffer(5)]], device half * kv [[buffer(6)]],
+                        device half * q_out [[buffer(5)]], device half * kv [[buffer(6)]],
                         uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float scratch[8];
     threadgroup float normed[256];
@@ -1073,7 +1074,7 @@ kernel void h_attn_prep(constant AttnPrepArgs & p [[buffer(7)]],
         else outv = normed[tid - half_rot] * s + nv * c;
     }
     if (is_q) {
-        q_out[((ulong)t * p.heads + head) * p.head_dim + tid] = outv;
+        q_out[((ulong)t * p.heads + head) * p.head_dim + tid] = half(outv * p.q_scale);
     } else {
         device half * kc = kv + (ulong)(p.position + t) * p.cache_stride + kvh * p.head_dim;
         kc[tid] = half(outv);
@@ -1102,19 +1103,19 @@ struct AttnArgs {
 // Reference-grade attention: one threadgroup (head_dim threads) per (query, head),
 // online softmax over keys. Output is multiplied by sigmoid(gate) from qg.
 kernel void h_attention(constant AttnArgs & p [[buffer(5)]],
-                        device const float * q [[buffer(0)]], device const half * kc [[buffer(1)]],
+                        device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],
                         device const half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],
                         device float * out [[buffer(4)]],
                         uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float scratch[8];
     const uint h = group.x, t = group.y;
     const uint kvh = h / (p.heads / p.kv_heads);
-    const float qv = q[((ulong)t * p.heads + h) * p.head_dim + tid];
+    const float qv = float(q[((ulong)t * p.heads + h) * p.head_dim + tid]);
     const uint keys = p.position + t + 1;
     float m = -INFINITY, l = 0.f, acc = 0.f;
     for (uint j = 0; j < keys; j++) {
         const ulong base = (ulong)j * p.cache_stride + kvh * p.head_dim + tid;
-        const float s = block_sum(qv * float(kc[base]), scratch, tid, p.head_dim) * p.scale;
+        const float s = block_sum(qv * float(kc[base]), scratch, tid, p.head_dim);
         const float m_new = max(m, s);
         const float corr = exp(m - m_new);
         const float e = exp(s - m_new);
@@ -1162,4 +1163,441 @@ kernel void h_argmax(constant ArgmaxArgs & p [[buffer(2)]], device const float *
 kernel void h_zero(constant EltArgs & a [[buffer(1)]], device float * y [[buffer(0)]],
                    uint i [[thread_position_in_grid]]) {
     if (i < a.n) y[i] = 0.f;
+}
+
+// ---------------------------------------------------------------- mixture of experts
+
+struct MoeRouteArgs { uint experts; uint used; uint hidden; uint tokens; };
+
+// Softmax over expert logits, top-k selection (ties to the lower index),
+// renormalized weights, and the sigmoid shared-expert gate dot(x, gate_w).
+// One threadgroup of `experts` threads per token.
+kernel void h_moe_route(constant MoeRouteArgs & p [[buffer(6)]],
+                        device const float * logits [[buffer(0)]], device const float * x [[buffer(1)]],
+                        device const float * shared_w [[buffer(2)]],
+                        device uint * ids [[buffer(3)]], device float * weights [[buffer(4)]],
+                        device float * shared_gate [[buffer(5)]],
+                        uint t [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                        ushort threads [[threads_per_threadgroup]]) {
+    threadgroup float scratch[32];
+    threadgroup float best_v[32];
+    threadgroup uint best_i[32];
+    const float l = logits[(ulong)t * p.experts + tid];
+    // max
+    float mx = simd_max(l);
+    if (tid % 32 == 0) scratch[tid / 32] = mx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    mx = -INFINITY;
+    for (ushort i = 0; i < threads / 32; i++) mx = max(mx, scratch[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float e = exp(l - mx);
+    const float total = block_sum(e, scratch, tid, threads);
+    float prob = e / total;
+    float picked_sum = 0.f;
+    for (uint k = 0; k < p.used; k++) {
+        float bv = prob;
+        uint bi = tid;
+        for (ushort off = 16; off > 0; off /= 2) {
+            const float ov = simd_shuffle_down(bv, off);
+            const uint oi = simd_shuffle_down(bi, off);
+            if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; }
+        }
+        if (tid % 32 == 0) { best_v[tid / 32] = bv; best_i[tid / 32] = bi; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        bv = best_v[0]; bi = best_i[0];
+        for (ushort i = 1; i < threads / 32; i++) {
+            if (best_v[i] > bv || (best_v[i] == bv && best_i[i] < bi)) { bv = best_v[i]; bi = best_i[i]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        picked_sum += bv;
+        if (tid == 0) {
+            ids[(ulong)t * p.used + k] = bi;
+            weights[(ulong)t * p.used + k] = bv;
+        }
+        if (tid == bi) prob = -1.f;
+    }
+    threadgroup_barrier(mem_flags::mem_device);
+    if (tid < p.used) weights[(ulong)t * p.used + tid] /= picked_sum;
+    // Shared-expert gate.
+    float dot = 0.f;
+    for (uint i = tid; i < p.hidden; i += threads) dot += x[(ulong)t * p.hidden + i] * shared_w[i];
+    dot = block_sum(dot, scratch, tid, threads);
+    if (tid == 0) shared_gate[t] = 1.f / (1.f + exp(-dot));
+}
+
+struct MoeMapArgs { uint experts; uint routes; };
+
+// Deterministic expert-major ordering of routes. One threadgroup, one thread
+// per expert: offsets[e]..offsets[e+1] are expert e's rows in sorted order,
+// sorted[p] is the route at row p and position[r] the row of route r.
+kernel void h_moe_map(constant MoeMapArgs & p [[buffer(4)]], device const uint * ids [[buffer(0)]],
+                      device uint * offsets [[buffer(1)]], device uint * sorted [[buffer(2)]],
+                      device uint * position [[buffer(3)]],
+                      ushort tid [[thread_index_in_threadgroup]], ushort threads [[threads_per_threadgroup]]) {
+    threadgroup uint counts[1024];
+    for (uint e = tid; e < p.experts; e += threads) {
+        uint n = 0;
+        for (uint r = 0; r < p.routes; r++) n += ids[r] == e ? 1u : 0u;
+        counts[e] = n;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        uint acc = 0;
+        for (uint e = 0; e < p.experts; e++) {
+            const uint n = counts[e];
+            counts[e] = acc;
+            offsets[e] = acc;
+            acc += n;
+        }
+        offsets[p.experts] = acc;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint e = tid; e < p.experts; e += threads) {
+        uint at = counts[e];
+        for (uint r = 0; r < p.routes; r++) {
+            if (ids[r] == e) {
+                sorted[at] = r;
+                position[r] = at;
+                at++;
+            }
+        }
+    }
+}
+
+struct MoeGatherArgs { uint hidden; uint used; uint routes; };
+
+// xg[row] = x[token of sorted[row]]; grid (ceil(hidden/256), routes).
+kernel void h_moe_gather(constant MoeGatherArgs & p [[buffer(3)]], device const float * x [[buffer(0)]],
+                         device const uint * sorted [[buffer(1)]], device float * xg [[buffer(2)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= p.hidden) return;
+    const uint token = sorted[gid.y] / p.used;
+    xg[(ulong)gid.y * p.hidden + gid.x] = x[(ulong)token * p.hidden + gid.x];
+}
+
+struct MoeCombineArgs { uint hidden; uint used; uint tokens; uint identity; };
+
+// out[t] = sum_s w[t][s] * down[row(t,s)] + shared_gate[t] * shared[t].
+kernel void h_moe_combine(constant MoeCombineArgs & p [[buffer(6)]],
+                          device const float * down [[buffer(0)]], device const float * weights [[buffer(1)]],
+                          device const uint * position [[buffer(2)]], device const float * shared [[buffer(3)]],
+                          device const float * shared_gate [[buffer(4)]], device float * out [[buffer(5)]],
+                          uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.tokens * p.hidden) return;
+    const uint t = gid / p.hidden, i = gid % p.hidden;
+    float acc = 0.f;
+    for (uint s = 0; s < p.used; s++) {
+        const uint r = t * p.used + s;
+        const uint row = p.identity ? r : position[r];
+        acc += weights[r] * down[(ulong)row * p.hidden + i];
+    }
+    out[gid] = acc + shared_gate[t] * shared[gid];
+}
+
+// Expert GEMV: route r (grid y) multiplies activation row r / x_div by the
+// rows of expert ids[r]; output row r.
+struct MoeMvArgs { ProjArgs p; uint expert_rows; uint x_div; };
+
+#define MV_ID_KERNEL(NAME, IMPL, NR0, NSG) \
+kernel void NAME(constant MoeMvArgs & a [[buffer(4)]], device const char * w [[buffer(0)]], \
+                 device const float * x [[buffer(1)]], device const uint * ids [[buffer(2)]], \
+                 device float * y [[buffer(3)]], \
+                 uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], \
+                 ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    const uint r = tgpig.y; \
+    device const char * we = w + (ulong)ids[r] * a.expert_rows * a.p.row_bytes; \
+    IMPL<NR0, NSG>(a.p, we, x + (ulong)(r / a.x_div) * a.p.x_stride, y + (ulong)r * a.p.y_stride, \
+                   uint3(tgpig.x, 0, 0), tiisg, sgitg); \
+}
+#define MV_ID_KERNEL_SHMEM(NAME, IMPL, NR0, NSG, T) \
+kernel void NAME(constant MoeMvArgs & a [[buffer(4)]], device const char * w [[buffer(0)]], \
+                 device const float * x [[buffer(1)]], device const uint * ids [[buffer(2)]], \
+                 device float * y [[buffer(3)]], threadgroup T * shmem [[threadgroup(0)]], \
+                 uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], \
+                 ushort sgitg [[simdgroup_index_in_threadgroup]]) { \
+    const uint r = tgpig.y; \
+    device const char * we = w + (ulong)ids[r] * a.expert_rows * a.p.row_bytes; \
+    IMPL<NR0, NSG>(a.p, we, x + (ulong)(r / a.x_div) * a.p.x_stride, y + (ulong)r * a.p.y_stride, \
+                   shmem, uint3(tgpig.x, 0, 0), tiisg, sgitg); \
+}
+MV_ID_KERNEL(h_mv_id_q4_k, mv_q4_K, 2, 2)
+MV_ID_KERNEL(h_mv_id_q5_k, mv_q5_K, 1, 2)
+MV_ID_KERNEL(h_mv_id_q6_k, mv_q6_K, 2, 2)
+MV_ID_KERNEL(h_mv_id_q4_0, mv_q4_0, 4, 2)
+MV_ID_KERNEL_SHMEM(h_mv_id_q8_0, mv_q8_0, 2, 4, float)
+MV_ID_KERNEL_SHMEM(h_mv_id_iq4_xs, mv_iq4_xs, 2, 2, float)
+MV_ID_KERNEL_SHMEM(h_mv_id_iq3_s, mv_iq3_s, 4, 2, uint)
+
+// Expert GEMM over expert-sorted rows: z = expert; rows offsets[z]..offsets[z+1]
+// of x (gathered) and y. grid (ceil(max_rows/128), ceil(expert_rows/64), experts).
+struct MoeMmArgs { ProjArgs p; uint expert_rows; };
+
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+void mm_id_impl(constant MoeMmArgs & a, device const char * w, device const float * x,
+                device const uint * offsets, device float * y,
+                threadgroup half * sa, uint3 tgpig, ushort tiitg) {
+    const uint e = tgpig.z;
+    const uint first = offsets[e];
+    const int count = int(offsets[e + 1] - first);
+    if (int(tgpig.x) * MM_NRB >= count) return;
+    const int K = a.p.k;
+    const int M = a.expert_rows;
+    const int ra = tgpig.y * MM_NRA;
+    const int rb = tgpig.x * MM_NRB;
+    device const char * we = w + (ulong)e * a.expert_rows * a.p.row_bytes;
+    auto tA = tensor(sa, dextents<int32_t, 2>(MM_NK, MM_NRA));
+    auto tB = tensor((device float *)(x + (ulong)first * a.p.x_stride), dextents<int32_t, 2>(K, count),
+                     array<int, 2>({1, int(a.p.x_stride)}));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(
+            MM_NRB, MM_NRA, MM_NK, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm;
+    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    for (int loop_k = 0; loop_k < K; loop_k += MM_NK) {
+        for (int work = tiitg; work < MM_NRA * 2; work += 128) {
+            const int row = work / 2;
+            const int k_chunk = work % 2;
+            const int k_pos = loop_k + k_chunk * 16;
+            if (ra + row < M) {
+                device const block_q * row_ptr = (device const block_q *)(we + (ulong)a.p.row_bytes * (ra + row));
+                half4x4 temp_a;
+                dequantize_func(row_ptr + k_pos / (16 * nl), (k_pos / 16) % nl, temp_a);
+                FOR_UNROLL (short i = 0; i < 16; i++) sa[row * MM_NK + k_chunk*16 + i] = temp_a[i/4][i%4];
+            } else {
+                FOR_UNROLL (short i = 0; i < 16; i++) sa[row * MM_NK + k_chunk*16 + i] = 0.h;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, rb);
+        mm.run(mB, mA, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    auto tD = tensor(y + (ulong)first * a.p.y_stride, dextents<int32_t, 2>(M, count),
+                     array<int, 2>({1, int(a.p.y_stride)}));
+    cT.store(tD.slice(ra, rb));
+}
+#define MM_ID_KERNEL(NAME, BLOCK, NL, DEQ) \
+kernel void NAME(constant MoeMmArgs & a [[buffer(4)]], device const char * w [[buffer(0)]], \
+                 device const float * x [[buffer(1)]], device const uint * offsets [[buffer(2)]], \
+                 device float * y [[buffer(3)]], threadgroup half * sa [[threadgroup(0)]], \
+                 uint3 tgpig [[threadgroup_position_in_grid]], ushort tiitg [[thread_index_in_threadgroup]]) { \
+    mm_id_impl<BLOCK, NL, DEQ<half4x4>>(a, w, x, offsets, y, sa, tgpig, tiitg); \
+}
+MM_ID_KERNEL(h_mm_id_q4_k, block_q4_K, 16, dequantize_q4_K)
+MM_ID_KERNEL(h_mm_id_q5_k, block_q5_K, 16, dequantize_q5_K)
+MM_ID_KERNEL(h_mm_id_q6_k, block_q6_K, 16, dequantize_q6_K)
+MM_ID_KERNEL(h_mm_id_q8_0, block_q8_0, 2, dequantize_q8_0)
+MM_ID_KERNEL(h_mm_id_q4_0, block_q4_0, 2, dequantize_q4_0)
+MM_ID_KERNEL(h_mm_id_iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
+MM_ID_KERNEL(h_mm_id_iq3_s, block_iq3_s, 16, dequantize_iq3_s)
+
+// ---------------------------------------------------------------- flash attention
+
+struct FaArgs {
+    uint tokens;         // query tokens
+    uint heads;          // query heads
+    uint kv_heads;
+    uint group;          // heads / kv_heads
+    uint position;       // absolute position of query token 0
+    uint cache_stride;   // halfs between cached positions
+    uint keys_per_split;
+    uint splits;
+};
+
+// Causal attention over the F16 cache for query rows r = t*group + g of one
+// KV head. Each SIMD group owns 8 rows; keys stream in blocks of 32 with an
+// online softmax. Q arrives in F16, pre-scaled by 1/sqrt(head_dim). With one
+// split the result is normalized, multiplied by sigmoid(gate) and written to
+// `out`; otherwise unnormalized partials and (max, sum) go to `po`/`pml`.
+// grid (ceil(tokens*group / (8*NSG)), kv_heads, splits); threads 32*NSG.
+template<short NSG>
+void flash_attn_impl(constant FaArgs & p, device const half * q, device const half * kc,
+                     device const half * vc, device const float * qg,
+                     device float * out, device float * po, device float * pml,
+                     threadgroup half * shared, uint3 tgpig, ushort sg, ushort lane) {
+    constexpr int D = 256, DT = D / 8, C = 32;
+    threadgroup half  * Qs = shared + sg * (8 * D);
+    threadgroup float * Ss = (threadgroup float *)(shared + NSG * 8 * D) + sg * (8 * C);
+    threadgroup half  * Ps = (threadgroup half *)((threadgroup float *)(shared + NSG * 8 * D) + NSG * 8 * C) + sg * (8 * C);
+    threadgroup float * Ds = (threadgroup float *)((threadgroup half *)((threadgroup float *)(shared + NSG * 8 * D) + NSG * 8 * C) + NSG * 8 * C) + sg * 64;
+
+    const uint kvh = tgpig.y;
+    const uint split = tgpig.z;
+    const uint rows_total = p.tokens * p.group;
+    const uint r0 = (tgpig.x * NSG + sg) * 8;
+    const uint total_keys = p.position + p.tokens;
+    // Stage this SIMD group's 8 query rows (zero beyond the valid rows).
+    for (uint i = lane; i < 8 * D; i += 32) {
+        const uint r = r0 + i / D, d = i % D;
+        half v = 0.h;
+        if (r < rows_total) {
+            const uint t = r / p.group, g = r % p.group;
+            v = q[((ulong)t * p.heads + kvh * p.group + g) * D + d];
+        }
+        Qs[i] = v;
+    }
+    simdgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 O[DT];
+    for (short i = 0; i < DT; i++) O[i] = make_filled_simdgroup_matrix<float, 8>(0.f);
+
+    const uint my_row = lane / 4;              // softmax: 4 lanes per row
+    const uint row = r0 + my_row;
+    const bool row_valid = row < rows_total;
+    const uint row_last_key = row_valid ? p.position + row / p.group : 0;
+    const uint sg_last_key = p.position + min(r0 + 7, rows_total - 1) / p.group;
+    float m = -INFINITY, l = 0.f;
+
+    const uint key_begin = split * p.keys_per_split;
+    const uint key_end = min(key_begin + p.keys_per_split, total_keys);
+    const ulong head_off = (ulong)kvh * D;
+    for (uint j0 = key_begin; j0 < key_end && j0 <= sg_last_key; j0 += C) {
+        simdgroup_float8x8 S[C / 8];
+        for (short kt = 0; kt < C / 8; kt++) S[kt] = make_filled_simdgroup_matrix<float, 8>(0.f);
+        for (short dt = 0; dt < DT; dt++) {
+            simdgroup_half8x8 qa;
+            simdgroup_load(qa, Qs + dt * 8, D);
+            for (short kt = 0; kt < C / 8; kt++) {
+                simdgroup_half8x8 kb;
+                simdgroup_load(kb, kc + (ulong)(j0 + kt * 8) * p.cache_stride + head_off + dt * 8,
+                               p.cache_stride, ulong2(0), true);
+                simdgroup_multiply_accumulate(S[kt], qa, kb, S[kt]);
+            }
+        }
+        for (short kt = 0; kt < C / 8; kt++) simdgroup_store(S[kt], Ss + kt * 8, C);
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        // Online softmax: lane owns row my_row, columns (lane%4)*8 .. +8.
+        const uint c0 = (lane % 4) * 8;
+        float s[8];
+        float mx = -INFINITY;
+        for (short c = 0; c < 8; c++) {
+            const uint key = j0 + c0 + c;
+            const bool ok = row_valid && key < key_end && key <= row_last_key;
+            s[c] = ok ? Ss[my_row * C + c0 + c] : -INFINITY;
+            mx = max(mx, s[c]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        mx = max(mx, simd_shuffle_xor(mx, 2));
+        const float m_new = max(m, mx);
+        const float corr = m_new == -INFINITY ? 1.f : exp(m - m_new);
+        float sum = 0.f;
+        for (short c = 0; c < 8; c++) {
+            const float e = m_new == -INFINITY ? 0.f : exp(s[c] - m_new);
+            sum += e;
+            Ps[my_row * C + c0 + c] = half(e);
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        sum += simd_shuffle_xor(sum, 2);
+        l = l * corr + sum;
+        m = m_new;
+        // Diagonal rescale of the running output.
+        for (uint i = lane; i < 64; i += 32) Ds[i] = 0.f;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane % 4 == 0) Ds[my_row * 9] = corr;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 diag;
+        simdgroup_load(diag, Ds, 8);
+        for (short dt = 0; dt < DT; dt++) simdgroup_multiply(O[dt], diag, O[dt]);
+        // O += P V
+        simdgroup_half8x8 pa[C / 8];
+        for (short kt = 0; kt < C / 8; kt++) simdgroup_load(pa[kt], Ps + kt * 8, C);
+        for (short dt = 0; dt < DT; dt++) {
+            for (short kt = 0; kt < C / 8; kt++) {
+                simdgroup_half8x8 vb;
+                simdgroup_load(vb, vc + (ulong)(j0 + kt * 8) * p.cache_stride + head_off + dt * 8,
+                               p.cache_stride);
+                simdgroup_multiply_accumulate(O[dt], pa[kt], vb, O[dt]);
+            }
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (p.splits == 1) {
+        for (uint i = lane; i < 64; i += 32) Ds[i] = 0.f;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        if (lane % 4 == 0) Ds[my_row * 9] = l > 0.f ? 1.f / l : 0.f;
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        simdgroup_float8x8 diag;
+        simdgroup_load(diag, Ds, 8);
+        threadgroup float * Os = Ss;   // reuse: 8x8 staging
+        for (short dt = 0; dt < DT; dt++) {
+            simdgroup_multiply(O[dt], diag, O[dt]);
+            simdgroup_store(O[dt], Os, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < 64; i += 32) {
+                const uint r = r0 + i / 8;
+                if (r < rows_total) {
+                    const uint t = r / p.group, g = r % p.group, h = kvh * p.group + g;
+                    const uint d = dt * 8 + i % 8;
+                    const float gate = qg[((ulong)t * p.heads + h) * 2 * D + D + d];
+                    out[((ulong)t * p.heads + h) * D + d] = Os[i] / (1.f + exp(-gate));
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    } else {
+        threadgroup float * Os = Ss;
+        for (short dt = 0; dt < DT; dt++) {
+            simdgroup_store(O[dt], Os, 8);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < 64; i += 32) {
+                const uint r = r0 + i / 8;
+                if (r < rows_total) {
+                    const uint t = r / p.group, g = r % p.group, h = kvh * p.group + g;
+                    const ulong grow = (ulong)split * p.tokens * p.heads + (ulong)t * p.heads + h;
+                    po[grow * D + dt * 8 + i % 8] = Os[i];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (lane % 4 == 0 && row_valid) {
+            const uint t = row / p.group, g = row % p.group, h = kvh * p.group + g;
+            const ulong grow = (ulong)split * p.tokens * p.heads + (ulong)t * p.heads + h;
+            pml[grow * 2] = m;
+            pml[grow * 2 + 1] = l;
+        }
+    }
+}
+
+kernel void h_flash_attn_4(constant FaArgs & p [[buffer(7)]],
+                           device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],
+                           device const half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],
+                           device float * out [[buffer(4)]], device float * po [[buffer(5)]],
+                           device float * pml [[buffer(6)]], threadgroup half * shared [[threadgroup(0)]],
+                           uint3 tgpig [[threadgroup_position_in_grid]],
+                           ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    flash_attn_impl<4>(p, q, kc, vc, qg, out, po, pml, shared, tgpig, sg, lane);
+}
+kernel void h_flash_attn_1(constant FaArgs & p [[buffer(7)]],
+                           device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],
+                           device const half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],
+                           device float * out [[buffer(4)]], device float * po [[buffer(5)]],
+                           device float * pml [[buffer(6)]], threadgroup half * shared [[threadgroup(0)]],
+                           uint3 tgpig [[threadgroup_position_in_grid]],
+                           ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    flash_attn_impl<1>(p, q, kc, vc, qg, out, po, pml, shared, tgpig, sg, lane);
+}
+
+// Merge split partials: one threadgroup of head_dim threads per (token, head).
+kernel void h_flash_reduce(constant FaArgs & p [[buffer(4)]],
+                           device const float * po [[buffer(0)]], device const float * pml [[buffer(1)]],
+                           device const float * qg [[buffer(2)]], device float * out [[buffer(3)]],
+                           uint row [[threadgroup_position_in_grid]], ushort d [[thread_index_in_threadgroup]]) {
+    constexpr uint D = 256;
+    const ulong rows = (ulong)p.tokens * p.heads;
+    float mx = -INFINITY;
+    for (uint s = 0; s < p.splits; s++) mx = max(mx, pml[(s * rows + row) * 2]);
+    float l = 0.f, acc = 0.f;
+    for (uint s = 0; s < p.splits; s++) {
+        const float ms = pml[(s * rows + row) * 2];
+        if (ms == -INFINITY) continue;
+        const float w = exp(ms - mx);
+        l += w * pml[(s * rows + row) * 2 + 1];
+        acc += w * po[(s * rows + row) * D + d];
+    }
+    const uint t = row / p.heads, h = row % p.heads;
+    const float gate = qg[((ulong)t * p.heads + h) * 2 * D + D + d];
+    out[(ulong)row * D + d] = (l > 0.f ? acc / l : 0.f) / (1.f + exp(-gate));
 }

@@ -1,7 +1,11 @@
 //! Compare Ferrum's hybrid-engine logits with a llama.cpp
 //! `llama-perplexity --kl-divergence-base` file for the same GGUF.
 //!
-//! usage: hybrid_kld MODEL.gguf BASE.kld [max_chunks]
+//! usage: hybrid_kld MODEL.gguf BASE.kld [max_chunks] [--write OUT.kld]
+//!
+//! With `--write`, Ferrum's own logits for the base file's tokens are also
+//! written in the same format, so llama-perplexity (or this tool) can be
+//! scored against a Ferrum reference, e.g. one run with FERRUM_HYBRID_EXACT=1.
 //!
 //! For every chunk the model starts from an empty state and scores positions
 //! n_ctx/2 .. n_ctx-2 exactly as llama-perplexity does. Reports Ferrum and
@@ -23,6 +27,10 @@ fn main() -> Result<()> {
     let max_chunks: usize = args
         .get(3)
         .map_or(usize::MAX, |v| v.parse().expect("chunk count"));
+    let write_path = args
+        .iter()
+        .position(|a| a == "--write")
+        .map(|i| args[i + 1].clone());
     let mut f = std::fs::File::open(&args[2]).expect("open base file");
     let mut bytes = Vec::new();
     f.read_to_end(&mut bytes).expect("read base file");
@@ -54,8 +62,20 @@ fn main() -> Result<()> {
     let (mut nll, mut nll_base, mut kld_sum, mut same_top, mut count) =
         (0f64, 0f64, 0f64, 0usize, 0usize);
     let mut klds = Vec::new();
+    let chunks_used = n_chunk.min(max_chunks);
+    let mut written = write_path.as_ref().map(|_| {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"_logits_");
+        out.extend_from_slice(&(n_ctx as u32).to_le_bytes());
+        out.extend_from_slice(&(n_vocab as u32).to_le_bytes());
+        out.extend_from_slice(&(chunks_used as u32).to_le_bytes());
+        for t in &tokens[..chunks_used * n_ctx] {
+            out.extend_from_slice(&t.to_le_bytes());
+        }
+        out
+    });
     let start = std::time::Instant::now();
-    for chunk in 0..n_chunk.min(max_chunks) {
+    for chunk in 0..chunks_used {
         state.reset();
         let seq = &tokens[chunk * n_ctx..(chunk + 1) * n_ctx];
         let mut logits = Vec::with_capacity(n_ctx * n_vocab);
@@ -76,6 +96,29 @@ fn main() -> Result<()> {
                 .sum::<f64>()
                 .ln();
             let target = seq[pos + 1] as usize;
+            if let Some(out) = written.as_mut() {
+                // llama-perplexity's encoding: scale, min log-prob, then u16 per token.
+                let min_logit = row
+                    .iter()
+                    .copied()
+                    .fold(f32::INFINITY, f32::min)
+                    .max(max - 16.);
+                let min_log_prob = min_logit - max - log_sum as f32;
+                let scale = (max - min_logit) / 65535.;
+                out.extend_from_slice(&scale.to_le_bytes());
+                out.extend_from_slice(&min_log_prob.to_le_bytes());
+                for &x in row {
+                    let q = if scale > 0. && x > min_logit {
+                        ((x - min_logit) / scale).round() as u16
+                    } else {
+                        0
+                    };
+                    out.extend_from_slice(&q.to_le_bytes());
+                }
+                if n_vocab % 2 == 1 {
+                    out.extend_from_slice(&0u16.to_le_bytes());
+                }
+            }
             nll += log_sum - (row[target] - max) as f64;
             nll_base -= (scale * base_u16(target) as f32 + min_log_prob) as f64;
             let mut kl = 0f64;
@@ -111,6 +154,10 @@ fn main() -> Result<()> {
             kld_sum / count as f64,
             100. * same_top as f64 / count as f64
         );
+    }
+    if let (Some(path), Some(out)) = (&write_path, written) {
+        std::fs::write(path, out).expect("write base file");
+        eprintln!("wrote {path}");
     }
     klds.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pct = |p: f64| klds[((klds.len() - 1) as f64 * p) as usize];

@@ -40,3 +40,60 @@ allocated once.
 Swift 27B, raw prompt "The capital of France is", greedy: the 16 generated
 tokens match `llama-completion --temp 0` exactly. Decode 6.78 tok/s (148 ms
 median) before any tuning, versus llama.cpp's 5.98.
+
+### Correctness method
+
+`examples/hybrid_kld.rs` replays the token chunks of a `llama-perplexity
+--kl-divergence-base` file (512-token chunks, scoring positions 256–510 exactly
+as llama-perplexity does) and reports both perplexities, KL divergence
+(base ‖ Ferrum, with llama.cpp's −16 log-probability truncation) and top-1
+agreement. Corpus: Ferrum's own docs and Rust sources (prose plus code).
+With `--write` it emits Ferrum logits in the same format, so llama.cpp can be
+scored against a Ferrum reference.
+
+## Experiment 2 — Qwen3.5 MoE, flash attention, TensorOps precision
+
+- **MoE** (`qwen35moe`): GPU routing (softmax, top-8, renormalized weights,
+  sigmoid shared-expert gate). Decode uses per-route expert GEMVs indexed by
+  expert ID; prompts use a deterministic expert-major map, a gather, one
+  TensorOps GEMM per expert and a weighted combine. IQ3_S kernels added.
+- **TensorOps precision**: `relaxed_precision=false` made the F16-tile GEMMs
+  3.5× slower than llama.cpp's setting (`true`); switching matched both its
+  speed and its numerics (Swift KLD vs llama.cpp fell from 7e-6 to 4e-6).
+- **Flash attention**: simdgroup-matrix kernel with query rows packed per KV
+  group (GQA shares K/V loads), 32-key blocks with online softmax, the
+  sigmoid output gate applied on write, and split-K partials plus a reduce
+  kernel for few-row (decode) attention. A unit test checks it against the
+  reference kernel for 24/4 and 16/2 head layouts, split and unsplit.
+
+### Accuracy
+
+| Model | vs llama.cpp Metal (KLD / same top-1 / PPL ratio) |
+|---|---|
+| Swift 27B | 4e-6 / 99.85% / 1.0001 |
+| Tiel 35B-A3B | 0.0085 / 93.2% / 1.004 |
+
+Tiel's larger number is not a Ferrum error. Its expert routing matches
+llama.cpp in 39 of 40 layers on a probe prompt (the remaining layer swaps one
+near-tied expert); llama.cpp's own CPU backend scores KLD 0.020 / 88.9% top-1
+against its Metal backend. To measure fidelity rather than agreement, a
+high-precision Ferrum reference (`FERRUM_HYBRID_EXACT=1`: every projection on
+the F32-activation GEMV kernels) was written with `--write` and both runtimes
+were scored against it:
+
+| Tiel, vs exact reference (2,040 positions) | Mean KLD | Same top-1 |
+|---|---|---|
+| llama.cpp Metal | 0.01068 | 92.40% |
+| Ferrum | 0.01057 | 91.76% |
+
+Both fast runtimes sit equally far from the exact result; this model is
+sensitive to F16 GEMM rounding, and Ferrum loses nothing relative to llama.cpp.
+
+### Throughput (`examples/hybrid_bench.rs`, llama-bench semantics)
+
+| Model | pp512 | pp2048 | tg |
+|---|---|---|---|
+| Swift 27B Ferrum | 171.9 | 158.0 | 6.29 (tg64) |
+| Swift 27B llama.cpp | 149.8 | 142.3 | 5.98 |
+| Tiel 35B-A3B Ferrum | 634.3 | 577.0 | 34.82 (tg128) |
+| Tiel 35B-A3B llama.cpp | 802.9 | 768.9 | 35.77 |

@@ -2,7 +2,9 @@
 #![forbid(unsafe_code)]
 use super::{
     config::HybridConfig,
-    weights::{AttentionWeights, DeltaWeights, DenseFfn, Ffn, Format, Matrix, Mixer, Weights},
+    weights::{
+        AttentionWeights, DeltaWeights, DenseFfn, Ffn, Format, Matrix, Mixer, MoeFfn, Weights,
+    },
 };
 use crate::{DType, Error, MetalDevice, Result, Tensor, metal::MetalBuffer};
 use std::cell::RefCell;
@@ -47,6 +49,8 @@ impl HybridState {
             return Err(Error::Cache("context capacity must be positive".into()));
         }
         let kv_row = c.kv_heads * c.head_dim;
+        // Attention reads keys in blocks of 32; pad so a block never leaves storage.
+        let kv_rows = capacity.next_multiple_of(32);
         let mut state = Self {
             capacity,
             len: 0,
@@ -60,10 +64,10 @@ impl HybridState {
             if c.is_attention(layer) {
                 state
                     .k
-                    .push(Some(Tensor::zeros(d, [capacity, kv_row], DType::F16)?));
+                    .push(Some(Tensor::zeros(d, [kv_rows, kv_row], DType::F16)?));
                 state
                     .v
-                    .push(Some(Tensor::zeros(d, [capacity, kv_row], DType::F16)?));
+                    .push(Some(Tensor::zeros(d, [kv_rows, kv_row], DType::F16)?));
                 state.conv.push(None);
                 state.ssm.push(None);
             } else {
@@ -117,6 +121,8 @@ struct Scratch {
     v: Tensor,
     q: Tensor,
     att: Tensor,
+    attn_partial: Tensor,
+    attn_ml: Tensor,
     qkv: Tensor,
     z: Tensor,
     alpha: Tensor,
@@ -131,6 +137,44 @@ struct Scratch {
     ffn_act: Tensor,
     logits: Tensor,
     token: Tensor,
+    moe: Option<MoeScratch>,
+}
+
+/// Routing and expert buffers for `chunk * experts_used` routes.
+struct MoeScratch {
+    logits: Tensor,
+    ids: Tensor,
+    weights: Tensor,
+    shared_gate: Tensor,
+    offsets: Tensor,
+    sorted: Tensor,
+    position: Tensor,
+    xg: Tensor,
+    gate: Tensor,
+    up: Tensor,
+    act: Tensor,
+    down: Tensor,
+    shared: Tensor,
+}
+
+impl MoeScratch {
+    fn tensors(&self) -> [&Tensor; 13] {
+        [
+            &self.logits,
+            &self.ids,
+            &self.weights,
+            &self.shared_gate,
+            &self.offsets,
+            &self.sorted,
+            &self.position,
+            &self.xg,
+            &self.gate,
+            &self.up,
+            &self.act,
+            &self.down,
+            &self.shared,
+        ]
+    }
 }
 
 impl Scratch {
@@ -148,8 +192,10 @@ impl Scratch {
             qg: f(&[chunk, 2 * c.heads * c.head_dim])?,
             k: f(&[chunk, c.kv_heads * c.head_dim])?,
             v: f(&[chunk, c.kv_heads * c.head_dim])?,
-            q: f(&[chunk, c.heads * c.head_dim])?,
+            q: Tensor::zeros(d, [chunk, c.heads * c.head_dim], DType::F16)?,
             att: f(&[chunk, c.heads * c.head_dim])?,
+            attn_partial: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim])?,
+            attn_ml: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * 2])?,
             qkv: f(&[chunk, c.conv_channels()])?,
             z: f(&[chunk, c.ssm_value_dim()])?,
             alpha: f(&[chunk, c.ssm_v_heads])?,
@@ -164,6 +210,27 @@ impl Scratch {
             ffn_act: f(&[chunk, ffn])?,
             logits: f(&[logit_rows, c.vocab])?,
             token: f(&[1])?,
+            moe: match c.moe {
+                None => None,
+                Some(moe) => {
+                    let routes = chunk * moe.experts_used;
+                    Some(MoeScratch {
+                        logits: f(&[chunk, moe.experts])?,
+                        ids: f(&[routes])?,
+                        weights: f(&[routes])?,
+                        shared_gate: f(&[chunk])?,
+                        offsets: f(&[moe.experts + 1])?,
+                        sorted: f(&[routes])?,
+                        position: f(&[routes])?,
+                        xg: f(&[routes, c.hidden])?,
+                        gate: f(&[routes, moe.expert_ffn])?,
+                        up: f(&[routes, moe.expert_ffn])?,
+                        act: f(&[routes, moe.expert_ffn])?,
+                        down: f(&[routes, c.hidden])?,
+                        shared: f(&[chunk, c.hidden])?,
+                    })
+                }
+            },
         })
     }
     fn byte_size(&self) -> usize {
@@ -177,6 +244,8 @@ impl Scratch {
             &self.v,
             &self.q,
             &self.att,
+            &self.attn_partial,
+            &self.attn_ml,
             &self.qkv,
             &self.z,
             &self.alpha,
@@ -194,7 +263,11 @@ impl Scratch {
         ]
         .iter()
         .map(|t| t.byte_size())
-        .sum()
+        .sum::<usize>()
+            + self
+                .moe
+                .as_ref()
+                .map_or(0, |m| m.tensors().iter().map(|t| t.byte_size()).sum())
     }
 }
 
@@ -365,10 +438,10 @@ impl HybridModel {
             std::mem::swap(&mut cur, &mut next);
             match &layer.ffn {
                 Ffn::Dense(f) => self.dense_ffn(d, &s, f, &xn, &mix, m)?,
-                Ffn::Moe(_) => {
-                    return Err(Error::Config(
-                        "MoE feed-forward is not implemented yet".into(),
-                    ));
+                Ffn::Moe(f) => {
+                    self.dump(d, "attn_post_norm", i, &xn)?;
+                    self.moe_ffn(d, &s, f, &xn, &mix, m)?;
+                    self.dump(d, "ffn_out", i, &mix)?;
                 }
             }
             let norm = self
@@ -378,6 +451,7 @@ impl HybridModel {
                 .map_or(&self.weights.output_norm, |l| &l.attn_norm);
             self.add_rmsnorm(d, cur, &mix, norm, next, &xn, m)?;
             std::mem::swap(&mut cur, &mut next);
+            self.dump(d, "l_out", i, cur)?;
         }
         // xn now holds output_norm(final hidden) for every position.
         let produced = if let Some(all) = all_logits {
@@ -437,7 +511,7 @@ impl HybridModel {
         let qg = rows(&s.qg, 0, m, 2 * q_width)?;
         let k = rows(&s.k, 0, m, kv_width)?;
         let v = rows(&s.v, 0, m, kv_width)?;
-        let q = rows(&s.q, 0, m, q_width)?;
+        let q = s.q.view(0, [m, q_width])?;
         let att = rows(&s.att, 0, m, q_width)?;
         self.project(d, &a.q, xn, m, &qg)?;
         self.project(d, &a.k, xn, m, &k)?;
@@ -457,7 +531,8 @@ impl HybridModel {
             .u(pos)?
             .f(c.rope_theta)
             .f(c.eps)
-            .u(kv_width)?;
+            .u(kv_width)?
+            .f(1. / (c.head_dim as f32).sqrt());
         d.dispatch_hybrid(
             "h_attn_prep",
             &[
@@ -482,24 +557,99 @@ impl HybridModel {
             [256, 1, 1],
             0,
         )?;
+        self.dump(d, "Qcur_full", layer, &qg)?;
+        self.dump(d, "Kcur", layer, &k)?;
+        self.dump(d, "Vcur", layer, &v)?;
+        self.flash_attention(d, s, &q, kc, vc, &qg, &att, m, pos)?;
+        self.dump(d, "attn_gated", layer, &att)?;
+        self.project(d, &a.o, &att, m, out)?;
+        self.dump(d, "attn_output", layer, out)
+    }
+
+    /// Causal attention of `m` new queries against the cache, gated by
+    /// sigmoid(gate) from `qg`, written to `att`.
+    #[allow(clippy::too_many_arguments)]
+    fn flash_attention(
+        &self,
+        d: &MetalDevice,
+        s: &Scratch,
+        q: &Tensor,
+        kc: &Tensor,
+        vc: &Tensor,
+        qg: &Tensor,
+        att: &Tensor,
+        m: usize,
+        pos: usize,
+    ) -> Result<()> {
+        let c = &self.config;
+        let group = c.heads / c.kv_heads;
+        let rows = m * group;
+        let keys = pos + m;
+        if std::env::var_os("FERRUM_HYBRID_REFERENCE_ATTENTION").is_some() {
+            let args = Params::default()
+                .u(m)?
+                .u(c.heads)?
+                .u(c.kv_heads)?
+                .u(c.head_dim)?
+                .u(pos)?
+                .u(c.kv_heads * c.head_dim)?
+                .f(1.);
+            return d.dispatch_hybrid(
+                "h_attention",
+                &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                &[att.binding()],
+                &args.0,
+                [c.heads, m, 1],
+                [c.head_dim, 1, 1],
+                0,
+            );
+        }
+        let simds = if rows <= 8 { 1 } else { 4 };
+        let row_blocks = rows.div_ceil(8 * simds);
+        // Split long key ranges across threadgroups when few query rows exist.
+        let splits = if m * c.heads <= MAX_SPLIT_ROWS {
+            let wanted = (64 / (row_blocks * c.kv_heads)).max(1);
+            wanted.min(keys.div_ceil(256)).clamp(1, MAX_SPLITS)
+        } else {
+            1
+        };
+        let keys_per_split = keys.div_ceil(splits).next_multiple_of(32);
+        let splits = keys.div_ceil(keys_per_split);
         let args = Params::default()
             .u(m)?
             .u(c.heads)?
             .u(c.kv_heads)?
-            .u(c.head_dim)?
+            .u(group)?
             .u(pos)?
-            .u(kv_width)?
-            .f(1. / (c.head_dim as f32).sqrt());
+            .u(c.kv_heads * c.head_dim)?
+            .u(keys_per_split)?
+            .u(splits)?
+            .0;
         d.dispatch_hybrid(
-            "h_attention",
+            if simds == 1 {
+                "h_flash_attn_1"
+            } else {
+                "h_flash_attn_4"
+            },
             &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
-            &[att.binding()],
-            &args.0,
-            [c.heads, m, 1],
-            [c.head_dim, 1, 1],
-            0,
+            &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
+            &args,
+            [row_blocks, c.kv_heads, splits],
+            [32 * simds, 1, 1],
+            simds * 5888,
         )?;
-        self.project(d, &a.o, &att, m, out)
+        if splits > 1 {
+            d.dispatch_hybrid(
+                "h_flash_reduce",
+                &[s.attn_partial.binding(), s.attn_ml.binding(), qg.binding()],
+                &[att.binding()],
+                &args,
+                [m * c.heads, 1, 1],
+                [c.head_dim, 1, 1],
+                0,
+            )?;
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -527,10 +677,15 @@ impl HybridModel {
         let conv = rows(&s.conv, 0, m, channels)?;
         let delta = rows(&s.delta, 0, m, vd)?;
         let gated = rows(&s.gated, 0, m, vd)?;
+        self.dump(d, "attn_norm", layer, xn)?;
         self.project(d, &w.qkv, xn, m, &qkv)?;
         self.project(d, &w.z, xn, m, &z)?;
         self.project(d, &w.alpha, xn, m, &alpha)?;
         self.project(d, &w.beta, xn, m, &beta)?;
+        self.dump(d, "linear_attn_qkv_mixed", layer, &qkv)?;
+        self.dump(d, "z", layer, &z)?;
+        self.dump(d, "alpha", layer, &alpha)?;
+        self.dump(d, "beta", layer, &beta)?;
         d.dispatch_hybrid(
             "h_gdn_gates",
             &[
@@ -583,6 +738,7 @@ impl HybridModel {
             [32, NSG, 1],
             0,
         )?;
+        self.dump(d, "attn_output", layer, &delta)?;
         d.dispatch_hybrid(
             "h_gated_rmsnorm",
             &[delta.binding(), z.binding(), w.norm.binding()],
@@ -592,7 +748,210 @@ impl HybridModel {
             [c.ssm_head_dim, 1, 1],
             0,
         )?;
-        self.project(d, &w.out, &gated, m, out)
+        self.dump(d, "final_output", layer, &gated)?;
+        self.project(d, &w.out, &gated, m, out)?;
+        self.dump(d, "linear_attn_out", layer, out)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn moe_ffn(
+        &self,
+        d: &MetalDevice,
+        s: &Scratch,
+        f: &MoeFfn,
+        xn: &Tensor,
+        out: &Tensor,
+        m: usize,
+    ) -> Result<()> {
+        let c = &self.config;
+        let moe = c.moe.expect("MoE layer has expert geometry");
+        let ms = s.moe.as_ref().expect("MoE model has MoE scratch");
+        let (experts, used, hidden, ef) = (moe.experts, moe.experts_used, c.hidden, moe.expert_ffn);
+        let routes = m * used;
+        let logits = rows(&ms.logits, 0, m, experts)?;
+        let ids = ms.ids.view(0, [routes])?;
+        let weights = ms.weights.view(0, [routes])?;
+        let shared_gate = ms.shared_gate.view(0, [m])?;
+        let shared = rows(&ms.shared, 0, m, hidden)?;
+        let gate = rows(&ms.gate, 0, routes, ef)?;
+        let up = rows(&ms.up, 0, routes, ef)?;
+        let act = rows(&ms.act, 0, routes, ef)?;
+        let down = rows(&ms.down, 0, routes, hidden)?;
+        self.project(d, &f.router, xn, m, &logits)?;
+        d.dispatch_hybrid(
+            "h_moe_route",
+            &[logits.binding(), xn.binding(), f.shared_gate_inp.binding()],
+            &[ids.binding(), weights.binding(), shared_gate.binding()],
+            &Params::default().u(experts)?.u(used)?.u(hidden)?.u(m)?.0,
+            [m, 1, 1],
+            [experts, 1, 1],
+            0,
+        )?;
+        self.dense_ffn(d, s, &f.shared, xn, &shared, m)?;
+        if std::env::var_os("FERRUM_HYBRID_DUMP").is_some() {
+            d.synchronize()?;
+            let picked: Vec<u32> = ids.to_f32().iter().map(|v| v.to_bits()).collect();
+            eprintln!(
+                "dump ffn_moe_topk: sum {} ids {:?}",
+                picked.iter().map(|&v| v as u64).sum::<u64>(),
+                picked
+            );
+        }
+        self.dump(d, "ffn_moe_logits", 0, &logits)?;
+        self.dump(d, "ffn_moe_weights", 0, &weights)?;
+        self.dump(d, "ffn_shexp", 0, &shared)?;
+        self.dump(d, "shared_expert_gate_sigmoid", 0, &shared_gate)?;
+        let identity = routes <= MV_ID_MAX_ROUTES || exact_math();
+        if identity {
+            self.project_id(d, &f.gate_exps, xn, &ids, routes, used, &gate)?;
+            self.project_id(d, &f.up_exps, xn, &ids, routes, used, &up)?;
+            self.swiglu(d, &gate, &up, &act)?;
+            self.project_id(d, &f.down_exps, &act, &ids, routes, 1, &down)?;
+        } else {
+            let offsets = ms.offsets.view(0, [experts + 1])?;
+            let sorted = ms.sorted.view(0, [routes])?;
+            let position = ms.position.view(0, [routes])?;
+            let xg = rows(&ms.xg, 0, routes, hidden)?;
+            d.dispatch_hybrid(
+                "h_moe_map",
+                &[ids.binding()],
+                &[offsets.binding(), sorted.binding(), position.binding()],
+                &Params::default().u(experts)?.u(routes)?.0,
+                [1, 1, 1],
+                [experts.min(1024), 1, 1],
+                0,
+            )?;
+            d.dispatch_hybrid(
+                "h_moe_gather",
+                &[xn.binding(), sorted.binding()],
+                &[xg.binding()],
+                &Params::default().u(hidden)?.u(used)?.u(routes)?.0,
+                [hidden.div_ceil(256), routes, 1],
+                [256, 1, 1],
+                0,
+            )?;
+            self.project_mm_id(d, &f.gate_exps, &xg, &offsets, m, &gate)?;
+            self.project_mm_id(d, &f.up_exps, &xg, &offsets, m, &up)?;
+            self.swiglu(d, &gate, &up, &act)?;
+            self.project_mm_id(d, &f.down_exps, &act, &offsets, m, &down)?;
+        }
+        let position = ms.position.view(0, [routes])?;
+        d.dispatch_hybrid(
+            "h_moe_combine",
+            &[
+                down.binding(),
+                weights.binding(),
+                if identity {
+                    ids.binding()
+                } else {
+                    position.binding()
+                },
+                shared.binding(),
+                shared_gate.binding(),
+            ],
+            &[out.binding()],
+            &Params::default()
+                .u(hidden)?
+                .u(used)?
+                .u(m)?
+                .u(usize::from(identity))?
+                .0,
+            [(m * hidden).div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+        )
+    }
+
+    fn swiglu(&self, d: &MetalDevice, gate: &Tensor, up: &Tensor, out: &Tensor) -> Result<()> {
+        let n = gate.numel();
+        d.dispatch_hybrid(
+            "h_swiglu",
+            &[gate.binding(), up.binding()],
+            &[out.binding()],
+            &Params::default().u(n)?.0,
+            [n.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+        )
+    }
+
+    /// Expert GEMV: route r multiplies activation row r / x_div by expert ids[r].
+    #[allow(clippy::too_many_arguments)]
+    fn project_id(
+        &self,
+        d: &MetalDevice,
+        w: &Matrix,
+        x: &Tensor,
+        ids: &Tensor,
+        routes: usize,
+        x_div: usize,
+        y: &Tensor,
+    ) -> Result<()> {
+        let rows_e = w.expert_rows();
+        if y.numel() != routes * rows_e || x.numel() * x_div != routes * w.cols {
+            return Err(Error::Shape("expert projection geometry".into()));
+        }
+        let args = Params::default()
+            .u(w.cols)?
+            .u(rows_e)?
+            .u(routes)?
+            .u(w.row_bytes)?
+            .u(w.cols)?
+            .u(rows_e)?
+            .u(rows_e)?
+            .u(x_div)?
+            .0;
+        let (name, rows_per_group, simds, shared) = mv_kernel(w.format, true);
+        d.dispatch_hybrid(
+            name,
+            &[w.binding(), x.binding(), ids.binding()],
+            &[y.binding()],
+            &args,
+            [rows_e.div_ceil(rows_per_group), routes, 1],
+            [32, simds, 1],
+            shared,
+        )
+    }
+
+    /// Expert GEMM over expert-sorted rows delimited by `offsets`.
+    fn project_mm_id(
+        &self,
+        d: &MetalDevice,
+        w: &Matrix,
+        x: &Tensor,
+        offsets: &Tensor,
+        max_rows: usize,
+        y: &Tensor,
+    ) -> Result<()> {
+        let rows_e = w.expert_rows();
+        let args = Params::default()
+            .u(w.cols)?
+            .u(rows_e)?
+            .u(0)?
+            .u(w.row_bytes)?
+            .u(w.cols)?
+            .u(rows_e)?
+            .u(rows_e)?
+            .0;
+        let name = match w.format {
+            Format::Q4K => "h_mm_id_q4_k",
+            Format::Q5K => "h_mm_id_q5_k",
+            Format::Q6K => "h_mm_id_q6_k",
+            Format::Q8_0 => "h_mm_id_q8_0",
+            Format::Q4_0 => "h_mm_id_q4_0",
+            Format::Iq4Xs => "h_mm_id_iq4_xs",
+            Format::Iq3S => "h_mm_id_iq3_s",
+            Format::F32 => return Err(Error::Gguf("F32 experts are unsupported".into())),
+        };
+        d.dispatch_hybrid(
+            name,
+            &[w.binding(), x.binding(), offsets.binding()],
+            &[y.binding()],
+            &args,
+            [max_rows.div_ceil(128), rows_e.div_ceil(64), w.experts],
+            [128, 1, 1],
+            64 * 32 * 2,
+        )
     }
 
     fn dense_ffn(
@@ -620,6 +979,21 @@ impl HybridModel {
             0,
         )?;
         self.project(d, &f.down, &act, m, out)
+    }
+
+    /// Debug aid (`FERRUM_HYBRID_DUMP=1`): complete queued work and print the
+    /// sum of `t`, named like llama.cpp's eval-callback tensors.
+    fn dump(&self, d: &MetalDevice, name: &str, layer: usize, t: &Tensor) -> Result<()> {
+        if std::env::var_os("FERRUM_HYBRID_DUMP").is_some() {
+            d.synchronize()?;
+            let values = t.to_f32();
+            let sum: f64 = values.iter().map(|&v| v as f64).sum();
+            eprintln!(
+                "dump {name}-{layer}: sum {sum:.6} first {:?}",
+                &values[..values.len().min(4)]
+            );
+        }
+        Ok(())
     }
 
     fn fill_zero(&self, d: &MetalDevice, t: &Tensor) -> Result<()> {
@@ -715,7 +1089,7 @@ impl HybridModel {
             .0;
         let inputs: [Binding; 2] = [w.binding(), x.binding()];
         let outputs: [Binding; 1] = [y.binding()];
-        if m > MV_MAX_ROWS {
+        if m > MV_MAX_ROWS && !exact_math() {
             let name = match w.format {
                 Format::Q4K => "h_mm_q4_k",
                 Format::Q5K => "h_mm_q5_k",
@@ -736,17 +1110,7 @@ impl HybridModel {
                 64 * 32 * 2,
             );
         }
-        // (kernel, output rows per threadgroup, SIMD groups, threadgroup bytes)
-        let (name, rows_per_group, simds, shared) = match w.format {
-            Format::Q4K => ("h_mv_q4_k", 4, 2, 0),
-            Format::Q5K => ("h_mv_q5_k", 2, 2, 0),
-            Format::Q6K => ("h_mv_q6_k", 4, 2, 0),
-            Format::Q4_0 => ("h_mv_q4_0", 8, 2, 0),
-            Format::F32 => ("h_mv_f32", 8, 2, 0),
-            Format::Q8_0 => ("h_mv_q8_0", 2, 4, 32 * 2 * 4),
-            Format::Iq4Xs => ("h_mv_iq4_xs", 4, 2, 32 * 4),
-            Format::Iq3S => ("h_mv_iq3_s", 8, 2, 512 * 4),
-        };
+        let (name, rows_per_group, simds, shared) = mv_kernel(w.format, false);
         d.dispatch_hybrid(
             name,
             &inputs,
@@ -759,5 +1123,187 @@ impl HybridModel {
     }
 }
 
+/// `FERRUM_HYBRID_EXACT=1`: every projection uses the F32-activation GEMV
+/// kernels (no F16 GEMM tiles). Slow; a high-precision reference for evaluation.
+fn exact_math() -> bool {
+    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *EXACT.get_or_init(|| std::env::var_os("FERRUM_HYBRID_EXACT").is_some_and(|v| v != "0"))
+}
+
+/// Most key splits for few-row attention, and (token, head) rows they may cover.
+const MAX_SPLITS: usize = 64;
+const MAX_SPLIT_ROWS: usize = 64;
 /// Activation rows at or below which projections use the GEMV kernels.
 const MV_MAX_ROWS: usize = 4;
+/// Expert routes at or below which experts use per-route GEMVs.
+const MV_ID_MAX_ROUTES: usize = 32;
+
+/// GEMV kernel, output rows per threadgroup, SIMD groups, threadgroup bytes.
+fn mv_kernel(format: Format, expert: bool) -> (&'static str, usize, usize, usize) {
+    let pick = |plain, id| if expert { id } else { plain };
+    match format {
+        Format::Q4K => (pick("h_mv_q4_k", "h_mv_id_q4_k"), 4, 2, 0),
+        Format::Q5K => (pick("h_mv_q5_k", "h_mv_id_q5_k"), 2, 2, 0),
+        Format::Q6K => (pick("h_mv_q6_k", "h_mv_id_q6_k"), 4, 2, 0),
+        Format::Q4_0 => (pick("h_mv_q4_0", "h_mv_id_q4_0"), 8, 2, 0),
+        Format::F32 => ("h_mv_f32", 8, 2, 0),
+        Format::Q8_0 => (pick("h_mv_q8_0", "h_mv_id_q8_0"), 2, 4, 32 * 2 * 4),
+        Format::Iq4Xs => (pick("h_mv_iq4_xs", "h_mv_id_iq4_xs"), 4, 2, 32 * 4),
+        Format::Iq3S => (pick("h_mv_iq3_s", "h_mv_id_iq3_s"), 8, 2, 512 * 4),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn random(n: usize, seed: u64) -> Vec<f32> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        (0..n)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                ((x >> 40) as f32 / (1u64 << 24) as f32) * 2. - 1.
+            })
+            .collect()
+    }
+
+    /// Flash attention (both SIMD-group shapes, split and unsplit) against the
+    /// reference online-softmax kernel for several GQA geometries.
+    #[test]
+    fn flash_attention_matches_reference() {
+        let d = MetalDevice::new().unwrap();
+        let cases: [(usize, usize, usize, usize); 7] = [
+            (24, 4, 1, 0),
+            (24, 4, 1, 700),
+            (16, 2, 1, 300),
+            (16, 2, 5, 40),
+            (16, 2, 37, 0),
+            (24, 4, 37, 90),
+            (16, 2, 64, 128),
+        ];
+        for (heads, kv_heads, m, pos) in cases {
+            let dim = 256;
+            let stride = kv_heads * dim;
+            let keys = pos + m;
+            let cap = keys.next_multiple_of(32);
+            let q = Tensor::from_f32(
+                &d,
+                [m, heads * dim],
+                DType::F16,
+                &random(m * heads * dim, 1)
+                    .iter()
+                    .map(|v| v / 16.)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let kc =
+                Tensor::from_f32(&d, [cap, stride], DType::F16, &random(cap * stride, 2)).unwrap();
+            let vc =
+                Tensor::from_f32(&d, [cap, stride], DType::F16, &random(cap * stride, 3)).unwrap();
+            let qg = Tensor::from_f32(
+                &d,
+                [m, 2 * heads * dim],
+                DType::F32,
+                &random(m * 2 * heads * dim, 4),
+            )
+            .unwrap();
+            let reference = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
+            let args = Params::default()
+                .u(m)
+                .unwrap()
+                .u(heads)
+                .unwrap()
+                .u(kv_heads)
+                .unwrap()
+                .u(dim)
+                .unwrap()
+                .u(pos)
+                .unwrap()
+                .u(stride)
+                .unwrap()
+                .f(1.);
+            {
+                let e = d.execution_with_shared_encoder(true).unwrap();
+                d.dispatch_hybrid(
+                    "h_attention",
+                    &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                    &[reference.binding()],
+                    &args.0,
+                    [heads, m, 1],
+                    [dim, 1, 1],
+                    0,
+                )
+                .unwrap();
+                e.finish().unwrap();
+            }
+            let expected = reference.to_f32();
+            let group = heads / kv_heads;
+            for simds in [1usize, 4] {
+                for splits_wanted in [1usize, 3] {
+                    let out = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
+                    let partial = Tensor::zeros(&d, [3 * m * heads * dim], DType::F32).unwrap();
+                    let ml = Tensor::zeros(&d, [3 * m * heads * 2], DType::F32).unwrap();
+                    let kps = keys.div_ceil(splits_wanted).next_multiple_of(32);
+                    let splits = keys.div_ceil(kps);
+                    let fa = Params::default()
+                        .u(m)
+                        .unwrap()
+                        .u(heads)
+                        .unwrap()
+                        .u(kv_heads)
+                        .unwrap()
+                        .u(group)
+                        .unwrap()
+                        .u(pos)
+                        .unwrap()
+                        .u(stride)
+                        .unwrap()
+                        .u(kps)
+                        .unwrap()
+                        .u(splits)
+                        .unwrap();
+                    let e = d.execution_with_shared_encoder(true).unwrap();
+                    d.dispatch_hybrid(
+                        if simds == 1 {
+                            "h_flash_attn_1"
+                        } else {
+                            "h_flash_attn_4"
+                        },
+                        &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                        &[out.binding(), partial.binding(), ml.binding()],
+                        &fa.0,
+                        [(m * group).div_ceil(8 * simds), kv_heads, splits],
+                        [32 * simds, 1, 1],
+                        simds * 5888,
+                    )
+                    .unwrap();
+                    if splits > 1 {
+                        d.dispatch_hybrid(
+                            "h_flash_reduce",
+                            &[partial.binding(), ml.binding(), qg.binding()],
+                            &[out.binding()],
+                            &fa.0,
+                            [m * heads, 1, 1],
+                            [dim, 1, 1],
+                            0,
+                        )
+                        .unwrap();
+                    }
+                    e.finish().unwrap();
+                    let got = out.to_f32();
+                    let worst = got
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        worst < 2e-3,
+                        "heads {heads}/{kv_heads} m {m} pos {pos} simds {simds} splits {splits}: max error {worst}"
+                    );
+                }
+            }
+        }
+    }
+}

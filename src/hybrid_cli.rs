@@ -68,8 +68,28 @@ fn ms(d: Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
+fn print_profile(label: &str, profile: ferrum::metal::Profile) {
+    let mut entries: Vec<_> = profile.into_iter().collect();
+    entries.sort_by(|a, b| b.1.gpu.cmp(&a.1.gpu));
+    let total: Duration = entries.iter().map(|(_, e)| e.gpu).sum();
+    eprintln!("{label}: GPU {:.2} ms total", ms(total));
+    for (name, e) in entries.iter().take(24) {
+        eprintln!(
+            "  {name:<22} {:>6} calls {:>9.3} ms  {:>5.1}%",
+            e.calls,
+            ms(e.gpu),
+            100. * e.gpu.as_secs_f64() / total.as_secs_f64().max(1e-12)
+        );
+    }
+}
+
 pub fn run(d: &MetalDevice) -> Result<()> {
     let o = parse()?;
+    let profile = std::env::var("FERRUM_HYBRID_PROFILE").is_ok_and(|v| v != "0");
+    if profile {
+        // One command buffer per kernel so each dispatch has its own GPU time.
+        d.set_batch_limit(1)?;
+    }
     let loaded = hybrid::load(d, &o.model, o.chunk, 1)?;
     let model = &loaded.model;
     let c = &model.config;
@@ -103,12 +123,17 @@ pub fn run(d: &MetalDevice) -> Result<()> {
     );
     for round in 0..o.repeat {
         state.reset();
+        d.set_profiling(profile && round + 1 == o.repeat);
+        d.take_profile();
         let start = Instant::now();
         let Produced::Token(mut token) = model.forward(d, &mut state, &prompt, Output::Argmax)?
         else {
             unreachable!("argmax output yields a token")
         };
         let prefill = start.elapsed();
+        if profile && round + 1 == o.repeat {
+            print_profile("prefill", d.take_profile());
+        }
         let mut generated = vec![token];
         let mut steps = Vec::new();
         let mut stream = loaded.tokenizer.decode_stream();
@@ -140,6 +165,9 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             }
         }
         println!();
+        if profile && round + 1 == o.repeat && !steps.is_empty() {
+            print_profile(&format!("decode ({} steps)", steps.len()), d.take_profile());
+        }
         let decode: Duration = steps.iter().sum();
         let mut sorted = steps.clone();
         sorted.sort();

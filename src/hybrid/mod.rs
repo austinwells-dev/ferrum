@@ -54,6 +54,13 @@ pub fn load(
     })
 }
 
+/// Build only the tokenizer of a hybrid GGUF (no weights are read).
+pub fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
+    let file = GgufFile::open(path)?;
+    let config = HybridConfig::from_gguf(&file)?;
+    Ok(tokenizer(&file, config.vocab)?.0)
+}
+
 fn tokenizer(file: &GgufFile, vocab: usize) -> Result<(Tokenizer, Vec<u32>)> {
     let md = file.metadata();
     let text = |key: &str| match md.get(key) {
