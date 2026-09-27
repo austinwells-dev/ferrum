@@ -3,6 +3,7 @@
 //! kernel library with preallocated state.
 #![forbid(unsafe_code)]
 pub mod bench;
+pub mod chat;
 pub mod config;
 pub mod engine;
 pub mod plan;
@@ -88,6 +89,15 @@ pub fn load_with(
         plan,
         loaded_bytes: device.allocated_bytes().saturating_sub(before),
     })
+}
+
+/// The chat template embedded in a GGUF (no weights are read).
+pub fn load_chat_template(path: impl AsRef<Path>) -> Result<Option<chat::ChatTemplate>> {
+    let file = GgufFile::open(path)?;
+    match file.metadata_value("tokenizer.chat_template") {
+        Some(MetadataValue::String(t)) => chat::ChatTemplate::new(t).map(Some),
+        _ => Ok(None),
+    }
 }
 
 /// Build only the tokenizer of a hybrid GGUF (no weights are read).
