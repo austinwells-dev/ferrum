@@ -53,7 +53,7 @@ speculative decoding (lossless; off by default):
                             DSpark checkpoint directory (or its HF cache entry)
   --draft-max N             drafts per step (default: 3 for MTP; the trained block
                             for dense targets, 2 for MoE targets)
-  --draft-quant q8_0|q4_0   draft weight precision (default q8_0)
+  --draft-quant q4_0|q8_0   draft weight precision (default q4_0)
   --draft-context N         context slots for drafts without a sliding window (8192)
   --draft-p-min P           DSpark: stop drafting below this confidence (0)
 generation defaults (requests may override):

@@ -259,11 +259,13 @@ fn yarn(rope: &Json, max_pos: Option<usize>, theta: f64, dim: usize) -> Result<(
     Ok((inv, attention_factor as f32))
 }
 
-/// Weight precision for the draft's projections.
+/// Weight precision for the draft's projections. Q4_0 halves the draft's
+/// memory and bandwidth at no measurable acceptance cost (Phase 9 journal,
+/// Experiment 7); the Markov, convolution and selector projections stay Q8_0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DraftQuant {
-    #[default]
     Q8_0,
+    #[default]
     Q4_0,
 }
 
@@ -284,7 +286,7 @@ pub struct DraftOptions {
 impl Default for DraftOptions {
     fn default() -> Self {
         Self {
-            quant: DraftQuant::Q8_0,
+            quant: DraftQuant::Q4_0,
             context_cap: 8192,
             confidence_min: 0.,
             vocab: None,

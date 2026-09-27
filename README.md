@@ -40,7 +40,7 @@ Phase 8 runs two current models end to end on a 32 GB Apple M5. Both use the Qwe
 - **Swift 1.5 Qwen3.8-27B**, Q4_K_M (dense, 27B)
 - **Tiel-Coder 35B-A3B**, UD-IQ4_XS (256-expert MoE with 3B active)
 
-They run on a dedicated engine (`src/hybrid`) with its own kernel library. The MTP/NextN block is ignored, and there is no speculative decoding.
+They run on a dedicated engine (`src/hybrid`) with its own kernel library. Phase 9 adds lossless speculative decoding on top (below).
 
 | Same GGUF, same machine (tok/s) | Ferrum | llama.cpp |
 |---|---|---|
@@ -77,6 +77,47 @@ Both binaries render the chat template embedded in the GGUF. They stream reasoni
 - **Streaming.** SSE keep-alives cover long prefills. `return_progress` streams prompt progress, and `stream_options.include_usage` adds a usage chunk. When a client disconnects, generation stops within one step, and whatever it had already prefilled stays cached for a retry. A panic inside the model resets the session instead of taking the server down.
 - **Logging.** One line per request covers the method, client and sampling. A progress line is printed every few seconds during long prefills and generations. A summary line gives cached and prefilled tokens, rates, reasoning tokens and the stop reason. Add `-v` to also log request bodies and outputs.
 - **Snapshots.** A recurrent snapshot is taken at the prompt's second-to-last token, so an identical retry reuses everything but one token.
+
+## Phase 9: speculative decoding
+
+Phase 9 adds lossless speculative decoding to the hybrid engine. It supports three drafter families:
+
+- **MTP**: the target GGUF's own NextN block.
+- **DFlash / DFlash2**: block-diffusion drafters that propose a whole block in one pass.
+- **DSpark**: DFlash plus a Markov bias and a confidence head.
+
+Drafters load from Hugging Face checkpoints and are quantized at load. They read the target's hidden states at a few layers.
+
+The target verifies all drafts in one forward pass. Recurrent layers only read their state during verification and record their inputs; the accepted prefix is then replayed into the live state. Greedy output equals plain greedy decoding. Sampled output keeps the target's distribution through rejection sampling.
+
+Small-batch kernels keep that verify cheap. An 8–16-row forward on Swift costs about 1.5× a single-token decode; llama.cpp's costs 2.4–3.8×.
+
+| Same GGUF, 8 chat prompts × 128 tokens, greedy (tok/s) | Ferrum | llama.cpp 9710a32 |
+|---|---|---|
+| Swift, no speculation | 7.11 | 6.74 |
+| Swift + MTP (3 drafts) | 12.60 | 11.17 |
+| Swift + `z-lab/Qwen3.8-27B-DFlash2` | **17.78** | 9.87 |
+| Swift + `RedHatAI/Qwen3.8-27B-speculator.dspark` | 16.37 | 6.83 |
+| Swift + `RadixArk/Qwen3.8-27B-DSpark` | 12.53 | 6.93 |
+| Tiel, no speculation | 41.29 | 41.14 |
+| Tiel + `jzinno/Ornith-1.5-35B-A3B-DFlash2` (2 drafts) | **57.12** | 50.61 |
+
+Both engines accept drafts at the same rate, to within a point for every drafter. On Swift, DFlash2 decodes 2.5× faster than plain decoding.
+
+On Tiel the gain is smaller. Each verify row routes to its own experts, so MoE targets default to 2 drafts.
+
+Drafter memory is planned before loading, and the auto-fitted context shrinks to make room. Q4_0 draft weights are the default; they cost no measurable acceptance. See the [Phase 9 plan](docs/phase9-plan.md) and [journal](docs/phase9-journal.md).
+
+```sh
+# The GGUF's MTP block, or a draft checkpoint directory / HF cache entry
+./target/release/ferrum-server --model swift.gguf --draft mtp
+./target/release/ferrum-server --model swift.gguf \
+  --draft ~/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2
+./target/release/ferrum-cli --model tiel.gguf \
+  --draft ~/.cache/huggingface/hub/models--jzinno--Ornith-1.5-35B-A3B-DFlash2
+```
+
+Tuning flags: `--draft-max N`, `--draft-quant q4_0|q8_0`, `--draft-context N` (context slots for drafts without a sliding window), `--draft-p-min P` (DSpark confidence cut-off) and `--draft-vocab N`. Responses report `draft_n` and `draft_n_accepted` in `timings`, as llama-server does.
 
 ## Build and run
 

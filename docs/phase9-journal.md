@@ -278,3 +278,39 @@ decode on Swift (Experiment 5), Ferrum's 1.5×, so llama.cpp gains little or
 nothing from the 7–8-draft DFlash2/DSpark blocks. Speedup over plain Ferrum
 decode: DFlash2 2.50×, RedHat DSpark 2.30×, MTP 1.77×, RadixArk DSpark 1.76×
 on Swift; 1.38× on Tiel.
+
+## Experiment 7 — draft weight precision
+
+Q8_0 against Q4_0 draft projections (greedy):
+
+| Target / drafter | prompts | Q8_0 tok/s (acceptance) | Q4_0 tok/s (acceptance) | draft memory |
+|---|---|---|---|---|
+| Swift / z-lab DFlash2 | 3 | 16.07 (3.91) | 16.87 (3.88) | 1,972 → 1,147 MiB |
+| Swift / RedHat DSpark | 3 | 14.88 (3.66) | 15.23 (3.72) | |
+| Tiel / jzinno DFlash2, 2 drafts | 8 | 57.02 (2.52) | 58.64 (2.51) | |
+
+Acceptance is unchanged within noise and drafting is 10–25% cheaper, so Q4_0
+is the default (`--draft-quant q8_0` restores Q8_0). On Swift the saved
+0.8 GB is ~13K tokens of extra auto-fitted context. The llama.cpp comparison
+in Experiment 6 used Q8_0 on both sides.
+
+## Summary and open items
+
+Done: verify/commit with recurrent replay; small-batch verify kernels;
+MTP, DFlash, DFlash2 and DSpark drafters matching llama.cpp's acceptance;
+rejection sampling; memory planning; CLI and server integration; session
+prefix reuse and snapshot rewinds with a drafter attached.
+
+Open:
+- The drafts' LM head is the largest draft cost (1 GB of Q6_K per row on
+  Swift). A frequency-ranked draft vocabulary, instead of the id prefix
+  tried in Experiment 4, could cut it without losing acceptance.
+- Verify at 4–32 rows is still dequantization-bound in the TensorOps tiles
+  (Q6_K at ~56 GB/s against ~122 GB/s for single-row GEMV).
+- Tiel's verify cost grows with distinct experts; routing-aware drafting or
+  expert-grouped verify GEMVs are unexplored.
+- Commit, ingest and the next draft still cost separate GPU round trips.
+- Tiel's MTP block (routed experts in Q3_K) is not supported.
+- The auto-fitted context with each drafter was not re-measured after the
+  switch to Q4_0 draft weights (the planner predicts it; Experiment 5 shows
+  predictions within 1.5 MiB).
