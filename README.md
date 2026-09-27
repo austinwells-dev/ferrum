@@ -63,6 +63,21 @@ cargo build --release
 
 Both binaries render the chat template embedded in the GGUF. They stream reasoning (as `reasoning_content`) and content separately, parse tool calls, and sample with the model's recommended settings unless told otherwise. The server keeps the conversation state between requests: a follow-up that extends the previous request prefills only the new tokens, and `usage.prompt_tokens_details.cached_tokens` reports how many were reused.
 
+`ferrum-server` follows llama-server's conventions and adds a few of its own:
+
+- **Endpoints.** It serves OpenAI `/v1/chat/completions` and `/v1/completions` and Anthropic `/v1/messages` (with `count_tokens`). It also serves `/health`, `/props`, `/slots`, `/metrics` (Prometheus), `/tokenize`, `/detokenize` and `/apply-template`.
+- **Thinking controls.** Requests can pass any of these, and each is mapped onto the template's `enable_thinking` and effort levels:
+  - `chat_template_kwargs`
+  - `enable_thinking` or `think`
+  - `reasoning_effort`, `reasoning: {effort}` or Anthropic `thinking: {type, budget_tokens}`
+  - `reasoning_budget` or `thinking_budget_tokens`, which forces `</think>` after N tokens
+  - `reasoning_format: none`, which keeps `<think>` inline
+
+  Server defaults come from `--no-think`, `--reasoning-effort`, `--reasoning-budget` and `--chat-template-kwargs`.
+- **Streaming.** SSE keep-alives cover long prefills. `return_progress` streams prompt progress, and `stream_options.include_usage` adds a usage chunk. When a client disconnects, generation stops within one step, and whatever it had already prefilled stays cached for a retry. A panic inside the model resets the session instead of taking the server down.
+- **Logging.** One line per request covers the method, client and sampling. A progress line is printed every few seconds during long prefills and generations. A summary line gives cached and prefilled tokens, rates, reasoning tokens and the stop reason. Add `-v` to also log request bodies and outputs.
+- **Snapshots.** A recurrent snapshot is taken at the prompt's second-to-last token, so an identical retry reuses everything but one token.
+
 ## Build and run
 
 Requires Apple Silicon macOS (tested on macOS 27, Apple M5), Rust 1.96+, Apple's Command Line Tools/macOS SDK, and Metal's runtime shader compiler. Native BF16 kernels require the supported Metal compiler/device capabilities; `info` reports these. We do not claim validation on older devices.

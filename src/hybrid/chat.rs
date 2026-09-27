@@ -8,6 +8,7 @@ use serde_json::{Map, Value as Json};
 
 pub struct ChatTemplate {
     env: Environment<'static>,
+    source: String,
 }
 
 /// Python `json.dumps(value, ensure_ascii=False)`: insertion order, `", "`
@@ -108,7 +109,14 @@ impl ChatTemplate {
         );
         env.add_template_owned("chat", source.to_owned())
             .map_err(|e| Error::Tokenizer(format!("chat template: {e:#}")))?;
-        Ok(Self { env })
+        Ok(Self {
+            env,
+            source: source.to_owned(),
+        })
+    }
+
+    pub fn source(&self) -> &str {
+        &self.source
     }
 
     /// Render `messages` (OpenAI-style JSON objects). `extra` carries template

@@ -4,7 +4,7 @@
 //!            [--temperature T] [--top-p P] [--top-k K] [--min-p P]
 //!            [--presence-penalty X] [--repetition-penalty X] [--seed N]
 //!            [--max-tokens N] [--no-think] [--reasoning-effort LEVEL]
-//!            [--hide-thinking]
+//!            [--reasoning-budget N] [--hide-thinking]
 //!
 //! Commands: /reset, /think on|off, /stats, /exit. End a line with `\` to
 //! continue the message on the next line.
@@ -26,6 +26,7 @@ struct Options {
     think: bool,
     effort: Option<String>,
     show_thinking: bool,
+    reasoning_budget: Option<usize>,
     overrides: Vec<(String, String)>,
 }
 
@@ -38,6 +39,7 @@ fn parse() -> Result<Options> {
         think: true,
         effort: None,
         show_thinking: true,
+        reasoning_budget: None,
         overrides: Vec::new(),
     };
     let mut args = std::env::args().skip(1);
@@ -78,6 +80,7 @@ fn parse() -> Result<Options> {
                     "--system" => o.system = Some(value.clone()),
                     "--max-tokens" | "-n" => o.max_tokens = number()?,
                     "--reasoning-effort" => o.effort = Some(value.clone()),
+                    "--reasoning-budget" => o.reasoning_budget = Some(number()?),
                     "--temperature"
                     | "--top-p"
                     | "--top-k"
@@ -120,6 +123,7 @@ fn run() -> Result<()> {
             ..Default::default()
         },
     )?;
+    rt.warmup()?;
     let mut sampling = rt.default_sampling.clone();
     for (key, value) in &o.overrides {
         let f = || {
@@ -216,6 +220,8 @@ fn run() -> Result<()> {
             sampling: sampling.clone(),
             template_vars: vars,
             stop: Vec::new(),
+            reasoning_budget: o.reasoning_budget,
+            raw_reasoning: false,
         };
         let mut in_reasoning = false;
         let show = o.show_thinking;

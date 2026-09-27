@@ -7,7 +7,7 @@ use super::{
     chat::{ChatTemplate, ParsedOutput, parse_output},
     config::uint,
     plan::PlanOptions,
-    session::{Completion, SamplingParams, Session, StopReason},
+    session::{Completion, Flow, GenerationHooks, SamplingParams, Session, StopReason},
 };
 use crate::{
     Error, MetalDevice, Result,
@@ -33,6 +33,26 @@ pub struct ChatRequest {
     pub template_vars: Map<String, Json>,
     /// Stop when any of these strings appears in the visible content.
     pub stop: Vec<String>,
+    /// Most reasoning tokens before `</think>` is forced (None = unlimited).
+    pub reasoning_budget: Option<usize>,
+    /// Leave reasoning inline (with its tags) in the content instead of
+    /// splitting it out (llama-server `--reasoning-format none`).
+    pub raw_reasoning: bool,
+}
+
+impl ChatRequest {
+    pub fn new(messages: Vec<Json>, sampling: SamplingParams) -> Self {
+        Self {
+            messages,
+            tools: Vec::new(),
+            max_tokens: usize::MAX,
+            sampling,
+            template_vars: Map::new(),
+            stop: Vec::new(),
+            reasoning_budget: None,
+            raw_reasoning: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -41,6 +61,35 @@ pub struct ChatResult {
     pub completion: Completion,
     /// True when a `stop` string ended generation.
     pub stopped_by_string: bool,
+    /// Generated tokens that belonged to the reasoning block.
+    pub reasoning_tokens: usize,
+    /// True when the thinking budget closed the reasoning block.
+    pub budget_exhausted: bool,
+    /// Raw generated text (reasoning, content and tool-call markup).
+    pub text: String,
+}
+
+/// Callbacks for one chat or completion request.
+pub trait ChatHooks {
+    fn delta(&mut self, delta: Delta) -> Result<()>;
+    /// Prompt length and tokens reused from the session, before prefill.
+    fn begin(&mut self, _prompt: usize, _reused: usize) {}
+    /// Prefill progress over the new prompt tokens; false cancels.
+    fn prefill(&mut self, _processed: usize, _total: usize) -> bool {
+        true
+    }
+    /// Polled after every token; true stops generation.
+    fn cancelled(&self) -> bool {
+        false
+    }
+    /// Called after every generated token with the running count.
+    fn generated(&mut self, _tokens: usize) {}
+}
+
+impl<F: FnMut(Delta) -> Result<()>> ChatHooks for F {
+    fn delta(&mut self, delta: Delta) -> Result<()> {
+        self(delta)
+    }
 }
 
 pub struct Runtime {
@@ -54,6 +103,26 @@ pub struct Runtime {
 }
 
 impl Runtime {
+    /// Compile and page in every kernel path (chunked prefill, single-token
+    /// decode, sampling candidates) so the first real request runs at full
+    /// speed, then clear the session.
+    pub fn warmup(&mut self) -> Result<()> {
+        let model = &self.loaded.model;
+        let n = (model.chunk() + 2).min(self.session.capacity() - 3);
+        let prompt: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
+        let result = self.session.generate(
+            &self.device,
+            model,
+            &prompt,
+            2,
+            &self.default_sampling,
+            &[],
+            &mut |_| Ok(true),
+        );
+        self.session.reset();
+        result.map(drop)
+    }
+
     pub fn load(path: impl AsRef<Path>, options: PlanOptions) -> Result<Self> {
         let path = path.as_ref();
         let device = MetalDevice::new()?;
@@ -88,64 +157,199 @@ impl Runtime {
     }
 
     pub fn render(&self, request: &ChatRequest) -> Result<String> {
+        let mut vars = request.template_vars.clone();
+        normalize_thinking(self.template.source(), &mut vars);
         self.template.render(
             &request.messages,
             (!request.tools.is_empty()).then_some(&request.tools[..]),
             true,
-            &request.template_vars,
+            &vars,
         )
     }
 
     /// Run one chat turn, reusing whatever prefix the session already holds.
-    pub fn chat(
-        &mut self,
-        request: &ChatRequest,
-        mut on_delta: impl FnMut(Delta) -> Result<()>,
-    ) -> Result<ChatResult> {
+    pub fn chat(&mut self, request: &ChatRequest, hooks: impl ChatHooks) -> Result<ChatResult> {
         let prompt_text = self.render(request)?;
-        let prompt = self.loaded.tokenizer.encode(&prompt_text)?;
         let starts_in_reasoning = prompt_text.trim_end().ends_with("<think>");
+        let (result, text) = self.run(
+            &prompt_text,
+            request.max_tokens,
+            &request.sampling,
+            &request.stop,
+            starts_in_reasoning && !request.raw_reasoning,
+            if starts_in_reasoning {
+                request.reasoning_budget
+            } else {
+                None
+            },
+            true,
+            hooks,
+        )?;
+        let (completion, stopped, reasoning_tokens, budget_exhausted, visible) = result;
+        let mut output = if request.raw_reasoning {
+            let mut parsed = parse_output(&text, false, &request.tools);
+            let prefix = if starts_in_reasoning { "<think>\n" } else { "" };
+            if !parsed.tool_calls.is_empty() {
+                parsed.content = format!("{prefix}{}", parsed.content);
+            } else {
+                parsed.content = format!("{prefix}{}", text.trim_end());
+            }
+            parsed
+        } else {
+            parse_output(&text, starts_in_reasoning, &request.tools)
+        };
+        if stopped {
+            output.content = visible;
+        }
+        Ok(ChatResult {
+            stopped_by_string: stopped,
+            output,
+            completion,
+            reasoning_tokens,
+            budget_exhausted,
+            text,
+        })
+    }
+
+    /// Raw text completion (no chat template, no tool parsing).
+    pub fn complete(
+        &mut self,
+        prompt: &str,
+        max_tokens: usize,
+        sampling: &SamplingParams,
+        stop: &[String],
+        hooks: impl ChatHooks,
+    ) -> Result<(Completion, String, bool)> {
+        let ((completion, stopped, _, _, visible), text) = self.run(
+            prompt, max_tokens, sampling, stop, false, None, false, hooks,
+        )?;
+        Ok((completion, if stopped { visible } else { text }, stopped))
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    fn run(
+        &mut self,
+        prompt_text: &str,
+        max_tokens: usize,
+        sampling: &SamplingParams,
+        stop: &[String],
+        split_reasoning: bool,
+        reasoning_budget: Option<usize>,
+        tools: bool,
+        hooks: impl ChatHooks,
+    ) -> Result<((Completion, bool, usize, bool, String), String)> {
+        let prompt = self.loaded.tokenizer.encode(prompt_text)?;
+        let close_reasoning = self.loaded.tokenizer.encode("\n</think>\n\n")?;
         let tokenizer = &self.loaded.tokenizer;
-        let mut stream = tokenizer.decode_stream();
-        let mut splitter = Splitter::new(starts_in_reasoning, &request.stop);
-        let mut failure = None;
+        struct Driver<'a, H: ChatHooks> {
+            hooks: H,
+            stream: tokenizers::tokenizer::DecodeStream<
+                'a,
+                tokenizers::ModelWrapper,
+                tokenizers::NormalizerWrapper,
+                tokenizers::PreTokenizerWrapper,
+                tokenizers::PostProcessorWrapper,
+                tokenizers::DecoderWrapper,
+            >,
+            splitter: Splitter,
+            failure: Option<Error>,
+            reasoning_tokens: usize,
+            budget: Option<usize>,
+            budget_exhausted: bool,
+            close: Vec<u32>,
+            close_text: &'static str,
+            count: usize,
+        }
+        impl<H: ChatHooks> Driver<'_, H> {
+            fn emit(&mut self, piece: &str) -> bool {
+                for delta in self.splitter.push(piece) {
+                    if let Err(e) = self.hooks.delta(delta) {
+                        self.failure = Some(e);
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+        impl<H: ChatHooks> GenerationHooks for Driver<'_, H> {
+            fn begin(&mut self, prompt: usize, reused: usize) {
+                self.hooks.begin(prompt, reused);
+            }
+            fn prefill(&mut self, processed: usize, total: usize) -> bool {
+                self.hooks.prefill(processed, total) && !self.hooks.cancelled()
+            }
+            fn token(&mut self, token: u32) -> Result<Flow> {
+                self.count += 1;
+                self.hooks.generated(self.count);
+                let in_reasoning = self.splitter.in_reasoning;
+                if in_reasoning {
+                    self.reasoning_tokens += 1;
+                }
+                let piece = self
+                    .stream
+                    .step(token)
+                    .map_err(|e| Error::Tokenizer(e.to_string()))?;
+                if let Some(piece) = piece
+                    && !self.emit(&piece)
+                {
+                    return Ok(Flow::Stop);
+                }
+                if self.splitter.stopped || self.hooks.cancelled() {
+                    return Ok(Flow::Stop);
+                }
+                if self.splitter.in_reasoning
+                    && self.budget.is_some_and(|b| self.reasoning_tokens >= b)
+                {
+                    self.budget_exhausted = true;
+                    let text = self.close_text;
+                    if !self.emit(text) {
+                        return Ok(Flow::Stop);
+                    }
+                    return Ok(Flow::Inject(self.close.clone()));
+                }
+                Ok(Flow::Continue)
+            }
+        }
+        let mut driver = Driver {
+            hooks,
+            stream: tokenizer.decode_stream(),
+            splitter: Splitter::new(split_reasoning, stop, tools),
+            failure: None,
+            reasoning_tokens: 0,
+            budget: reasoning_budget,
+            budget_exhausted: false,
+            close: close_reasoning,
+            close_text: "\n</think>\n\n",
+            count: 0,
+        };
         let completion = self.session.generate(
             &self.device,
             &self.loaded.model,
             &prompt,
-            request.max_tokens,
-            &request.sampling,
+            max_tokens,
+            sampling,
             &self.loaded.eos_ids,
-            |token| {
-                let piece = match stream.step(token) {
-                    Ok(Some(piece)) => piece,
-                    Ok(None) => return Ok(true),
-                    Err(e) => return Err(Error::Tokenizer(e.to_string())),
-                };
-                for delta in splitter.push(&piece) {
-                    if let Err(e) = on_delta(delta) {
-                        failure = Some(e);
-                        return Ok(false);
-                    }
-                }
-                Ok(!splitter.stopped)
-            },
+            &mut driver,
         )?;
-        if let Some(e) = failure {
+        if let Some(e) = driver.failure.take() {
             return Err(e);
         }
-        for delta in splitter.finish() {
-            on_delta(delta)?;
+        for delta in driver.splitter.finish() {
+            driver.hooks.delta(delta)?;
         }
-        let mut output = parse_output(&splitter.text, starts_in_reasoning, &request.tools);
-        if splitter.stopped {
-            output.content = splitter.visible_content();
-        }
-        Ok(ChatResult {
-            stopped_by_string: splitter.stopped,
-            output,
-            completion,
-        })
+        let stopped = driver.splitter.stopped;
+        let visible = driver.splitter.visible_content();
+        let text = std::mem::take(&mut driver.splitter.text);
+        Ok((
+            (
+                completion,
+                stopped,
+                driver.reasoning_tokens,
+                driver.budget_exhausted,
+                visible,
+            ),
+            text,
+        ))
     }
 }
 
@@ -153,13 +357,77 @@ impl StopReason {
     /// OpenAI `finish_reason` for a completion that produced no tool call.
     pub fn finish_reason(self) -> &'static str {
         match self {
-            StopReason::Eos | StopReason::Stopped => "stop",
+            StopReason::Eos | StopReason::Stopped | StopReason::Cancelled => "stop",
             StopReason::Length | StopReason::ContextFull => "length",
         }
     }
 }
 
-fn recommended_sampling(file: &GgufFile) -> SamplingParams {
+/// Map thinking controls onto what this template understands:
+/// `reasoning_effort` "none"/"off"/"disabled" becomes `enable_thinking=false`;
+/// other efforts snap to the nearest level the template names (e.g. "high"
+/// becomes "xhigh" for a template that only knows low/medium/xhigh).
+pub fn normalize_thinking(template: &str, vars: &mut Map<String, Json>) {
+    for key in ["enable_thinking", "thinking"] {
+        if let Some(Json::String(s)) = vars.get(key) {
+            let on = !matches!(
+                s.to_ascii_lowercase().as_str(),
+                "false" | "off" | "no" | "0" | "disabled"
+            );
+            vars.insert(key.into(), Json::Bool(on));
+        }
+    }
+    let Some(effort) = vars
+        .get("reasoning_effort")
+        .and_then(Json::as_str)
+        .map(str::to_ascii_lowercase)
+    else {
+        return;
+    };
+    if matches!(effort.as_str(), "none" | "off" | "disabled" | "false") {
+        vars.remove("reasoning_effort");
+        vars.insert("enable_thinking".into(), Json::Bool(false));
+        return;
+    }
+    const LEVELS: [&str; 8] = [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "extreme",
+        "ultracode",
+    ];
+    let known: Vec<usize> = LEVELS
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| {
+            template.contains(&format!("'{l}'")) || template.contains(&format!("\"{l}\""))
+        })
+        .map(|(i, _)| i)
+        .collect();
+    let Some(wanted) = LEVELS.iter().position(|l| *l == effort) else {
+        return;
+    };
+    if known.is_empty() || known.contains(&wanted) {
+        vars.insert("reasoning_effort".into(), Json::String(effort));
+        return;
+    }
+    // Nearest named level, preferring the higher one on ties.
+    let nearest = known
+        .iter()
+        .min_by_key(|&&i| (i as isize - wanted as isize).abs() * 2 - isize::from(i > wanted))
+        .copied()
+        .unwrap_or(wanted);
+    vars.insert(
+        "reasoning_effort".into(),
+        Json::String(LEVELS[nearest].into()),
+    );
+}
+
+/// The GGUF's recommended sampling (`general.sampling.*`), with Qwen defaults.
+pub fn recommended_sampling(file: &GgufFile) -> SamplingParams {
     let md = file.metadata();
     let float = |key: &str| match md.get(key) {
         Some(MetadataValue::Float32(v)) => Some(*v),
@@ -188,10 +456,11 @@ struct Splitter {
     stop: Vec<String>,
     stopped: bool,
     stop_at: Option<usize>,
+    tools: bool,
 }
 
 impl Splitter {
-    fn new(in_reasoning: bool, stop: &[String]) -> Self {
+    fn new(in_reasoning: bool, stop: &[String], tools: bool) -> Self {
         Self {
             text: String::new(),
             in_reasoning,
@@ -201,6 +470,7 @@ impl Splitter {
             stop: stop.iter().filter(|s| !s.is_empty()).cloned().collect(),
             stopped: false,
             stop_at: None,
+            tools,
         }
     }
 
@@ -255,11 +525,19 @@ impl Splitter {
             .iter()
             .filter_map(|s| pending.find(s.as_str()))
             .min();
-        let tool_hit = pending.find("<tool_call>");
+        let tool_hit = if self.tools {
+            pending.find("<tool_call>")
+        } else {
+            None
+        };
         let mut end = if last {
             self.text.len()
         } else {
-            let mut markers: Vec<&str> = vec!["<tool_call>"];
+            let mut markers: Vec<&str> = if self.tools {
+                vec!["<tool_call>"]
+            } else {
+                Vec::new()
+            };
             markers.extend(self.stop.iter().map(String::as_str));
             hold_back(&self.text, self.emitted, &markers)
         };
@@ -321,6 +599,7 @@ mod tests {
         let mut s = Splitter::new(
             reasoning,
             &stop.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            true,
         );
         let mut out = Vec::new();
         for p in pieces {
@@ -366,5 +645,26 @@ mod tests {
         assert_eq!(join(&deltas).1, "a b ");
         assert!(s.stopped);
         assert_eq!(s.visible_content(), "a b");
+    }
+}
+
+#[cfg(test)]
+mod thinking_tests {
+    use super::*;
+
+    #[test]
+    fn effort_snaps_to_template_levels() {
+        let template = "{% if reasoning_effort not in ('xhigh', 'medium', 'low') %}";
+        let mut vars = Map::new();
+        vars.insert("reasoning_effort".into(), Json::String("high".into()));
+        normalize_thinking(template, &mut vars);
+        assert_eq!(vars["reasoning_effort"], "xhigh");
+        vars.insert("reasoning_effort".into(), Json::String("minimal".into()));
+        normalize_thinking(template, &mut vars);
+        assert_eq!(vars["reasoning_effort"], "low");
+        vars.insert("reasoning_effort".into(), Json::String("none".into()));
+        normalize_thinking(template, &mut vars);
+        assert_eq!(vars["enable_thinking"], false);
+        assert!(!vars.contains_key("reasoning_effort"));
     }
 }

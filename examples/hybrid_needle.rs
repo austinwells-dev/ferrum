@@ -88,6 +88,8 @@ fn main() -> Result<()> {
             sampling: SamplingParams::default(),
             template_vars: vars,
             stop: Vec::new(),
+            reasoning_budget: None,
+            raw_reasoning: false,
         };
         rt.session.reset();
         let result = rt.chat(&request, |_| Ok(()))?;

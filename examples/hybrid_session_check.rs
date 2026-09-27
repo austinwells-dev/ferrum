@@ -33,16 +33,18 @@ fn main() -> Result<()> {
     let mut fresh = Session::new(&d, model, 4096, 0)?;
     let base = "<|im_start|>user\nList three prime numbers and explain why each is prime.<|im_end|>\n<|im_start|>assistant\n";
     let p1 = tok.encode(base)?;
-    let first = cached.generate(&d, model, &p1, 40, &greedy, eos, |_| Ok(true))?;
+    let first = cached.generate(&d, model, &p1, 40, &greedy, eos, &mut |_| Ok(true))?;
     // 1. Extension: previous prompt + generation + a new turn.
     let mut p2 = p1.clone();
     p2.extend(&first.tokens);
     p2.extend(tok.encode(
         "<|im_end|>\n<|im_start|>user\nNow two more.<|im_end|>\n<|im_start|>assistant\n",
     )?);
-    // 2. Divergence inside the cache: same first turn, different question.
+    // 2. Retry: the identical prompt again (resumes from the `len - 1` snapshot).
+    let retry = p1.clone();
+    // 3. Divergence inside the cache: same first turn, different question.
     let p3 = tok.encode("<|im_start|>user\nList three prime numbers and explain why each is prime.<|im_end|>\n<|im_start|>assistant\nSure")?;
-    // 3. Divergence before any snapshot: entirely different prompt.
+    // 4. Divergence before any snapshot: entirely different prompt.
     let p4 = tok.encode(
         "<|im_start|>user\nWhat is the boiling point of water?<|im_end|>\n<|im_start|>assistant\n",
     )?;
@@ -50,25 +52,18 @@ fn main() -> Result<()> {
     for (name, prompt) in [
         ("extend", &p2),
         ("rewind", &p3),
+        ("retry", &retry),
         ("replace", &p4),
         ("extend again", &p2),
     ] {
-        let a = cached.generate(&d, model, prompt, 32, &greedy, eos, |_| Ok(true))?;
+        let a = cached.generate(&d, model, prompt, 32, &greedy, eos, &mut |_| Ok(true))?;
         // Reference: a fresh session split at the same point, so both sides run
         // identical kernels (single-row and chunk kernels round differently).
         fresh.reset();
         if a.reused_tokens > 0 {
-            fresh.generate(
-                &d,
-                model,
-                &prompt[..a.reused_tokens],
-                1,
-                &greedy,
-                eos,
-                |_| Ok(true),
-            )?;
+            fresh.prefill(&d, model, &prompt[..a.reused_tokens])?;
         }
-        let b = fresh.generate(&d, model, prompt, 32, &greedy, eos, |_| Ok(true))?;
+        let b = fresh.generate(&d, model, prompt, 32, &greedy, eos, &mut |_| Ok(true))?;
         assert_eq!(b.reused_tokens, a.reused_tokens);
         let same = a.tokens == b.tokens;
         ok &= same;

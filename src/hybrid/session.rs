@@ -71,6 +71,40 @@ impl SamplingParams {
     }
 }
 
+/// What generation does after a token was sampled.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Flow {
+    Continue,
+    Stop,
+    /// Feed these tokens after the sampled one (e.g. to close a reasoning
+    /// block when a thinking budget runs out), then keep sampling.
+    Inject(Vec<u32>),
+}
+
+/// Callbacks during `Session::generate`.
+pub trait GenerationHooks {
+    /// Before prefill: prompt length and how much of it the cache already holds.
+    fn begin(&mut self, _prompt: usize, _reused: usize) {}
+    /// After each prompt chunk: `processed` of `total` new prompt tokens are
+    /// in the cache. Return false to cancel (the processed prefix stays
+    /// cached, so a retry resumes where this left off).
+    fn prefill(&mut self, _processed: usize, _total: usize) -> bool {
+        true
+    }
+    /// A sampled, non-EOS token.
+    fn token(&mut self, token: u32) -> Result<Flow>;
+}
+
+impl<F: FnMut(u32) -> Result<bool>> GenerationHooks for F {
+    fn token(&mut self, token: u32) -> Result<Flow> {
+        Ok(if self(token)? {
+            Flow::Continue
+        } else {
+            Flow::Stop
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     /// An end-of-sequence token was sampled (it is not included in `tokens`).
@@ -81,6 +115,8 @@ pub enum StopReason {
     ContextFull,
     /// The token callback asked to stop.
     Stopped,
+    /// The prefill callback cancelled before any token was generated.
+    Cancelled,
 }
 
 #[derive(Debug, Clone)]
@@ -230,9 +266,33 @@ impl Session {
         Ok(())
     }
 
-    /// Generate up to `max_tokens` after `prompt`. `on_token` sees each new
-    /// (non-EOS) token and may return `false` to stop. The prompt shares any
-    /// prefix already in the session; divergence resumes from a snapshot.
+    /// Extend the session with `tokens` (sharing any cached prefix) without
+    /// producing output, snapshotting at the end. Returns the reused length.
+    pub fn prefill(
+        &mut self,
+        d: &MetalDevice,
+        model: &HybridModel,
+        tokens: &[u32],
+    ) -> Result<usize> {
+        if tokens.len() >= self.capacity() {
+            return Err(Error::Parameter(format!(
+                "{} tokens do not fit the {}-token context",
+                tokens.len(),
+                self.capacity()
+            )));
+        }
+        let reused = self.reuse_prefix(d, tokens)?;
+        for piece in tokens[reused..].chunks(model.chunk()) {
+            model.forward(d, &mut self.state, piece, Output::None)?;
+            self.tokens.extend_from_slice(piece);
+        }
+        self.snapshot(d)?;
+        Ok(reused)
+    }
+
+    /// Generate up to `max_tokens` after `prompt`. `hooks` see prefill
+    /// progress and each new (non-EOS) token. The prompt shares any prefix
+    /// already in the session; divergence resumes from a snapshot.
     #[allow(clippy::too_many_arguments)]
     pub fn generate(
         &mut self,
@@ -242,7 +302,7 @@ impl Session {
         max_tokens: usize,
         params: &SamplingParams,
         eos: &[u32],
-        mut on_token: impl FnMut(u32) -> Result<bool>,
+        hooks: &mut impl GenerationHooks,
     ) -> Result<Completion> {
         params.validate()?;
         if prompt.is_empty() {
@@ -257,6 +317,7 @@ impl Session {
         }
         let start = Instant::now();
         let reused = self.reuse_prefix(d, prompt)?;
+        hooks.begin(prompt.len(), reused);
         let mut rng = ChaCha8Rng::seed_from_u64(params.seed);
         let mut generated: Vec<u32> = Vec::new();
         let output = |generated: &[u32]| -> Output {
@@ -266,9 +327,31 @@ impl Session {
                 Output::Argmax
             }
         };
-        let produced = model.forward(d, &mut self.state, &prompt[reused..], output(&generated))?;
-        self.tokens.extend_from_slice(&prompt[reused..]);
+        // Prefill all but the final prompt token and snapshot there: the next
+        // request always recomputes at least its final token, so a snapshot
+        // at `len - 1` serves both a retry of this prompt and a continuation
+        // of the conversation. The final token then yields the first output.
+        let (body, tail) = prompt[reused..].split_at(prompt.len() - reused - 1);
+        let mut processed = 0;
+        for piece in body.chunks(model.chunk()) {
+            model.forward(d, &mut self.state, piece, Output::None)?;
+            self.tokens.extend_from_slice(piece);
+            processed += piece.len();
+            if !hooks.prefill(processed, body.len() + 1) {
+                return Ok(Completion {
+                    tokens: Vec::new(),
+                    stop: StopReason::Cancelled,
+                    prompt_tokens: prompt.len(),
+                    reused_tokens: reused,
+                    prefill: start.elapsed(),
+                    decode: Duration::ZERO,
+                });
+            }
+        }
         self.snapshot(d)?;
+        let produced = model.forward(d, &mut self.state, tail, output(&generated))?;
+        self.tokens.extend_from_slice(tail);
+        hooks.prefill(body.len() + 1, body.len() + 1);
         let prefill = start.elapsed();
         let decode_start = Instant::now();
         let mut next = select(produced, params, &mut rng)?;
@@ -277,17 +360,23 @@ impl Session {
                 break StopReason::Eos;
             }
             generated.push(next);
-            if !on_token(next)? {
+            let flow = hooks.token(next)?;
+            if flow == Flow::Stop {
                 break StopReason::Stopped;
             }
             if generated.len() >= max_tokens {
                 break StopReason::Length;
             }
-            if self.state.len() + 1 > self.capacity() {
+            let mut feed = vec![next];
+            if let Flow::Inject(extra) = flow {
+                feed.extend(extra);
+            }
+            if self.state.len() + feed.len() > self.capacity() {
                 break StopReason::ContextFull;
             }
-            let produced = model.forward(d, &mut self.state, &[next], output(&generated))?;
-            self.tokens.push(next);
+            let produced = model.forward(d, &mut self.state, &feed, output(&generated))?;
+            self.tokens.extend_from_slice(&feed);
+            generated.extend_from_slice(&feed[1..]);
             next = select(produced, params, &mut rng)?;
         };
         Ok(Completion {
