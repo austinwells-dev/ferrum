@@ -62,23 +62,27 @@ impl HybridState {
         };
         for layer in 0..c.layers {
             if c.is_attention(layer) {
-                state
-                    .k
-                    .push(Some(Tensor::zeros(d, [kv_rows, kv_row], DType::F16)?));
-                state
-                    .v
-                    .push(Some(Tensor::zeros(d, [kv_rows, kv_row], DType::F16)?));
+                state.k.push(Some(Tensor::zeros_resident(
+                    d,
+                    [kv_rows, kv_row],
+                    DType::F16,
+                )?));
+                state.v.push(Some(Tensor::zeros_resident(
+                    d,
+                    [kv_rows, kv_row],
+                    DType::F16,
+                )?));
                 state.conv.push(None);
                 state.ssm.push(None);
             } else {
                 state.k.push(None);
                 state.v.push(None);
-                state.conv.push(Some(Tensor::zeros(
+                state.conv.push(Some(Tensor::zeros_resident(
                     d,
                     [(c.conv_kernel - 1) * c.conv_channels()],
                     DType::F32,
                 )?));
-                state.ssm.push(Some(Tensor::zeros(
+                state.ssm.push(Some(Tensor::zeros_resident(
                     d,
                     [c.ssm_v_heads * c.ssm_head_dim * c.ssm_head_dim],
                     DType::F32,
@@ -100,7 +104,7 @@ impl HybridState {
         [&self.k, &self.v, &self.conv, &self.ssm]
             .iter()
             .flat_map(|v| v.iter().flatten())
-            .map(Tensor::byte_size)
+            .map(|t| page(t.byte_size()))
             .sum()
     }
     /// Forget the conversation. Recurrent state is zeroed on the next forward.
@@ -177,9 +181,94 @@ impl MoeScratch {
     }
 }
 
+/// Bytes of every scratch allocation `Scratch::new` makes, page-rounded.
+pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize {
+    let chunk = chunk.max(1);
+    let logit_rows = logit_rows.clamp(1, chunk);
+    let ffn = match c.moe {
+        Some(moe) => moe.shared_ffn.max(moe.expert_ffn),
+        None => c.ffn,
+    };
+    let f32s = |n: usize| page(n * 4);
+    let mut total = 0;
+    for n in [
+        chunk * c.hidden,
+        chunk * c.hidden,
+        chunk * c.hidden,
+        chunk * c.hidden,
+        chunk * 2 * c.heads * c.head_dim,
+        chunk * c.kv_heads * c.head_dim,
+        chunk * c.kv_heads * c.head_dim,
+        chunk * c.heads * c.head_dim,
+        MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim,
+        MAX_SPLITS * MAX_SPLIT_ROWS * 2,
+        chunk * c.conv_channels(),
+        chunk * c.ssm_value_dim(),
+        chunk * c.ssm_v_heads,
+        chunk * c.ssm_v_heads,
+        chunk * c.ssm_v_heads,
+        chunk * c.ssm_v_heads,
+        chunk * c.conv_channels(),
+        chunk * c.ssm_value_dim(),
+        chunk * c.ssm_value_dim(),
+        chunk * ffn,
+        chunk * ffn,
+        chunk * ffn,
+        logit_rows * c.vocab,
+        1,
+    ] {
+        total += f32s(n);
+    }
+    total += page(chunk * c.heads * c.head_dim * 2); // F16 queries
+    if let Some(moe) = c.moe {
+        let routes = chunk * moe.experts_used;
+        for n in [
+            chunk * moe.experts,
+            routes,
+            routes,
+            chunk,
+            moe.experts + 1,
+            routes,
+            routes,
+            routes * c.hidden,
+            routes * moe.expert_ffn,
+            routes * moe.expert_ffn,
+            routes * moe.expert_ffn,
+            routes * c.hidden,
+            chunk * c.hidden,
+        ] {
+            total += f32s(n);
+        }
+    }
+    total
+}
+
+/// Bytes of a `HybridState` for `capacity` positions, page-rounded.
+pub fn state_bytes(c: &HybridConfig, capacity: usize) -> usize {
+    kv_bytes(c, capacity) + recurrent_bytes(c)
+}
+
+/// K and V caches of every attention layer for `capacity` positions.
+pub fn kv_bytes(c: &HybridConfig, capacity: usize) -> usize {
+    let per_tensor = page(capacity.next_multiple_of(32) * c.kv_heads * c.head_dim * 2);
+    c.attention_layer_count() * 2 * per_tensor
+}
+
+/// Convolution windows and delta-rule matrices of every recurrent layer.
+pub fn recurrent_bytes(c: &HybridConfig) -> usize {
+    let conv = page((c.conv_kernel - 1) * c.conv_channels() * 4);
+    let ssm = page(c.ssm_v_heads * c.ssm_head_dim * c.ssm_head_dim * 4);
+    c.recurrent_layer_count() * (conv + ssm)
+}
+
+/// Metal rounds each allocation up to whole 16 KiB pages.
+pub(crate) fn page(bytes: usize) -> usize {
+    bytes.max(4).next_multiple_of(16384)
+}
+
 impl Scratch {
     fn new(d: &MetalDevice, c: &HybridConfig, chunk: usize, logit_rows: usize) -> Result<Self> {
-        let f = |dims: &[usize]| Tensor::zeros(d, dims, DType::F32);
+        let f = |dims: &[usize]| Tensor::zeros_resident(d, dims, DType::F32);
         let ffn = match c.moe {
             Some(moe) => moe.shared_ffn.max(moe.expert_ffn),
             None => c.ffn,
@@ -192,7 +281,7 @@ impl Scratch {
             qg: f(&[chunk, 2 * c.heads * c.head_dim])?,
             k: f(&[chunk, c.kv_heads * c.head_dim])?,
             v: f(&[chunk, c.kv_heads * c.head_dim])?,
-            q: Tensor::zeros(d, [chunk, c.heads * c.head_dim], DType::F16)?,
+            q: Tensor::zeros_resident(d, [chunk, c.heads * c.head_dim], DType::F16)?,
             att: f(&[chunk, c.heads * c.head_dim])?,
             attn_partial: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim])?,
             attn_ml: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * 2])?,
@@ -262,12 +351,12 @@ impl Scratch {
             &self.token,
         ]
         .iter()
-        .map(|t| t.byte_size())
+        .map(|t| page(t.byte_size()))
         .sum::<usize>()
             + self
                 .moe
                 .as_ref()
-                .map_or(0, |m| m.tensors().iter().map(|t| t.byte_size()).sum())
+                .map_or(0, |m| m.tensors().iter().map(|t| page(t.byte_size())).sum())
     }
 }
 

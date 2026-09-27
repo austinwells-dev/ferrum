@@ -13,7 +13,7 @@ struct Options {
     prompt: String,
     raw: bool,
     max_new: usize,
-    context: usize,
+    context: Option<usize>,
     chunk: usize,
     repeat: usize,
 }
@@ -24,7 +24,7 @@ fn parse() -> Result<Options> {
         prompt: String::new(),
         raw: false,
         max_new: 32,
-        context: 4096,
+        context: None,
         chunk: 512,
         repeat: 1,
     };
@@ -50,7 +50,13 @@ fn parse() -> Result<Options> {
                     .map_err(|e| Error::Parameter(format!("{value}: {e}")))?
             }
             "--max-new-tokens" => o.max_new = number()?,
-            "--context" => o.context = number()?,
+            "--context" => {
+                o.context = if value == "auto" {
+                    None
+                } else {
+                    Some(number()?)
+                }
+            }
             "--chunk" => o.chunk = number()?,
             "--repeat" => o.repeat = number()?,
             _ => return Err(Error::Parameter(format!("unknown option {key}"))),
@@ -90,7 +96,31 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         // One command buffer per kernel so each dispatch has its own GPU time.
         d.set_batch_limit(1)?;
     }
-    let loaded = hybrid::load(d, &o.model, o.chunk, 1)?;
+    let loaded = hybrid::load_with(
+        d,
+        &o.model,
+        hybrid::plan::PlanOptions {
+            context: o.context,
+            chunk: o.chunk,
+            ..Default::default()
+        },
+    )?;
+    let plan = &loaded.plan;
+    let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
+    eprintln!(
+        "memory plan: budget {:.0} MiB = weights {:.0} + scratch {:.0} + recurrent {:.0} + snapshots {:.0} + overhead {:.0} + KV {:.0} ({:.1} KiB/token x {}); max context {} (trained {})",
+        mib(plan.budget),
+        mib(plan.weights),
+        mib(plan.scratch),
+        mib(plan.recurrent),
+        mib(plan.snapshots),
+        mib(plan.overhead),
+        mib(plan.kv(plan.context)),
+        plan.kv_per_token / 1024.,
+        plan.context,
+        plan.max_context,
+        plan.trained_context,
+    );
     let model = &loaded.model;
     let c = &model.config;
     eprintln!(
@@ -114,7 +144,16 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         )
     };
     let prompt = loaded.tokenizer.encode(&text)?;
-    let mut state = HybridState::new(d, c, o.context)?;
+    let before_state = d.allocated_bytes();
+    let mut state = HybridState::new(d, c, plan.context)?;
+    let state_measured = d.allocated_bytes() - before_state;
+    eprintln!(
+        "measured: weights+scratch {:.0} MiB (predicted {:.0}), state {:.0} MiB (predicted {:.0})",
+        mib(loaded.loaded_bytes),
+        mib(plan.weights + plan.scratch),
+        mib(state_measured),
+        mib(plan.recurrent + plan.kv(plan.context)),
+    );
     eprintln!(
         "prompt {} tokens; state {:.1} MiB for {} positions",
         prompt.len(),

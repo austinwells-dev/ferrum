@@ -5,6 +5,7 @@
 pub mod bench;
 pub mod config;
 pub mod engine;
+pub mod plan;
 pub mod weights;
 
 pub use config::{HybridConfig, Variant};
@@ -26,6 +27,10 @@ pub struct LoadedHybrid {
     pub eos_ids: Vec<u32>,
     pub chat_template: Option<String>,
     pub load_time: std::time::Duration,
+    /// Memory plan computed from metadata before any weight was read.
+    pub plan: plan::MemoryPlan,
+    /// Device bytes the weights and scratch actually took (Metal accounting).
+    pub loaded_bytes: usize,
 }
 
 /// Load a hybrid GGUF with `chunk` prompt rows per forward pass and
@@ -36,22 +41,52 @@ pub fn load(
     chunk: usize,
     logit_rows: usize,
 ) -> Result<LoadedHybrid> {
+    load_with(
+        device,
+        path,
+        plan::PlanOptions {
+            chunk,
+            logit_rows,
+            // Tools size their own state; only require that the model fits.
+            context: Some(256),
+            snapshots: 0,
+            ..Default::default()
+        },
+    )
+}
+
+/// Plan memory from metadata (failing before any weight is read if the
+/// request cannot fit), then load weights and scratch.
+pub fn load_with(
+    device: &MetalDevice,
+    path: impl AsRef<Path>,
+    options: plan::PlanOptions,
+) -> Result<LoadedHybrid> {
     let start = std::time::Instant::now();
     let mut file = GgufFile::open(path)?;
     let config = HybridConfig::from_gguf(&file)?;
+    let plan = plan::plan(
+        &file,
+        &config,
+        device.recommended_max_working_set() as usize,
+        options,
+    )?;
     let (tokenizer, eos_ids) = tokenizer(&file, config.vocab)?;
     let chat_template = match file.metadata_value("tokenizer.chat_template") {
         Some(MetadataValue::String(t)) => Some(t.clone()),
         _ => None,
     };
+    let before = device.allocated_bytes();
     let weights = weights::load(device, &mut file, &config)?;
-    let model = HybridModel::new(device, config, weights, chunk, logit_rows)?;
+    let model = HybridModel::new(device, config, weights, options.chunk, options.logit_rows)?;
     Ok(LoadedHybrid {
         model,
         tokenizer,
         eos_ids,
         chat_template,
         load_time: start.elapsed(),
+        plan,
+        loaded_bytes: device.allocated_bytes().saturating_sub(before),
     })
 }
 

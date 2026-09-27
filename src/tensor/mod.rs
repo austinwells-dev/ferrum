@@ -106,6 +106,24 @@ impl Tensor {
             dtype,
         })
     }
+    /// Zeroed storage kept in the device residency set with the weights
+    /// (long-lived state such as KV caches).
+    pub(crate) fn zeros_resident(
+        device: &MetalDevice,
+        dims: impl AsRef<[usize]>,
+        dtype: DType,
+    ) -> Result<Self> {
+        let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape)?;
+        let storage = Rc::new(device.allocate_resident(shape.byte_size(dtype)?)?);
+        Ok(Self {
+            storage,
+            offset: 0,
+            shape,
+            layout,
+            dtype,
+        })
+    }
     pub(crate) fn output(device: &MetalDevice, dims: &[usize], dtype: DType) -> Result<Self> {
         let shape = Shape::new(dims)?;
         let layout = Layout::contiguous(&shape)?;

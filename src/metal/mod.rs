@@ -1494,6 +1494,10 @@ impl MetalDevice {
     pub fn recommended_max_working_set(&self) -> u64 {
         self.raw.recommendedMaxWorkingSetSize()
     }
+    /// Bytes currently allocated on this device (Metal's own accounting).
+    pub fn allocated_bytes(&self) -> usize {
+        self.raw.currentAllocatedSize()
+    }
     pub fn max_buffer_length(&self) -> usize {
         self.raw.maxBufferLength()
     }
