@@ -131,6 +131,9 @@ pub struct Completion {
     pub reused_tokens: usize,
     pub prefill: Duration,
     pub decode: Duration,
+    /// Speculative drafts proposed and accepted (0 without a drafter).
+    pub drafted: usize,
+    pub accepted: usize,
 }
 
 struct Snapshot {
@@ -425,6 +428,8 @@ impl Session {
                     reused_tokens: reused,
                     prefill: start.elapsed(),
                     decode: Duration::ZERO,
+                    drafted: 0,
+                    accepted: 0,
                 });
             }
         }
@@ -558,6 +563,8 @@ impl Session {
             reused_tokens: reused,
             prefill,
             decode: decode_start.elapsed(),
+            drafted: self.spec_stats.drafted,
+            accepted: self.spec_stats.accepted,
         })
     }
 }
@@ -703,6 +710,45 @@ fn draw(dist: &[(u32, f64)], rng: &mut impl Rng) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Rejection sampling against a deterministic draft reproduces the
+    /// target distribution (after temperature and top-k), whatever the draft.
+    #[test]
+    fn speculative_acceptance_preserves_the_distribution() {
+        let logits = vec![(3, 2.0f32), (8, 1.5), (1, 1.0), (6, 0.2), (4, -1.0)];
+        let params = SamplingParams {
+            temperature: 0.8,
+            top_k: 4,
+            ..Default::default()
+        };
+        let mut expect = distribution(&mut logits.clone(), &params).unwrap();
+        expect.sort_by_key(|&(t, _)| t);
+        for draft in [3u32, 6, 4] {
+            let mut rng = ChaCha8Rng::seed_from_u64(11);
+            let mut counts = std::collections::BTreeMap::<u32, usize>::new();
+            let trials = 200_000;
+            for _ in 0..trials {
+                // One draft: row 0 judges it, row 1 supplies the bonus token.
+                let rows = RowsProduced::Candidates(vec![logits.clone(), logits.clone()]);
+                let (accepted, bonus) = accept(rows, &[draft], &params, &mut rng).unwrap();
+                let first = if accepted == 1 { draft } else { bonus };
+                *counts.entry(first).or_default() += 1;
+            }
+            for &(t, p) in &expect {
+                let got = *counts.get(&t).unwrap_or(&0) as f64 / trials as f64;
+                assert!(
+                    (got - p).abs() < 0.005,
+                    "draft {draft}: token {t} sampled {got:.4}, expected {p:.4}"
+                );
+            }
+            let outside: usize = counts
+                .iter()
+                .filter(|(t, _)| !expect.iter().any(|(e, _)| e == *t))
+                .map(|(_, n)| n)
+                .sum();
+            assert_eq!(outside, 0, "draft {draft}: sampled outside top-k");
+        }
+    }
 
     #[test]
     fn sampling_respects_top_k_min_p_and_greedy() {

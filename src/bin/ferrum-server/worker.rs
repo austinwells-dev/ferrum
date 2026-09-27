@@ -5,7 +5,7 @@ use ferrum::{
     Error,
     hybrid::{
         plan::PlanOptions,
-        runtime::{ChatHooks, ChatRequest, ChatResult, Delta, Runtime},
+        runtime::{ChatHooks, ChatRequest, ChatResult, Delta, Runtime, SpecOptions},
         session::{Completion, SamplingParams, StopReason},
     },
 };
@@ -83,6 +83,10 @@ pub struct Status {
     pub last_decode_tps: f64,
     pub memory_budget_bytes: usize,
     pub memory_predicted_bytes: usize,
+    /// Speculative drafter name (empty without one).
+    pub drafter: String,
+    pub draft_tokens: u64,
+    pub draft_accepted_tokens: u64,
 }
 
 pub struct Shared {
@@ -104,13 +108,14 @@ impl Shared {
 pub fn spawn(
     path: PathBuf,
     options: PlanOptions,
+    spec: Option<SpecOptions>,
     alias: Option<String>,
     shared: Arc<Shared>,
 ) -> Sender<Job> {
     let (tx, rx) = channel::<Job>();
     std::thread::Builder::new()
         .name("model".into())
-        .spawn(move || run(path, options, alias, shared, rx))
+        .spawn(move || run(path, options, spec, alias, shared, rx))
         .expect("spawn model thread");
     tx
 }
@@ -118,12 +123,13 @@ pub fn spawn(
 fn run(
     path: PathBuf,
     options: PlanOptions,
+    spec: Option<SpecOptions>,
     alias: Option<String>,
     shared: Arc<Shared>,
     jobs: Receiver<Job>,
 ) {
     let start = Instant::now();
-    let mut rt = match Runtime::load(&path, options) {
+    let mut rt = match Runtime::load_speculative(&path, options, spec.as_ref()) {
         Ok(rt) => rt,
         Err(e) => {
             error!(None, "failed to load {}: {e}", path.display());
@@ -170,6 +176,18 @@ fn run(
         gib(plan.recurrent + plan.snapshots),
         gib(plan.scratch)
     );
+    let drafter = rt
+        .session
+        .drafter()
+        .map(|d| (d.name().to_owned(), d.max_drafts()));
+    if let Some((name, drafts)) = &drafter {
+        info!(
+            None,
+            "speculative decoding: {name}, {drafts} drafts per step; drafter memory {:.2} GiB (predicted {:.2})",
+            gib(rt.draft_loaded_bytes),
+            gib(plan.draft_total(plan.context))
+        );
+    }
     let warm = Instant::now();
     match rt.warmup() {
         Ok(()) => info!(None, "warmed up in {:.1} s", warm.elapsed().as_secs_f64()),
@@ -190,6 +208,7 @@ fn run(
         s.context = plan.context;
         s.memory_budget_bytes = plan.budget;
         s.memory_predicted_bytes = plan.total();
+        s.drafter = drafter.map(|(name, _)| name).unwrap_or_default();
     });
     for job in jobs {
         shared.queued.fetch_sub(1, Ordering::SeqCst);
@@ -298,6 +317,8 @@ fn record(shared: &Shared, job: &Job, c: &Completion, event: &Event, session_len
         s.cached_tokens += c.reused_tokens as u64;
         s.prefilled_tokens += prefilled as u64;
         s.generated_tokens += c.tokens.len() as u64;
+        s.draft_tokens += c.drafted as u64;
+        s.draft_accepted_tokens += c.accepted as u64;
         s.prefill_seconds += c.prefill.as_secs_f64();
         s.decode_seconds += c.decode.as_secs_f64();
         if prefilled > 0 {

@@ -5,6 +5,8 @@
 //!            [--presence-penalty X] [--repetition-penalty X] [--seed N]
 //!            [--max-tokens N] [--no-think] [--reasoning-effort LEVEL]
 //!            [--reasoning-budget N] [--hide-thinking]
+//!            [--draft mtp|DIR] [--draft-max N] [--draft-quant q8_0|q4_0]
+//!            [--draft-context N] [--draft-p-min P]
 //!
 //! Commands: /reset, /think on|off, /stats, /exit. End a line with `\` to
 //! continue the message on the next line.
@@ -12,7 +14,7 @@ use ferrum::{
     Error, Result,
     hybrid::{
         plan::PlanOptions,
-        runtime::{ChatRequest, Delta, Runtime},
+        runtime::{ChatRequest, Delta, Runtime, SpecOptions},
     },
 };
 use serde_json::{Map, Value as Json, json};
@@ -28,6 +30,7 @@ struct Options {
     show_thinking: bool,
     reasoning_budget: Option<usize>,
     overrides: Vec<(String, String)>,
+    spec: Option<SpecOptions>,
 }
 
 fn parse() -> Result<Options> {
@@ -41,6 +44,7 @@ fn parse() -> Result<Options> {
         show_thinking: true,
         reasoning_budget: None,
         overrides: Vec::new(),
+        spec: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(key) = args.next() {
@@ -52,7 +56,7 @@ fn parse() -> Result<Options> {
                     "{}",
                     include_str!("ferrum-cli.rs")
                         .lines()
-                        .take(12)
+                        .take(14)
                         .map(|l| l.trim_start_matches("//!").trim_start_matches(' '))
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -68,6 +72,9 @@ fn parse() -> Result<Options> {
                         .parse::<usize>()
                         .map_err(|_| Error::Parameter(format!("invalid {key}: {value}")))
                 };
+                if SpecOptions::apply_flag(&mut o.spec, &key, &value)? {
+                    continue;
+                }
                 match key.as_str() {
                     "--model" | "-m" => o.model = value.clone(),
                     "--context" | "-c" => {
@@ -116,13 +123,22 @@ fn main() {
 fn run() -> Result<()> {
     let o = parse()?;
     eprintln!("loading {} ...", o.model);
-    let mut rt = Runtime::load(
+    let mut rt = Runtime::load_speculative(
         &o.model,
         PlanOptions {
             context: o.context,
             ..Default::default()
         },
+        o.spec.as_ref(),
     )?;
+    if let Some(drafter) = rt.session.drafter() {
+        eprintln!(
+            "speculative decoding: {} ({} drafts per step, {:.2} GiB)",
+            drafter.name(),
+            drafter.max_drafts(),
+            rt.draft_loaded_bytes as f64 / (1u64 << 30) as f64
+        );
+    }
     rt.warmup()?;
     let mut sampling = rt.default_sampling.clone();
     for (key, value) in &o.overrides {
@@ -267,6 +283,15 @@ fn run() -> Result<()> {
             c.tokens.len() as f64 / c.decode.as_secs_f64().max(1e-9),
             c.stop
         );
+        let spec = &rt.session.spec_stats;
+        if spec.steps > 0 {
+            last_stats += &format!(
+                "; speculative acceptance {:.2} ({} of {} drafts)",
+                spec.acceptance_length(),
+                spec.accepted,
+                spec.drafted
+            );
+        }
         eprintln!("\x1b[2m[{last_stats}]\x1b[0m");
         let mut reply = json!({"role": "assistant", "content": result.output.content});
         if let Some(reasoning) = result.output.reasoning {

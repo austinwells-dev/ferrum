@@ -23,6 +23,17 @@ pub struct PlanOptions {
     pub logit_rows: usize,
     /// Recurrent-state snapshots kept for prefix reuse across requests.
     pub snapshots: usize,
+    /// Speculative drafter memory (`runtime::SpecOptions::memory`).
+    pub draft: DraftMemory,
+}
+
+/// Memory a speculative drafter adds: weights, verify and draft buffers,
+/// plus any K/V that grows with the context (MTP).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct DraftMemory {
+    pub weights: usize,
+    pub fixed: usize,
+    pub per_token: f64,
 }
 
 impl Default for PlanOptions {
@@ -34,6 +45,7 @@ impl Default for PlanOptions {
             chunk: 512,
             logit_rows: 1,
             snapshots: 2,
+            draft: DraftMemory::default(),
         }
     }
 }
@@ -53,6 +65,8 @@ pub struct MemoryPlan {
     pub max_context: usize,
     pub context: usize,
     pub trained_context: usize,
+    /// Speculative drafter (zero without one).
+    pub draft: DraftMemory,
 }
 
 /// Measured on the M5: pipelines, command buffers and small per-forward
@@ -62,14 +76,27 @@ const RUNTIME_OVERHEAD: usize = 96 << 20;
 impl MemoryPlan {
     /// Total predicted bytes at the chosen context.
     pub fn total(&self) -> usize {
-        self.fixed() + self.kv(self.context)
+        self.fixed() + self.kv(self.context) + self.draft_kv(self.context)
+    }
+    /// Drafter bytes at `context` (weights, buffers and context-sized K/V).
+    pub fn draft_total(&self, context: usize) -> usize {
+        self.draft.weights + self.draft.fixed + self.draft_kv(context)
+    }
+    fn draft_kv(&self, context: usize) -> usize {
+        (self.draft.per_token * context.next_multiple_of(32) as f64).ceil() as usize
     }
     /// K+V bytes at `context` (upper bound; allocation pads to 32 positions).
     pub fn kv(&self, context: usize) -> usize {
         (self.kv_per_token * context.next_multiple_of(32) as f64).ceil() as usize + (1 << 20)
     }
     fn fixed(&self) -> usize {
-        self.weights + self.scratch + self.recurrent + self.snapshots + self.overhead
+        self.weights
+            + self.scratch
+            + self.recurrent
+            + self.snapshots
+            + self.overhead
+            + self.draft.weights
+            + self.draft.fixed
     }
 }
 
@@ -122,9 +149,11 @@ pub fn plan(
         max_context: 0,
         context: 0,
         trained_context: c.trained_context,
+        draft: options.draft,
     };
     let free = budget.saturating_sub(plan.fixed());
-    let fits = ((free as f64 / kv_per_token) as usize / 256 * 256).min(c.trained_context);
+    let per_token = kv_per_token + options.draft.per_token;
+    let fits = ((free as f64 / per_token) as usize / 256 * 256).min(c.trained_context);
     plan.max_context = fits;
     plan.context = match options.context {
         Some(requested) if requested > c.trained_context => {
@@ -136,7 +165,7 @@ pub fn plan(
         Some(requested) if requested > fits => {
             return Err(Error::Config(format!(
                 "context {requested} needs {} MiB but the budget is {} MiB; the largest context that fits is {fits}",
-                (plan.fixed() + plan.kv(requested)) >> 20,
+                (plan.fixed() + plan.kv(requested) + plan.draft_kv(requested)) >> 20,
                 budget >> 20
             )));
         }

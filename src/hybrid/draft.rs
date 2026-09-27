@@ -1042,20 +1042,20 @@ fn check_target(c: &DraftConfig, t: &HybridConfig) -> Result<()> {
     Ok(())
 }
 
-/// Bytes a `DraftModel` allocates for `capacity` positions (weights excluded).
-pub fn draft_state_bytes(
-    c: &DraftConfig,
-    t: &HybridConfig,
-    capacity: usize,
-    chunk: usize,
-    cap: usize,
-) -> usize {
-    let ring = c.window.unwrap_or(cap.min(capacity)).min(capacity);
+/// Bytes a `DraftModel` allocates beyond its weights: the context ring and
+/// the block and ingestion buffers.
+fn state_bytes(c: &DraftConfig, t: &HybridConfig, ring: usize, chunk: usize) -> usize {
     let kvw = c.kv_heads * c.head_dim;
     let block = c.block_size;
     let f = |n: usize| page(n * 4);
+    let groups = c.conv.map_or(1, |(k, g)| 2 * k * (c.hidden / g));
+    let rank = match c.kind {
+        Kind::DSpark { rank, .. } | Kind::DFlash2 { rank, .. } => rank,
+        Kind::DFlash => 1,
+    };
     c.layers * 2 * page(ring * kvw * 2)
         + page(ring * 4)
+        + page(c.inv_freq.len() * 4)
         + 2 * f(chunk * c.hidden)
         + 2 * f(chunk * kvw)
         + 4 * f(block * c.hidden)
@@ -1063,9 +1063,62 @@ pub fn draft_state_bytes(
         + 2 * f(block * kvw)
         + page(block * c.heads * c.head_dim * 2)
         + 2 * page(block * kvw * 2)
+        + f(block * groups)
         + 3 * f(block * c.ffn)
         + f(block * t.vocab)
         + f(block * t.vocab.div_ceil(1024) * 64)
+        + 2 * f(block * rank)
+        + f(block + 1)
+        + f(t.vocab)
+        + f(block)
+}
+
+impl DraftModel {
+    /// Device bytes a checkpoint will take for `target` without loading it:
+    /// (weights, buffers and context ring). Context rings of drafts without
+    /// a window are sized for `options.context_cap`.
+    pub fn memory(
+        dir: impl AsRef<Path>,
+        target: &HybridConfig,
+        chunk: usize,
+        options: DraftOptions,
+    ) -> Result<(DraftConfig, usize, usize)> {
+        let dir = resolve(dir.as_ref())?;
+        let json: Json =
+            serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(io)?)
+                .map_err(|e| Error::Config(format!("draft config.json: {e}")))?;
+        let config = DraftConfig::from_json(&json)?;
+        check_target(&config, target)?;
+        let st = Safetensors::open(&dir.join("model.safetensors"))?;
+        let quantized = |cols: usize| match options.quant {
+            DraftQuant::Q8_0 => cols / 32 * 34,
+            DraftQuant::Q4_0 => cols / 32 * 18,
+        };
+        let mut weights = 0;
+        for (name, (_, shape, _, _)) in &st.tensors {
+            let numel: usize = shape.iter().product();
+            weights += if name.ends_with("_codebook") || name == "confidence_head.proj.bias" {
+                0
+            } else if name.starts_with("lm_head")
+                || name.starts_with("embed_tokens")
+                || name == "d2t"
+                || name == "t2d"
+            {
+                0
+            } else if shape.len() == 2 && shape[0] > 1 {
+                let (rows, cols) = (shape[0], shape[1]);
+                let q8 = name.starts_with("markov_head")
+                    || name.contains("kernel_projection")
+                    || name.starts_with("candidate_selector");
+                page(rows * if q8 { cols / 32 * 34 } else { quantized(cols) })
+            } else {
+                page(numel * 4)
+            };
+        }
+        let ring = config.window.unwrap_or(options.context_cap);
+        let state = state_bytes(&config, target, ring, chunk);
+        Ok((config, weights, state))
+    }
 }
 
 impl Drafter for DraftModel {

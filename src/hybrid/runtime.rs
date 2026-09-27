@@ -3,18 +3,180 @@
 //! streaming split of generated text into reasoning, content and tool calls.
 #![forbid(unsafe_code)]
 use super::{
-    LoadedHybrid,
+    HybridConfig, LoadedHybrid, Variant,
     chat::{ChatTemplate, ParsedOutput, parse_output},
     config::uint,
-    plan::PlanOptions,
+    draft::{DraftModel, DraftOptions, DraftQuant},
+    engine::{SpecGeometry, spec_bytes},
+    mtp::{Mtp, mtp_state_bytes, mtp_weight_bytes},
+    plan::{DraftMemory, PlanOptions},
     session::{Completion, Flow, GenerationHooks, SamplingParams, Session, StopReason},
+    speculative::Drafter,
 };
 use crate::{
     Error, MetalDevice, Result,
     loader::gguf::{GgufFile, MetadataValue},
 };
 use serde_json::{Map, Value as Json};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Where speculative drafts come from.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DraftSource {
+    /// The target GGUF's own NextN/MTP block.
+    Mtp,
+    /// A DFlash / DFlash2 / DSpark checkpoint directory (or HF cache entry).
+    Checkpoint(PathBuf),
+}
+
+impl DraftSource {
+    /// `mtp` or a path.
+    pub fn parse(value: &str) -> Self {
+        if value.eq_ignore_ascii_case("mtp") {
+            Self::Mtp
+        } else {
+            Self::Checkpoint(value.into())
+        }
+    }
+}
+
+/// Speculative decoding setup for `Runtime::load_speculative`.
+#[derive(Debug, Clone)]
+pub struct SpecOptions {
+    pub source: DraftSource,
+    /// Drafts per step (None: 3 for MTP; the trained block for dense
+    /// targets and 2 for MoE targets, whose verify cost grows with the
+    /// number of distinct experts).
+    pub max_drafts: Option<usize>,
+    pub draft: DraftOptions,
+}
+
+impl SpecOptions {
+    pub fn new(source: DraftSource) -> Self {
+        Self {
+            source,
+            max_drafts: None,
+            draft: DraftOptions::default(),
+        }
+    }
+
+    /// Apply one command-line flag shared by `ferrum-cli` and
+    /// `ferrum-server`; returns false when `key` is not a draft flag.
+    /// `--draft mtp|DIR` enables speculation; the others tune it:
+    /// `--draft-max N`, `--draft-quant q8_0|q4_0`, `--draft-context N`
+    /// (context slots for drafts without a sliding window) and
+    /// `--draft-p-min P` (DSpark confidence cut-off).
+    pub fn apply_flag(spec: &mut Option<Self>, key: &str, value: &str) -> Result<bool> {
+        let bad = || Error::Parameter(format!("invalid {key}: {value}"));
+        if key == "--draft" {
+            let previous = spec.take();
+            let mut next = Self::new(DraftSource::parse(value));
+            if let Some(p) = previous {
+                next.max_drafts = p.max_drafts;
+                next.draft = p.draft;
+            }
+            *spec = Some(next);
+            return Ok(true);
+        }
+        if !key.starts_with("--draft-") {
+            return Ok(false);
+        }
+        let s = spec.get_or_insert_with(|| Self::new(DraftSource::Mtp));
+        match key {
+            "--draft-max" => s.max_drafts = Some(value.parse().map_err(|_| bad())?),
+            "--draft-quant" => {
+                s.draft.quant = match value.to_ascii_lowercase().as_str() {
+                    "q8_0" => DraftQuant::Q8_0,
+                    "q4_0" => DraftQuant::Q4_0,
+                    _ => return Err(bad()),
+                }
+            }
+            "--draft-context" => s.draft.context_cap = value.parse().map_err(|_| bad())?,
+            "--draft-p-min" => s.draft.confidence_min = value.parse().map_err(|_| bad())?,
+            _ => return Ok(false),
+        }
+        Ok(true)
+    }
+
+    fn drafts(&self, target: &HybridConfig, trained: usize) -> usize {
+        self.max_drafts
+            .unwrap_or(match (&self.source, target.variant) {
+                (DraftSource::Mtp, _) => 3,
+                (_, Variant::Moe) => trained.min(2),
+                _ => trained,
+            })
+    }
+
+    /// Memory the drafter will take next to `target`, before loading.
+    pub fn memory(
+        &self,
+        file: &GgufFile,
+        target: &HybridConfig,
+        chunk: usize,
+    ) -> Result<DraftMemory> {
+        match &self.source {
+            DraftSource::Mtp => {
+                let k = self.drafts(target, 3);
+                let geometry = SpecGeometry {
+                    rows: k + 1,
+                    aux_layers: Vec::new(),
+                    final_hidden: true,
+                };
+                let per_token = (2 * target.kv_heads * target.head_dim * 2) as f64;
+                Ok(DraftMemory {
+                    weights: mtp_weight_bytes(file, target),
+                    fixed: mtp_state_bytes(target, 0, chunk, k)
+                        + spec_bytes(target, chunk, &geometry),
+                    per_token,
+                })
+            }
+            DraftSource::Checkpoint(dir) => {
+                let (config, weights, state) = DraftModel::memory(dir, target, chunk, self.draft)?;
+                let k = self.drafts(target, config.max_drafts());
+                let geometry = SpecGeometry {
+                    rows: k + 1,
+                    aux_layers: config.target_layers.clone(),
+                    final_hidden: false,
+                };
+                Ok(DraftMemory {
+                    weights,
+                    fixed: state + spec_bytes(target, chunk, &geometry),
+                    per_token: 0.,
+                })
+            }
+        }
+    }
+
+    /// Load the drafter for a session of `capacity` positions.
+    pub fn build(
+        &self,
+        d: &MetalDevice,
+        target_path: &Path,
+        loaded: &LoadedHybrid,
+        capacity: usize,
+    ) -> Result<Box<dyn Drafter>> {
+        let model = &loaded.model;
+        Ok(match &self.source {
+            DraftSource::Mtp => {
+                let k = self.drafts(&model.config, 3);
+                Box::new(Mtp::load(d, target_path, model, capacity, k)?)
+            }
+            DraftSource::Checkpoint(dir) => {
+                let (config, _, _) =
+                    DraftModel::memory(dir, &model.config, model.chunk(), self.draft)?;
+                let k = self.drafts(&model.config, config.max_drafts());
+                Box::new(DraftModel::load(
+                    d,
+                    dir,
+                    model,
+                    capacity,
+                    Some(k),
+                    self.draft,
+                )?)
+            }
+        })
+    }
+}
 
 /// Incremental text produced while generating.
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +262,8 @@ pub struct Runtime {
     /// The model's recommended sampling (GGUF `general.sampling.*`).
     pub default_sampling: SamplingParams,
     pub model_name: String,
+    /// Device bytes the drafter took (weights, buffers, verify buffers).
+    pub draft_loaded_bytes: usize,
 }
 
 impl Runtime {
@@ -124,10 +288,25 @@ impl Runtime {
     }
 
     pub fn load(path: impl AsRef<Path>, options: PlanOptions) -> Result<Self> {
+        Self::load_speculative(path, options, None)
+    }
+
+    /// Load with an optional drafter: its memory is planned before any
+    /// weight is read (the auto-fitted context shrinks to make room), and the
+    /// session speculates by default.
+    pub fn load_speculative(
+        path: impl AsRef<Path>,
+        mut options: PlanOptions,
+        spec: Option<&SpecOptions>,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let device = MetalDevice::new()?;
         let file = GgufFile::open(path)?;
         let default_sampling = recommended_sampling(&file);
+        if let Some(spec) = spec {
+            let config = HybridConfig::from_gguf(&file)?;
+            options.draft = spec.memory(&file, &config, options.chunk.max(1))?;
+        }
         drop(file);
         let loaded = super::load_with(&device, path, options)?;
         let template = ChatTemplate::new(
@@ -136,12 +315,19 @@ impl Runtime {
                 .as_deref()
                 .ok_or_else(|| Error::Tokenizer("GGUF has no chat template".into()))?,
         )?;
-        let session = Session::new(
+        let mut session = Session::new(
             &device,
             &loaded.model,
             loaded.plan.context,
             options.snapshots,
         )?;
+        let mut draft_loaded_bytes = 0;
+        if let Some(spec) = spec {
+            let before = device.allocated_bytes();
+            let drafter = spec.build(&device, path, &loaded, loaded.plan.context)?;
+            session.set_drafter(&device, &loaded.model, drafter)?;
+            draft_loaded_bytes = device.allocated_bytes().saturating_sub(before);
+        }
         let model_name = path.file_stem().map_or_else(
             || loaded.model.config.name.clone(),
             |s| s.to_string_lossy().into_owned(),
@@ -153,6 +339,7 @@ impl Runtime {
             session,
             default_sampling,
             model_name,
+            draft_loaded_bytes,
         })
     }
 

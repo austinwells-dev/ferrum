@@ -11,7 +11,10 @@ mod openai;
 mod worker;
 
 use ferrum::hybrid::{
-    self, chat::ChatTemplate, plan::PlanOptions, runtime::recommended_sampling,
+    self,
+    chat::ChatTemplate,
+    plan::PlanOptions,
+    runtime::{SpecOptions, recommended_sampling},
     session::SamplingParams,
 };
 use ferrum::{loader::gguf::GgufFile, tokenizer::Tokenizer};
@@ -45,6 +48,14 @@ memory:
   --reserve-mib N           GPU memory left free for the system (default 1024)
   --snapshots N             recurrent snapshots kept for prefix reuse (default 2)
   --chunk N                 prompt tokens per forward pass (default 512)
+speculative decoding (lossless; off by default):
+  --draft mtp|DIR           drafter: the GGUF's MTP block, or a DFlash / DFlash2 /
+                            DSpark checkpoint directory (or its HF cache entry)
+  --draft-max N             drafts per step (default: 3 for MTP; the trained block
+                            for dense targets, 2 for MoE targets)
+  --draft-quant q8_0|q4_0   draft weight precision (default q8_0)
+  --draft-context N         context slots for drafts without a sliding window (8192)
+  --draft-p-min P           DSpark: stop drafting below this confidence (0)
 generation defaults (requests may override):
   --temp, --top-p, --top-k, --min-p, --presence-penalty, --frequency-penalty,
   --repeat-penalty X        sampling (default: the GGUF's recommended values)
@@ -134,6 +145,7 @@ struct Options {
     host: String,
     port: u16,
     plan: PlanOptions,
+    spec: Option<SpecOptions>,
     api_key: Option<String>,
     alias: Option<String>,
     verbose: bool,
@@ -150,6 +162,7 @@ fn parse() -> Result<Options, String> {
         host: "127.0.0.1".into(),
         port: 8080,
         plan: PlanOptions::default(),
+        spec: None,
         api_key: None,
         alias: None,
         verbose: false,
@@ -179,6 +192,9 @@ fn parse() -> Result<Options, String> {
         let value = args.next().ok_or(format!("missing value for {key}"))?;
         let bad = || format!("invalid value for {key}: {value}");
         let number = || value.parse::<usize>().map_err(|_| bad());
+        if SpecOptions::apply_flag(&mut o.spec, &key, &value).map_err(|e| e.to_string())? {
+            continue;
+        }
         match key.as_str() {
             "-m" | "--model" => o.model = value.clone().into(),
             "--host" => o.host = value.clone(),
@@ -304,7 +320,13 @@ fn run(o: Options) -> Result<(), String> {
         }),
         queued: AtomicUsize::new(0),
     });
-    let jobs = worker::spawn(o.model.clone(), o.plan, o.alias.clone(), shared.clone());
+    let jobs = worker::spawn(
+        o.model.clone(),
+        o.plan,
+        o.spec.clone(),
+        o.alias.clone(),
+        shared.clone(),
+    );
     if !o.vars.is_empty() {
         info!(
             None,
@@ -646,7 +668,9 @@ fn handle(
                  # TYPE ferrum_cached_tokens gauge\nferrum_cached_tokens {}\n\
                  # TYPE ferrum_context_tokens gauge\nferrum_context_tokens {}\n\
                  # TYPE ferrum_memory_predicted_bytes gauge\nferrum_memory_predicted_bytes {}\n\
-                 # TYPE ferrum_uptime_seconds gauge\nferrum_uptime_seconds {:.0}\n",
+                 # TYPE ferrum_uptime_seconds gauge\nferrum_uptime_seconds {:.0}\n\
+                 # TYPE ferrum_draft_tokens_total counter\nferrum_draft_tokens_total {}\n\
+                 # TYPE ferrum_draft_tokens_accepted_total counter\nferrum_draft_tokens_accepted_total {}\n",
                 s.requests,
                 s.cancelled,
                 s.failed,
@@ -665,7 +689,9 @@ fn handle(
                 s.session_tokens,
                 s.context,
                 s.memory_predicted_bytes,
-                server.started.elapsed().as_secs_f64()
+                server.started.elapsed().as_secs_f64(),
+                s.draft_tokens,
+                s.draft_accepted_tokens
             );
             http::respond(
                 stream,

@@ -277,6 +277,8 @@ pub fn timings(c: &Completion) -> Json {
         "predicted_ms": dm,
         "predicted_per_token_ms": dm / c.tokens.len().max(1) as f64,
         "predicted_per_second": c.tokens.len() as f64 / (dm / 1e3).max(1e-9),
+        "draft_n": c.drafted,
+        "draft_n_accepted": c.accepted,
     })
 }
 

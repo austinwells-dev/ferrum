@@ -13,12 +13,11 @@ use ferrum::{
     Result,
     hybrid::{
         HybridState, Output, Produced,
-        draft::{DraftModel, DraftOptions},
-        mtp::Mtp,
+        draft::DraftOptions,
         plan::PlanOptions,
-        runtime::{ChatRequest, Runtime},
+        runtime::{ChatRequest, DraftSource, Runtime, SpecOptions},
         session::SamplingParams,
-        speculative::{Drafter, SpecStats},
+        speculative::SpecStats,
     },
 };
 use serde_json::json;
@@ -50,43 +49,32 @@ fn main() -> Result<()> {
         .parse()
         .expect("prompts");
     let drafter_arg = get("--drafter", "mtp");
-    let mut rt = Runtime::load(
+    let drafts: usize = get("--drafts", "0").parse().expect("drafts");
+    let spec = SpecOptions {
+        source: DraftSource::parse(&drafter_arg),
+        max_drafts: (drafts > 0).then_some(drafts),
+        draft: DraftOptions {
+            confidence_min: get("--pmin", "0").parse().expect("pmin"),
+            ..Default::default()
+        },
+    };
+    let mut rt = Runtime::load_speculative(
         &args[1],
         PlanOptions {
             context: Some(context),
             ..Default::default()
         },
+        Some(&spec),
     )?;
-    let drafts: usize = get("--drafts", "0").parse().expect("drafts");
-    let drafter: Box<dyn Drafter> = if drafter_arg == "mtp" {
-        let k = if drafts == 0 { 3 } else { drafts };
-        Box::new(Mtp::load(
-            &rt.device,
-            &args[1],
-            &rt.loaded.model,
-            context,
-            k,
-        )?)
-    } else {
-        Box::new(DraftModel::load(
-            &rt.device,
-            &drafter_arg,
-            &rt.loaded.model,
-            context,
-            (drafts > 0).then_some(drafts),
-            DraftOptions {
-                confidence_min: get("--pmin", "0").parse().expect("pmin"),
-                ..Default::default()
-            },
-        )?)
-    };
+    let plan = &rt.loaded.plan;
+    let drafter = rt.session.drafter().expect("drafter attached");
     println!(
-        "drafter {} (max {} drafts)",
+        "drafter {} (max {} drafts); memory predicted {:.1} MiB, measured {:.1} MiB",
         drafter.name(),
-        drafter.max_drafts()
+        drafter.max_drafts(),
+        plan.draft_total(plan.context) as f64 / 1048576.,
+        rt.draft_loaded_bytes as f64 / 1048576.
     );
-    rt.session
-        .set_drafter(&rt.device, &rt.loaded.model, drafter)?;
     rt.warmup()?;
     let sampling = SamplingParams {
         temperature,
