@@ -1391,7 +1391,30 @@ impl HybridModel {
             .0;
         let inputs: [Binding; 2] = [w.binding(), x.binding()];
         let outputs: [Binding; 1] = [y.binding()];
-        if m > MV_MAX_ROWS && !exact_math() {
+        if (2..=MVB_MAX_ROWS).contains(&m) && !exact_math() {
+            const SIMDS: usize = 4;
+            return d.dispatch_hybrid(
+                mvb_kernel(w.format),
+                &inputs,
+                &outputs,
+                &args,
+                [w.rows.div_ceil(SIMDS * 2), m.div_ceil(4), 1],
+                [32, SIMDS, 1],
+                0,
+            );
+        }
+        if (2..=MMS_MAX_ROWS).contains(&m) && !exact_math() {
+            return d.dispatch_hybrid(
+                mms_kernel(w.format),
+                &inputs,
+                &outputs,
+                &args,
+                [m.div_ceil(16), w.rows.div_ceil(64), 1],
+                [128, 1, 1],
+                64 * 64 * 2,
+            );
+        }
+        if m > 1 && !exact_math() {
             let name = match w.format {
                 Format::Q4K => "h_mm_q4_k",
                 Format::Q5K => "h_mm_q5_k",
@@ -1468,10 +1491,40 @@ const SPLIT_MIN_KEYS: usize = 256;
 const DECODE_SPLIT_TARGET: usize = 128;
 const DECODE_SPLIT_MIN_KEYS: usize = 256;
 const MAX_SPLIT_ROWS: usize = 64;
-/// Activation rows at or below which projections use the GEMV kernels.
-const MV_MAX_ROWS: usize = 4;
+/// Activation rows served by the small-batch GEMV, and by the narrow
+/// TensorOps tiles (speculative verify widths; see the Phase 9 journal).
+const MVB_MAX_ROWS: usize = 3;
+const MMS_MAX_ROWS: usize = 32;
 /// Expert routes at or below which experts use per-route GEMVs.
 const MV_ID_MAX_ROUTES: usize = 32;
+
+/// Small-batch GEMV (4 activation rows per threadgroup, 2 output rows per SIMD group).
+fn mvb_kernel(format: Format) -> &'static str {
+    match format {
+        Format::Q4K => "h_mvb_q4_k",
+        Format::Q5K => "h_mvb_q5_k",
+        Format::Q6K => "h_mvb_q6_k",
+        Format::Q8_0 => "h_mvb_q8_0",
+        Format::Q4_0 => "h_mvb_q4_0",
+        Format::Iq4Xs => "h_mvb_iq4_xs",
+        Format::Iq3S => "h_mvb_iq3_s",
+        Format::F32 => "h_mvb_f32",
+    }
+}
+
+/// Narrow-tile TensorOps GEMM (16 activation rows by 64 output rows).
+fn mms_kernel(format: Format) -> &'static str {
+    match format {
+        Format::Q4K => "h_mms_q4_k",
+        Format::Q5K => "h_mms_q5_k",
+        Format::Q6K => "h_mms_q6_k",
+        Format::Q8_0 => "h_mms_q8_0",
+        Format::Q4_0 => "h_mms_q4_0",
+        Format::Iq4Xs => "h_mms_iq4_xs",
+        Format::Iq3S => "h_mms_iq3_s",
+        Format::F32 => "h_mms_f32",
+    }
+}
 
 /// GEMV kernel, output rows per threadgroup, SIMD groups, threadgroup bytes.
 fn mv_kernel(format: Format, expert: bool) -> (&'static str, usize, usize, usize) {

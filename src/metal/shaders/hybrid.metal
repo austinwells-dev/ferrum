@@ -105,7 +105,7 @@ static inline uchar2 get_scale_min_k4_just2(int j, int k, device const uchar * q
 template <typename type4x4>
 void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & reg) {
     device const ushort * qs = ((device const ushort *)xb + 1);
-    const float d1 = il ? (xb->d / 16.h) : xb->d;
+    const float d1 = il ? (float(xb->d) / 16.f) : float(xb->d);
     const float d2 = d1 / 256.f;
     const float md = -8.h * xb->d;
     const ushort mask0 = il ? 0x00F0 : 0x000F;
@@ -136,7 +136,8 @@ void dequantize_q4_K(device const block_q4_K * xb, short il, thread type4x4 & re
     q = q + (il/4) * 32 + 16 * (il&1);
     il = il & 3;
     const uchar2 sc = get_scale_min_k4_just2(is, il/2, xb->scales);
-    const float d   = il < 2 ? xb->d : xb->d / 16.h;
+    // Divide in float: d/16 is often below the smallest normal half.
+    const float d   = il < 2 ? float(xb->d) : float(xb->d) / 16.f;
     const float min = xb->dmin;
     const float dl = d * sc[0];
     const float ml = min * sc[1];
@@ -725,6 +726,70 @@ kernel void h_mv_iq4_xs(constant ProjArgs & a [[buffer(3)]], device const char *
     mv_iq4_xs<2, 2>(a, w, x, y, shmem, tgpig, tiisg, sgitg);
 }
 
+// Small-batch GEMV (2..4 activation rows): each lane dequantizes one
+// 16-value weight chunk per output row and applies it to up to R activation
+// rows, so the weights are streamed once for the whole batch. Wider batches
+// are compute-bound here and use the narrow TensorOps tiles instead.
+// grid (ceil(n / (NSG*NR)), ceil(m / R)); threads (32, NSG).
+template<typename block_q, short nl, void (*deq)(device const block_q *, short, thread float4x4 &), short NR, short R>
+void mvb_impl(constant ProjArgs & a, device const char * w, device const float * x, device float * y,
+              uint3 tgpig, ushort tiisg, ushort sgitg, ushort nsg) {
+    const int first_row = (tgpig.x * nsg + sgitg) * NR;
+    const int nrows = min(int(NR), int(a.n) - first_row);
+    if (nrows <= 0) return;
+    const int r0 = tgpig.y * R;
+    const int rrows = min(int(R), int(a.m) - r0);
+    const int chunks = a.k / 16;
+    device const block_q * wr[NR];
+    FOR_UNROLL (short row = 0; row < NR; ++row) {
+        wr[row] = (device const block_q *)(w + (ulong)(first_row + min(int(row), nrows - 1)) * a.row_bytes);
+    }
+    float sums[NR][R];
+    FOR_UNROLL (short row = 0; row < NR; ++row) {
+        FOR_UNROLL (short r = 0; r < R; ++r) sums[row][r] = 0.f;
+    }
+    device const float * xb = x + (ulong)r0 * a.x_stride;
+    for (int ch = tiisg; ch < chunks; ch += 32) {
+        float4x4 wv[NR];
+        FOR_UNROLL (short row = 0; row < NR; ++row) deq(wr[row] + ch / nl, ch % nl, wv[row]);
+        FOR_UNROLL (short r = 0; r < R; ++r) {
+            if (r < rrows) {
+                device const float4 * xv = (device const float4 *)(xb + (ulong)r * a.x_stride + ch * 16);
+                const float4 x0 = xv[0], x1 = xv[1], x2 = xv[2], x3 = xv[3];
+                FOR_UNROLL (short row = 0; row < NR; ++row) {
+                    sums[row][r] += dot(wv[row][0], x0) + dot(wv[row][1], x1) +
+                                    dot(wv[row][2], x2) + dot(wv[row][3], x3);
+                }
+            }
+        }
+    }
+    FOR_UNROLL (short row = 0; row < NR; ++row) {
+        FOR_UNROLL (short r = 0; r < R; ++r) {
+            const float s = simd_sum(sums[row][r]);
+            if (tiisg == 0 && row < nrows && r < rrows) {
+                y[(ulong)(r0 + r) * a.y_stride + first_row + row] = s;
+            }
+        }
+    }
+}
+
+#define MVB_KERNEL(NAME, BLOCK, NL, DEQ, NR, R) \
+kernel void NAME(constant ProjArgs & a [[buffer(3)]], device const char * w [[buffer(0)]], \
+                 device const float * x [[buffer(1)]], device float * y [[buffer(2)]], \
+                 uint3 tgpig [[threadgroup_position_in_grid]], ushort tiisg [[thread_index_in_simdgroup]], \
+                 ushort sgitg [[simdgroup_index_in_threadgroup]], ushort3 ntg [[threads_per_threadgroup]]) { \
+    mvb_impl<BLOCK, NL, DEQ<float4x4>, NR, R>(a, w, x, y, tgpig, tiisg, sgitg, ntg.y); \
+}
+#define MVB_FORMAT(FMT, BLOCK, NL, DEQ) MVB_KERNEL(h_mvb_##FMT, BLOCK, NL, DEQ, 2, 4)
+MVB_FORMAT(q4_k, block_q4_K, 16, dequantize_q4_K)
+MVB_FORMAT(q5_k, block_q5_K, 16, dequantize_q5_K)
+MVB_FORMAT(q6_k, block_q6_K, 16, dequantize_q6_K)
+MVB_FORMAT(q8_0, block_q8_0, 2, dequantize_q8_0)
+MVB_FORMAT(q4_0, block_q4_0, 2, dequantize_q4_0)
+MVB_FORMAT(iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
+MVB_FORMAT(iq3_s, block_iq3_s, 16, dequantize_iq3_s)
+MVB_FORMAT(f32, float4x4, 1, dequantize_f32)
+
 // TensorOps GEMM after llama.cpp's kernel_mul_mm (tensor path): a 64-row
 // weight tile is dequantized to F16 in threadgroup memory; 128 activation
 // rows are read as F32 directly from device memory; accumulation is F32.
@@ -733,26 +798,28 @@ constant constexpr int MM_NRA = 64;   // weight rows per tile
 constant constexpr int MM_NRB = 128;  // activation rows per tile
 constant constexpr int MM_NK = 32;    // K per step (two 16-value chunks)
 
-template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
+template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &),
+         int NRB, int NK>
 void mm_impl(constant ProjArgs & a, device const char * w, device const float * x, device float * y,
              threadgroup half * sa, uint3 tgpig, ushort tiitg) {
     const int K = a.k;
     const int M = a.n;      // output features
     const int N = a.m;      // activation rows
     const int ra = tgpig.y * MM_NRA;
-    const int rb = tgpig.x * MM_NRB;
-    auto tA = tensor(sa, dextents<int32_t, 2>(MM_NK, MM_NRA));
+    const int rb = tgpig.x * NRB;
+    constexpr int CHUNKS = NK / 16;
+    auto tA = tensor(sa, dextents<int32_t, 2>(NK, MM_NRA));
     auto tB = tensor((device float *)x, dextents<int32_t, 2>(K, N), array<int, 2>({1, int(a.x_stride)}));
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
-            MM_NRB, MM_NRA, MM_NK, false, true, true,
+            NRB, MM_NRA, NK, false, true, true,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
-    for (int loop_k = 0; loop_k < K; loop_k += MM_NK) {
-        for (int work = tiitg; work < MM_NRA * 2; work += 128) {
-            const int row = work / 2;
-            const int k_chunk = work % 2;
+    auto cT = mm.template get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        for (int work = tiitg; work < MM_NRA * CHUNKS; work += 128) {
+            const int row = work / CHUNKS;
+            const int k_chunk = work % CHUNKS;
             const int k_pos = loop_k + k_chunk * 16;
             if (ra + row < M) {
                 const int block_idx = k_pos / (16 * nl);
@@ -760,9 +827,9 @@ void mm_impl(constant ProjArgs & a, device const char * w, device const float * 
                 device const block_q * row_ptr = (device const block_q *)(w + (ulong)a.row_bytes * (ra + row));
                 half4x4 temp_a;
                 dequantize_func(row_ptr + block_idx, il, temp_a);
-                FOR_UNROLL (short i = 0; i < 16; i++) sa[row * MM_NK + k_chunk*16 + i] = temp_a[i/4][i%4];
+                FOR_UNROLL (short i = 0; i < 16; i++) sa[row * NK + k_chunk*16 + i] = temp_a[i/4][i%4];
             } else {
-                FOR_UNROLL (short i = 0; i < 16; i++) sa[row * MM_NK + k_chunk*16 + i] = 0.h;
+                FOR_UNROLL (short i = 0; i < 16; i++) sa[row * NK + k_chunk*16 + i] = 0.h;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -780,8 +847,27 @@ kernel void NAME(constant ProjArgs & a [[buffer(3)]], device const char * w [[bu
                  device const float * x [[buffer(1)]], device float * y [[buffer(2)]], \
                  threadgroup half * sa [[threadgroup(0)]], \
                  uint3 tgpig [[threadgroup_position_in_grid]], ushort tiitg [[thread_index_in_threadgroup]]) { \
-    mm_impl<BLOCK, NL, DEQ<half4x4>>(a, w, x, y, sa, tgpig, tiitg); \
+    mm_impl<BLOCK, NL, DEQ<half4x4>, MM_NRB, MM_NK>(a, w, x, y, sa, tgpig, tiitg); \
 }
+// Narrow tiles for small batches (speculative verify, 4..64 rows): 16
+// activation rows by 64 weight rows, K steps of 64. Grid (ceil(m/16),
+// ceil(n/64)); threads 128; 64*64*2 bytes of threadgroup memory.
+#define MMS_KERNEL(NAME, BLOCK, NL, DEQ, NRB, NK) \
+kernel void NAME(constant ProjArgs & a [[buffer(3)]], device const char * w [[buffer(0)]], \
+                 device const float * x [[buffer(1)]], device float * y [[buffer(2)]], \
+                 threadgroup half * sa [[threadgroup(0)]], \
+                 uint3 tgpig [[threadgroup_position_in_grid]], ushort tiitg [[thread_index_in_threadgroup]]) { \
+    mm_impl<BLOCK, NL, DEQ<half4x4>, NRB, NK>(a, w, x, y, sa, tgpig, tiitg); \
+}
+#define MMS_FORMAT(FMT, BLOCK, NL, DEQ) MMS_KERNEL(h_mms_##FMT, BLOCK, NL, DEQ, 16, 64)
+MMS_FORMAT(q4_k, block_q4_K, 16, dequantize_q4_K)
+MMS_FORMAT(q5_k, block_q5_K, 16, dequantize_q5_K)
+MMS_FORMAT(q6_k, block_q6_K, 16, dequantize_q6_K)
+MMS_FORMAT(q8_0, block_q8_0, 2, dequantize_q8_0)
+MMS_FORMAT(q4_0, block_q4_0, 2, dequantize_q4_0)
+MMS_FORMAT(iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
+MMS_FORMAT(iq3_s, block_iq3_s, 16, dequantize_iq3_s)
+MMS_FORMAT(f32, float4x4, 1, dequantize_f32)
 MM_KERNEL(h_mm_q4_k, block_q4_K, 16, dequantize_q4_K)
 MM_KERNEL(h_mm_q5_k, block_q5_K, 16, dequantize_q5_K)
 MM_KERNEL(h_mm_q6_k, block_q6_K, 16, dequantize_q6_K)

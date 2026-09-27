@@ -1,5 +1,6 @@
 //! Projection kernel throughput on real hybrid-model weights.
-//! usage: hybrid_kernels MODEL.gguf [m=1] [iters=200]
+//! usage: hybrid_kernels MODEL.gguf [m=1] [iters=200] [--check]
+//! --check compares m-row projections against m single-row GEMVs instead.
 fn main() -> ferrum::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let m: usize = args.get(2).map_or(1, |v| v.parse().expect("m"));
@@ -7,6 +8,12 @@ fn main() -> ferrum::Result<()> {
     let d = ferrum::MetalDevice::new()?;
     d.set_batch_limit(100_000)?;
     let loaded = ferrum::hybrid::load(&d, &args[1], m.max(1), 1)?;
+    if args.iter().any(|a| a == "--check") {
+        for (name, rel, _) in loaded.model.check_projections(&d, m)? {
+            println!("{name:<40} max rel diff {rel:.2e}");
+        }
+        return Ok(());
+    }
     for (name, us, gbs) in loaded.model.bench_projections(&d, m, iters)? {
         println!("{name:<40} {us:>9.1} us  {gbs:>7.1} GB/s");
     }
