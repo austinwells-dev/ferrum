@@ -1097,13 +1097,15 @@ impl DraftModel {
         let mut weights = 0;
         for (name, (_, shape, _, _)) in &st.tensors {
             let numel: usize = shape.iter().product();
-            weights += if name.ends_with("_codebook") || name == "confidence_head.proj.bias" {
-                0
-            } else if name.starts_with("lm_head")
+            // Host-side codebooks and scalars, and the target's own
+            // embedding / LM head, take no draft device memory.
+            let host = name.ends_with("_codebook")
+                || name == "confidence_head.proj.bias"
+                || name.starts_with("lm_head")
                 || name.starts_with("embed_tokens")
                 || name == "d2t"
-                || name == "t2d"
-            {
+                || name == "t2d";
+            weights += if host {
                 0
             } else if shape.len() == 2 && shape[0] > 1 {
                 let (rows, cols) = (shape[0], shape[1]);
