@@ -948,7 +948,7 @@ impl HybridModel {
             &[w.binding(), x.binding(), offsets.binding()],
             &[y.binding()],
             &args,
-            [max_rows.div_ceil(128), rows_e.div_ceil(64), w.experts],
+            [max_rows.div_ceil(32), rows_e.div_ceil(64), w.experts],
             [128, 1, 1],
             64 * 32 * 2,
         )
@@ -1110,7 +1110,10 @@ impl HybridModel {
                 64 * 32 * 2,
             );
         }
-        let (name, rows_per_group, simds, shared) = mv_kernel(w.format, false);
+        let (mut name, mut rows_per_group, mut simds, shared) = mv_kernel(w.format, false);
+        if let Some(variant) = kernel_variant(w.format) {
+            (name, rows_per_group, simds) = variant;
+        }
         d.dispatch_hybrid(
             name,
             &inputs,
@@ -1128,6 +1131,29 @@ impl HybridModel {
 fn exact_math() -> bool {
     static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EXACT.get_or_init(|| std::env::var_os("FERRUM_HYBRID_EXACT").is_some_and(|v| v != "0"))
+}
+
+/// Experiment hook: `FERRUM_HYBRID_MV_Q4K=r1s4` (etc.) selects a GEMV shape.
+fn kernel_variant(format: Format) -> Option<(&'static str, usize, usize)> {
+    let key = match format {
+        Format::Q4K => "FERRUM_HYBRID_MV_Q4K",
+        Format::Q6K => "FERRUM_HYBRID_MV_Q6K",
+        _ => return None,
+    };
+    let v = std::env::var(key).ok()?;
+    let q4 = format == Format::Q4K;
+    Some(match (v.as_str(), q4) {
+        ("r1s2", true) => ("h_mv_q4_k_r1s2", 2, 2),
+        ("r1s4", true) => ("h_mv_q4_k_r1s4", 4, 4),
+        ("r2s4", true) => ("h_mv_q4_k_r2s4", 8, 4),
+        ("r4s2", true) => ("h_mv_q4_k_r4s2", 8, 2),
+        ("r4s1", true) => ("h_mv_q4_k_r4s1", 4, 1),
+        ("r1s2", false) => ("h_mv_q6_k_r1s2", 2, 2),
+        ("r1s4", false) => ("h_mv_q6_k_r1s4", 4, 4),
+        ("r2s4", false) => ("h_mv_q6_k_r2s4", 8, 4),
+        ("r4s2", false) => ("h_mv_q6_k_r4s2", 8, 2),
+        _ => return None,
+    })
 }
 
 /// Most key splits for few-row attention, and (token, head) rows they may cover.
@@ -1306,4 +1332,104 @@ mod tests {
             }
         }
     }
+}
+
+impl HybridModel {
+    /// Kernel microbenchmark on real weights: every distinct (format, shape)
+    /// projection of the first four layers is run `iters` times with `m`
+    /// activation rows inside one command buffer. Returns
+    /// (description, microseconds per call, GB/s of weight bytes).
+    pub fn bench_projections(
+        &self,
+        d: &MetalDevice,
+        m: usize,
+        iters: usize,
+    ) -> Result<Vec<(String, f64, f64)>> {
+        let mut seen = std::collections::BTreeSet::new();
+        let mut mats: Vec<(&str, &Matrix)> = vec![("output", &self.weights.output)];
+        for layer in self.weights.layers.iter().take(4) {
+            match &layer.mixer {
+                Mixer::Attention(a) => {
+                    mats.extend([("attn_q", &a.q), ("attn_k", &a.k), ("attn_o", &a.o)])
+                }
+                Mixer::Delta(w) => mats.extend([
+                    ("ssm_qkv", &w.qkv),
+                    ("ssm_z", &w.z),
+                    ("ssm_alpha", &w.alpha),
+                    ("ssm_out", &w.out),
+                ]),
+            }
+            match &layer.ffn {
+                Ffn::Dense(f) => mats.extend([
+                    ("ffn_gate", &f.gate),
+                    ("ffn_up", &f.up),
+                    ("ffn_down", &f.down),
+                ]),
+                Ffn::Moe(f) => mats.extend([
+                    ("router", &f.router),
+                    ("shexp_gate", &f.shared.gate),
+                    ("shexp_down", &f.shared.down),
+                ]),
+            }
+        }
+        let mut results = Vec::new();
+        for (role, w) in mats {
+            if !seen.insert((w.format.name(), w.rows, w.cols)) {
+                continue;
+            }
+            let x = Tensor::from_f32(d, [m, w.cols], DType::F32, &vec![0.01; m * w.cols])?;
+            let y = Tensor::zeros(d, [m, w.rows], DType::F32)?;
+            let run = |n: usize| -> Result<f64> {
+                let e = d.execution_with_shared_encoder(true)?;
+                let start = std::time::Instant::now();
+                for _ in 0..n {
+                    self.project(d, w, &x, m, &y)?;
+                }
+                e.finish()?;
+                Ok(start.elapsed().as_secs_f64())
+            };
+            run(2)?;
+            let secs = run(iters)?;
+            let per = secs / iters as f64;
+            results.push((
+                format!("{role} {} [{}x{}]", w.format.name(), w.rows, w.cols),
+                per * 1e6,
+                w.byte_size() as f64 / per / 1e9,
+            ));
+        }
+        Ok(results)
+    }
+}
+
+/// Streaming-read bandwidth probe (GB/s) over `bytes` with `per_group` bytes
+/// per threadgroup and `threads` threads per threadgroup.
+pub fn bench_read_bandwidth(
+    d: &MetalDevice,
+    bytes: usize,
+    per_group: usize,
+    threads: usize,
+) -> Result<f64> {
+    let x = Tensor::zeros(d, [bytes / 4], DType::F32)?;
+    let groups = bytes / per_group;
+    let y = Tensor::zeros(d, [groups], DType::F32)?;
+    let run = |n: usize| -> Result<f64> {
+        let e = d.execution_with_shared_encoder(false)?;
+        let start = std::time::Instant::now();
+        for _ in 0..n {
+            d.dispatch_hybrid(
+                "h_bw_read",
+                &[x.binding()],
+                &[y.binding()],
+                &Params::default().u(per_group / 16)?.0,
+                [groups, 1, 1],
+                [threads, 1, 1],
+                0,
+            )?;
+        }
+        e.finish()?;
+        Ok(start.elapsed().as_secs_f64())
+    };
+    run(2)?;
+    let n = 20;
+    Ok(bytes as f64 * n as f64 / run(n)? / 1e9)
 }

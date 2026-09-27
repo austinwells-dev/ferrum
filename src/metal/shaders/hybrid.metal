@@ -698,6 +698,15 @@ kernel void NAME(constant ProjArgs & a [[buffer(3)]], device const char * w [[bu
     IMPL<NR0, NSG>(a, w, x, y, tgpig, tiisg, sgitg); \
 }
 MV_KERNEL(h_mv_q4_k, mv_q4_K, 2, 2)
+MV_KERNEL(h_mv_q4_k_r1s2, mv_q4_K, 1, 2)
+MV_KERNEL(h_mv_q4_k_r1s4, mv_q4_K, 1, 4)
+MV_KERNEL(h_mv_q4_k_r2s4, mv_q4_K, 2, 4)
+MV_KERNEL(h_mv_q4_k_r4s2, mv_q4_K, 4, 2)
+MV_KERNEL(h_mv_q4_k_r4s1, mv_q4_K, 4, 1)
+MV_KERNEL(h_mv_q6_k_r1s2, mv_q6_K, 1, 2)
+MV_KERNEL(h_mv_q6_k_r1s4, mv_q6_K, 1, 4)
+MV_KERNEL(h_mv_q6_k_r2s4, mv_q6_K, 2, 4)
+MV_KERNEL(h_mv_q6_k_r4s2, mv_q6_K, 4, 2)
 MV_KERNEL(h_mv_q5_k, mv_q5_K, 1, 2)
 MV_KERNEL(h_mv_q6_k, mv_q6_K, 2, 2)
 MV_KERNEL(h_mv_q4_0, mv_q4_0, 4, 2)
@@ -1331,6 +1340,8 @@ MV_ID_KERNEL_SHMEM(h_mv_id_iq3_s, mv_iq3_s, 4, 2, uint)
 // Expert GEMM over expert-sorted rows: z = expert; rows offsets[z]..offsets[z+1]
 // of x (gathered) and y. grid (ceil(max_rows/128), ceil(expert_rows/64), experts).
 struct MoeMmArgs { ProjArgs p; uint expert_rows; };
+// Experts see few rows each (~routes/experts), so the activation tile is 32.
+constant constexpr int MM_ID_NRB = 32;
 
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
 void mm_id_impl(constant MoeMmArgs & a, device const char * w, device const float * x,
@@ -1339,18 +1350,18 @@ void mm_id_impl(constant MoeMmArgs & a, device const char * w, device const floa
     const uint e = tgpig.z;
     const uint first = offsets[e];
     const int count = int(offsets[e + 1] - first);
-    if (int(tgpig.x) * MM_NRB >= count) return;
+    if (int(tgpig.x) * MM_ID_NRB >= count) return;
     const int K = a.p.k;
     const int M = a.expert_rows;
     const int ra = tgpig.y * MM_NRA;
-    const int rb = tgpig.x * MM_NRB;
+    const int rb = tgpig.x * MM_ID_NRB;
     device const char * we = w + (ulong)e * a.expert_rows * a.p.row_bytes;
     auto tA = tensor(sa, dextents<int32_t, 2>(MM_NK, MM_NRA));
     auto tB = tensor((device float *)(x + (ulong)first * a.p.x_stride), dextents<int32_t, 2>(K, count),
                      array<int, 2>({1, int(a.p.x_stride)}));
     mpp::tensor_ops::matmul2d<
         mpp::tensor_ops::matmul2d_descriptor(
-            MM_NRB, MM_NRA, MM_NK, false, true, true,
+            MM_ID_NRB, MM_NRA, MM_NK, false, true, true,
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<4>> mm;
     auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
@@ -1600,4 +1611,15 @@ kernel void h_flash_reduce(constant FaArgs & p [[buffer(4)]],
     const uint t = row / p.heads, h = row % p.heads;
     const float gate = qg[((ulong)t * p.heads + h) * 2 * D + D + d];
     out[(ulong)row * D + d] = (l > 0.f ? acc / l : 0.f) / (1.f + exp(-gate));
+}
+
+// Bandwidth probe: each threadgroup streams a contiguous span with 16-byte loads.
+kernel void h_bw_read(constant EltArgs & a [[buffer(2)]], device const uint4 * x [[buffer(0)]],
+                      device float * y [[buffer(1)]], uint tg [[threadgroup_position_in_grid]],
+                      ushort tid [[thread_index_in_threadgroup]], ushort threads [[threads_per_threadgroup]]) {
+    const uint per_group = a.n;   // uint4 elements per threadgroup
+    device const uint4 * p = x + (ulong)tg * per_group;
+    uint4 acc = 0;
+    for (uint i = tid; i < per_group; i += threads) acc ^= p[i];
+    if (acc.x == 0x12345678u) y[tg] = float(acc.y);
 }

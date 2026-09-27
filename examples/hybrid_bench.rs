@@ -29,18 +29,50 @@ fn main() -> Result<()> {
         .map(|s| s.parse().expect("pp size"))
         .collect();
     let tg: usize = get("--tg", "128").parse().expect("tg");
+    let depths: Vec<usize> = get("--depth", "")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse().expect("depth"))
+        .collect();
     let reps: usize = get("--reps", "3").parse().expect("reps");
     let chunk: usize = get("--chunk", "512").parse().expect("chunk");
     let d = MetalDevice::new()?;
     let loaded = hybrid::load(&d, &args[1], chunk, 1)?;
     let model = &loaded.model;
     let max_pp = pp.iter().copied().max().unwrap_or(0);
-    let mut state = HybridState::new(&d, &model.config, max_pp.max(tg) + 1)?;
+    let max_depth = depths.iter().copied().max().unwrap_or(0);
+    let mut state = HybridState::new(&d, &model.config, max_pp.max(tg).max(max_depth + 32) + 1)?;
     // Deterministic pseudo-text tokens in the ordinary-word ID range.
-    let tokens: Vec<u32> = (0..max_pp as u32)
+    let tokens: Vec<u32> = (0..max_pp.max(max_depth) as u32)
         .map(|i| 1000 + (i * 7919) % 20000)
         .collect();
     println!("| model | test | t/s |\n|---|---|---|");
+    // Decode speed after a prefilled context of each depth (16 timed steps).
+    for &depth in &depths {
+        state.reset();
+        if depth > 0 {
+            model.forward(&d, &mut state, &tokens[..depth], Output::None)?;
+        }
+        let mut token = 1000u32;
+        let mut times = Vec::new();
+        for _ in 0..17 {
+            let start = Instant::now();
+            if let hybrid::Produced::Token(t) =
+                model.forward(&d, &mut state, &[token], Output::Argmax)?
+            {
+                token = t;
+            }
+            times.push(start.elapsed().as_secs_f64());
+        }
+        times.remove(0);
+        let (mean, _) = stats(&times);
+        println!(
+            "| {} | tg@{depth} | {:.2} (step {:.2} ms) |",
+            model.config.name,
+            1. / mean,
+            mean * 1e3
+        );
+    }
     for &n in &pp {
         let mut rates = Vec::new();
         for rep in 0..=reps {
@@ -73,6 +105,21 @@ fn main() -> Result<()> {
         }
         let (mean, sd) = stats(&rates);
         println!("| {} | tg{tg} | {mean:.2} ± {sd:.2} |", model.config.name);
+        // One decode step's runtime counters.
+        let before = d.counters();
+        let start = Instant::now();
+        model.forward(&d, &mut state, &[1000], Output::Argmax)?;
+        let wall = start.elapsed();
+        let after = d.counters();
+        eprintln!(
+            "decode step: wall {:.2} ms; {} dispatches in {} command buffers; encode {:.2} ms; wait {:.2} ms; GPU {:.2} ms",
+            wall.as_secs_f64() * 1e3,
+            after.dispatches - before.dispatches,
+            after.command_buffers - before.command_buffers,
+            (after.encode - before.encode).as_secs_f64() * 1e3,
+            (after.wait - before.wait).as_secs_f64() * 1e3,
+            (after.gpu - before.gpu).as_secs_f64() * 1e3,
+        );
     }
     Ok(())
 }
