@@ -463,6 +463,24 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let q8_0_gemv_rows = match request.get("q8_0_gemv_rows") {
+        None | Some(Value::Null) => {
+            device.set_q8_0_gemv_rows(4)?;
+            4
+        }
+        Some(Value::Number(rows)) => {
+            let rows = rows.as_u64().ok_or_else(|| {
+                Error::Parameter("request field q8_0_gemv_rows must be an integer".into())
+            })? as usize;
+            device.set_q8_0_gemv_rows(rows)?;
+            rows
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field q8_0_gemv_rows must be an integer".into(),
+            ));
+        }
+    };
     let q5_1_gemv_n4 = match request.get("q5_1_gemv_n4") {
         None | Some(Value::Null) => {
             device.set_q5_1_gemv_n4(true)?;
@@ -850,6 +868,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "q5_0_gemv_ksplit": q5_0_gemv_ksplit,
         "k_quant_gemv_ksplit": k_quant_gemv_ksplit,
         "fuse_swiglu": fuse_swiglu,
+        "q8_0_gemv_rows": q8_0_gemv_rows,
         "q5_1_gemv_n4": q5_1_gemv_n4,
         "q5_k_gemv_8rows": q5_k_gemv_8rows,
         "moe_gpu_routing_prefill": moe_gpu_routing_prefill,

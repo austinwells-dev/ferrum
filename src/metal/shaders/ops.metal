@@ -1653,6 +1653,59 @@ kernel void q8_0_gemv_k_split(ARGS,
         }
     }
 }
+// Four-row variant of q8_0_gemv_k_split: each lane's eight activations are
+// loaded once for four rows, and weights load as 16-bit words. Per-row
+// arithmetic and reduction order match the two-row kernel bit for bit.
+template<uint R>
+inline void q8_0_gemv_k_split_rows(device const uchar* a, device const uchar* b, device uchar* c,
+                                   constant uint* p, threadgroup float* partial, uint tid, uint group) {
+    uint lane=tid%32, simd=tid/32;
+    uint row0=group*R, n=p[3];
+    uint k=p[2], blocks=k/32;
+    uint block_lane=lane/4, sub=lane%4;
+    float sum[R];
+    for(uint r=0;r<R;r++) sum[r]=0.0f;
+    for(uint tile=0;tile<blocks;tile+=32) {
+        uint block=tile+simd*8+block_lane;
+        if(block<blocks) {
+            uint column=block*32+sub*8;
+            float x[8];
+            for(uint i=0;i<8;i++) x[i]=load(a,column+i,p[4]);
+            for(uint r=0;r<R;r++) {
+                if(row0+r<n) {
+                    device const uchar* packed=b+(ulong(row0+r)*blocks+block)*34;
+                    float scale=float(*((device const half*)packed));
+                    device const ushort* words=(device const ushort*)(packed+2+sub*8);
+                    float dot=0.0f;
+                    for(uint w=0;w<4;w++) {
+                        char2 q=as_type<char2>(words[w]);
+                        dot+=float(q[0])*x[2*w];
+                        dot+=float(q[1])*x[2*w+1];
+                    }
+                    sum[r]+=dot*scale;
+                }
+            }
+        }
+    }
+    for(uint r=0;r<R;r++) {
+        float reduced=simd_sum(sum[r]);
+        if(lane==0) partial[simd*R+r]=reduced;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(simd==0) {
+        float totals[R];
+        for(uint r=0;r<R;r++) totals[r]=simd_sum(lane<4 ? partial[lane*R+r] : 0.0f);
+        if(lane==0) for(uint r=0;r<R;r++) if(row0+r<n) store(c,row0+r,p[4],totals[r]);
+    }
+}
+kernel void q8_0_gemv_k_split4(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[4*4];
+    q8_0_gemv_k_split_rows<4>(a,b,c,p,partial,tid,group);
+}
+kernel void q8_0_gemv_k_split8(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[4*8];
+    q8_0_gemv_k_split_rows<8>(a,b,c,p,partial,tid,group);
+}
 // One SIMD group handles one output channel across four independent sequence
 // rows. The packed weight and its scale are loaded once for four outputs.
 kernel void q8_0_gemm(ARGS, uint tid [[thread_index_in_threadgroup]], uint2 group [[threadgroup_position_in_grid]]) {

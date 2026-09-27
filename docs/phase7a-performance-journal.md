@@ -2441,3 +2441,41 @@ Raw: `qwen2.5-q4_k_m-fused-swiglu-ab.jsonl` (dasd-exempt preflight; llama.cpp ra
 | Qwen2.5 Q4_K_M / Sustained decode | 920.3->975.4 / 1,385.7 `[0.664->0.704; 1.058]` | 188.5->201.2 / 244.3 `[0.771->0.823; 1.023]` | 186.9->192.1 / 221.8 `[0.843->0.866; 1.015]` | 22.8->21.5 / 15.4 | 5/5; 0/5; 0/5 |
 
 **Result.** Paired decode ratios were +6.4% (short), −2.5% (128 tokens), +2.3% (512 tokens), +0.8% (1,024 tokens), and +2.3% (sustained). Sustained decode went from 188.5 to 201.2 tok/s (0.82x llama.cpp). The in-situ gain is smaller than the microbenchmark because gate and up already overlapped under concurrent dispatch.
+
+## Experiment 72: Four-row K-split Q8_0 GEMV (retained)
+
+Status: retained (`set_q8_0_gemv_rows`, default 4; accepts 2, 4, or 8).
+
+**Change.** `q8_0_gemv_k_split` gave each 128-thread group two output rows, reloading the activation fragment for every row pair and reading weights one byte at a time. `q8_0_gemv_k_split_rows<R>` gives each group R rows, loads each lane's eight activations once for all of them, and reads weights as 16-bit `char2` words. Per-row arithmetic and the reduction order are unchanged, so every row count is bit-identical (`q8_0_gemv_k_split_row_counts_are_bit_identical`, and 5/5 control/candidate ID matches below).
+
+Microbenchmark (`bench_q8_0_gemv`):
+
+| Shape | 2 rows | 4 rows | 8 rows |
+|---|---:|---:|---:|
+| Qwen2.5 lm_head, 151,936×896 | 1,392–1,398 µs (104 GB/s) | 1,101–1,179 µs (123–131 GB/s) | 1,138 µs |
+| Qwen3 3,072×1,024 | 29.9 µs | 27.8 µs | 28.9 µs |
+| Qwen3 1,024×3,072 | 31.1 µs | 29.9 µs | 31.3 µs |
+| Qwen3 2,048×1,024 | 20.6 µs | 19.7 µs | 20.4 µs |
+
+Four rows is best or near best everywhere.
+
+Raw: `qwen2.5-q4_k_m-q8_0-gemv-rows4-ab.jsonl` and `qwen3-0.6b-q8_0-q8_0-gemv-rows4-ab.jsonl` (dasd-exempt preflight; llama.cpp ratios indicative).
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_K_M / Short | 938.1->942.6 / 1,406.7 `[0.667->0.670; 1.007]` | 183.8->193.6 / 238.8 `[0.769->0.811; 1.043]` | 157.8->164.8 / 197.5 `[0.799->0.834; 1.038]` | 22.4->22.3 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 4,670.4->4,505.5 / 6,989.8 `[0.668->0.645; 0.963]` | 185.1->197.6 / 230.7 `[0.802->0.856; 1.037]` | 149.7->154.7 / 187.6 `[0.798->0.825; 1.020]` | 27.4->28.4 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 7,388.8->7,509.7 / 9,336.9 `[0.791->0.804; 1.004]` | 180.4->185.5 / 233.5 `[0.773->0.795; 1.026]` | 107.0->109.6 / 133.5 `[0.802->0.821; 1.023]` | 69.3->68.2 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 7,854.1->7,924.4 / 8,844.2 `[0.888->0.896; 1.009]` | 170.5->177.2 / 236.5 `[0.721->0.749; 1.039]` | 75.8->77.3 / 90.0 `[0.842->0.859; 1.021]` | 130.4->129.2 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 954.6->940.3 / 1,385.7 `[0.689->0.679; 0.985]` | 197.6->202.6 / 244.3 `[0.809->0.829; 1.025]` | 189.9->196.6 / 221.8 `[0.856->0.886; 1.038]` | 22.0->22.3 / 15.4 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / Short | 820.9->813.3 / 1,258.3 `[0.652->0.646; 1.003]` | 137.1->141.6 / 164.5 `[0.833->0.861; 1.028]` | 120.9->122.9 / 143.8 `[0.841->0.855; 1.016]` | 25.6->25.8 / 17.0 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 3,600.3->3,688.9 / 6,001.2 `[0.600->0.615; 1.022]` | 134.0->141.2 / 163.8 `[0.818->0.862; 1.055]` | 110.5->114.8 / 138.8 `[0.797->0.827; 1.038]` | 35.6->34.7 / 21.6 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / 512-token prompt | 5,727.2->5,774.5 / 7,099.6 `[0.807->0.813; 1.005]` | 123.5->128.4 / 154.9 `[0.798->0.829; 1.039]` | 74.6->76.1 / 95.2 `[0.784->0.799; 1.025]` | 89.4->88.7 / 72.4 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 5,902.2->5,863.6 / 6,283.2 `[0.939->0.933; 0.993]` | 110.5->114.0 / 143.3 `[0.771->0.796; 1.030]` | 51.1->51.6 / 61.1 `[0.836->0.843; 1.015]` | 173.5->174.6 / 163.2 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 820.1->785.3 / 1,241.8 `[0.660->0.632; 0.981]` | 139.6->144.7 / 164.7 `[0.847->0.879; 1.048]` | 138.3->143.0 / 157.4 `[0.879->0.909; 1.043]` | 25.6->26.7 / 17.2 | 5/5; 0/5; 0/5 |
+
+**Result.** Decode rose 2.5–4.3% on Qwen2.5 Q4_K_M and 2.8–5.5% on Qwen3. Prefill is unchanged; it does not use M=1 GEMV.
+
+Decode against the saved llama.cpp rows is now:
+- **Qwen2.5 Q4_K_M:** 0.75–0.86x (sustained 0.83x).
+- **Qwen3:** 0.80–0.88x (sustained 0.88x).

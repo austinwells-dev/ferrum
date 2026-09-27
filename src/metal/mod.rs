@@ -377,6 +377,7 @@ pub struct MetalDevice {
     q5_0_ksplit: Cell<usize>,
     k_quant_ksplit: Cell<usize>,
     fuse_swiglu: Cell<bool>,
+    q8_0_rows: Cell<usize>,
     q5_1_gemv_n4: Cell<bool>,
     q4_0_gemv_8rows: Cell<bool>,
     q4_k_gemv_8rows: Cell<bool>,
@@ -487,6 +488,7 @@ impl MetalDevice {
             q5_0_ksplit: Cell::new(2),
             k_quant_ksplit: Cell::new(8),
             fuse_swiglu: Cell::new(true),
+            q8_0_rows: Cell::new(4),
             q5_1_gemv_n4: Cell::new(true),
             q4_0_gemv_8rows: Cell::new(true),
             q4_k_gemv_8rows: Cell::new(true),
@@ -836,6 +838,23 @@ impl MetalDevice {
     }
     pub(crate) fn fuse_swiglu(&self) -> bool {
         self.fuse_swiglu.get()
+    }
+    /// Output rows per threadgroup of the K-split Q8_0 M=1 GEMV: 2, 4, or 8.
+    /// Every count is bit-identical; more rows reuse each activation load.
+    pub fn set_q8_0_gemv_rows(&self, rows: usize) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q8_0 GEMV during execution".into(),
+            ));
+        }
+        if !matches!(rows, 2 | 4 | 8) {
+            return Err(Error::Parameter("Q8_0 GEMV rows must be 2, 4, or 8".into()));
+        }
+        self.q8_0_rows.set(rows);
+        Ok(())
+    }
+    pub(crate) fn q8_0_gemv_rows(&self) -> usize {
+        self.q8_0_rows.get()
     }
     /// K-split GEMVs carry their SIMD groups per threadgroup in `params[8]`.
     fn ksplit_simds(name: &str, params: &[u32; 9]) -> Option<usize> {
@@ -1802,6 +1821,8 @@ impl MetalDevice {
                 | "q8_0_gemv"
                 | "q8_0_gemv_8rows"
                 | "q8_0_gemv_k_split"
+                | "q8_0_gemv_k_split4"
+                | "q8_0_gemv_k_split8"
                 | "q4_0_gemv_8rows"
                 | "q4_k_gemv_8rows"
                 | "q4_k_gemv_factored"
@@ -2231,6 +2252,8 @@ impl MetalDevice {
                     | "q8_0_gemv"
                     | "q8_0_gemv_8rows"
                     | "q8_0_gemv_k_split"
+                    | "q8_0_gemv_k_split4"
+                    | "q8_0_gemv_k_split8"
                     | "q4_0_gemv_8rows"
                     | "q4_k_gemv_8rows"
                     | "q4_k_gemv_factored"
@@ -2253,6 +2276,7 @@ impl MetalDevice {
                         } else if matches!(
                             name,
                             "q8_0_gemv_8rows"
+                                | "q8_0_gemv_k_split8"
                                 | "q4_0_gemv_8rows"
                                 | "q4_k_gemv_8rows"
                                 | "q5_k_gemv_8rows"

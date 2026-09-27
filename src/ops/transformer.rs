@@ -138,7 +138,11 @@ impl MetalDevice {
         let name = match (weight.format(), ad[0] == 1, supports_mpp) {
             (QuantizationFormat::Q8_0, true, _) => {
                 if self.q8_0_gemv_k_split(weight.rows(), weight.columns()) {
-                    "q8_0_gemv_k_split"
+                    match self.q8_0_gemv_rows() {
+                        8 => "q8_0_gemv_k_split8",
+                        4 => "q8_0_gemv_k_split4",
+                        _ => "q8_0_gemv_k_split",
+                    }
                 } else if self.q8_0_gemv_8rows(weight.rows()) {
                     "q8_0_gemv_8rows"
                 } else {
@@ -1575,6 +1579,73 @@ mod q8_0_tests {
     }
 
     #[test]
+    fn q8_0_gemv_k_split_row_counts_are_bit_identical() {
+        let d = MetalDevice::new().unwrap();
+        for (n, k) in [(131, 896), (130, 1024), (129, 3072)] {
+            let weight = packed(&d, n, k);
+            let x = Tensor::from_f32(&d, [1, k], DType::BF16, &input(1, k)).unwrap();
+            let mut outputs = Vec::new();
+            for rows in [2, 4, 8] {
+                d.set_q8_0_gemv_rows(rows).unwrap();
+                let output = d.project_quantized(&x, &weight).unwrap();
+                let name = match rows {
+                    8 => "q8_0_gemv_k_split8",
+                    4 => "q8_0_gemv_k_split4",
+                    _ => "q8_0_gemv_k_split",
+                };
+                assert_eq!(output.metrics.operation, name);
+                outputs.push(output.tensor.to_f32());
+            }
+            for output in &outputs[1..] {
+                for (index, (a, b)) in outputs[0].iter().zip(output).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "({n}, {k}) index {index}");
+                }
+            }
+        }
+        d.set_q8_0_gemv_rows(2).unwrap();
+    }
+
+    /// Steady-state Q8_0 GEMV: Qwen2.5 lm_head and Qwen3-0.6B shapes.
+    #[test]
+    #[ignore = "microbenchmark; run with --ignored --nocapture"]
+    fn bench_q8_0_gemv() {
+        let d = MetalDevice::new().unwrap();
+        for (n, k, copies) in [
+            (151936, 896, 2),
+            (3072, 1024, 24),
+            (1024, 3072, 24),
+            (2048, 1024, 24),
+        ] {
+            let weights: Vec<_> = (0..copies).map(|_| packed(&d, n, k)).collect();
+            let x = Tensor::from_f32(&d, [1, k], DType::BF16, &input(1, k)).unwrap();
+            let bytes = (weights[0].byte_size() * copies) as f64;
+            for rows in [2, 4, 8] {
+                d.set_q8_0_gemv_rows(rows).unwrap();
+                let mut best = f64::MAX;
+                for _ in 0..7 {
+                    let start = std::time::Instant::now();
+                    let execution = d.execution().unwrap();
+                    let mut last = None;
+                    for _ in 0..4 {
+                        for weight in &weights {
+                            last = Some(d.project_quantized(&x, weight).unwrap().tensor);
+                        }
+                    }
+                    drop(execution);
+                    std::hint::black_box(last.unwrap().to_f32());
+                    best = best.min(start.elapsed().as_secs_f64() / 4.0);
+                }
+                println!(
+                    "Q8_0 {n}x{k} rows={rows}: {:.1} us/projection, {:.1} GB/s",
+                    best * 1e6 / copies as f64,
+                    bytes / best / 1e9
+                );
+            }
+        }
+        d.set_q8_0_gemv_rows(2).unwrap();
+    }
+
+    #[test]
     fn q8_0_gemv_and_gemm_cover_output_tails_and_odd_batch_sizes() {
         let d = MetalDevice::new().unwrap();
         assert!(d.q8_0_gemv_k_split(128, 768));
@@ -1631,7 +1702,7 @@ mod q8_0_tests {
         assert!(!d.q8_0_gemv_k_split(n, 767));
         assert!(d.q8_0_gemv_k_split(n, k));
         let output = d.project_quantized(&x, &weight).unwrap();
-        assert_eq!(output.metrics.operation, "q8_0_gemv_k_split");
+        assert_eq!(output.metrics.operation, "q8_0_gemv_k_split4");
         let expected_k_split = expected(&values, 1, n, k);
         for (index, (actual, expected)) in output
             .tensor
