@@ -7,10 +7,11 @@ pub mod chat;
 pub mod config;
 pub mod engine;
 pub mod plan;
+pub mod session;
 pub mod weights;
 
 pub use config::{HybridConfig, Variant};
-pub use engine::{HybridModel, HybridState, Output, Produced};
+pub use engine::{HybridModel, HybridState, Output, Penalties, Produced};
 
 use crate::{
     Error, MetalDevice, Result,

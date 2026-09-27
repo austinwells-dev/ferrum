@@ -49,7 +49,10 @@ the two models below, on the reference Apple M5 (32 GB, 24 GiB GPU working set).
 3. `qwen35moe`.
 4. Throughput: fused decode kernels, chunked GDN prefill, flash attention.
 5. Context planner and preallocated cache; long-context validation.
-6. Session state reuse, chat templates, and a local serving interface for agents.
+6. Session state reuse, chat templates, and sampling (temperature, top-k, top-p,
+   min-p, presence/frequency/repetition penalties) for normal chatting.
+7. Two binaries: `ferrum-cli` (interactive chat in the terminal) and
+   `ferrum-server` (OpenAI-compatible local HTTP server for agents).
 
 Progress, measurements and decisions are recorded in the
 [Phase 8 journal](phase8-journal.md).

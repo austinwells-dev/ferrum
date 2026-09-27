@@ -1847,3 +1847,66 @@ kernel void h_attn_decode(constant FaArgs & p [[buffer(7)]],
         }
     }
 }
+
+// ---------------------------------------------------------------- sampling support
+
+struct PenaltyArgs { uint count; float presence; float frequency; float repetition; };
+
+// Adjust logits of previously generated tokens: ids[i] seen counts[i] times.
+kernel void h_penalize(constant PenaltyArgs & p [[buffer(3)]], device const uint * ids [[buffer(0)]],
+                       device const float * counts [[buffer(1)]], device float * logits [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= p.count) return;
+    const uint id = ids[i];
+    float v = logits[id];
+    if (p.repetition != 1.f) v = v > 0.f ? v / p.repetition : v * p.repetition;
+    v -= p.presence + p.frequency * counts[i];
+    logits[id] = v;
+}
+
+struct TopKArgs { uint n; };
+
+// Per 1024-value block, the 32 largest (value, index) pairs in descending
+// order (ties to the lower index). grid (ceil(n/1024)); threads 256.
+kernel void h_topk_blocks(constant TopKArgs & p [[buffer(2)]], device const float * x [[buffer(0)]],
+                          device float2 * out [[buffer(1)]],
+                          uint block [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float bv[8];
+    threadgroup uint bi[8];
+    float v[4];
+    uint idx[4];
+    for (int j = 0; j < 4; j++) {
+        idx[j] = block * 1024 + j * 256 + tid;
+        v[j] = idx[j] < p.n ? x[idx[j]] : -INFINITY;
+    }
+    for (int k = 0; k < 32; k++) {
+        float best = v[0];
+        uint bidx = idx[0];
+        int slot = 0;
+        for (int j = 1; j < 4; j++) {
+            if (v[j] > best || (v[j] == best && idx[j] < bidx)) { best = v[j]; bidx = idx[j]; slot = j; }
+        }
+        float sv = best;
+        uint si = bidx;
+        for (ushort off = 16; off > 0; off /= 2) {
+            const float ov = simd_shuffle_down(sv, off);
+            const uint oi = simd_shuffle_down(si, off);
+            if (ov > sv || (ov == sv && oi < si)) { sv = ov; si = oi; }
+        }
+        if (tid % 32 == 0) { bv[tid / 32] = sv; bi[tid / 32] = si; }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float gv = bv[0];
+        uint gi = bi[0];
+        for (int s = 1; s < 8; s++) {
+            if (bv[s] > gv || (bv[s] == gv && bi[s] < gi)) { gv = bv[s]; gi = bi[s]; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) out[block * 32 + k] = float2(gv, as_type<float>(gi));
+        if (bidx == gi && best == gv) v[slot] = -INFINITY;
+    }
+}
+
+kernel void h_copy(constant EltArgs & a [[buffer(2)]], device const float * x [[buffer(0)]],
+                   device float * y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i < a.n) y[i] = x[i];
+}

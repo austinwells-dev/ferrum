@@ -112,6 +112,44 @@ impl HybridState {
         self.len = 0;
         self.valid = true;
     }
+    /// Recurrent tensors (conv windows then delta-rule matrices) in a fixed order.
+    pub(crate) fn recurrent(&self) -> impl Iterator<Item = &Tensor> {
+        self.conv.iter().flatten().chain(self.ssm.iter().flatten())
+    }
+    /// Copy the recurrent state into `dst` (same order and shapes).
+    pub(crate) fn save_recurrent(&self, d: &MetalDevice, dst: &[Tensor]) -> Result<()> {
+        let e = d.execution_with_shared_encoder(true)?;
+        for (src, dst) in self.recurrent().zip(dst) {
+            copy(d, src, dst)?;
+        }
+        e.finish()
+    }
+    /// Restore recurrent state saved at `position`. K/V rows up to
+    /// `position` are unchanged because the cache is append-only.
+    pub(crate) fn restore_recurrent(
+        &mut self,
+        d: &MetalDevice,
+        src: &[Tensor],
+        position: usize,
+    ) -> Result<()> {
+        if position > self.len && self.valid {
+            return Err(Error::Cache(
+                "snapshot lies beyond the cached sequence".into(),
+            ));
+        }
+        self.valid = false;
+        let e = d.execution_with_shared_encoder(true)?;
+        for (dst, src) in self.recurrent().zip(src) {
+            copy(d, src, dst)?;
+        }
+        e.finish()?;
+        self.len = position;
+        self.valid = true;
+        Ok(())
+    }
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid
+    }
 }
 
 /// Per-chunk activation buffers, allocated once for the largest chunk.
@@ -141,6 +179,7 @@ pub(crate) struct Scratch {
     ffn_act: Tensor,
     logits: Tensor,
     token: Tensor,
+    candidates: Tensor,
     moe: Option<MoeScratch>,
 }
 
@@ -181,6 +220,22 @@ impl MoeScratch {
     }
 }
 
+fn copy(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
+    let n = src.numel();
+    if dst.numel() != n {
+        return Err(Error::Shape("copy between different sizes".into()));
+    }
+    d.dispatch_hybrid(
+        "h_copy",
+        &[src.binding()],
+        &[dst.binding()],
+        &Params::default().u(n)?.0,
+        [n.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
+}
+
 /// Bytes of every scratch allocation `Scratch::new` makes, page-rounded.
 pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize {
     let chunk = chunk.max(1);
@@ -216,6 +271,7 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
         chunk * ffn,
         logit_rows * c.vocab,
         1,
+        c.vocab.div_ceil(1024) * 64,
     ] {
         total += f32s(n);
     }
@@ -299,6 +355,7 @@ impl Scratch {
             ffn_act: f(&[chunk, ffn])?,
             logits: f(&[logit_rows, c.vocab])?,
             token: f(&[1])?,
+            candidates: f(&[c.vocab.div_ceil(1024) * 64])?,
             moe: match c.moe {
                 None => None,
                 Some(moe) => {
@@ -349,6 +406,7 @@ impl Scratch {
             &self.ffn_act,
             &self.logits,
             &self.token,
+            &self.candidates,
         ]
         .iter()
         .map(|t| page(t.byte_size()))
@@ -360,6 +418,25 @@ impl Scratch {
     }
 }
 
+/// Logit adjustments for previously generated tokens (OpenAI / llama.cpp
+/// semantics): repetition divides positive and multiplies negative logits;
+/// presence and frequency subtract per occurrence.
+#[derive(Debug, Clone, Default)]
+pub struct Penalties {
+    /// (token, occurrences) within the penalty window.
+    pub tokens: Vec<(u32, u32)>,
+    pub presence: f32,
+    pub frequency: f32,
+    pub repetition: f32,
+}
+
+impl Penalties {
+    fn active(&self) -> bool {
+        !self.tokens.is_empty()
+            && (self.presence != 0. || self.frequency != 0. || self.repetition != 1.)
+    }
+}
+
 /// What a forward call returns for its final token(s).
 pub enum Output {
     /// Nothing (prefill of a prefix that will be continued).
@@ -368,12 +445,17 @@ pub enum Output {
     Argmax,
     /// Final-position logits copied to the host.
     Logits,
+    /// Sampling candidates: after penalties, the 32 largest logits of every
+    /// 1024-token block (so the global top 32 is exact).
+    Candidates(Penalties),
 }
 
 pub enum Produced {
     None,
     Token(u32),
     Logits(Vec<f32>),
+    /// (token, logit) pairs, unordered across blocks.
+    Candidates(Vec<(u32, f32)>),
 }
 
 pub struct HybridModel {
@@ -554,6 +636,66 @@ impl HybridModel {
                 Output::None => {
                     execution.finish()?;
                     Produced::None
+                }
+                Output::Candidates(penalties) => {
+                    let last = rows(&xn, m - 1, 1, h)?;
+                    let logits = rows(&s.logits, 0, 1, c.vocab)?;
+                    self.project(d, &self.weights.output, &last, 1, &logits)?;
+                    if penalties.active() {
+                        let ids = Tensor::from_le_bytes(
+                            d,
+                            [penalties.tokens.len()],
+                            DType::F32,
+                            &penalties
+                                .tokens
+                                .iter()
+                                .flat_map(|(t, _)| t.to_le_bytes())
+                                .collect::<Vec<_>>(),
+                        )?;
+                        let counts = Tensor::from_f32(
+                            d,
+                            [penalties.tokens.len()],
+                            DType::F32,
+                            &penalties
+                                .tokens
+                                .iter()
+                                .map(|&(_, n)| n as f32)
+                                .collect::<Vec<_>>(),
+                        )?;
+                        d.dispatch_hybrid(
+                            "h_penalize",
+                            &[ids.binding(), counts.binding()],
+                            &[logits.binding()],
+                            &Params::default()
+                                .u(penalties.tokens.len())?
+                                .f(penalties.presence)
+                                .f(penalties.frequency)
+                                .f(penalties.repetition)
+                                .0,
+                            [penalties.tokens.len().div_ceil(64), 1, 1],
+                            [64, 1, 1],
+                            0,
+                        )?;
+                    }
+                    let blocks = c.vocab.div_ceil(1024);
+                    d.dispatch_hybrid(
+                        "h_topk_blocks",
+                        &[logits.binding()],
+                        &[s.candidates.binding()],
+                        &Params::default().u(c.vocab)?.0,
+                        [blocks, 1, 1],
+                        [256, 1, 1],
+                        0,
+                    )?;
+                    execution.finish()?;
+                    let raw = s.candidates.to_f32();
+                    Produced::Candidates(
+                        raw[..blocks * 64]
+                            .chunks_exact(2)
+                            .filter(|pair| pair[0].is_finite())
+                            .map(|pair| (pair[1].to_bits(), pair[0]))
+                            .collect(),
+                    )
                 }
                 Output::Argmax | Output::Logits => {
                     let last = rows(&xn, m - 1, 1, h)?;
