@@ -136,3 +136,88 @@ Both attention kernels are unit-tested against the reference kernel.
 
 Decode figures are the mean of 16 steps after the given prefilled depth; run-to-run
 noise on this machine is about ±5%.
+
+## Experiment 4 — context planning, sessions, chat and serving
+
+**Memory planner** (`hybrid::plan`). Every allocation is predicted from GGUF
+metadata before a weight is read: trunk tensors (page-rounded, as Metal
+allocates), scratch for the prompt chunk, recurrent state, recurrent snapshots,
+F16 K/V per position (padded to 32) and a fixed runtime overhead. With no
+requested context the planner fits the largest one (multiple of 256, capped at
+the trained context) under the recommended working set minus a 1 GiB reserve.
+Requests that cannot fit fail before loading, stating the need, the budget and
+the largest context that fits. KV, recurrent state and scratch join the weight
+residency set, and everything is allocated once, so memory is flat for the
+life of the process.
+
+| Model | Auto context | weights+scratch measured / predicted | state measured / predicted |
+|---|---|---|---|
+| Swift 27B | 101,120 | 16,679 / 16,682 MiB | 6,470 / 6,471 MiB |
+| Tiel 35B-A3B | 262,144 (trained max) | 17,114 / 17,116 MiB | 5,183 / 5,184 MiB |
+
+**Chat templates** (`hybrid::chat`). The GGUF's Jinja template is rendered with
+minijinja configured like Hugging Face's `apply_chat_template` (trim/lstrip
+blocks, Python string methods via minijinja-contrib, a `json.dumps`-compatible
+`tojson`, insertion-ordered maps, `raise_exception`). Plain chat, multi-turn
+with reasoning, and tool definitions/calls/responses render byte-identically to
+llama-server's `/apply-template` for both models. Output is split into
+reasoning, content and XML-style tool calls whose arguments are typed by the
+tool's JSON schema.
+
+**Sessions** (`hybrid::session`). A session holds the hybrid state and the
+tokens it represents. Recurrent layers cannot be truncated, so the session
+snapshots conv and delta-rule state at the end of every prompt (LRU slots,
+counted by the planner). A request reuses the longest common prefix with the
+cached tokens; if it diverges inside the cache, the deepest snapshot at or
+before the divergence is restored (K/V rows are append-only and stay valid).
+
+**Sampling.** Presence/frequency/repetition penalties are applied to the logits
+on the GPU; a block kernel returns the 32 largest logits of every 1,024-token
+block (so the global top 32 is exact), and the host applies temperature,
+top-k, min-p and top-p. Greedy decoding keeps the on-GPU argmax. Defaults come
+from the GGUF's `general.sampling.*` (both models: temperature 1.0, top-p 0.95,
+top-k 20).
+
+**Binaries.** `ferrum-cli` (interactive chat) and `ferrum-server`
+(OpenAI-compatible `/v1/chat/completions` with SSE streaming, tools,
+`reasoning_content`, sampling fields, `stop`, `chat_template_kwargs`, and
+`usage.prompt_tokens_details.cached_tokens`). In a Tiel tool round-trip the
+follow-up request (assistant tool call plus tool result) reused 664 of 694
+prompt tokens: the template re-rendered the generated reasoning and tool call
+token-for-token.
+
+## Experiment 5 — long-context and session validation
+
+**Needle in a haystack** (`examples/hybrid_needle.rs`). Tiel, a 124,314-token
+prompt of Ferrum's docs and sources through the real chat template (thinking
+off, greedy), with a passphrase at 10%, 50% and 90% depth:
+
+| Depth | Prefill | Decode at 124K | Answer |
+|---|---|---|---|
+| 0.10 | 601 s (207 tok/s) | 19.0 tok/s | correct |
+| 0.50 | 608 s (204 tok/s) | 18.3 tok/s | correct |
+| 0.90 | 615 s (202 tok/s) | 18.1 tok/s | correct |
+
+Device memory was 19,822.5 MiB after loading and 19,822.8 MiB after the three
+runs (plan: 19,921.7 MiB), so nothing grows with use.
+
+**Prefill at depth** (one 512-token chunk after a cached context):
+
+| Tiel | Ferrum | llama.cpp |
+|---|---|---|
+| pp512 @ 32K | 388 | 257 |
+| pp512 @ 64K | 247 | 148 |
+
+Prompt attention runs at ~3.9 TFLOP/s at every depth
+(`examples/hybrid_prefill_attention.rs`), about 40% of the dense GEMMs'
+effective rate; it is the long-context prefill bottleneck and the main
+remaining kernel opportunity. Skipping the per-block O rescale when every
+row's correction is exactly 1 is kept but is within noise.
+
+**Prefix reuse is exact** (`examples/hybrid_session_check.rs`). For both
+models, greedy generations after extending a cached conversation, rewinding it
+through a recurrent snapshot, and replacing it are bit-identical to a fresh
+session computing the same prefix/suffix split. (Against a fresh session that
+prefills the whole prompt in one chunk, the rewind case can flip a near-tie
+after ~30 tokens: single-token and chunk kernels round differently, the same
+batch-size dependence llama.cpp has.)

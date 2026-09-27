@@ -33,6 +33,36 @@ Status against the saved llama.cpp rows (decode target 0.85x; prefill target 0.8
 
 LFM2.5-8B-A1B, the only realistically sized model measured, meets the decode and medium/long prefill targets. The sub-1B Qwen models still fall short at short prompts and long-context decode, where fixed per-kernel latency dominates. Split-context flash decode is implemented but off by default (Experiment 73). Results since Experiment 65 were measured while a system daemon (`dasd`) was pinned, so their llama.cpp ratios are indicative until re-measured on a quiet machine. See the journal's closing summary.
 
+## Phase 8: large hybrid models
+
+Phase 8 runs two current models end to end on a 32 GB Apple M5. Both use the Qwen3.5 hybrid architecture: Gated DeltaNet linear attention interleaved with gated full attention.
+
+- **Swift 1.5 Qwen3.8-27B**, Q4_K_M (dense, 27B)
+- **Tiel-Coder 35B-A3B**, UD-IQ4_XS (256-expert MoE with 3B active)
+
+They run on a dedicated engine (`src/hybrid`) with its own kernel library. The MTP/NextN block is ignored, and there is no speculative decoding.
+
+| Same GGUF, same machine (tok/s) | Ferrum | llama.cpp |
+|---|---|---|
+| Swift pp512 / pp8192 | 171.9 / 162.1 | 149.8 / 134.4 |
+| Swift tg @0 / @32K context | 6.65 / 5.85 | 5.98 / 5.47 |
+| Tiel pp512 / pp16384 | 867 / 623 | 803 / 559 |
+| Tiel tg @0 / @32K context | 42.1 / 29.5 | 35.8 / 26.8 |
+
+Accuracy is measured with KL divergence over llama-perplexity's own chunks. On Swift, Ferrum's logits match llama.cpp's at a mean KLD of 4e-6. Tiel is a routing-sensitive MoE, so Ferrum and llama.cpp were each scored against a high-precision reference, and they sit equally close to it (KLD 0.0106 vs 0.0107).
+
+Memory is planned from GGUF metadata before any weight is loaded. The largest context that fits is chosen automatically: 101K tokens for Swift and the full 262K for Tiel within the 24 GiB working set. Predictions match Metal's own accounting to within a few MiB. See the [Phase 8 plan](docs/phase8-plan.md) and [journal](docs/phase8-journal.md).
+
+```sh
+cargo build --release
+# Interactive chat
+./target/release/ferrum-cli --model /path/to/model.gguf
+# OpenAI-compatible server for agents (http://127.0.0.1:8080/v1)
+./target/release/ferrum-server --model /path/to/model.gguf --port 8080
+```
+
+Both binaries render the chat template embedded in the GGUF. They stream reasoning (as `reasoning_content`) and content separately, parse tool calls, and sample with the model's recommended settings unless told otherwise. The server keeps the conversation state between requests: a follow-up that extends the previous request prefills only the new tokens, and `usage.prompt_tokens_details.cached_tokens` reports how many were reused.
+
 ## Build and run
 
 Requires Apple Silicon macOS (tested on macOS 27, Apple M5), Rust 1.96+, Apple's Command Line Tools/macOS SDK, and Metal's runtime shader compiler. Native BF16 kernels require the supported Metal compiler/device capabilities; `info` reports these. We do not claim validation on older devices.

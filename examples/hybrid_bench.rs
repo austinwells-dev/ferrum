@@ -40,13 +40,35 @@ fn main() -> Result<()> {
     let loaded = hybrid::load(&d, &args[1], chunk, 1)?;
     let model = &loaded.model;
     let max_pp = pp.iter().copied().max().unwrap_or(0);
-    let max_depth = depths.iter().copied().max().unwrap_or(0);
+    let pp_depth_max = get("--pp-depth", "")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<usize>().expect("pp depth") + 512)
+        .max()
+        .unwrap_or(0);
+    let max_depth = depths.iter().copied().max().unwrap_or(0).max(pp_depth_max);
     let mut state = HybridState::new(&d, &model.config, max_pp.max(tg).max(max_depth + 32) + 1)?;
     // Deterministic pseudo-text tokens in the ordinary-word ID range.
     let tokens: Vec<u32> = (0..max_pp.max(max_depth) as u32)
         .map(|i| 1000 + (i * 7919) % 20000)
         .collect();
     println!("| model | test | t/s |\n|---|---|---|");
+    // Prefill of one 512-token chunk after `depth` cached positions.
+    for depth in get("--pp-depth", "")
+        .split(',')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<usize>().expect("pp depth"))
+    {
+        state.reset();
+        model.forward(&d, &mut state, &tokens[..depth], Output::None)?;
+        let start = Instant::now();
+        model.forward(&d, &mut state, &tokens[depth..depth + 512], Output::Argmax)?;
+        println!(
+            "| {} | pp512 @ d{depth} | {:.2} |",
+            model.config.name,
+            512. / start.elapsed().as_secs_f64()
+        );
+    }
     // Decode speed after a prefilled context of each depth (16 timed steps).
     for &depth in &depths {
         state.reset();

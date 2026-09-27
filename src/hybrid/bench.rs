@@ -142,3 +142,43 @@ impl HybridModel {
         Ok((per * 1e6, 2. * (keys * stride * 2) as f64 / per / 1e9))
     }
 }
+
+impl HybridModel {
+    /// Prompt-chunk attention alone: `m` queries at positions `keys - m ..
+    /// keys`. Returns (milliseconds per layer, effective TFLOP/s).
+    pub fn bench_prefill_attention(
+        &self,
+        d: &MetalDevice,
+        m: usize,
+        keys: usize,
+        iters: usize,
+    ) -> Result<(f64, f64)> {
+        let c = &self.config;
+        let stride = c.kv_heads * c.head_dim;
+        let cap = keys.next_multiple_of(32);
+        let q = Tensor::zeros(d, [m, c.heads * c.head_dim], DType::F16)?;
+        let kc = Tensor::zeros(d, [cap, stride], DType::F16)?;
+        let vc = Tensor::zeros(d, [cap, stride], DType::F16)?;
+        let qg = Tensor::zeros(d, [m, 2 * c.heads * c.head_dim], DType::F32)?;
+        let att = Tensor::zeros(d, [m, c.heads * c.head_dim], DType::F32)?;
+        let s = self.scratch.borrow();
+        let run = |n: usize| -> Result<f64> {
+            let e = d.execution_with_shared_encoder(true)?;
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                self.flash_attention(d, &s, &q, &kc, &vc, &qg, &att, m, keys - m)?;
+            }
+            e.finish()?;
+            Ok(start.elapsed().as_secs_f64())
+        };
+        let warm = std::time::Instant::now();
+        while warm.elapsed().as_secs_f64() < 0.3 {
+            run(1)?;
+        }
+        let per = run(iters)? / iters as f64;
+        // QKᵀ and PV over the causal region: ~ m * (keys - m/2) pairs.
+        let pairs = m as f64 * (keys as f64 - m as f64 / 2.);
+        let flops = 4. * pairs * c.head_dim as f64 * c.heads as f64;
+        Ok((per * 1e3, flops / per / 1e12))
+    }
+}

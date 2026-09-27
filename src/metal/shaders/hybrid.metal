@@ -1642,6 +1642,7 @@ kernel void h_flash_attn_mpp(constant FaArgs & p [[buffer(5)]],
     threadgroup float * corr = (threadgroup float *)(Ps + BR * BC);       // [BR]
     threadgroup float * mrow = corr + BR;                                 // [BR]
     threadgroup float * lrow = mrow + BR;                                 // [BR]
+    threadgroup uint rescale;                                             // any corr != 1
     const uint h = tgpig.y;
     const uint kvh = h / p.group;
     const int t0 = int(tgpig.x) * BR;
@@ -1699,17 +1700,22 @@ kernel void h_flash_attn_mpp(constant FaArgs & p [[buffer(5)]],
             Ps[my_row * BC + c0 + c] = half(e);
         }
         sum += simd_shuffle_xor(sum, 1);
+        if (tid == 0) rescale = 0;
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (tid % 2 == 0) {
             mrow[my_row] = m_new;
             lrow[my_row] = lrow[my_row] * cr + sum;
             corr[my_row] = cr;
+            if (cr != 1.f) rescale = 1;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint i = 0; i < cO.get_capacity(); i++) {
-            if (cO.is_valid_element(i)) {
-                auto idx = cO.get_multidimensional_index(i);
-                cO[i] *= corr[idx[1]];
+        // Once row maxima settle the correction is exactly 1: skip the pass.
+        if (rescale) {
+            for (uint i = 0; i < cO.get_capacity(); i++) {
+                if (cO.is_valid_element(i)) {
+                    auto idx = cO.get_multidimensional_index(i);
+                    cO[i] *= corr[idx[1]];
+                }
             }
         }
         auto mV = tV.slice(0, int(j0));
