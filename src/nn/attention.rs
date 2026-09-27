@@ -133,6 +133,12 @@ impl Attention {
         let (k, v) = cache
             .active(layer)?
             .ok_or_else(|| Error::Cache("missing active K/V".into()))?;
+        if trace.is_none() && d.can_flash_decode(&q, k, v) {
+            let merged = d
+                .attention_decode(&q, k, v, self.scale)?
+                .reshape([s, self.q_heads * self.head_dim])?;
+            return d.profile_projection("o_proj", || self.output.forward(d, &merged));
+        }
         let scores = d.attention_scores(&q, k)?.tensor;
         let t = k.shape().dimensions()[0];
         let scale = self.scale;

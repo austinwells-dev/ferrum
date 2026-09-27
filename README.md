@@ -13,7 +13,25 @@ Phase 7 targets GGUF performance against a matched llama.cpp build. Its journal 
 - Sparse-MoE prompt chunks are assembled on the device instead of through host round trips.
 - Greedy decoding selects argmax on the GPU and reads back one ID.
 
-Against the Phase 7A checkpoint on an Apple M5, paired runs measured Qwen2.5-0.5B Q4_K_M at +4–8% cached decode and +5–11% complete generation. Qwen3-0.6B Q8_0 measured +2–7% decode and +3–9% complete generation. LFM2.5-8B-A1B Q4_K_M was neutral, within about 1% on decode and generation. A later pass ported llama.cpp's factored-scale Q4_K and Q6_K M=1 kernels (Experiments 54–56). It doubled LFM2.5-8B-A1B decode, from 35.5 to 77.7 tok/s, or 0.76–0.90x llama.cpp, and added 3–7% decode on Qwen2.5 K-quant artifacts. Removing a serial BF16 rounding safeguard from RMSNorm (Experiment 59) added 5–18% decode; LFM2.5-8B-A1B short-prompt decode now slightly exceeds llama.cpp (1.03x). Block-wise decoding of GGUF weights into TensorOps tiles (Experiment 57) then raised prompt prefill 1.3–2.5x across Qwen2.5, Qwen3, and LFM2.5 with bit-identical output. No format yet meets the Phase 7 gate of 0.85x llama.cpp decode and 0.80x prefill; 512- and 1,024-token prefill (about 0.56–0.80x) remains the larger gap.
+Against the Phase 7A checkpoint on an Apple M5, paired runs measured Qwen2.5-0.5B Q4_K_M at +4–8% cached decode and +5–11% complete generation. Qwen3-0.6B Q8_0 measured +2–7% decode and +3–9% complete generation. LFM2.5-8B-A1B Q4_K_M was neutral, within about 1% on decode and generation.
+
+Kernel work after that checkpoint:
+- **Factored-scale Q4_K/Q6_K M=1 kernels** (llama.cpp ports, Experiments 54–56) doubled LFM2.5-8B-A1B decode.
+- **Block-wise GGUF-to-TensorOps tile decoding** (Experiment 57) raised prefill 1.3–2.5x.
+- **Paired TensorOps M tiles, a shared RoPE table, and intra-epoch arena reuse** (Experiments 61–63) lifted prefill further.
+- **Weight residency set with a dispatching keep-alive** (Experiments 64 and 69) removed a post-idle re-wiring stall: short-prompt prefill +20–33%.
+- **Grouped small-batch expert GEMV** (Experiment 65): LFM2.5 short-prompt prefill +32%.
+- **RoPE written straight into KV-cache slots** (Experiment 67), **16-bit Q5_0 loads** (Experiment 68), **K-split M=1 GEMVs** (Experiment 70), **fused Q5_0 SwiGLU** (Experiment 71), and **four-row Q8_0 GEMV** (Experiment 72) together raised Qwen2.5 Q4_K_M sustained decode from 178.8 to 202.6 tok/s (+13%).
+
+Status against the saved llama.cpp rows (decode target 0.85x; prefill target 0.80x at 512/1,024 tokens):
+
+| Model | Decode | 512 / 1,024 prefill | Short / 128 prefill |
+|---|---|---|---|
+| LFM2.5-8B-A1B Q4_K_M | 0.87–1.01x | 0.85–0.88x | 0.86x / 0.66–0.70x |
+| Qwen3-0.6B Q8_0 | 0.80–0.88x | 0.81x / 0.93x | 0.65x / 0.62x |
+| Qwen2.5-0.5B Q4_K_M | 0.75–0.86x | 0.80x / 0.90x | 0.67x / 0.65x |
+
+LFM2.5-8B-A1B, the only realistically sized model measured, meets the decode and medium/long prefill targets. The sub-1B Qwen models still fall short at short prompts and long-context decode, where fixed per-kernel latency dominates. Split-context flash decode is implemented but off by default (Experiment 73). Results since Experiment 65 were measured while a system daemon (`dasd`) was pinned, so their llama.cpp ratios are indicative until re-measured on a quiet machine. See the journal's closing summary.
 
 ## Build and run
 

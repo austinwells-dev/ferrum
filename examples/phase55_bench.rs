@@ -481,6 +481,21 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let flash_decode = match request.get("flash_decode") {
+        None | Some(Value::Null) => {
+            device.set_flash_decode(false)?;
+            false
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_flash_decode(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field flash_decode must be a boolean".into(),
+            ));
+        }
+    };
     let q5_1_gemv_n4 = match request.get("q5_1_gemv_n4") {
         None | Some(Value::Null) => {
             device.set_q5_1_gemv_n4(true)?;
@@ -869,6 +884,7 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "k_quant_gemv_ksplit": k_quant_gemv_ksplit,
         "fuse_swiglu": fuse_swiglu,
         "q8_0_gemv_rows": q8_0_gemv_rows,
+        "flash_decode": flash_decode,
         "q5_1_gemv_n4": q5_1_gemv_n4,
         "q5_k_gemv_8rows": q5_k_gemv_8rows,
         "moe_gpu_routing_prefill": moe_gpu_routing_prefill,

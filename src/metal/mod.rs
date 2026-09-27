@@ -378,6 +378,7 @@ pub struct MetalDevice {
     k_quant_ksplit: Cell<usize>,
     fuse_swiglu: Cell<bool>,
     q8_0_rows: Cell<usize>,
+    flash_decode: Cell<bool>,
     q5_1_gemv_n4: Cell<bool>,
     q4_0_gemv_8rows: Cell<bool>,
     q4_k_gemv_8rows: Cell<bool>,
@@ -489,6 +490,7 @@ impl MetalDevice {
             k_quant_ksplit: Cell::new(8),
             fuse_swiglu: Cell::new(true),
             q8_0_rows: Cell::new(4),
+            flash_decode: Cell::new(false),
             q5_1_gemv_n4: Cell::new(true),
             q4_0_gemv_8rows: Cell::new(true),
             q4_k_gemv_8rows: Cell::new(true),
@@ -855,6 +857,21 @@ impl MetalDevice {
     }
     pub(crate) fn q8_0_gemv_rows(&self) -> usize {
         self.q8_0_rows.get()
+    }
+    /// Single-row decode attention as split-context flash kernels. Off by
+    /// default: it skips the unfused path's BF16 probability rounding, which
+    /// moves the Qwen2.5 BF16 reference check from 0.516 to 0.562 (limit 0.55).
+    pub fn set_flash_decode(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change attention policy during execution".into(),
+            ));
+        }
+        self.flash_decode.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn flash_decode(&self) -> bool {
+        self.flash_decode.get()
     }
     /// K-split GEMVs carry their SIMD groups per threadgroup in `params[8]`.
     fn ksplit_simds(name: &str, params: &[u32; 9]) -> Option<usize> {
@@ -1706,6 +1723,8 @@ impl MetalDevice {
             "lfm2_short_conv" => (4, 2),
             "add_rmsnorm" => (3, 2),
             "q5_0_gemv_swiglu" => (3, 1),
+            "attention_decode_split" => (3, 1),
+            "attention_decode_reduce" => (1, 1),
             "rope_split_table_bias" => (3, 1),
             "lfm2_split3" => (1, 3),
             _ => (2, 1),
@@ -2034,6 +2053,33 @@ impl MetalDevice {
                     },
                     MTLSize {
                         width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if matches!(name, "attention_decode_split" | "attention_decode_reduce") {
+                // Split: 128 threads per (head, split). Reduce: one thread per
+                // head dimension (params[6], a multiple of 32).
+                let threads = if name == "attention_decode_split" {
+                    128
+                } else {
+                    params[6] as usize
+                };
+                if p.raw.threadExecutionWidth() != 32
+                    || p.raw.maxTotalThreadsPerThreadgroup() < threads
+                {
+                    return Err(Error::Dispatch(
+                        "flash decode requires 32-wide SIMD groups".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0],
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: threads,
                         height: 1,
                         depth: 1,
                     },

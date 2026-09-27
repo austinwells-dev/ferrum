@@ -2479,3 +2479,40 @@ Raw: `qwen2.5-q4_k_m-q8_0-gemv-rows4-ab.jsonl` and `qwen3-0.6b-q8_0-q8_0-gemv-ro
 Decode against the saved llama.cpp rows is now:
 - **Qwen2.5 Q4_K_M:** 0.75–0.86x (sustained 0.83x).
 - **Qwen3:** 0.80–0.88x (sustained 0.88x).
+
+## Experiment 73: Split-context flash decode attention (implemented, off by default)
+
+Status: implemented behind `set_flash_decode` (default off) and the bench field `flash_decode`.
+
+**Diagnosis.** At 1,024 tokens of context, Qwen2.5 decode attention cost 34 µs per layer: context 22.7 µs, scores 6.4 µs, softmax 5.0 µs. At short context it cost 10 µs. The wide context kernel launches only 28 threadgroups (14 heads × 2 column tiles), each thread walking 32 tokens serially, and every V row is re-read by all seven query heads that share it.
+
+**Change.** Two kernels replace scores, softmax, and context for a single query row:
+- `attention_decode_split` runs one 128-thread group per (head, split). It walks its token range with an online softmax, reproducing the unfused path's storage rounding of scores before and after scaling. It writes max, sum, and D unnormalized context values in f32.
+- `attention_decode_reduce` combines the splits per head.
+
+The split count targets about 96 groups with at least 32 tokens each. `flash_decode_matches_reference_and_unfused_path` checks grouped-query shapes, head dims 64/128/256, and 1–1,024 tokens against an f32 CPU reference. Flash is never worse than the unfused path plus a small margin.
+
+**Measured.** In a Qwen2.5 Q4_K_M decode profile at 1,024 tokens of context, per-token GPU time fell from 5.12 to 4.57 ms (−11%), and attention left the top of the profile. No paired A/B was run yet.
+
+**Why off by default.** Flash skips the unfused path's BF16 rounding of probabilities. It is closer to exact math, but the Qwen2.5 BF16 cross-engine check (`official_qwen_bf16_cached_generation`) then peaks at 0.562 against its 0.55 bound. The unfused path peaks at 0.516. Token choices are identical.
+
+| Path | Step 0 | Step 1 | Step 2 | Step 3 | Step 4 |
+|---|---:|---:|---:|---:|---:|
+| Flash | 0.25 | 0.36 | 0.56 | 0.50 | 0.44 |
+| Unfused | 0.25 | 0.42 | 0.52 | 0.38 | 0.38 |
+
+Enabling flash by default needs a decision on that bound, plus an A/B.
+
+## Phase 7 closing summary (this pass)
+
+| Model | Decode | 512 / 1,024 prefill | Short / 128 prefill | Gate |
+|---|---|---|---|---|
+| LFM2.5-8B-A1B Q4_K_M | 0.87–1.01x | 0.85–0.88x | 0.86x / 0.66–0.70x | Decode and medium/long prefill met |
+| Qwen3-0.6B Q8_0 | 0.80–0.88x | 0.81x / 0.93x | 0.65x / 0.62x | Prefill met; decode borderline |
+| Qwen2.5-0.5B Q4_K_M | 0.75–0.86x | 0.80x / 0.90x | 0.67x / 0.65x | Prefill met; decode short at long context |
+
+Known limitations carried forward:
+- **Short-prompt and 128-token prefill on sub-1B models** stay below 0.70x. The work there is dominated by fixed per-kernel latency, not bandwidth.
+- **Long-context decode on the small Qwen models** is the target of Experiment 73.
+- **Measurement conditions.** Every ratio from Experiment 65 onward was measured while `dasd` was pinned (`PHASE7A_PREFLIGHT_IGNORE=dasd`). The Ferrum-versus-Ferrum pairs are valid, but the llama.cpp ratios need a clean re-measurement on a quiet machine before the gate can be formally signed off.
+- **Unused add+RMSNorm fusion code** remains behind its toggle and can be removed.

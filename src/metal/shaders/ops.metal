@@ -2366,6 +2366,73 @@ kernel void attention_context_decode_wide(ARGS, uint tid [[thread_index_in_threa
         store(c,h*d+col,p[4],sum);
     }
 }
+// Split-context flash decode (one query row). Threadgroup (head, split) walks
+// its token range with an online softmax: each SIMD group takes every fourth
+// token, each lane holds D/32 dimensions of q and of the running context.
+// Scores are rounded to storage before and after scaling, as the unfused
+// scores/softmax kernels do. Output per (head, split): max, sum, then D
+// unnormalized context values, all f32; attention_decode_reduce combines them.
+// p[1]=T, p[2]=splits, p[3]=heads, p[5]=kv heads, p[6]=D (multiple of 32, <=256).
+kernel void attention_decode_split(device const uchar* q [[buffer(0)]], device const uchar* k [[buffer(1)]],
+                                   device const uchar* v [[buffer(2)]], device float* out [[buffer(3)]],
+                                   constant uint* p [[buffer(4)]],
+                                   uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
+    uint lane=tid%32, simd=tid/32;
+    uint T=p[1], splits=p[2], heads=p[3], kv_heads=p[5], d=p[6], e=d/32;
+    uint h=group/splits, split=group%splits;
+    uint kv=h/(heads/kv_heads);
+    uint chunk=(T+splits-1)/splits, t0=split*chunk, t1=min(T,t0+chunk);
+    float scale=as_type<float>(p[7]);
+    float qv[8], acc[8];
+    for(uint i=0;i<e;i++) { qv[i]=load(q,h*d+lane*e+i,p[4]); acc[i]=0.0f; }
+    float m=-INFINITY, l=0.0f;
+    for(uint t=t0+simd;t<t1;t+=4) {
+        uint base=(t*kv_heads+kv)*d+lane*e;
+        float dot=0.0f;
+        for(uint i=0;i<e;i++) dot+=qv[i]*load(k,base+i,p[4]);
+        float x=round_storage(round_storage(simd_sum(dot),p[4])*scale,p[4]);
+        float next=max(m,x);
+        float correction=exp(m-next), weight=exp(x-next);
+        l=l*correction+weight;
+        for(uint i=0;i<e;i++) acc[i]=acc[i]*correction+weight*load(v,base+i,p[4]);
+        m=next;
+    }
+    threadgroup float sm[4], sl[4], sacc[4][256];
+    if(lane==0) { sm[simd]=m; sl[simd]=l; }
+    for(uint i=0;i<e;i++) sacc[simd][lane*e+i]=acc[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mx=max(max(sm[0],sm[1]),max(sm[2],sm[3]));
+    device float* o=out+ulong(group)*(d+2);
+    if(tid==0) {
+        float total=0.0f;
+        for(uint w=0;w<4;w++) if(sm[w]>-INFINITY) total+=sl[w]*exp(sm[w]-mx);
+        o[0]=mx; o[1]=total;
+    }
+    for(uint j=tid;j<d;j+=128) {
+        float value=0.0f;
+        for(uint w=0;w<4;w++) if(sm[w]>-INFINITY) value+=sacc[w][j]*exp(sm[w]-mx);
+        o[2+j]=value;
+    }
+}
+// Combines attention_decode_split partials: one threadgroup per head, one
+// thread per output dimension. p[2]=splits, p[6]=D.
+kernel void attention_decode_reduce(device const uchar* a [[buffer(0)]], device uchar* c [[buffer(1)]],
+                                    constant uint* p [[buffer(2)]],
+                                    uint tid [[thread_index_in_threadgroup]], uint h [[threadgroup_position_in_grid]]) {
+    uint splits=p[2], d=p[6];
+    device const float* partial=(device const float*)a+ulong(h)*splits*(d+2);
+    float mx=-INFINITY;
+    for(uint s=0;s<splits;s++) mx=max(mx,partial[s*(d+2)]);
+    float total=0.0f, value=0.0f;
+    for(uint s=0;s<splits;s++) {
+        device const float* o=partial+s*(d+2);
+        if(o[0]==-INFINITY) continue;
+        float w=exp(o[0]-mx);
+        total+=o[1]*w;
+        if(tid<d) value+=o[2+tid]*w;
+    }
+    if(tid<d) store(c,h*d+tid,p[4],value/total);
+}
 // Greedy selection per row: first index of the maximum (matching host argmax)
 // plus a non-finite flag. Output is two u32 words per row.
 kernel void argmax_rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {

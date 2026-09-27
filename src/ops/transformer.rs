@@ -927,6 +927,85 @@ impl MetalDevice {
         };
         self.run(kernel, scores, None, dims, p, [scores.numel() / dims[2], 1])
     }
+    /// Whether `attention_decode` handles one query row against this cache.
+    pub(crate) fn can_flash_decode(&self, q: &Tensor, k: &Tensor, v: &Tensor) -> bool {
+        let (qd, kd) = (q.shape().dimensions(), k.shape().dimensions());
+        self.flash_decode()
+            && !self.reference_math()
+            && qd.len() == 3
+            && qd[0] == 1
+            && kd.len() == 3
+            && k.shape() == v.shape()
+            && q.dtype() == k.dtype()
+            && k.dtype() == v.dtype()
+            && q.dtype() != DType::F32
+            && qd[2] == kd[2]
+            && kd[1] > 0
+            && qd[1].is_multiple_of(kd[1])
+            && kd[2].is_multiple_of(32)
+            && kd[2] <= 256
+            && kd[0] > 0
+            && kd[0] <= u32::MAX as usize / 2
+    }
+    /// Single-row decode attention, `softmax(scale * q Kᵀ) V`, as a
+    /// split-context pass plus a combine. Returns `[1, heads, head_dim]`.
+    pub(crate) fn attention_decode(
+        &self,
+        q: &Tensor,
+        k: &Tensor,
+        v: &Tensor,
+        scale: f32,
+    ) -> Result<Tensor> {
+        if !self.can_flash_decode(q, k, v) || !scale.is_finite() {
+            return Err(Error::Shape("flash decode operands".into()));
+        }
+        if [q, k, v].iter().any(|t| !self.owns(t.buffer())) {
+            return Err(Error::DeviceMismatch);
+        }
+        let (heads, tokens, kv_heads, dim) = (
+            q.shape().dimensions()[1],
+            k.shape().dimensions()[0],
+            k.shape().dimensions()[1],
+            k.shape().dimensions()[2],
+        );
+        // Enough (head, split) groups to fill the GPU, at least 32 tokens each.
+        let splits = tokens.div_ceil(32).min(96usize.div_ceil(heads)).max(1);
+        let partial = Tensor::output(self, &[heads * splits, dim + 2], DType::F32)?;
+        let out = Tensor::output(self, &[1, heads, dim], q.dtype())?;
+        let mut p = [0; 9];
+        p[1] = index(tokens)?;
+        p[2] = index(splits)?;
+        p[3] = index(heads)?;
+        p[4] = q.dtype() as u32;
+        p[5] = index(kv_heads)?;
+        p[6] = index(dim)?;
+        p[7] = scale.to_bits();
+        let start = self.profiling().then(std::time::Instant::now);
+        self.dispatch(
+            "attention_decode_split",
+            &[q.binding(), k.binding(), v.binding(), partial.binding()],
+            &p,
+            [heads * splits, 1],
+            false,
+        )?;
+        let timing = self.dispatch(
+            "attention_decode_reduce",
+            &[partial.binding(), out.binding()],
+            &p,
+            [heads, 1],
+            false,
+        )?;
+        if let Some(start) = start {
+            self.record_profile(
+                "attention_decode",
+                start.elapsed(),
+                std::time::Duration::ZERO,
+                out.storage_info().allocation_bytes,
+                &timing,
+            );
+        }
+        Ok(out)
+    }
     pub(crate) fn attention_context(&self, probs: &Tensor, v: &Tensor) -> Result<Output> {
         let a = probs.shape().dimensions();
         let b = v.shape().dimensions();
@@ -1093,6 +1172,76 @@ impl MetalDevice {
 #[cfg(test)]
 mod fusion_tests {
     use super::*;
+    fn pseudo(n: usize, seed: usize) -> Vec<f32> {
+        (0..n)
+            .map(|i| (((i * 2654435761 + seed * 40503) >> 7) % 2001) as f32 / 1000.0 - 1.0)
+            .collect()
+    }
+    #[test]
+    fn flash_decode_matches_reference_and_unfused_path() {
+        let d = MetalDevice::new().unwrap();
+        d.set_flash_decode(true).unwrap();
+        for (heads, kv_heads, dim, tokens) in [
+            (14, 2, 64, 1),
+            (14, 2, 64, 37),
+            (14, 2, 64, 1024),
+            (16, 8, 128, 300),
+            (32, 8, 64, 5),
+            (4, 4, 256, 70),
+        ] {
+            let scale = 1.0 / (dim as f32).sqrt() * 3.0;
+            let dtype = DType::BF16;
+            let q = Tensor::from_f32(&d, [1, heads, dim], dtype, &pseudo(heads * dim, 1)).unwrap();
+            let kv = [tokens, kv_heads, dim];
+            let k = Tensor::from_f32(&d, kv, dtype, &pseudo(tokens * kv_heads * dim, 2)).unwrap();
+            let v = Tensor::from_f32(&d, kv, dtype, &pseudo(tokens * kv_heads * dim, 3)).unwrap();
+            let (qv, kv_, vv) = (q.to_f32(), k.to_f32(), v.to_f32());
+            let group = heads / kv_heads;
+            let mut reference = vec![0.0f32; heads * dim];
+            for h in 0..heads {
+                let kvh = h / group;
+                let scores: Vec<f32> = (0..tokens)
+                    .map(|t| {
+                        scale
+                            * (0..dim)
+                                .map(|j| qv[h * dim + j] * kv_[(t * kv_heads + kvh) * dim + j])
+                                .sum::<f32>()
+                    })
+                    .collect();
+                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let weights: Vec<f32> = scores.iter().map(|x| (x - max).exp()).collect();
+                let total: f32 = weights.iter().sum();
+                for j in 0..dim {
+                    reference[h * dim + j] = (0..tokens)
+                        .map(|t| weights[t] * vv[(t * kv_heads + kvh) * dim + j])
+                        .sum::<f32>()
+                        / total;
+                }
+            }
+            let flash = d.attention_decode(&q, &k, &v, scale).unwrap().to_f32();
+            let scores = d
+                .attention_scores(&q.reshape([1, heads, dim]).unwrap(), &k)
+                .unwrap()
+                .tensor;
+            let probs = d
+                .attention_softmax(&scores, tokens - 1, scale)
+                .unwrap()
+                .tensor;
+            let unfused = d.attention_context(&probs, &v).unwrap().tensor.to_f32();
+            let error = |x: &[f32]| {
+                x.iter()
+                    .zip(&reference)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max)
+            };
+            let (flash_error, unfused_error) = (error(&flash), error(&unfused));
+            assert!(
+                // Both paths round scores to storage; flash must be no worse.
+                flash_error <= 5e-2 && flash_error <= unfused_error * 1.25 + 2e-3,
+                "({heads},{kv_heads},{dim},{tokens}): flash {flash_error} unfused {unfused_error}"
+            );
+        }
+    }
     #[test]
     fn fused_silu_multiply_preserves_storage_rounding() {
         let d = MetalDevice::new().unwrap();
