@@ -2029,3 +2029,173 @@ kernel void h_copy_rows(constant CopyRowsArgs & a [[buffer(2)]], device const fl
     const uint r = i / a.width, c = i % a.width;
     dst[(ulong)r * a.dst_stride + a.dst_offset + c] = src[(ulong)r * a.src_stride + c];
 }
+
+// ---------------------------------------------------------------- block-diffusion drafters
+
+struct DraftPrepArgs {
+    uint rows;
+    uint heads;
+    uint head_dim;     // 128 or 256
+    float eps;
+    uint position;     // absolute position of row 0
+    uint ring;         // 0: row r goes to dst row r; else to row (position + r) % ring, tagged
+    float scale;       // folded into the output (YaRN mscale, softmax scale for queries)
+};
+
+// Per-head RMSNorm + full-width NeoX RoPE (frequencies from `inv_freq`) of
+// x [rows][heads*head_dim] into F16 dst. grid (heads, rows); threads head_dim.
+kernel void d_qk_prep(constant DraftPrepArgs & p [[buffer(5)]],
+                      device const float * x [[buffer(0)]], device const float * norm [[buffer(1)]],
+                      device const float * inv_freq [[buffer(2)]],
+                      device half * dst [[buffer(3)]], device uint * tags [[buffer(4)]],
+                      uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    threadgroup float normed[256];
+    const uint head = group.x, r = group.y;
+    const float v = x[((ulong)r * p.heads + head) * p.head_dim + tid];
+    const float ss = block_sum(v * v, scratch, tid, p.head_dim);
+    const float nv = v * rsqrt(ss / float(p.head_dim) + p.eps) * norm[tid];
+    normed[tid] = nv;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint half_dim = p.head_dim / 2;
+    const uint pair = tid % half_dim;
+    const uint pos = p.position + r;
+    const float angle = float(pos) * inv_freq[pair];
+    const float c = cos(angle), s = sin(angle);
+    const float outv = tid < half_dim ? nv * c - normed[tid + half_dim] * s
+                                      : normed[tid - half_dim] * s + nv * c;
+    const uint row = p.ring ? pos % p.ring : r;
+    dst[((ulong)row * p.heads + head) * p.head_dim + tid] = half(outv * p.scale);
+    if (p.ring && head == 0 && tid == 0) tags[row] = pos;
+}
+
+// v [rows][width] into F16 dst rows (ring-mapped like d_qk_prep).
+kernel void d_store_v(constant DraftPrepArgs & p [[buffer(2)]], device const float * v [[buffer(0)]],
+                      device half * dst [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    const uint width = p.heads * p.head_dim;
+    if (i >= p.rows * width) return;
+    const uint r = i / width, c = i % width;
+    const uint row = p.ring ? (p.position + r) % p.ring : r;
+    dst[(ulong)row * width + c] = half(v[i]);
+}
+
+struct DraftAttnArgs {
+    uint rows;         // block rows (queries and noise keys)
+    uint heads;
+    uint kv_heads;
+    uint head_dim;
+    uint position;     // position of row 0; context keys must precede it
+    uint ring;         // context slots
+    uint window;       // a query at q sees context positions t with q - t < window
+};
+
+// Block attention of the draft: every query row sees the valid context slots
+// (tag < position, inside the window) and all block rows (non-causal).
+// q is pre-scaled. grid (heads, rows); threads 128 (4 SIMD groups split keys).
+kernel void d_attention(constant DraftAttnArgs & p [[buffer(7)]],
+                        device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],
+                        device const half * vc [[buffer(2)]], device const uint * tags [[buffer(3)]],
+                        device const half * kn [[buffer(4)]], device const half * vn [[buffer(5)]],
+                        device float * out [[buffer(6)]],
+                        uint2 group [[threadgroup_position_in_grid]],
+                        ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float tm[4], tl[4];
+    threadgroup float tacc[4][256];
+    const uint h = group.x, r = group.y;
+    const uint kvh = h / (p.heads / p.kv_heads);
+    const uint per = p.head_dim / 32;           // dims per lane (4 or 8)
+    const uint qpos = p.position + r;
+    const uint stride = p.kv_heads * p.head_dim;
+    float qv[8], acc[8];
+    for (uint i = 0; i < per; i++) {
+        qv[i] = float(q[((ulong)r * p.heads + h) * p.head_dim + lane * per + i]);
+        acc[i] = 0.f;
+    }
+    float m = -INFINITY, l = 0.f;
+    const uint keys = p.ring + p.rows;
+    for (uint j = sg; j < keys; j += 4) {
+        device const half * kr;
+        device const half * vr;
+        if (j < p.ring) {
+            const uint t = tags[j];
+            if (t >= p.position || qpos - t >= p.window) continue;
+            kr = kc + (ulong)j * stride + kvh * p.head_dim;
+            vr = vc + (ulong)j * stride + kvh * p.head_dim;
+        } else {
+            kr = kn + (ulong)(j - p.ring) * stride + kvh * p.head_dim;
+            vr = vn + (ulong)(j - p.ring) * stride + kvh * p.head_dim;
+        }
+        float dot = 0.f;
+        for (uint i = 0; i < per; i++) dot += qv[i] * float(kr[lane * per + i]);
+        const float s = simd_sum(dot);
+        const float m_new = max(m, s);
+        const float corr = exp(m - m_new);
+        const float e = exp(s - m_new);
+        l = l * corr + e;
+        for (uint i = 0; i < per; i++) acc[i] = acc[i] * corr + e * float(vr[lane * per + i]);
+        m = m_new;
+    }
+    if (lane == 0) { tm[sg] = m; tl[sg] = l; }
+    for (uint i = 0; i < per; i++) tacc[sg][lane * per + i] = acc[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg != 0) return;
+    float M = -INFINITY;
+    for (uint s = 0; s < 4; s++) M = max(M, tm[s]);
+    float L = 0.f;
+    float w[4];
+    for (uint s = 0; s < 4; s++) {
+        w[s] = tm[s] == -INFINITY ? 0.f : exp(tm[s] - M);
+        L += tl[s] * w[s];
+    }
+    for (uint i = 0; i < per; i++) {
+        const uint dim = lane * per + i;
+        float v = 0.f;
+        for (uint s = 0; s < 4; s++) v += tacc[s][dim] * w[s];
+        out[((ulong)r * p.heads + h) * p.head_dim + dim] = v / L;
+    }
+}
+
+struct DynConvArgs { uint rows; uint hidden; uint taps; uint group; uint side; };
+
+// DFlash2 grouped causal conv inside the block:
+// y[t][c] = sum_tap (dyn[t][side][tap][c/group] + base[side][tap][c]) * x[t-tap][c].
+// dyn rows hold 2*taps*(hidden/group) coefficients. One thread per value.
+kernel void d_dyn_conv(constant DynConvArgs & p [[buffer(4)]],
+                       device const float * x [[buffer(0)]], device const float * dyn [[buffer(1)]],
+                       device const float * base [[buffer(2)]], device float * y [[buffer(3)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= p.rows * p.hidden) return;
+    const uint t = i / p.hidden, c = i % p.hidden;
+    const uint groups = p.hidden / p.group;
+    const uint g = c / p.group;
+    device const float * d = dyn + (ulong)t * 2 * p.taps * groups;
+    float acc = 0.f;
+    for (uint tap = 0; tap < p.taps && tap <= t; tap++) {
+        const float w = d[g + groups * (tap + p.taps * p.side)] +
+                        base[(p.side * p.taps + tap) * p.hidden + c];
+        acc += w * x[(ulong)(t - tap) * p.hidden + c];
+    }
+    y[i] = acc;
+}
+
+struct ConfArgs { uint hidden; uint rank; float bias; };
+
+// DSpark confidence: sigmoid(w . [hidden_row ; markov_row] + bias) into out[0].
+// One threadgroup of 256 threads.
+kernel void d_confidence(constant ConfArgs & p [[buffer(4)]],
+                         device const float * hrow [[buffer(0)]], device const float * mrow [[buffer(1)]],
+                         device const float * w [[buffer(2)]], device float * out [[buffer(3)]],
+                         ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    float acc = 0.f;
+    for (uint i = tid; i < p.hidden; i += 256) acc += w[i] * hrow[i];
+    for (uint i = tid; i < p.rank; i += 256) acc += w[p.hidden + i] * mrow[i];
+    const float total = block_sum(acc, scratch, tid, 256);
+    if (tid == 0) out[0] = 1.f / (1.f + exp(-(total + p.bias)));
+}
+
+// y += r (in place; y is bound only as an output).
+kernel void h_accumulate(constant EltArgs & a [[buffer(2)]], device const float * r [[buffer(0)]],
+                         device float * y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i < a.n) y[i] += r[i];
+}

@@ -115,6 +115,38 @@ fn main() -> Result<()> {
         ),
     }
 
+    // Numerics: verify-row logits versus single-row decode logits at the
+    // same positions (reference prefix, one full-width verify).
+    {
+        let rows = block + 1;
+        let mut a = HybridState::new(&d, &model.config, capacity)?;
+        model.forward(&d, &mut a, &prompt, Output::None)?;
+        let RowsProduced::Logits(wide) =
+            model.verify(&d, &mut a, &reference[..rows], RowOutput::Logits)?
+        else {
+            unreachable!()
+        };
+        let mut b = HybridState::new(&d, &model.config, capacity)?;
+        model.forward(&d, &mut b, &prompt, Output::None)?;
+        let (mut worst, mut kl_max) = (0f32, 0f64);
+        for (i, row) in wide.iter().enumerate() {
+            let Produced::Logits(single) =
+                model.forward(&d, &mut b, &[reference[i]], Output::Logits)?
+            else {
+                unreachable!()
+            };
+            worst = worst.max(
+                row.iter()
+                    .zip(&single)
+                    .fold(0f32, |m, (x, y)| m.max((x - y).abs())),
+            );
+            kl_max = kl_max.max(kl(&single, row));
+        }
+        println!(
+            "verify rows vs single-row decode over {rows} positions: max |dlogit| {worst:.4}, max KL {kl_max:.2e}"
+        );
+    }
+
     // Replay check: commit(n) versus plain forwards of the same n tokens.
     let n = block / 2 + 1;
     let tail = &reference[..n];
@@ -155,4 +187,20 @@ fn top2(logits: &[f32]) -> (u32, f32) {
         }
     }
     (best.0, best.1 - second)
+}
+
+/// KL(p || q) of the softmax distributions of two logit rows.
+fn kl(p: &[f32], q: &[f32]) -> f64 {
+    let lse = |x: &[f32]| {
+        let m = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b)) as f64;
+        m + x.iter().map(|&v| (v as f64 - m).exp()).sum::<f64>().ln()
+    };
+    let (lp, lq) = (lse(p), lse(q));
+    p.iter()
+        .zip(q)
+        .map(|(&a, &b)| {
+            let pa = (a as f64 - lp).exp();
+            pa * ((a as f64 - lp) - (b as f64 - lq))
+        })
+        .sum()
 }

@@ -438,3 +438,98 @@ pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> 
         },
     })
 }
+
+impl Matrix {
+    /// Quantize a row-major BF16 `[rows, cols]` matrix (little-endian bytes)
+    /// into `format` (Q8_0, Q4_0 or F32), rows in parallel.
+    pub(crate) fn from_bf16(
+        device: &MetalDevice,
+        rows: usize,
+        cols: usize,
+        bf16: &[u8],
+        format: Format,
+    ) -> Result<Self> {
+        if bf16.len() != rows * cols * 2 || !cols.is_multiple_of(32) {
+            return Err(Error::Shape(format!(
+                "BF16 matrix [{rows}, {cols}] from {} bytes",
+                bf16.len()
+            )));
+        }
+        let row_bytes = match format {
+            Format::Q8_0 => cols / 32 * 34,
+            Format::Q4_0 => cols / 32 * 18,
+            Format::F32 => cols * 4,
+            f => {
+                return Err(Error::Parameter(format!("cannot quantize to {}", f.name())));
+            }
+        };
+        let storage = PackedStorage::from_reader(device, rows * row_bytes, |dst| {
+            let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+            let per = rows.div_ceil(threads).max(1);
+            std::thread::scope(|scope| {
+                for (index, out) in dst.chunks_mut(per * row_bytes).enumerate() {
+                    let first = index * per;
+                    scope.spawn(move || {
+                        let mut row = vec![0f32; cols];
+                        for (r, out_row) in out.chunks_mut(row_bytes).enumerate() {
+                            let src = &bf16[(first + r) * cols * 2..(first + r + 1) * cols * 2];
+                            for (v, b) in row.iter_mut().zip(src.chunks_exact(2)) {
+                                *v = f32::from_bits(
+                                    u32::from(u16::from_le_bytes([b[0], b[1]])) << 16,
+                                );
+                            }
+                            quantize_row(&row, out_row, format);
+                        }
+                    });
+                }
+            });
+            Ok(())
+        })?;
+        Ok(Matrix {
+            rows,
+            cols,
+            experts: 1,
+            format,
+            row_bytes,
+            storage,
+        })
+    }
+}
+
+/// ggml's reference Q8_0 / Q4_0 row quantization.
+fn quantize_row(x: &[f32], out: &mut [u8], format: Format) {
+    match format {
+        Format::F32 => {
+            for (o, v) in out.chunks_exact_mut(4).zip(x) {
+                o.copy_from_slice(&v.to_le_bytes());
+            }
+        }
+        Format::Q8_0 => {
+            for (block, o) in x.chunks_exact(32).zip(out.chunks_exact_mut(34)) {
+                let amax = block.iter().fold(0f32, |m, v| m.max(v.abs()));
+                let d = amax / 127.;
+                let id = if d != 0. { 1. / d } else { 0. };
+                o[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                for (q, v) in o[2..].iter_mut().zip(block) {
+                    *q = ((v * id).round() as i8) as u8;
+                }
+            }
+        }
+        Format::Q4_0 => {
+            for (block, o) in x.chunks_exact(32).zip(out.chunks_exact_mut(18)) {
+                let max = block
+                    .iter()
+                    .fold(0f32, |m, &v| if v.abs() > m.abs() { v } else { m });
+                let d = max / -8.;
+                let id = if d != 0. { 1. / d } else { 0. };
+                o[..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+                for j in 0..16 {
+                    let lo = ((block[j] * id + 8.5) as i32).clamp(0, 15) as u8;
+                    let hi = ((block[j + 16] * id + 8.5) as i32).clamp(0, 15) as u8;
+                    o[2 + j] = lo | (hi << 4);
+                }
+            }
+        }
+        _ => unreachable!("checked by the caller"),
+    }
+}

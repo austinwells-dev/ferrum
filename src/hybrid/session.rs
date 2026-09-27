@@ -583,6 +583,7 @@ fn accept(
                 .count();
             Ok((accepted, targets[accepted]))
         }
+        RowsProduced::Logits(_) => Err(Error::Parameter("verify produced logits".into())),
         RowsProduced::Candidates(mut rows) => {
             for (i, &draft) in drafts.iter().enumerate() {
                 let dist = distribution(&mut rows[i], params)?;

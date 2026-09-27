@@ -5,6 +5,7 @@
 pub mod bench;
 pub mod chat;
 pub mod config;
+pub mod draft;
 pub mod engine;
 pub mod mtp;
 pub mod plan;

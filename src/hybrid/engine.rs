@@ -543,11 +543,14 @@ pub enum RowOutput {
     /// Sampling candidates of every row (see `Output::Candidates`), each row
     /// with its own penalty window.
     Candidates(Vec<Penalties>),
+    /// Full logits of every row (evaluation).
+    Logits,
 }
 
 pub enum RowsProduced {
     Tokens(Vec<u32>),
     Candidates(Vec<Vec<(u32, f32)>>),
+    Logits(Vec<Vec<f32>>),
 }
 
 impl HybridModel {
@@ -830,6 +833,16 @@ impl HybridModel {
         let e = d.execution_with_shared_encoder(true)?;
         self.project(d, &self.weights.output, &xn, m, &logits)?;
         match output {
+            RowOutput::Logits => {
+                e.finish()?;
+                Ok(RowsProduced::Logits(
+                    logits
+                        .to_f32()
+                        .chunks(c.vocab)
+                        .map(<[f32]>::to_vec)
+                        .collect(),
+                ))
+            }
             RowOutput::Argmax => {
                 d.dispatch_hybrid(
                     "h_argmax",

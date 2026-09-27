@@ -1,6 +1,7 @@
 //! Speculative decoding benchmark and losslessness check on chat prompts.
 //! usage: hybrid_spec MODEL.gguf --drafter mtp|DRAFT_DIR [--drafts K]
 //!        [--tokens 256] [--context 8192] [--temp 0] [--baseline] [--prompts N]
+//!        [--pmin P]  (DSpark confidence cut-off)
 //!
 //! Each prompt is rendered with the model's chat template (thinking on) and
 //! generated with speculation. With --baseline the same prompt is first
@@ -12,6 +13,7 @@ use ferrum::{
     Result,
     hybrid::{
         HybridState, Output, Produced,
+        draft::{DraftModel, DraftOptions},
         mtp::Mtp,
         plan::PlanOptions,
         runtime::{ChatRequest, Runtime},
@@ -66,7 +68,17 @@ fn main() -> Result<()> {
             k,
         )?)
     } else {
-        panic!("unknown drafter {drafter_arg}");
+        Box::new(DraftModel::load(
+            &rt.device,
+            &drafter_arg,
+            &rt.loaded.model,
+            context,
+            (drafts > 0).then_some(drafts),
+            DraftOptions {
+                confidence_min: get("--pmin", "0").parse().expect("pmin"),
+                ..Default::default()
+            },
+        )?)
     };
     println!(
         "drafter {} (max {} drafts)",
