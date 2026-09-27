@@ -97,3 +97,42 @@ sensitive to F16 GEMM rounding, and Ferrum loses nothing relative to llama.cpp.
 | Swift 27B llama.cpp | 149.8 | 142.3 | 5.98 |
 | Tiel 35B-A3B Ferrum | 634.3 | 577.0 | 34.82 (tg128) |
 | Tiel 35B-A3B llama.cpp | 802.9 | 768.9 | 35.77 |
+
+## Experiment 3 — MoE tile, TensorOps attention, vector decode attention
+
+**Expert GEMM tile.** A layer's routes spread over 256 experts (~16 rows each
+at 512 tokens), so a 128-row activation tile was mostly padding. A 32-row tile
+(llama.cpp's NR1): Tiel pp512 634 → 881, pp2048 577 → 778 tok/s.
+
+**Bandwidth ceiling.** A pure streaming-read probe (`examples/hybrid_bandwidth.rs`)
+reaches 122–134 GB/s on this M5. Real-weight GEMV probes
+(`examples/hybrid_kernels.rs`) run at 113–147 GB/s, so M=1 projections are at
+the ceiling; Swift decode is ~85% weight streaming and ~15% small kernels.
+Sweeps of rows-per-SIMD-group and SIMD groups per threadgroup for Q4_K/Q6_K
+were within ±5% run-to-run noise; the llama.cpp shapes stay.
+
+**TensorOps flash attention (prompts).** One threadgroup per 64 queries of one
+head; S = Q Kᵀ and O += P V as `matmul2d` on 64×64 key blocks, with the online
+softmax over S in threadgroup memory and O kept in a cooperative tensor
+(rescaled per row through `get_multidimensional_index`). Tiel pp8192 528 → 747,
+pp16384 398 → 623 tok/s.
+
+**Vector decode attention.** The simdgroup-matrix kernel loaded K/V as strided
+8×8 tiles and topped out near 50–60 GB/s. The single-token kernel makes QKᵀ
+key-parallel (a lane reads one contiguous 512-byte K row, Q from threadgroup
+memory) and PV dimension-parallel (coalesced V rows), merges four SIMD groups
+pairwise in threadgroup memory, and splits keys across ~128 threadgroups.
+Decode attention at 16K–64K keys: 2–3× faster (77–97 GB/s effective).
+Both attention kernels are unit-tested against the reference kernel.
+
+### Status against llama.cpp (same GGUF, same machine)
+
+| | Ferrum | llama.cpp |
+|---|---|---|
+| Swift pp512 / pp2048 / pp8192 | 171.9 / 158.0 / 162.1 | 149.8 / 142.3 / 134.4 |
+| Swift tg @0 / @8K / @32K | 6.65 / 6.41 / 5.85 | 5.98 / 6.00 / 5.47 |
+| Tiel pp512 / pp2048 / pp8192 / pp16384 | 867 / 865 / 747 / 623 | 803 / 769 / 662 / 559 |
+| Tiel tg @0 / @16K / @32K | 42.1 / 34.5 / 29.5 | 35.8 / 30.5 / 26.8 |
+
+Decode figures are the mean of 16 steps after the given prefilled depth; run-to-run
+noise on this machine is about ±5%.

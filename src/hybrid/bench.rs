@@ -105,3 +105,40 @@ pub fn bench_read_bandwidth(
     let n = 20;
     Ok(bytes as f64 * n as f64 / run(n)? / 1e9)
 }
+
+impl HybridModel {
+    /// Decode attention alone: one query token against `keys` cached
+    /// positions. Returns (microseconds per call, GB/s of K+V read).
+    pub fn bench_decode_attention(
+        &self,
+        d: &MetalDevice,
+        keys: usize,
+        iters: usize,
+    ) -> Result<(f64, f64)> {
+        let c = &self.config;
+        let stride = c.kv_heads * c.head_dim;
+        let cap = keys.next_multiple_of(32);
+        let q = Tensor::zeros(d, [1, c.heads * c.head_dim], DType::F16)?;
+        let kc = Tensor::zeros(d, [cap, stride], DType::F16)?;
+        let vc = Tensor::zeros(d, [cap, stride], DType::F16)?;
+        let qg = Tensor::zeros(d, [1, 2 * c.heads * c.head_dim], DType::F32)?;
+        let att = Tensor::zeros(d, [1, c.heads * c.head_dim], DType::F32)?;
+        let s = self.scratch.borrow();
+        let run = |n: usize| -> Result<f64> {
+            let e = d.execution_with_shared_encoder(true)?;
+            let start = std::time::Instant::now();
+            for _ in 0..n {
+                self.flash_attention(d, &s, &q, &kc, &vc, &qg, &att, 1, keys - 1)?;
+            }
+            e.finish()?;
+            Ok(start.elapsed().as_secs_f64())
+        };
+        // Warm up until the GPU has run at least 300 ms, so clocks are up.
+        let warm = std::time::Instant::now();
+        while warm.elapsed().as_secs_f64() < 0.3 {
+            run(iters)?;
+        }
+        let per = run(iters)? / iters as f64;
+        Ok((per * 1e6, 2. * (keys * stride * 2) as f64 / per / 1e9))
+    }
+}

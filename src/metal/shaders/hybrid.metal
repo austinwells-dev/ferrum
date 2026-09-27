@@ -1727,3 +1727,123 @@ kernel void h_flash_attn_mpp(constant FaArgs & p [[buffer(5)]],
         out[((ulong)t * p.heads + h) * D + dcol] = (l > 0.f ? cO[i] / l : 0.f) / (1.f + exp(-gate));
     }
 }
+
+// Single-token decode attention for one KV head and all `group` (<= 8) query
+// heads sharing it. QKᵀ is key-parallel (lane = key, full 256-wide dot
+// products against Q staged in threadgroup memory); PV is dimension-parallel
+// (lane owns 8 of 256 dims, V rows load coalesced). Four SIMD groups take
+// interleaved 32-key blocks of this split's range and merge before writing a
+// partial (or, with one split, the gated output).
+// grid (kv_heads, splits); threads 128; 8*256*2 + 4*8*2*4 + 2*8*256*4 bytes.
+kernel void h_attn_decode(constant FaArgs & p [[buffer(7)]],
+                          device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],
+                          device const half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],
+                          device float * out [[buffer(4)]], device float * po [[buffer(5)]],
+                          device float * pml [[buffer(6)]],
+                          threadgroup char * shared [[threadgroup(0)]],
+                          uint2 tgpig [[threadgroup_position_in_grid]],
+                          ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+    constexpr int D = 256, G = 8, NSG = 4;
+    threadgroup half * Qs = (threadgroup half *)shared;                     // [G][D]
+    threadgroup float * Ms = (threadgroup float *)(Qs + G * D);             // [NSG][G] max
+    threadgroup float * Ls = Ms + NSG * G;                                  // [NSG][G] sum
+    threadgroup float * As = Ls + NSG * G;                                  // [2][G][D]
+    const uint kvh = tgpig.x;
+    const uint split = tgpig.y;
+    const uint group = p.group;
+    const uint tid = sg * 32 + lane;
+    for (uint i = tid; i < G * D; i += 128) {
+        const uint g = i / D;
+        Qs[i] = g < group ? q[(kvh * group + g) * D + i % D] : 0.h;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint total = p.position + 1;
+    const uint begin = split * p.keys_per_split;
+    const uint end = min(begin + p.keys_per_split, total);
+    const ulong head = (ulong)kvh * D;
+    float m[G], l[G], acc[G][8];
+    for (int g = 0; g < G; g++) {
+        m[g] = -INFINITY; l[g] = 0.f;
+        for (int j = 0; j < 8; j++) acc[g][j] = 0.f;
+    }
+    for (uint j0 = begin + sg * 32; j0 < end; j0 += NSG * 32) {
+        const uint key = j0 + lane;
+        const bool ok = key < end;
+        float s[G];
+        for (int g = 0; g < G; g++) s[g] = 0.f;
+        if (ok) {
+            device const half4 * kr = (device const half4 *)(kc + (ulong)key * p.cache_stride + head);
+            for (int d4 = 0; d4 < D / 4; d4++) {
+                const float4 kv = float4(kr[d4]);
+                for (int g = 0; g < G; g++) {
+                    const float4 qv = float4(((threadgroup const half4 *)(Qs + g * D))[d4]);
+                    s[g] += dot(qv, kv);
+                }
+            }
+        }
+        float pr[G];
+        for (int g = 0; g < G; g++) {
+            const float sv = ok ? s[g] : -INFINITY;
+            const float bm = simd_max(sv);
+            const float m_new = max(m[g], bm);
+            const float corr = m_new == -INFINITY ? 1.f : exp(m[g] - m_new);
+            pr[g] = ok ? exp(sv - m_new) : 0.f;
+            l[g] = l[g] * corr + simd_sum(pr[g]);
+            m[g] = m_new;
+            for (int j = 0; j < 8; j++) acc[g][j] *= corr;
+        }
+        const uint count = min(32u, end - j0);
+        for (uint k = 0; k < count; k++) {
+            device const half * vr = vc + (ulong)(j0 + k) * p.cache_stride + head + lane * 8;
+            const float4 v0 = float4(*(device const half4 *)vr);
+            const float4 v1 = float4(*(device const half4 *)(vr + 4));
+            for (int g = 0; g < G; g++) {
+                const float pk = simd_shuffle(pr[g], ushort(k));
+                acc[g][0] += pk * v0.x; acc[g][1] += pk * v0.y; acc[g][2] += pk * v0.z; acc[g][3] += pk * v0.w;
+                acc[g][4] += pk * v1.x; acc[g][5] += pk * v1.y; acc[g][6] += pk * v1.z; acc[g][7] += pk * v1.w;
+            }
+        }
+    }
+    // Merge the four SIMD groups pairwise (2+3 into 0+1, then 1 into 0).
+    for (int round = 0; round < 2; round++) {
+        const uint writers = round == 0 ? 2u : 1u;      // SIMD groups >= writers publish
+        if (sg >= writers && sg < 2 * writers) {
+            const uint slot = sg - writers;
+            for (int g = 0; g < G; g++) {
+                if (lane == 0) { Ms[slot * G + g] = m[g]; Ls[slot * G + g] = l[g]; }
+                for (int j = 0; j < 8; j++) As[(slot * G + g) * D + lane * 8 + j] = acc[g][j];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg < writers) {
+            for (int g = 0; g < G; g++) {
+                const float m2 = Ms[sg * G + g];
+                const float m_new = max(m[g], m2);
+                if (m_new == -INFINITY) continue;
+                const float w1 = exp(m[g] - m_new), w2 = exp(m2 - m_new);
+                l[g] = l[g] * w1 + Ls[sg * G + g] * w2;
+                for (int j = 0; j < 8; j++) {
+                    acc[g][j] = acc[g][j] * w1 + As[(sg * G + g) * D + lane * 8 + j] * w2;
+                }
+                m[g] = m_new;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (sg == 0) {
+        for (uint g = 0; g < group; g++) {
+            const uint h = kvh * group + g;
+            for (int j = 0; j < 8; j++) {
+                const uint dcol = lane * 8 + j;
+                if (p.splits == 1) {
+                    const float gate = qg[(ulong)h * 2 * D + D + dcol];
+                    out[(ulong)h * D + dcol] = (l[g] > 0.f ? acc[g][j] / l[g] : 0.f) / (1.f + exp(-gate));
+                } else {
+                    const ulong grow = (ulong)split * p.heads + h;
+                    po[grow * D + dcol] = acc[g][j];
+                    if (dcol == 0) { pml[grow * 2] = m[g]; pml[grow * 2 + 1] = l[g]; }
+                }
+            }
+        }
+    }
+}

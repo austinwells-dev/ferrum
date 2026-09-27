@@ -111,7 +111,7 @@ impl HybridState {
 }
 
 /// Per-chunk activation buffers, allocated once for the largest chunk.
-struct Scratch {
+pub(crate) struct Scratch {
     chunk: usize,
     x: [Tensor; 2],
     xn: Tensor,
@@ -290,7 +290,7 @@ pub enum Produced {
 pub struct HybridModel {
     pub config: HybridConfig,
     pub(crate) weights: Weights,
-    scratch: RefCell<Scratch>,
+    pub(crate) scratch: RefCell<Scratch>,
     /// Rows of logits the scratch holds (1 unless evaluation asked for more).
     logit_rows: usize,
 }
@@ -569,7 +569,7 @@ impl HybridModel {
     /// Causal attention of `m` new queries against the cache, gated by
     /// sigmoid(gate) from `qg`, written to `att`.
     #[allow(clippy::too_many_arguments)]
-    fn flash_attention(
+    pub(crate) fn flash_attention(
         &self,
         d: &MetalDevice,
         s: &Scratch,
@@ -627,12 +627,67 @@ impl HybridModel {
                 64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
             );
         }
+        if m == 1 && group <= 8 && std::env::var_os("FERRUM_HYBRID_SIMD_ATTENTION").is_none() {
+            let target: usize = std::env::var("FERRUM_HYBRID_SPLIT_TARGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DECODE_SPLIT_TARGET);
+            let min_keys: usize = std::env::var("FERRUM_HYBRID_SPLIT_MIN_KEYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DECODE_SPLIT_MIN_KEYS);
+            let splits = (target / c.kv_heads)
+                .max(1)
+                .min(keys.div_ceil(min_keys))
+                .clamp(1, MAX_SPLITS);
+            let keys_per_split = keys.div_ceil(splits).next_multiple_of(32);
+            let splits = keys.div_ceil(keys_per_split);
+            let args = Params::default()
+                .u(1)?
+                .u(c.heads)?
+                .u(c.kv_heads)?
+                .u(group)?
+                .u(pos)?
+                .u(c.kv_heads * c.head_dim)?
+                .u(keys_per_split)?
+                .u(splits)?
+                .0;
+            d.dispatch_hybrid(
+                "h_attn_decode",
+                &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
+                &args,
+                [c.kv_heads, splits, 1],
+                [128, 1, 1],
+                8 * 256 * 2 + 4 * 8 * 2 * 4 + 2 * 8 * 256 * 4,
+            )?;
+            if splits > 1 {
+                d.dispatch_hybrid(
+                    "h_flash_reduce",
+                    &[s.attn_partial.binding(), s.attn_ml.binding(), qg.binding()],
+                    &[att.binding()],
+                    &args,
+                    [c.heads, 1, 1],
+                    [c.head_dim, 1, 1],
+                    0,
+                )?;
+            }
+            return Ok(());
+        }
         let simds = if rows <= 8 { 1 } else { 4 };
         let row_blocks = rows.div_ceil(8 * simds);
         // Split long key ranges across threadgroups when few query rows exist.
         let splits = if m * c.heads <= MAX_SPLIT_ROWS {
-            let wanted = (64 / (row_blocks * c.kv_heads)).max(1);
-            wanted.min(keys.div_ceil(256)).clamp(1, MAX_SPLITS)
+            let target: usize = std::env::var("FERRUM_HYBRID_SPLIT_TARGET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SPLIT_TARGET_GROUPS);
+            let min_keys: usize = std::env::var("FERRUM_HYBRID_SPLIT_MIN_KEYS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(SPLIT_MIN_KEYS);
+            let wanted = (target / (row_blocks * c.kv_heads)).max(1);
+            wanted.min(keys.div_ceil(min_keys)).clamp(1, MAX_SPLITS)
         } else {
             1
         };
@@ -1190,7 +1245,14 @@ fn kernel_variant(format: Format) -> Option<(&'static str, usize, usize)> {
 const MPP_ATTENTION_MIN_TOKENS: usize = 16;
 
 /// Most key splits for few-row attention, and (token, head) rows they may cover.
-const MAX_SPLITS: usize = 64;
+const MAX_SPLITS: usize = 256;
+/// Few-row attention aims for this many threadgroups, each with at least
+/// `SPLIT_MIN_KEYS` keys, so long-context decode fills the GPU.
+const SPLIT_TARGET_GROUPS: usize = 64;
+const SPLIT_MIN_KEYS: usize = 256;
+/// Single-token decode attention: target threadgroups and keys per split.
+const DECODE_SPLIT_TARGET: usize = 128;
+const DECODE_SPLIT_MIN_KEYS: usize = 256;
 const MAX_SPLIT_ROWS: usize = 64;
 /// Activation rows at or below which projections use the GEMV kernels.
 const MV_MAX_ROWS: usize = 4;
@@ -1361,6 +1423,67 @@ mod tests {
                     assert!(
                         worst < 2e-3,
                         "heads {heads}/{kv_heads} m {m} pos {pos} simds {simds} splits {splits}: max error {worst}"
+                    );
+                }
+            }
+            // Vector decode kernel (one query token).
+            if m == 1 {
+                for splits_wanted in [1usize, 5] {
+                    let out = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
+                    let partial = Tensor::zeros(&d, [8 * heads * dim], DType::F32).unwrap();
+                    let ml = Tensor::zeros(&d, [8 * heads * 2], DType::F32).unwrap();
+                    let kps = keys.div_ceil(splits_wanted).next_multiple_of(32);
+                    let splits = keys.div_ceil(kps);
+                    let fa = Params::default()
+                        .u(1)
+                        .unwrap()
+                        .u(heads)
+                        .unwrap()
+                        .u(kv_heads)
+                        .unwrap()
+                        .u(group)
+                        .unwrap()
+                        .u(pos)
+                        .unwrap()
+                        .u(stride)
+                        .unwrap()
+                        .u(kps)
+                        .unwrap()
+                        .u(splits)
+                        .unwrap();
+                    let e = d.execution_with_shared_encoder(true).unwrap();
+                    d.dispatch_hybrid(
+                        "h_attn_decode",
+                        &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                        &[out.binding(), partial.binding(), ml.binding()],
+                        &fa.0,
+                        [kv_heads, splits, 1],
+                        [128, 1, 1],
+                        8 * 256 * 2 + 4 * 8 * 2 * 4 + 2 * 8 * 256 * 4,
+                    )
+                    .unwrap();
+                    if splits > 1 {
+                        d.dispatch_hybrid(
+                            "h_flash_reduce",
+                            &[partial.binding(), ml.binding(), qg.binding()],
+                            &[out.binding()],
+                            &fa.0,
+                            [heads, 1, 1],
+                            [dim, 1, 1],
+                            0,
+                        )
+                        .unwrap();
+                    }
+                    e.finish().unwrap();
+                    let worst = out
+                        .to_f32()
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        worst < 2e-3,
+                        "decode heads {heads}/{kv_heads} pos {pos} splits {splits}: max error {worst}"
                     );
                 }
             }
