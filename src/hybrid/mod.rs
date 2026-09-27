@@ -12,7 +12,9 @@ pub mod session;
 pub mod weights;
 
 pub use config::{HybridConfig, Variant};
-pub use engine::{HybridModel, HybridState, Output, Penalties, Produced};
+pub use engine::{
+    HybridModel, HybridState, Output, Penalties, Produced, RowOutput, RowsProduced, SpecGeometry,
+};
 
 use crate::{
     Error, MetalDevice, Result,

@@ -37,6 +37,8 @@ pub struct HybridState {
     capacity: usize,
     len: usize,
     valid: bool,
+    /// Rows written by a speculative verify and not yet committed.
+    verified: usize,
     k: Vec<Option<Tensor>>,
     v: Vec<Option<Tensor>>,
     conv: Vec<Option<Tensor>>,
@@ -55,6 +57,7 @@ impl HybridState {
             capacity,
             len: 0,
             valid: true,
+            verified: 0,
             k: Vec::new(),
             v: Vec::new(),
             conv: Vec::new(),
@@ -111,6 +114,7 @@ impl HybridState {
     pub fn reset(&mut self) {
         self.len = 0;
         self.valid = true;
+        self.verified = 0;
     }
     /// Recurrent tensors (conv windows then delta-rule matrices) in a fixed order.
     pub(crate) fn recurrent(&self) -> impl Iterator<Item = &Tensor> {
@@ -145,6 +149,7 @@ impl HybridState {
         e.finish()?;
         self.len = position;
         self.valid = true;
+        self.verified = 0;
         Ok(())
     }
     pub(crate) fn is_valid(&self) -> bool {
@@ -218,6 +223,70 @@ impl MoeScratch {
             &self.shared,
         ]
     }
+}
+
+/// Speculative-decoding buffers (`HybridModel::enable_speculation`).
+pub(crate) struct Spec {
+    /// Widest verify (anchor plus drafts).
+    pub(crate) rows: usize,
+    /// Layers whose outputs are captured, in feature-column order.
+    pub(crate) aux: Vec<usize>,
+    /// `[max(chunk, rows), aux.len() * hidden]`: aux-layer outputs of the
+    /// rows of the latest forward.
+    pub(crate) features: Option<Tensor>,
+    /// `[max(chunk, rows), hidden]`: output-normed final hidden state of the
+    /// rows of the latest forward (MTP input).
+    pub(crate) hidden: Option<Tensor>,
+    /// Per recurrent layer: pre-conv qkv, g and beta of the verify rows.
+    tape_qkv: Vec<Tensor>,
+    tape_g: Vec<Tensor>,
+    tape_b: Vec<Tensor>,
+    /// Recurrent-layer index of each layer (None for attention layers).
+    recurrent_index: Vec<Option<usize>>,
+    logits: Tensor,
+    candidates: Tensor,
+    tokens: Tensor,
+}
+
+impl Spec {
+    fn byte_size(&self) -> usize {
+        self.features
+            .iter()
+            .chain(&self.hidden)
+            .chain(&self.tape_qkv)
+            .chain(&self.tape_g)
+            .chain(&self.tape_b)
+            .chain([&self.logits, &self.candidates, &self.tokens])
+            .map(|t| page(t.byte_size()))
+            .sum()
+    }
+}
+
+/// What speculation needs from the target (see `spec_bytes`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SpecGeometry {
+    /// Widest verify: anchor plus the most drafts.
+    pub rows: usize,
+    /// Target layers whose outputs feed the drafter.
+    pub aux_layers: Vec<usize>,
+    /// The drafter reads the output-normed final hidden state (MTP).
+    pub final_hidden: bool,
+}
+
+/// Bytes `HybridModel::enable_speculation` allocates, page-rounded.
+pub fn spec_bytes(c: &HybridConfig, chunk: usize, g: &SpecGeometry) -> usize {
+    let f32s = |n: usize| page(n * 4);
+    let capture = chunk.max(g.rows);
+    let mut total = 0;
+    if !g.aux_layers.is_empty() {
+        total += f32s(capture * g.aux_layers.len() * c.hidden);
+    }
+    if g.final_hidden {
+        total += f32s(capture * c.hidden);
+    }
+    total += c.recurrent_layer_count()
+        * (f32s(g.rows * c.conv_channels()) + 2 * f32s(g.rows * c.ssm_v_heads));
+    total + f32s(g.rows * c.vocab) + f32s(g.rows * c.vocab.div_ceil(1024) * 64) + f32s(g.rows)
 }
 
 fn copy(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
@@ -431,7 +500,7 @@ pub struct Penalties {
 }
 
 impl Penalties {
-    fn active(&self) -> bool {
+    pub(crate) fn active(&self) -> bool {
         !self.tokens.is_empty()
             && (self.presence != 0. || self.frequency != 0. || self.repetition != 1.)
     }
@@ -464,6 +533,21 @@ pub struct HybridModel {
     pub(crate) scratch: RefCell<Scratch>,
     /// Rows of logits the scratch holds (1 unless evaluation asked for more).
     logit_rows: usize,
+    pub(crate) spec: RefCell<Option<Spec>>,
+}
+
+/// Per-row outputs of a speculative verify.
+pub enum RowOutput {
+    /// Greedy token of every row, selected on the GPU.
+    Argmax,
+    /// Sampling candidates of every row (see `Output::Candidates`), each row
+    /// with its own penalty window.
+    Candidates(Vec<Penalties>),
+}
+
+pub enum RowsProduced {
+    Tokens(Vec<u32>),
+    Candidates(Vec<Vec<(u32, f32)>>),
 }
 
 impl HybridModel {
@@ -482,7 +566,71 @@ impl HybridModel {
             weights,
             scratch: RefCell::new(scratch),
             logit_rows,
+            spec: RefCell::new(None),
         })
+    }
+
+    /// Allocate verify and feature-capture buffers for `g` (replacing any
+    /// previous speculation setup).
+    pub fn enable_speculation(&self, d: &MetalDevice, g: &SpecGeometry) -> Result<()> {
+        let c = &self.config;
+        if g.rows < 2 || g.rows > MMS_MAX_ROWS {
+            return Err(Error::Parameter(format!(
+                "verify width {} must be within 2..={MMS_MAX_ROWS}",
+                g.rows
+            )));
+        }
+        if let Some(&bad) = g.aux_layers.iter().find(|&&l| l >= c.layers) {
+            return Err(Error::Parameter(format!(
+                "aux layer {bad} beyond the {} trunk layers",
+                c.layers
+            )));
+        }
+        *self.spec.borrow_mut() = None;
+        let f = |dims: &[usize]| Tensor::zeros_resident(d, dims, DType::F32);
+        let capture = self.chunk().max(g.rows);
+        let mut recurrent_index = Vec::with_capacity(c.layers);
+        let (mut tape_qkv, mut tape_g, mut tape_b) = (Vec::new(), Vec::new(), Vec::new());
+        for layer in 0..c.layers {
+            if c.is_attention(layer) {
+                recurrent_index.push(None);
+            } else {
+                recurrent_index.push(Some(tape_qkv.len()));
+                tape_qkv.push(f(&[g.rows, c.conv_channels()])?);
+                tape_g.push(f(&[g.rows, c.ssm_v_heads])?);
+                tape_b.push(f(&[g.rows, c.ssm_v_heads])?);
+            }
+        }
+        *self.spec.borrow_mut() = Some(Spec {
+            rows: g.rows,
+            aux: g.aux_layers.clone(),
+            features: if g.aux_layers.is_empty() {
+                None
+            } else {
+                Some(f(&[capture, g.aux_layers.len() * c.hidden])?)
+            },
+            hidden: if g.final_hidden {
+                Some(f(&[capture, c.hidden])?)
+            } else {
+                None
+            },
+            tape_qkv,
+            tape_g,
+            tape_b,
+            recurrent_index,
+            logits: f(&[g.rows, c.vocab])?,
+            candidates: f(&[g.rows, c.vocab.div_ceil(1024) * 64])?,
+            tokens: f(&[g.rows])?,
+        });
+        Ok(())
+    }
+
+    pub fn disable_speculation(&self) {
+        *self.spec.borrow_mut() = None;
+    }
+
+    pub fn spec_bytes(&self) -> usize {
+        self.spec.borrow().as_ref().map_or(0, Spec::byte_size)
     }
     pub fn weight_bytes(&self) -> usize {
         self.weights.byte_size()
@@ -529,11 +677,13 @@ impl HybridModel {
         let chunk = self.chunk();
         let mut produced = Produced::None;
         let pieces = tokens.chunks(chunk).count();
+        // An uncommitted verify only wrote K/V rows past `len`; drop it.
+        state.verified = 0;
         for (index, piece) in tokens.chunks(chunk).enumerate() {
             let last = index + 1 == pieces;
             let out = if last { &output } else { &Output::None };
             state.valid = false;
-            produced = self.forward_chunk(d, state, piece, out, None)?;
+            produced = self.forward_chunk(d, state, piece, out, None, false)?;
             state.len += piece.len();
             state.valid = true;
         }
@@ -558,11 +708,238 @@ impl HybridModel {
             return Err(Error::Cache("state invalid or full".into()));
         }
         state.valid = false;
+        state.verified = 0;
         let mut all = Vec::new();
-        self.forward_chunk(d, state, tokens, &Output::None, Some(&mut all))?;
+        self.forward_chunk(d, state, tokens, &Output::None, Some(&mut all), false)?;
         state.len += tokens.len();
         state.valid = true;
         Ok(all)
+    }
+
+    /// Speculative verify: run `tokens` (anchor then drafts) after the cached
+    /// sequence and return every row's output, without advancing the state.
+    /// Attention K/V rows are written past `len`; recurrent layers only read
+    /// their state and record their inputs so that `commit` can replay the
+    /// accepted prefix. Captured features cover all verify rows.
+    pub fn verify(
+        &self,
+        d: &MetalDevice,
+        state: &mut HybridState,
+        tokens: &[u32],
+        output: RowOutput,
+    ) -> Result<RowsProduced> {
+        let rows = self
+            .spec
+            .borrow()
+            .as_ref()
+            .map(|s| s.rows)
+            .ok_or_else(|| Error::Parameter("speculation is not enabled".into()))?;
+        if tokens.is_empty() || tokens.len() > rows {
+            return Err(Error::Parameter(format!(
+                "verify takes 1..={rows} tokens, got {}",
+                tokens.len()
+            )));
+        }
+        if !state.valid {
+            return Err(Error::Cache(
+                "state was invalidated by a failed forward; reset it".into(),
+            ));
+        }
+        if state.len + tokens.len() > state.capacity {
+            return Err(Error::Cache("verify rows exceed the context".into()));
+        }
+        if let Some(&id) = tokens.iter().find(|&&id| id as usize >= self.config.vocab) {
+            return Err(Error::Token {
+                id,
+                vocab: self.config.vocab,
+            });
+        }
+        if let RowOutput::Candidates(p) = &output
+            && p.len() != tokens.len()
+        {
+            return Err(Error::Parameter("one penalty set per verify row".into()));
+        }
+        state.verified = 0;
+        // The recurrent state is never written, so a failure leaves it valid.
+        let produced = self.forward_chunk(d, state, tokens, &Output::None, None, true);
+        let produced = match produced {
+            Ok(_) => self.verify_outputs(d, tokens.len(), &output)?,
+            Err(e) => return Err(e),
+        };
+        state.verified = tokens.len();
+        Ok(produced)
+    }
+
+    /// Keep the first `n` rows of the last verify: replay them through the
+    /// recurrent layers and advance the sequence by `n`.
+    pub fn commit(&self, d: &MetalDevice, state: &mut HybridState, n: usize) -> Result<()> {
+        if n == 0 || n > state.verified {
+            return Err(Error::Cache(format!(
+                "commit of {n} rows after a verify of {}",
+                state.verified
+            )));
+        }
+        let c = &self.config;
+        let spec = self.spec.borrow();
+        let spec = spec.as_ref().expect("verify implies speculation");
+        let s = self.scratch.borrow();
+        let channels = c.conv_channels();
+        let heads = c.ssm_v_heads;
+        state.valid = false;
+        let e = d.execution_with_shared_encoder(true)?;
+        for (layer, index) in spec.recurrent_index.iter().enumerate() {
+            let Some(r) = *index else { continue };
+            let Mixer::Delta(w) = &self.weights.layers[layer].mixer else {
+                unreachable!("recurrent index on an attention layer")
+            };
+            let qkv = rows(&spec.tape_qkv[r], 0, n, channels)?;
+            let conv = rows(&s.conv, 0, n, channels)?;
+            let delta = rows(&s.delta, 0, n, c.ssm_value_dim())?;
+            self.gdn_conv(d, &qkv, w, &conv, state, layer, n, true)?;
+            self.gdn_recurrent(
+                d,
+                &conv,
+                &rows(&spec.tape_g[r], 0, n, heads)?,
+                &rows(&spec.tape_b[r], 0, n, heads)?,
+                &delta,
+                state,
+                layer,
+                n,
+                true,
+            )?;
+        }
+        e.finish()?;
+        state.len += n;
+        state.verified = 0;
+        state.valid = true;
+        Ok(())
+    }
+
+    fn verify_outputs(
+        &self,
+        d: &MetalDevice,
+        m: usize,
+        output: &RowOutput,
+    ) -> Result<RowsProduced> {
+        let c = &self.config;
+        let spec = self.spec.borrow();
+        let spec = spec.as_ref().expect("verify implies speculation");
+        let s = self.scratch.borrow();
+        let xn = rows(&s.xn, 0, m, c.hidden)?;
+        let logits = rows(&spec.logits, 0, m, c.vocab)?;
+        let e = d.execution_with_shared_encoder(true)?;
+        self.project(d, &self.weights.output, &xn, m, &logits)?;
+        match output {
+            RowOutput::Argmax => {
+                d.dispatch_hybrid(
+                    "h_argmax",
+                    &[logits.binding()],
+                    &[spec.tokens.binding()],
+                    &Params::default().u(c.vocab)?.0,
+                    [m, 1, 1],
+                    [1024, 1, 1],
+                    0,
+                )?;
+                e.finish()?;
+                Ok(RowsProduced::Tokens(
+                    spec.tokens.to_f32()[..m]
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect(),
+                ))
+            }
+            RowOutput::Candidates(penalties) => {
+                let mut ids = Vec::new();
+                let mut row_ids = Vec::new();
+                let mut counts = Vec::new();
+                let mut settings = None;
+                for (row, p) in penalties.iter().enumerate() {
+                    if !p.active() {
+                        continue;
+                    }
+                    settings = Some((p.presence, p.frequency, p.repetition));
+                    for &(t, n) in &p.tokens {
+                        ids.push(t);
+                        row_ids.push(row as u32);
+                        counts.push(n as f32);
+                    }
+                }
+                if let Some((presence, frequency, repetition)) = settings {
+                    let bytes =
+                        |v: &[u32]| v.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>();
+                    let ids_t = Tensor::from_le_bytes(d, [ids.len()], DType::F32, &bytes(&ids))?;
+                    let rows_t =
+                        Tensor::from_le_bytes(d, [ids.len()], DType::F32, &bytes(&row_ids))?;
+                    let counts_t = Tensor::from_f32(d, [ids.len()], DType::F32, &counts)?;
+                    d.dispatch_hybrid(
+                        "h_penalize_rows",
+                        &[ids_t.binding(), rows_t.binding(), counts_t.binding()],
+                        &[logits.binding()],
+                        &Params::default()
+                            .u(ids.len())?
+                            .u(c.vocab)?
+                            .f(presence)
+                            .f(frequency)
+                            .f(repetition)
+                            .0,
+                        [ids.len().div_ceil(64), 1, 1],
+                        [64, 1, 1],
+                        0,
+                    )?;
+                }
+                let blocks = c.vocab.div_ceil(1024);
+                d.dispatch_hybrid(
+                    "h_topk_blocks",
+                    &[logits.binding()],
+                    &[spec.candidates.binding()],
+                    &Params::default().u(c.vocab)?.0,
+                    [blocks, m, 1],
+                    [256, 1, 1],
+                    0,
+                )?;
+                e.finish()?;
+                let raw = spec.candidates.to_f32();
+                Ok(RowsProduced::Candidates(
+                    raw.chunks(blocks * 64)
+                        .take(m)
+                        .map(|row| {
+                            row.chunks_exact(2)
+                                .filter(|pair| pair[0].is_finite())
+                                .map(|pair| (pair[1].to_bits(), pair[0]))
+                                .collect()
+                        })
+                        .collect(),
+                ))
+            }
+        }
+    }
+
+    /// Copy `m` rows of a layer output into its column block of the features.
+    fn capture(
+        &self,
+        d: &MetalDevice,
+        src: &Tensor,
+        dst: &Tensor,
+        column: usize,
+        m: usize,
+    ) -> Result<()> {
+        let h = self.config.hidden;
+        let width = dst.numel() / dst.shape().dimensions()[0];
+        d.dispatch_hybrid(
+            "h_copy_rows",
+            &[src.binding()],
+            &[dst.binding()],
+            &Params::default()
+                .u(m)?
+                .u(h)?
+                .u(h)?
+                .u(width)?
+                .u(column * h)?
+                .0,
+            [(m * h).div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+        )
     }
 
     fn forward_chunk(
@@ -572,6 +949,7 @@ impl HybridModel {
         tokens: &[u32],
         output: &Output,
         all_logits: Option<&mut Vec<f32>>,
+        verify: bool,
     ) -> Result<Produced> {
         let c = &self.config;
         let s = self.scratch.borrow();
@@ -599,11 +977,22 @@ impl HybridModel {
         let mix = rows(&s.mix, 0, m, h)?;
         self.get_rows(d, &self.weights.embedding, &ids, &x0)?;
         self.rmsnorm(d, &x0, &self.weights.layers[0].attn_norm, &xn, m)?;
+        let spec = self.spec.borrow();
+        let spec = spec.as_ref();
         let (mut cur, mut next) = (&x0, &x1);
         for (i, layer) in self.weights.layers.iter().enumerate() {
             match &layer.mixer {
                 Mixer::Attention(a) => self.attention(d, &s, a, state, i, &xn, &mix, m, pos)?,
-                Mixer::Delta(w) => self.delta(d, &s, w, state, i, &xn, &mix, m)?,
+                Mixer::Delta(w) => {
+                    let tape = match (verify, spec) {
+                        (true, Some(sp)) => {
+                            let r = sp.recurrent_index[i].expect("delta layer is recurrent");
+                            Some((&sp.tape_qkv[r], &sp.tape_g[r], &sp.tape_b[r]))
+                        }
+                        _ => None,
+                    };
+                    self.delta(d, &s, w, state, i, &xn, &mix, m, tape)?
+                }
             }
             self.add_rmsnorm(d, cur, &mix, &layer.post_norm, next, &xn, m)?;
             std::mem::swap(&mut cur, &mut next);
@@ -623,6 +1012,15 @@ impl HybridModel {
             self.add_rmsnorm(d, cur, &mix, norm, next, &xn, m)?;
             std::mem::swap(&mut cur, &mut next);
             self.dump(d, "l_out", i, cur)?;
+            if let Some(sp) = spec
+                && let Some(features) = &sp.features
+                && let Some(column) = sp.aux.iter().position(|&l| l == i)
+            {
+                self.capture(d, cur, features, column, m)?;
+            }
+        }
+        if let Some(hidden) = spec.and_then(|sp| sp.hidden.as_ref()) {
+            self.capture(d, &xn, hidden, 0, m)?;
         }
         // xn now holds output_norm(final hidden) for every position.
         let produced = if let Some(all) = all_logits {
@@ -947,6 +1345,9 @@ impl HybridModel {
         Ok(())
     }
 
+    /// Gated DeltaNet mixer. With `tape` (speculative verify) the pre-conv
+    /// qkv, g and beta rows are written to the tape and the recurrent state
+    /// is only read.
     #[allow(clippy::too_many_arguments)]
     fn delta(
         &self,
@@ -958,17 +1359,28 @@ impl HybridModel {
         xn: &Tensor,
         out: &Tensor,
         m: usize,
+        tape: Option<(&Tensor, &Tensor, &Tensor)>,
     ) -> Result<()> {
         let c = &self.config;
         let channels = c.conv_channels();
         let vd = c.ssm_value_dim();
         let heads = c.ssm_v_heads;
-        let qkv = rows(&s.qkv, 0, m, channels)?;
+        let (qkv, g, b) = match tape {
+            Some((tq, tg, tb)) => (
+                rows(tq, 0, m, channels)?,
+                rows(tg, 0, m, heads)?,
+                rows(tb, 0, m, heads)?,
+            ),
+            None => (
+                rows(&s.qkv, 0, m, channels)?,
+                rows(&s.g, 0, m, heads)?,
+                rows(&s.b, 0, m, heads)?,
+            ),
+        };
+        let write_state = tape.is_none();
         let z = rows(&s.z, 0, m, vd)?;
         let alpha = rows(&s.alpha, 0, m, heads)?;
         let beta = rows(&s.beta, 0, m, heads)?;
-        let g = rows(&s.g, 0, m, heads)?;
-        let b = rows(&s.b, 0, m, heads)?;
         let conv = rows(&s.conv, 0, m, channels)?;
         let delta = rows(&s.delta, 0, m, vd)?;
         let gated = rows(&s.gated, 0, m, vd)?;
@@ -995,44 +1407,8 @@ impl HybridModel {
             [64, 1, 1],
             0,
         )?;
-        let conv_state = state.conv[layer]
-            .as_ref()
-            .expect("delta layer has conv state");
-        d.dispatch_hybrid(
-            "h_gdn_conv",
-            &[qkv.binding(), w.conv.binding()],
-            &[conv.binding(), conv_state.binding()],
-            &Params::default()
-                .u(channels)?
-                .u(m)?
-                .u(c.ssm_key_dim())?
-                .u(c.ssm_head_dim)?
-                .f(c.eps)
-                .0,
-            [channels / c.ssm_head_dim, 1, 1],
-            [c.ssm_head_dim, 1, 1],
-            0,
-        )?;
-        let ssm = state.ssm[layer]
-            .as_ref()
-            .expect("delta layer has recurrent state");
-        const NSG: usize = 4;
-        d.dispatch_hybrid(
-            "h_gdn_recurrent",
-            &[conv.binding(), g.binding(), b.binding()],
-            &[delta.binding(), ssm.binding()],
-            &Params::default()
-                .u(m)?
-                .u(heads)?
-                .u(c.ssm_k_heads)?
-                .u(channels)?
-                .u(c.ssm_key_dim())?
-                .f(1. / (c.ssm_head_dim as f32).sqrt())
-                .0,
-            [c.ssm_head_dim / NSG, heads, 1],
-            [32, NSG, 1],
-            0,
-        )?;
+        self.gdn_conv(d, &qkv, w, &conv, state, layer, m, write_state)?;
+        self.gdn_recurrent(d, &conv, &g, &b, &delta, state, layer, m, write_state)?;
         self.dump(d, "attn_output", layer, &delta)?;
         d.dispatch_hybrid(
             "h_gated_rmsnorm",
@@ -1046,6 +1422,80 @@ impl HybridModel {
         self.dump(d, "final_output", layer, &gated)?;
         self.project(d, &w.out, &gated, m, out)?;
         self.dump(d, "linear_attn_out", layer, out)
+    }
+
+    /// Causal conv + SiLU + Q/K L2 norm of `m` qkv rows into `conv`.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_conv(
+        &self,
+        d: &MetalDevice,
+        qkv: &Tensor,
+        w: &DeltaWeights,
+        conv: &Tensor,
+        state: &HybridState,
+        layer: usize,
+        m: usize,
+        write_state: bool,
+    ) -> Result<()> {
+        let c = &self.config;
+        let channels = c.conv_channels();
+        let conv_state = state.conv[layer]
+            .as_ref()
+            .expect("delta layer has conv state");
+        d.dispatch_hybrid(
+            "h_gdn_conv",
+            &[qkv.binding(), w.conv.binding()],
+            &[conv.binding(), conv_state.binding()],
+            &Params::default()
+                .u(channels)?
+                .u(m)?
+                .u(c.ssm_key_dim())?
+                .u(c.ssm_head_dim)?
+                .f(c.eps)
+                .u(usize::from(write_state))?
+                .0,
+            [channels / c.ssm_head_dim, 1, 1],
+            [c.ssm_head_dim, 1, 1],
+            0,
+        )
+    }
+
+    /// Sequential gated delta rule over `m` conv rows into `delta`.
+    #[allow(clippy::too_many_arguments)]
+    fn gdn_recurrent(
+        &self,
+        d: &MetalDevice,
+        conv: &Tensor,
+        g: &Tensor,
+        b: &Tensor,
+        delta: &Tensor,
+        state: &HybridState,
+        layer: usize,
+        m: usize,
+        write_state: bool,
+    ) -> Result<()> {
+        let c = &self.config;
+        let ssm = state.ssm[layer]
+            .as_ref()
+            .expect("delta layer has recurrent state");
+        const NSG: usize = 4;
+        d.dispatch_hybrid(
+            "h_gdn_recurrent",
+            &[conv.binding(), g.binding(), b.binding()],
+            &[delta.binding(), ssm.binding()],
+            &Params::default()
+                .u(m)?
+                .u(c.ssm_v_heads)?
+                .u(c.ssm_k_heads)?
+                .u(c.conv_channels())?
+                .u(c.ssm_key_dim())?
+                .f(1. / (c.ssm_head_dim as f32).sqrt())
+                .u(usize::from(write_state))?
+                .0,
+            [c.ssm_head_dim / NSG, c.ssm_v_heads, 1],
+            [32, NSG, 1],
+            0,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]

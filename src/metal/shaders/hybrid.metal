@@ -1000,12 +1000,13 @@ struct ConvArgs {
     uint key_dim;      // channels [0, 2*key_dim) are Q then K and are L2-normalized per head
     uint head_dim;     // 128
     float eps;
+    uint write_state;  // 0 during a speculative verify: the state is only read
 };
 
 // Causal depthwise conv (kernel 4) + SiLU + per-head L2 norm of Q and K.
 // One threadgroup of head_dim threads per channel group; loops over tokens in
 // order so the rolling 3-row state stays in registers. `state` [3][channels]
-// is read and rewritten in place.
+// is read and (unless write_state is 0) rewritten in place.
 kernel void h_gdn_conv(constant ConvArgs & p [[buffer(4)]],
                        device const float * x [[buffer(0)]],        // [tokens][channels]
                        device const float * w [[buffer(1)]],        // [channels][4]
@@ -1030,6 +1031,7 @@ kernel void h_gdn_conv(constant ConvArgs & p [[buffer(4)]],
         }
         y[(ulong)t * p.channels + c] = v;
     }
+    if (!p.write_state) return;
     state[c] = s0;
     state[p.channels + c] = s1;
     state[2 * p.channels + c] = s2;
@@ -1042,6 +1044,7 @@ struct DeltaArgs {
     uint channels;     // row stride of the conv output
     uint key_dim;      // offset of K within a row (Q at 0, V at 2*key_dim)
     float scale;       // 1/sqrt(head_dim)
+    uint write_state;  // 0 during a speculative verify: the state is only read
 };
 
 // Sequential gated delta rule after llama.cpp's kernel_gated_delta_net_impl.
@@ -1083,6 +1086,7 @@ void gdn_recurrent_impl(constant DeltaArgs & p, device const float * qkv, device
         yv = simd_sum(yv);
         if (tx == 0) out[((ulong)t * p.v_heads + h) * S + i] = yv * p.scale;
     }
+    if (!p.write_state) return;
     FOR_UNROLL (short j = 0; j < NSG; j++) s_ptr[tx * NSG + j] = ls[j];
 }
 
@@ -1217,11 +1221,15 @@ kernel void h_attention(constant AttnArgs & p [[buffer(5)]],
 
 struct ArgmaxArgs { uint n; };
 
-// One threadgroup of 1024 threads; writes the index of the (first) maximum.
+// One threadgroup of 1024 threads per row of `n` values; writes the index of
+// the (first) maximum of row r to out[r].
 kernel void h_argmax(constant ArgmaxArgs & p [[buffer(2)]], device const float * x [[buffer(0)]],
-                     device uint * out [[buffer(1)]], ushort tid [[thread_index_in_threadgroup]]) {
+                     device uint * out [[buffer(1)]], uint row [[threadgroup_position_in_grid]],
+                     ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float best_v[32];
     threadgroup uint best_i[32];
+    x += (ulong)row * p.n;
+    out += row;
     float bv = -INFINITY;
     uint bi = 0;
     for (uint i = tid; i < p.n; i += 1024) {
@@ -1947,15 +1955,33 @@ kernel void h_penalize(constant PenaltyArgs & p [[buffer(3)]], device const uint
     logits[id] = v;
 }
 
+// Row-wise penalties for a speculative verify: entry i adjusts
+// logits[rows[i]*vocab + ids[i]] for a token seen counts[i] times.
+struct PenaltyRowsArgs { uint count; uint vocab; float presence; float frequency; float repetition; };
+kernel void h_penalize_rows(constant PenaltyRowsArgs & p [[buffer(4)]], device const uint * ids [[buffer(0)]],
+                            device const uint * rows [[buffer(1)]], device const float * counts [[buffer(2)]],
+                            device float * logits [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.count) return;
+    const ulong at = (ulong)rows[i] * p.vocab + ids[i];
+    float v = logits[at];
+    if (p.repetition != 1.f) v = v > 0.f ? v / p.repetition : v * p.repetition;
+    v -= p.presence + p.frequency * counts[i];
+    logits[at] = v;
+}
+
 struct TopKArgs { uint n; };
 
 // Per 1024-value block, the 32 largest (value, index) pairs in descending
-// order (ties to the lower index). grid (ceil(n/1024)); threads 256.
+// order (ties to the lower index). grid (ceil(n/1024), rows); threads 256.
+// Row r reads x[r*n ..] and writes out[r*blocks*32 ..].
 kernel void h_topk_blocks(constant TopKArgs & p [[buffer(2)]], device const float * x [[buffer(0)]],
                           device float2 * out [[buffer(1)]],
-                          uint block [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+                          uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float bv[8];
     threadgroup uint bi[8];
+    const uint block = tg.x;
+    x += (ulong)tg.y * p.n;
+    out += (ulong)tg.y * ((p.n + 1023) / 1024) * 32;
     float v[4];
     uint idx[4];
     for (int j = 0; j < 4; j++) {
@@ -1992,4 +2018,14 @@ kernel void h_topk_blocks(constant TopKArgs & p [[buffer(2)]], device const floa
 kernel void h_copy(constant EltArgs & a [[buffer(2)]], device const float * x [[buffer(0)]],
                    device float * y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
     if (i < a.n) y[i] = x[i];
+}
+
+struct CopyRowsArgs { uint rows; uint width; uint src_stride; uint dst_stride; uint dst_offset; };
+
+// dst[r*dst_stride + dst_offset + c] = src[r*src_stride + c]; one thread per value.
+kernel void h_copy_rows(constant CopyRowsArgs & a [[buffer(2)]], device const float * src [[buffer(0)]],
+                        device float * dst [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i >= a.rows * a.width) return;
+    const uint r = i / a.width, c = i % a.width;
+    dst[(ulong)r * a.dst_stride + a.dst_offset + c] = src[(ulong)r * a.src_stride + c];
 }
