@@ -1623,3 +1623,107 @@ kernel void h_bw_read(constant EltArgs & a [[buffer(2)]], device const uint4 * x
     for (uint i = tid; i < per_group; i += threads) acc ^= p[i];
     if (acc.x == 0x12345678u) y[tg] = float(acc.y);
 }
+
+// TensorOps flash attention for prompt chunks. One threadgroup = 64 query
+// tokens of one query head; keys stream in blocks of 64. S = Q Kᵀ and
+// O += P V run as matmul2d; the online softmax runs over S staged in
+// threadgroup memory. Q is F16 pre-scaled; K/V come from the F16 cache.
+// grid (ceil(tokens/64), heads); threads 128; 64*64*4 + 64*64*2 + 3*64*4 bytes.
+kernel void h_flash_attn_mpp(constant FaArgs & p [[buffer(5)]],
+                             device half * q [[buffer(0)]], device half * kc [[buffer(1)]],
+                             device half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],
+                             device float * out [[buffer(4)]],
+                             threadgroup char * shared [[threadgroup(0)]],
+                             uint2 tgpig [[threadgroup_position_in_grid]],
+                             ushort tid [[thread_index_in_threadgroup]]) {
+    constexpr int D = 256, BR = 64, BC = 64;
+    threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
+    threadgroup half  * Ps = (threadgroup half *)(Ss + BR * BC);          // [BR][BC]
+    threadgroup float * corr = (threadgroup float *)(Ps + BR * BC);       // [BR]
+    threadgroup float * mrow = corr + BR;                                 // [BR]
+    threadgroup float * lrow = mrow + BR;                                 // [BR]
+    const uint h = tgpig.y;
+    const uint kvh = h / p.group;
+    const int t0 = int(tgpig.x) * BR;
+    const int rows = min(BR, int(p.tokens) - t0);
+    const uint total_keys = p.position + p.tokens;
+    const uint last_key = p.position + uint(t0 + rows - 1);
+    const int q_stride = int(p.heads) * D;
+    const int kv_stride = int(p.cache_stride);
+
+    auto tQ = tensor(q + (ulong)t0 * q_stride + h * D, dextents<int32_t, 2>(D, rows), array<int, 2>({1, q_stride}));
+    auto tK = tensor(kc + kvh * D, dextents<int32_t, 2>(D, int(total_keys)), array<int, 2>({1, kv_stride}));
+    auto tV = tensor(vc + kvh * D, dextents<int32_t, 2>(D, int(total_keys)), array<int, 2>({1, kv_stride}));
+    auto tS = tensor(Ss, dextents<int32_t, 2>(BC, BR));
+    auto tP = tensor(Ps, dextents<int32_t, 2>(BC, BR));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(BR, BC, D, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<4>> mm_s;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(BR, D, BC, false, false, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm_o;
+    auto cS = mm_s.get_destination_cooperative_tensor<decltype(tQ), decltype(tK), float>();
+    auto cO = mm_o.get_destination_cooperative_tensor<decltype(tP), decltype(tV), float>();
+    for (uint i = 0; i < cO.get_capacity(); i++) cO[i] = 0.f;
+    if (tid < BR) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Softmax work split: thread tid owns row tid/2, columns (tid%2)*32 .. +32.
+    const int my_row = tid / 2;
+    const int c0 = (tid % 2) * 32;
+    const uint row_last_key = p.position + uint(t0 + my_row);
+    for (uint j0 = 0; j0 < total_keys && j0 <= last_key; j0 += BC) {
+        auto mK = tK.slice(0, int(j0));
+        mm_s.run(tQ, mK, cS);
+        cS.store(tS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float s[32];
+        float mx = -INFINITY;
+        for (int c = 0; c < 32; c++) {
+            const uint key = j0 + uint(c0 + c);
+            const bool ok = my_row < rows && key < total_keys && key <= row_last_key;
+            s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
+            mx = max(mx, s[c]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        const float m_old = mrow[my_row];
+        const float m_new = max(m_old, mx);
+        const float cr = m_new == -INFINITY ? 1.f : exp(m_old - m_new);
+        float sum = 0.f;
+        for (int c = 0; c < 32; c++) {
+            const float e = m_new == -INFINITY ? 0.f : exp(s[c] - m_new);
+            sum += e;
+            Ps[my_row * BC + c0 + c] = half(e);
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid % 2 == 0) {
+            mrow[my_row] = m_new;
+            lrow[my_row] = lrow[my_row] * cr + sum;
+            corr[my_row] = cr;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint i = 0; i < cO.get_capacity(); i++) {
+            if (cO.is_valid_element(i)) {
+                auto idx = cO.get_multidimensional_index(i);
+                cO[i] *= corr[idx[1]];
+            }
+        }
+        auto mV = tV.slice(0, int(j0));
+        mm_o.run(tP, mV, cO);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < cO.get_capacity(); i++) {
+        if (!cO.is_valid_element(i)) continue;
+        auto idx = cO.get_multidimensional_index(i);
+        const int r = idx[1], dcol = idx[0];
+        if (r >= rows) continue;
+        const uint t = uint(t0 + r);
+        const float l = lrow[r];
+        const float gate = qg[((ulong)t * p.heads + h) * 2 * D + D + dcol];
+        out[((ulong)t * p.heads + h) * D + dcol] = (l > 0.f ? cO[i] / l : 0.f) / (1.f + exp(-gate));
+    }
+}

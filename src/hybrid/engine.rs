@@ -604,6 +604,29 @@ impl HybridModel {
                 0,
             );
         }
+        if m >= MPP_ATTENTION_MIN_TOKENS
+            && std::env::var_os("FERRUM_HYBRID_SIMD_ATTENTION").is_none()
+        {
+            let args = Params::default()
+                .u(m)?
+                .u(c.heads)?
+                .u(c.kv_heads)?
+                .u(group)?
+                .u(pos)?
+                .u(c.kv_heads * c.head_dim)?
+                .u(0)?
+                .u(1)?
+                .0;
+            return d.dispatch_hybrid(
+                "h_flash_attn_mpp",
+                &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                &[att.binding()],
+                &args,
+                [m.div_ceil(64), c.heads, 1],
+                [128, 1, 1],
+                64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
+            );
+        }
         let simds = if rows <= 8 { 1 } else { 4 };
         let row_blocks = rows.div_ceil(8 * simds);
         // Split long key ranges across threadgroups when few query rows exist.
@@ -1163,6 +1186,9 @@ fn kernel_variant(format: Format) -> Option<(&'static str, usize, usize)> {
     })
 }
 
+/// Query tokens from which attention uses the TensorOps flash kernel.
+const MPP_ATTENTION_MIN_TOKENS: usize = 16;
+
 /// Most key splits for few-row attention, and (token, head) rows they may cover.
 const MAX_SPLITS: usize = 64;
 const MAX_SPLIT_ROWS: usize = 64;
@@ -1207,7 +1233,7 @@ mod tests {
     #[test]
     fn flash_attention_matches_reference() {
         let d = MetalDevice::new().unwrap();
-        let cases: [(usize, usize, usize, usize); 7] = [
+        let cases: [(usize, usize, usize, usize); 8] = [
             (24, 4, 1, 0),
             (24, 4, 1, 700),
             (16, 2, 1, 300),
@@ -1215,6 +1241,7 @@ mod tests {
             (16, 2, 37, 0),
             (24, 4, 37, 90),
             (16, 2, 64, 128),
+            (24, 4, 150, 70),
         ];
         for (heads, kv_heads, m, pos) in cases {
             let dim = 256;
@@ -1337,6 +1364,47 @@ mod tests {
                     );
                 }
             }
+            // TensorOps kernel (prompt chunks).
+            let out = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
+            let fa = Params::default()
+                .u(m)
+                .unwrap()
+                .u(heads)
+                .unwrap()
+                .u(kv_heads)
+                .unwrap()
+                .u(group)
+                .unwrap()
+                .u(pos)
+                .unwrap()
+                .u(stride)
+                .unwrap()
+                .u(0)
+                .unwrap()
+                .u(1)
+                .unwrap();
+            let e = d.execution_with_shared_encoder(true).unwrap();
+            d.dispatch_hybrid(
+                "h_flash_attn_mpp",
+                &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                &[out.binding()],
+                &fa.0,
+                [m.div_ceil(64), heads, 1],
+                [128, 1, 1],
+                64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
+            )
+            .unwrap();
+            e.finish().unwrap();
+            let worst = out
+                .to_f32()
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(
+                worst < 2e-3,
+                "TensorOps heads {heads}/{kv_heads} m {m} pos {pos}: max error {worst}"
+            );
         }
     }
 }
