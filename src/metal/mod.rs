@@ -1688,6 +1688,125 @@ impl MetalDevice {
         self.builtins.borrow_mut().insert(name, p.clone());
         Ok(p)
     }
+    /// Bounds, ownership, failed-producer and aliasing checks shared by every
+    /// dispatch path. Outputs follow the `input_count` inputs in `buffers`.
+    fn check_bindings(
+        &self,
+        name: &str,
+        buffers: &[(&MetalBuffer, usize, usize)],
+        input_count: usize,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if self
+            .fail_after
+            .get()
+            .is_some_and(|n| self.counters.get().dispatches >= n)
+        {
+            return Err(Error::Dispatch("injected encoder failure".into()));
+        }
+        for (b, offset, length) in buffers {
+            if offset
+                .checked_add(*length)
+                .is_none_or(|end| end > b.len_bytes())
+            {
+                return Err(Error::Range("binding offset exceeds allocation".into()));
+            }
+            if !self.owns(b) {
+                return Err(Error::DeviceMismatch);
+            }
+        }
+        for (buffer, offset, length) in &buffers[..input_count] {
+            if buffer.writes.borrow().iter().any(|(start, end, state)| {
+                *offset < *end && offset + length > *start && state.get() == Completion::Failed
+            }) {
+                return Err(Error::Synchronization(
+                    "input range belongs to a failed submission".into(),
+                ));
+            }
+        }
+        for (output_index, (output, output_offset, output_length)) in
+            buffers[input_count..].iter().enumerate()
+        {
+            for (input, input_offset, input_length) in &buffers[..input_count] {
+                if std::ptr::eq(*input, *output)
+                    && *input_offset < *output_offset + *output_length
+                    && *output_offset < *input_offset + *input_length
+                {
+                    return Err(Error::Dispatch(format!("input/output alias for {name}")));
+                }
+            }
+            for (other, other_offset, other_length) in
+                buffers[input_count..input_count + output_index].iter()
+            {
+                if std::ptr::eq(*other, *output)
+                    && *other_offset < *output_offset + *output_length
+                    && *output_offset < *other_offset + *other_length
+                {
+                    return Err(Error::Dispatch(format!("output/output alias for {name}")));
+                }
+            }
+        }
+        Ok(())
+    }
+    fn hybrid_pipeline(&self, name: &'static str) -> Result<Rc<ComputePipeline>> {
+        if let Some(p) = self.builtins.borrow().get(name) {
+            return Ok(p.clone());
+        }
+        let p = self.compile_kernel_version(
+            include_str!("shaders/hybrid.metal"),
+            name,
+            MTLLanguageVersion::Version4_0,
+        )?;
+        self.builtins.borrow_mut().insert(name, p.clone());
+        Ok(p)
+    }
+    /// Dispatch a kernel from the hybrid-model library with explicit
+    /// threadgroup geometry. `inputs` are read-only; `outputs` are written.
+    /// Parameters are one little-endian block bound after the buffers.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn dispatch_hybrid(
+        &self,
+        name: &'static str,
+        inputs: &[(&MetalBuffer, usize, usize)],
+        outputs: &[(&MetalBuffer, usize, usize)],
+        params: &[u8],
+        groups: [usize; 3],
+        threads: [usize; 3],
+        threadgroup_bytes: usize,
+    ) -> Result<()> {
+        let buffers: smallvec::SmallVec<[(&MetalBuffer, usize, usize); 12]> =
+            inputs.iter().chain(outputs).copied().collect();
+        self.check_bindings(name, &buffers, inputs.len())?;
+        if groups.contains(&0) {
+            return Ok(());
+        }
+        let p = self.hybrid_pipeline(name)?;
+        let per_group: usize = threads.iter().product();
+        if p.raw.threadExecutionWidth() != 32
+            || per_group == 0
+            || p.raw.maxTotalThreadsPerThreadgroup() < per_group
+            || threadgroup_bytes > 32 * 1024
+            || !threadgroup_bytes.is_multiple_of(16)
+        {
+            return Err(Error::Dispatch(format!(
+                "{name}: unsupported threadgroup configuration"
+            )));
+        }
+        self.encode_dispatch(&p, &buffers, inputs.len(), params, |encoder| {
+            // SAFETY: the length is bounded by the device's 32 KiB threadgroup limit.
+            if threadgroup_bytes > 0 {
+                unsafe { encoder.setThreadgroupMemoryLength_atIndex(threadgroup_bytes, 0) };
+            }
+            let size = |v: [usize; 3]| MTLSize {
+                width: v[0],
+                height: v[1],
+                depth: v[2],
+            };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(size(groups), size(threads));
+            Ok(())
+        })
+        .map(|_| ())
+    }
     pub(crate) fn owns(&self, buffer: &MetalBuffer) -> bool {
         Rc::ptr_eq(&self.owner, &buffer.owner)
     }
@@ -1732,58 +1851,9 @@ impl MetalDevice {
         if buffers.len() != input_count + output_count {
             return Err(Error::Dispatch(format!("invalid buffer count for {name}")));
         }
-        #[cfg(test)]
-        if self
-            .fail_after
-            .get()
-            .is_some_and(|n| self.counters.get().dispatches >= n)
-        {
-            return Err(Error::Dispatch("injected encoder failure".into()));
-        }
-        for (b, offset, length) in buffers {
-            if offset
-                .checked_add(*length)
-                .is_none_or(|end| end > b.len_bytes())
-            {
-                return Err(Error::Range("binding offset exceeds allocation".into()));
-            }
-            if !self.owns(b) {
-                return Err(Error::DeviceMismatch);
-            }
-        }
-        for (buffer, offset, length) in &buffers[..input_count] {
-            if buffer.writes.borrow().iter().any(|(start, end, state)| {
-                *offset < *end && offset + length > *start && state.get() == Completion::Failed
-            }) {
-                return Err(Error::Synchronization(
-                    "input range belongs to a failed submission".into(),
-                ));
-            }
-        }
+        self.check_bindings(name, buffers, input_count)?;
         if grid.contains(&0) {
             return Ok(DispatchTiming::default());
-        }
-        for (output_index, (output, output_offset, output_length)) in
-            buffers[input_count..].iter().enumerate()
-        {
-            for (input, input_offset, input_length) in &buffers[..input_count] {
-                if std::ptr::eq(*input, *output)
-                    && *input_offset < *output_offset + *output_length
-                    && *output_offset < *input_offset + *input_length
-                {
-                    return Err(Error::Dispatch(format!("input/output alias for {name}")));
-                }
-            }
-            for (other, other_offset, other_length) in
-                buffers[input_count..input_count + output_index].iter()
-            {
-                if std::ptr::eq(*other, *output)
-                    && *other_offset < *output_offset + *output_length
-                    && *output_offset < *other_offset + *other_length
-                {
-                    return Err(Error::Dispatch(format!("output/output alias for {name}")));
-                }
-            }
         }
         debug_assert!(params[4] <= 2);
         let p = self.builtin(name)?;
@@ -1877,99 +1947,8 @@ impl MetalDevice {
                 "required modern Apple SIMD configuration unavailable".into(),
             ));
         }
-        autoreleasepool(|_| {
-            let start = Instant::now();
-            if self.pending.borrow().is_none() {
-                if self.residency_dirty.replace(false)
-                    && let Some(set) = &self.residency
-                {
-                    set.commit();
-                    set.requestResidency();
-                }
-                let command = self
-                    .queue
-                    .commandBuffer()
-                    .ok_or_else(|| Error::Dispatch("command buffer creation failed".into()))?;
-                *self.pending.borrow_mut() = Some(Submission {
-                    command,
-                    encoder: None,
-                    reads: Vec::new(),
-                    writes: Vec::new(),
-                    resources: Vec::new(),
-                    ready: Rc::new(Cell::new(Completion::Encoding)),
-                    dispatches: 0,
-                });
-            }
-            let mut pending = self.pending.borrow_mut();
-            let submission = pending
-                .as_mut()
-                .ok_or_else(|| Error::Dispatch("missing submission".into()))?;
-            let shared = self.shared_encoder.get() && self.execution_shared_encoder.get();
-            let concurrent = shared && self.concurrent_dispatch.get();
-            if submission.encoder.is_none() {
-                let encoder = if concurrent {
-                    submission
-                        .command
-                        .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
-                } else {
-                    submission.command.computeCommandEncoder()
-                };
-                submission.encoder =
-                    Some(encoder.ok_or_else(|| {
-                        Error::Dispatch("compute encoder creation failed".into())
-                    })?);
-            }
-            if concurrent {
-                let range = |(b, offset, length): &(&MetalBuffer, usize, usize)| {
-                    (
-                        Retained::as_ptr(&b.raw) as *const () as usize,
-                        *offset,
-                        offset + length,
-                    )
-                };
-                let overlaps =
-                    |set: &[(usize, usize, usize)], (id, start, end): (usize, usize, usize)| {
-                        set.iter()
-                            .any(|&(other, s, e)| other == id && start < e && s < end)
-                    };
-                let hazard = buffers[..input_count]
-                    .iter()
-                    .any(|b| overlaps(&submission.writes, range(b)))
-                    || buffers[input_count..].iter().any(|b| {
-                        overlaps(&submission.writes, range(b))
-                            || overlaps(&submission.reads, range(b))
-                    });
-                if hazard {
-                    if let Some(encoder) = &submission.encoder {
-                        encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
-                    }
-                    submission.reads.clear();
-                    submission.writes.clear();
-                }
-                submission
-                    .reads
-                    .extend(buffers[..input_count].iter().map(range));
-                submission
-                    .writes
-                    .extend(buffers[input_count..].iter().map(range));
-            }
-            let encoder = submission
-                .encoder
-                .as_ref()
-                .ok_or_else(|| Error::Dispatch("missing compute encoder".into()))?;
-            encoder.setComputePipelineState(&p.raw);
-            // SAFETY: crate-private callers validate dimensions, dtypes and lengths against the
-            // embedded kernel ABI. Buffers stay alive through completion; params is copied by Metal.
-            unsafe {
-                for (i, (b, offset, _)) in buffers.iter().enumerate() {
-                    encoder.setBuffer_offset_atIndex(Some(&b.raw), *offset, i);
-                }
-                encoder.setBytes_length_atIndex(
-                    NonNull::from(params).cast(),
-                    size_of_val(params),
-                    buffers.len(),
-                );
-            }
+        let param_bytes = params.map(u32::to_le_bytes).concat();
+        self.encode_dispatch(&p, buffers, input_count, &param_bytes, |encoder| {
             if matches!(
                 name,
                 "project_mpp"
@@ -2500,6 +2479,118 @@ impl MetalDevice {
                     },
                 );
             }
+            Ok(())
+        })
+    }
+    /// Shared encoding path: open or reuse the epoch's command buffer and
+    /// encoder, order hazards, bind buffers and parameters, let `geometry`
+    /// dispatch, then record completion ownership of every output range.
+    fn encode_dispatch(
+        &self,
+        p: &ComputePipeline,
+        buffers: &[(&MetalBuffer, usize, usize)],
+        input_count: usize,
+        params: &[u8],
+        geometry: impl FnOnce(&ProtocolObject<dyn MTLComputeCommandEncoder>) -> Result<()>,
+    ) -> Result<DispatchTiming> {
+        autoreleasepool(|_| {
+            let start = Instant::now();
+            if self.pending.borrow().is_none() {
+                if self.residency_dirty.replace(false)
+                    && let Some(set) = &self.residency
+                {
+                    set.commit();
+                    set.requestResidency();
+                }
+                let command = self
+                    .queue
+                    .commandBuffer()
+                    .ok_or_else(|| Error::Dispatch("command buffer creation failed".into()))?;
+                *self.pending.borrow_mut() = Some(Submission {
+                    command,
+                    encoder: None,
+                    reads: Vec::new(),
+                    writes: Vec::new(),
+                    resources: Vec::new(),
+                    ready: Rc::new(Cell::new(Completion::Encoding)),
+                    dispatches: 0,
+                });
+            }
+            let mut pending = self.pending.borrow_mut();
+            let submission = pending
+                .as_mut()
+                .ok_or_else(|| Error::Dispatch("missing submission".into()))?;
+            let shared = self.shared_encoder.get() && self.execution_shared_encoder.get();
+            let concurrent = shared && self.concurrent_dispatch.get();
+            if submission.encoder.is_none() {
+                let encoder = if concurrent {
+                    submission
+                        .command
+                        .computeCommandEncoderWithDispatchType(MTLDispatchType::Concurrent)
+                } else {
+                    submission.command.computeCommandEncoder()
+                };
+                submission.encoder =
+                    Some(encoder.ok_or_else(|| {
+                        Error::Dispatch("compute encoder creation failed".into())
+                    })?);
+            }
+            if concurrent {
+                let range = |(b, offset, length): &(&MetalBuffer, usize, usize)| {
+                    (
+                        Retained::as_ptr(&b.raw) as *const () as usize,
+                        *offset,
+                        offset + length,
+                    )
+                };
+                let overlaps =
+                    |set: &[(usize, usize, usize)], (id, start, end): (usize, usize, usize)| {
+                        set.iter()
+                            .any(|&(other, s, e)| other == id && start < e && s < end)
+                    };
+                let hazard = buffers[..input_count]
+                    .iter()
+                    .any(|b| overlaps(&submission.writes, range(b)))
+                    || buffers[input_count..].iter().any(|b| {
+                        overlaps(&submission.writes, range(b))
+                            || overlaps(&submission.reads, range(b))
+                    });
+                if hazard {
+                    if let Some(encoder) = &submission.encoder {
+                        encoder.memoryBarrierWithScope(MTLBarrierScope::Buffers);
+                    }
+                    submission.reads.clear();
+                    submission.writes.clear();
+                }
+                submission
+                    .reads
+                    .extend(buffers[..input_count].iter().map(range));
+                submission
+                    .writes
+                    .extend(buffers[input_count..].iter().map(range));
+            }
+            let encoder = submission
+                .encoder
+                .as_ref()
+                .ok_or_else(|| Error::Dispatch("missing compute encoder".into()))?;
+            encoder.setComputePipelineState(&p.raw);
+            // SAFETY: crate-private callers validate dimensions, dtypes and lengths against the
+            // embedded kernel ABI. Buffers stay alive through completion; params is copied by Metal.
+            unsafe {
+                for (i, (b, offset, _)) in buffers.iter().enumerate() {
+                    encoder.setBuffer_offset_atIndex(Some(&b.raw), *offset, i);
+                }
+                if !params.is_empty() {
+                    encoder.setBytes_length_atIndex(
+                        NonNull::new(params.as_ptr() as *mut u8)
+                            .ok_or_else(|| Error::Dispatch("null parameter block".into()))?
+                            .cast(),
+                        params.len(),
+                        buffers.len(),
+                    );
+                }
+            }
+            geometry(encoder)?;
             if !shared {
                 encoder.endEncoding();
                 submission.encoder = None;

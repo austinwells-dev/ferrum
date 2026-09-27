@@ -103,7 +103,9 @@ pub fn block_layout(type_id: u32) -> Result<BlockLayout> {
         13 => (256, 176),
         14 => (256, 210),
         15 => (256, 292),
-        30 => (1, 2), // BF16
+        21 => (256, 110), // IQ3_S
+        23 => (256, 136), // IQ4_XS
+        30 => (1, 2),     // BF16
         _ => {
             return Err(Error::Gguf(format!(
                 "unsupported GGML tensor type {type_id}"

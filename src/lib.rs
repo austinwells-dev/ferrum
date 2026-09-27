@@ -14,6 +14,7 @@ pub use metal::MetalDevice;
 pub use tensor::{DType, Tensor};
 
 pub mod generation;
+pub mod hybrid;
 pub mod loader;
 pub mod model;
 pub mod nn;

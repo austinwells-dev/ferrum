@@ -20,6 +20,15 @@ impl Tokenizer {
         token_types: &[i32],
     ) -> Result<Self> {
         const QWEN_REGEX: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+        Self::from_gguf_bpe_with_pattern(tokens, merges, token_types, QWEN_REGEX)
+    }
+    /// GPT-2 byte-level BPE from GGUF arrays with the model's split pattern.
+    pub(crate) fn from_gguf_bpe_with_pattern(
+        tokens: &[String],
+        merges: &[String],
+        token_types: &[i32],
+        pattern: &str,
+    ) -> Result<Self> {
         if tokens.is_empty() || tokens.len() != token_types.len() {
             return Err(Error::Tokenizer(
                 "GGUF Qwen token/type arrays are empty or differ in length".into(),
@@ -85,7 +94,7 @@ impl Tokenizer {
                 "pretokenizers": [
                     {
                         "type": "Split",
-                        "pattern": {"Regex": QWEN_REGEX},
+                        "pattern": {"Regex": pattern},
                         "behavior": "Isolated",
                         "invert": false
                     },

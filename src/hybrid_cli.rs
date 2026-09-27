@@ -1,0 +1,161 @@
+//! `ferrum hybrid`: load a Qwen3.5-family GGUF and generate.
+use ferrum::{
+    Error, MetalDevice, Result,
+    hybrid::{self, HybridState, Output, Produced},
+};
+use std::{
+    io::Write,
+    time::{Duration, Instant},
+};
+
+struct Options {
+    model: String,
+    prompt: String,
+    raw: bool,
+    max_new: usize,
+    context: usize,
+    chunk: usize,
+    repeat: usize,
+}
+
+fn parse() -> Result<Options> {
+    let mut o = Options {
+        model: String::new(),
+        prompt: String::new(),
+        raw: false,
+        max_new: 32,
+        context: 4096,
+        chunk: 512,
+        repeat: 1,
+    };
+    let mut args = std::env::args().skip(2);
+    while let Some(key) = args.next() {
+        if key == "--raw" {
+            o.raw = true;
+            continue;
+        }
+        let value = args
+            .next()
+            .ok_or_else(|| Error::Parameter(format!("missing value for {key}")))?;
+        let number = || {
+            value
+                .parse::<usize>()
+                .map_err(|_| Error::Parameter(format!("invalid value for {key}: {value}")))
+        };
+        match key.as_str() {
+            "--model" => o.model = value.clone(),
+            "--prompt" => o.prompt = value.clone(),
+            "--prompt-file" => {
+                o.prompt = std::fs::read_to_string(&value)
+                    .map_err(|e| Error::Parameter(format!("{value}: {e}")))?
+            }
+            "--max-new-tokens" => o.max_new = number()?,
+            "--context" => o.context = number()?,
+            "--chunk" => o.chunk = number()?,
+            "--repeat" => o.repeat = number()?,
+            _ => return Err(Error::Parameter(format!("unknown option {key}"))),
+        }
+    }
+    if o.model.is_empty() || o.prompt.is_empty() {
+        return Err(Error::Parameter(
+            "usage: hybrid --model FILE.gguf --prompt TEXT [--raw] [--max-new-tokens N] [--context N] [--chunk N] [--repeat N]".into(),
+        ));
+    }
+    Ok(o)
+}
+
+fn ms(d: Duration) -> f64 {
+    d.as_secs_f64() * 1e3
+}
+
+pub fn run(d: &MetalDevice) -> Result<()> {
+    let o = parse()?;
+    let loaded = hybrid::load(d, &o.model, o.chunk, 1)?;
+    let model = &loaded.model;
+    let c = &model.config;
+    eprintln!(
+        "{} ({:?}): {} layers ({} attention), hidden {}, vocab {}; weights {:.2} GiB; scratch {:.1} MiB; load {:.2} s",
+        c.name,
+        c.variant,
+        c.layers,
+        c.attention_layer_count(),
+        c.hidden,
+        c.vocab,
+        model.weight_bytes() as f64 / (1u64 << 30) as f64,
+        model.scratch_bytes() as f64 / (1u64 << 20) as f64,
+        loaded.load_time.as_secs_f64()
+    );
+    let text = if o.raw {
+        o.prompt.clone()
+    } else {
+        format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            o.prompt
+        )
+    };
+    let prompt = loaded.tokenizer.encode(&text)?;
+    let mut state = HybridState::new(d, c, o.context)?;
+    eprintln!(
+        "prompt {} tokens; state {:.1} MiB for {} positions",
+        prompt.len(),
+        state.byte_size() as f64 / (1u64 << 20) as f64,
+        state.capacity()
+    );
+    for round in 0..o.repeat {
+        state.reset();
+        let start = Instant::now();
+        let Produced::Token(mut token) = model.forward(d, &mut state, &prompt, Output::Argmax)?
+        else {
+            unreachable!("argmax output yields a token")
+        };
+        let prefill = start.elapsed();
+        let mut generated = vec![token];
+        let mut steps = Vec::new();
+        let mut stream = loaded.tokenizer.decode_stream();
+        let mut out = std::io::stdout();
+        if round == 0
+            && let Some(piece) = stream
+                .step(token)
+                .map_err(|e| Error::Tokenizer(e.to_string()))?
+        {
+            print!("{piece}");
+        }
+        while generated.len() < o.max_new && !loaded.eos_ids.contains(&token) {
+            let t = Instant::now();
+            let Produced::Token(next) = model.forward(d, &mut state, &[token], Output::Argmax)?
+            else {
+                unreachable!()
+            };
+            steps.push(t.elapsed());
+            token = next;
+            generated.push(token);
+            if round == 0
+                && !loaded.eos_ids.contains(&token)
+                && let Some(piece) = stream
+                    .step(token)
+                    .map_err(|e| Error::Tokenizer(e.to_string()))?
+            {
+                print!("{piece}");
+                out.flush().ok();
+            }
+        }
+        println!();
+        let decode: Duration = steps.iter().sum();
+        let mut sorted = steps.clone();
+        sorted.sort();
+        eprintln!(
+            "round {round}: prefill {} tok in {:.1} ms ({:.1} tok/s); decode {} tok in {:.1} ms ({:.2} tok/s, median {:.1} ms)",
+            prompt.len(),
+            ms(prefill),
+            prompt.len() as f64 / prefill.as_secs_f64(),
+            steps.len(),
+            ms(decode),
+            steps.len() as f64 / decode.as_secs_f64().max(1e-9),
+            sorted.get(sorted.len() / 2).map_or(0., |&d| ms(d)),
+        );
+        if round == 0 {
+            eprintln!("generated IDs: {generated:?}");
+        }
+    }
+    Ok(())
+}

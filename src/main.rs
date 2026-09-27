@@ -1,3 +1,4 @@
+mod hybrid_cli;
 mod run;
 mod transformer_smoke;
 use ferrum::{DType, MetalDevice, Result, Tensor, reference as cpu};
@@ -16,6 +17,7 @@ fn main() -> Result<()> {
             );
         }
         "run" | "profile" => run::run(&device)?,
+        "hybrid" => hybrid_cli::run(&device)?,
         "transformer-smoke" => transformer_smoke::run(&device)?,
         "smoke" => {
             println!("Metal device: {}", device.name());
