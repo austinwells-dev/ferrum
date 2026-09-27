@@ -7,6 +7,7 @@ pub mod chat;
 pub mod config;
 pub mod engine;
 pub mod plan;
+pub mod runtime;
 pub mod session;
 pub mod weights;
 

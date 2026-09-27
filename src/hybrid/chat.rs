@@ -28,7 +28,7 @@ fn python_json(value: &Json, indent: Option<usize>, depth: usize, out: &mut Stri
             out.push('{');
             for (i, (k, v)) in map.iter().enumerate() {
                 if i > 0 {
-                    out.push(if indent.is_some() { ',' } else { ',' });
+                    out.push(',');
                     if indent.is_none() {
                         out.push(' ');
                     }
