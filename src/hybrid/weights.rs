@@ -72,6 +72,18 @@ impl Matrix {
     pub fn expert_rows(&self) -> usize {
         self.rows / self.experts
     }
+    /// The first `rows` rows, sharing storage (a draft vocabulary prefix of
+    /// an LM head).
+    pub(crate) fn prefix_rows(&self, rows: usize) -> Matrix {
+        Matrix {
+            rows: rows.min(self.rows),
+            cols: self.cols,
+            experts: 1,
+            format: self.format,
+            row_bytes: self.row_bytes,
+            storage: self.storage.clone(),
+        }
+    }
 }
 
 pub struct AttentionWeights {

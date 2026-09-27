@@ -35,6 +35,8 @@ pub struct Mtp {
     logits: Tensor,
     /// `prev_h` at recurrent-snapshot positions, for rewinds.
     saved: Vec<(usize, Vec<f32>)>,
+    /// Draft LM head: a prefix of the target's (see `DraftOptions::vocab`).
+    head: super::weights::Matrix,
 }
 
 /// Bytes an `Mtp` for `capacity` positions allocates beyond its weights.
@@ -73,8 +75,10 @@ impl Mtp {
         target: &HybridModel,
         capacity: usize,
         max_drafts: usize,
+        vocab: Option<usize>,
     ) -> Result<Self> {
         let c = &target.config;
+        let head_rows = vocab.map_or(c.vocab, |v| v.clamp(1024, c.vocab));
         let mut file = GgufFile::open(path)?;
         let weights = load_mtp(d, &mut file, c)?;
         if weights.ffn.gate.rows != c.ffn {
@@ -99,8 +103,9 @@ impl Mtp {
             prev_h: f(&[1, c.hidden])?,
             h_out: f(&[1, c.hidden])?,
             drafts: f(&[max_drafts])?,
-            logits: f(&[1, c.vocab])?,
+            logits: f(&[1, head_rows])?,
             saved: Vec::new(),
+            head: target.weights.output.prefix_rows(head_rows),
         })
     }
 
@@ -156,12 +161,12 @@ impl Mtp {
         t.add_rmsnorm(d, &x0, &mix, &w.head_norm, &x1, &xn, m)?;
         if let Some((token, h_out)) = out {
             let last = xn.view((m - 1) * hd, [1, hd])?;
-            t.project(d, &t.weights.output, &last, 1, &self.logits)?;
+            t.project(d, &self.head, &last, 1, &self.logits)?;
             d.dispatch_hybrid(
                 "h_argmax",
                 &[self.logits.binding()],
                 &[token.binding()],
-                &Params::default().u(c.vocab)?.0,
+                &Params::default().u(self.head.rows)?.0,
                 [1, 1, 1],
                 [1024, 1, 1],
                 0,

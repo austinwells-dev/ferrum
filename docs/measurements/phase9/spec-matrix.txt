@@ -1,0 +1,40 @@
+== llama-swift-base
+decode 6.74 tok/s over 1009 tokens; draft acceptance 0/0 (0.0%)
+== llama-swift-mtp
+decode 11.17 tok/s over 1009 tokens; draft acceptance 648/1050 (61.7%)
+== llama-swift-dflash2
+urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+== llama-swift-radix
+decode 3.95 tok/s over 1009 tokens; draft acceptance 672/2243 (30.0%)
+== llama-swift-redhat
+urllib.error.HTTPError: HTTP Error 500: Internal Server Error
+== ferrum-swift-base
+decode 7.11 tok/s over 1008 tokens; draft acceptance 0/0 (0.0%)
+== ferrum-swift-mtp
+decode 12.60 tok/s over 1008 tokens; draft acceptance 657/1043 (63.0%)
+== ferrum-swift-dflash2
+decode 17.78 tok/s over 1008 tokens; draft acceptance 773/1617 (47.8%)
+== ferrum-swift-radix
+decode 12.53 tok/s over 1008 tokens; draft acceptance 676/2257 (30.0%)
+== ferrum-swift-redhat
+decode 16.37 tok/s over 1008 tokens; draft acceptance 763/1920 (39.7%)
+== llama-tiel-base
+decode 41.14 tok/s over 1004 tokens; draft acceptance 0/0 (0.0%)
+== llama-tiel-dflash2
+decode 50.61 tok/s over 1004 tokens; draft acceptance 596/792 (75.3%)
+== llama-tiel-dflash2-8
+decode 36.59 tok/s over 999 tokens; draft acceptance 752/1885 (39.9%)
+== ferrum-tiel-base
+decode 41.29 tok/s over 998 tokens; draft acceptance 0/0 (0.0%)
+== ferrum-tiel-dflash2
+decode 57.12 tok/s over 998 tokens; draft acceptance 602/788 (76.4%)
+== ferrum-tiel-dflash2-8
+decode 44.80 tok/s over 998 tokens; draft acceptance 753/1932 (39.0%)
+DONE
+== llama-swift-dflash2-np1
+decode 9.87 tok/s over 1009 tokens; draft acceptance 766/1611 (47.5%)
+== llama-swift-radix-np1
+decode 6.93 tok/s over 1009 tokens; draft acceptance 666/2280 (29.2%)
+== llama-swift-redhat-np1
+decode 6.83 tok/s over 1009 tokens; draft acceptance 755/1910 (39.5%)
+DONE2

@@ -1987,7 +1987,7 @@ const DECODE_SPLIT_MIN_KEYS: usize = 256;
 const MAX_SPLIT_ROWS: usize = 64;
 /// Activation rows served by the small-batch GEMV, and by the narrow
 /// TensorOps tiles (speculative verify widths; see the Phase 9 journal).
-const MVB_MAX_ROWS: usize = 3;
+const MVB_MAX_ROWS: usize = 4;
 const MMS_MAX_ROWS: usize = 32;
 /// Expert routes at or below which experts use per-route GEMVs.
 const MV_ID_MAX_ROUTES: usize = 32;

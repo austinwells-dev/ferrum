@@ -1,0 +1,8 @@
+{"prompt": 0, "tokens": 128, "ms": 10071.234958, "draft_n": 134, "draft_accepted": 83}
+{"prompt": 1, "tokens": 128, "ms": 8063.850084000001, "draft_n": 106, "draft_accepted": 92}
+{"prompt": 2, "tokens": 128, "ms": 13713.141125, "draft_n": 180, "draft_accepted": 67}
+{"prompt": 3, "tokens": 128, "ms": 9388.419959, "draft_n": 121, "draft_accepted": 87}
+{"prompt": 4, "tokens": 128, "ms": 12245.234124999999, "draft_n": 158, "draft_accepted": 75}
+{"prompt": 5, "tokens": 128, "ms": 8538.6715, "draft_n": 111, "draft_accepted": 90}
+{"prompt": 6, "tokens": 128, "ms": 10343.367833, "draft_n": 134, "draft_accepted": 83}
+{"prompt": 7, "tokens": 112, "ms": 7605.116375, "draft_n": 99, "draft_accepted": 80}

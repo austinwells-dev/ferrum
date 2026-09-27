@@ -274,6 +274,11 @@ pub struct DraftOptions {
     pub context_cap: usize,
     /// DSpark: stop the block where the confidence head falls below this.
     pub confidence_min: f32,
+    /// Draft only among token ids below this (the LM head and Markov rows
+    /// are prefixes; byte-level BPE ids follow merge order, roughly by
+    /// frequency). None: the full vocabulary. Verification always uses the
+    /// full vocabulary, so this trades acceptance for draft speed only.
+    pub vocab: Option<usize>,
 }
 
 impl Default for DraftOptions {
@@ -282,6 +287,7 @@ impl Default for DraftOptions {
             quant: DraftQuant::Q8_0,
             context_cap: 8192,
             confidence_min: 0.,
+            vocab: None,
         }
     }
 }
@@ -466,9 +472,10 @@ struct Layer {
 }
 
 struct Markov {
-    /// `[vocab, rank]` (row lookup) and `[vocab, rank]` (projection).
+    /// `[vocab, rank]` (row lookup) and the draft-vocabulary prefix of the
+    /// `[vocab, rank]` projection.
     w1: Matrix,
-    w2: Matrix,
+    w2_head: Matrix,
     /// Confidence head over `[hidden ; rank]` and its bias.
     confidence: Option<(Tensor, f32)>,
 }
@@ -530,6 +537,9 @@ pub struct DraftModel {
     max_drafts: usize,
     confidence_min: f32,
     weight_bytes: usize,
+    /// Draft LM head (a prefix of the target's) and its vocabulary.
+    head: Matrix,
+    vocab: usize,
 }
 
 impl DraftModel {
@@ -587,10 +597,13 @@ impl DraftModel {
             });
         }
         let vocab = t.vocab;
+        let vocab_limit = options.vocab.map_or(vocab, |v| v.clamp(1024, vocab));
         let markov = match c.kind {
             Kind::DSpark { rank, confidence } => Some(Markov {
                 w1: l.matrix("markov_head.markov_w1.weight", vocab, rank, Format::Q8_0)?,
-                w2: l.matrix("markov_head.markov_w2.weight", vocab, rank, Format::Q8_0)?,
+                w2_head: l
+                    .matrix("markov_head.markov_w2.weight", vocab, rank, Format::Q8_0)?
+                    .prefix_rows(vocab_limit),
                 confidence: if confidence && l.st.has("confidence_head.proj.weight") {
                     let w = l.st.f32s("confidence_head.proj.weight", &[1, h + rank])?;
                     let b = l.st.f32s("confidence_head.proj.bias", &[1])?[0];
@@ -694,6 +707,8 @@ impl DraftModel {
             max_drafts,
             confidence_min: options.confidence_min,
             weight_bytes,
+            head: target.weights.output.prefix_rows(vocab_limit),
+            vocab: vocab_limit,
         })
     }
 
@@ -952,13 +967,7 @@ impl DraftModel {
         self.rmsnorm(d, &x, &self.norm, &hn, m)?;
         let n = m - from;
         let out = hn.view(from * h, [n, h])?;
-        t.project(
-            d,
-            &t.weights.output,
-            &out,
-            n,
-            &b.logits.view(0, [n, t.config.vocab])?,
-        )
+        t.project(d, &self.head, &out, n, &b.logits.view(0, [n, self.vocab])?)
     }
 
     /// Greedy DFlash2 path through each row's top-k candidates.
@@ -1199,7 +1208,7 @@ impl Drafter for DraftModel {
         if max == 0 {
             return Ok(Vec::new());
         }
-        let vocab = t.config.vocab;
+        let vocab = self.vocab;
         match c.kind {
             Kind::DSpark { rank, .. } => {
                 // Slot i predicts position pos + i + 1.
@@ -1219,7 +1228,7 @@ impl Drafter for DraftModel {
                     };
                     let w1p = b.w1p.view(i * rank, [1, rank])?;
                     t.get_rows(d, &markov.w1, &prev, &w1p)?;
-                    t.project(d, &markov.w2, &w1p, 1, &b.bias)?;
+                    t.project(d, &markov.w2_head, &w1p, 1, &b.bias.view(0, [1, vocab])?)?;
                     let row = b.logits.view(i * vocab, [1, vocab])?;
                     d.dispatch_hybrid(
                         "h_accumulate",
@@ -1292,22 +1301,8 @@ impl Drafter for DraftModel {
                 tokens[0] = anchor;
                 let b = &self.b;
                 let sel = self.selector.as_ref().expect("DFlash2 has a selector");
-                let profile = std::env::var_os("FERRUM_DRAFT_PROFILE").is_some();
-                let t0 = std::time::Instant::now();
-                if profile {
-                    let e = d.execution_with_shared_encoder(true)?;
-                    self.block(d, t, &tokens, pos, 1)?;
-                    e.finish()?;
-                    eprintln!(
-                        "draft block {} rows: {:.2} ms",
-                        max + 1,
-                        t0.elapsed().as_secs_f64() * 1e3
-                    );
-                }
                 let e = d.execution_with_shared_encoder(true)?;
-                if !profile {
-                    self.block(d, t, &tokens, pos, 1)?;
-                }
+                self.block(d, t, &tokens, pos, 1)?;
                 let blocks = vocab.div_ceil(1024);
                 d.dispatch_hybrid(
                     "h_topk_blocks",
@@ -1321,12 +1316,6 @@ impl Drafter for DraftModel {
                 let out = b.hn.view(c.hidden, [max, c.hidden])?;
                 t.project(d, &sel.hidden, &out, max, &b.sel_gate.view(0, [max, rank])?)?;
                 e.finish()?;
-                if profile {
-                    eprintln!(
-                        "draft +topk/gate: {:.2} ms",
-                        t0.elapsed().as_secs_f64() * 1e3
-                    );
-                }
                 let raw = b.candidates.to_f32();
                 let candidates: Vec<Vec<(u32, f32)>> = raw
                     .chunks(blocks * 64)
@@ -1343,11 +1332,7 @@ impl Drafter for DraftModel {
                     })
                     .collect();
                 let gates = b.sel_gate.to_f32();
-                let path = self.walk(anchor, &candidates, &gates[..max * rank], rank);
-                if profile {
-                    eprintln!("draft +walk: {:.2} ms", t0.elapsed().as_secs_f64() * 1e3);
-                }
-                Ok(path)
+                Ok(self.walk(anchor, &candidates, &gates[..max * rank], rank))
             }
         }
     }

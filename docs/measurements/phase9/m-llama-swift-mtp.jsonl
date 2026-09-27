@@ -1,0 +1,8 @@
+{"prompt": 0, "tokens": 128, "ms": 11843.557, "draft_n": 138, "draft_accepted": 81}
+{"prompt": 1, "tokens": 128, "ms": 9338.41, "draft_n": 111, "draft_accepted": 90}
+{"prompt": 2, "tokens": 128, "ms": 15375.372, "draft_n": 177, "draft_accepted": 66}
+{"prompt": 3, "tokens": 128, "ms": 10620.004, "draft_n": 125, "draft_accepted": 85}
+{"prompt": 4, "tokens": 128, "ms": 13374.498, "draft_n": 156, "draft_accepted": 74}
+{"prompt": 5, "tokens": 128, "ms": 9495.032, "draft_n": 111, "draft_accepted": 90}
+{"prompt": 6, "tokens": 128, "ms": 11871.578, "draft_n": 133, "draft_accepted": 82}
+{"prompt": 7, "tokens": 113, "ms": 8429.57, "draft_n": 99, "draft_accepted": 80}

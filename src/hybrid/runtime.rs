@@ -93,6 +93,7 @@ impl SpecOptions {
             }
             "--draft-context" => s.draft.context_cap = value.parse().map_err(|_| bad())?,
             "--draft-p-min" => s.draft.confidence_min = value.parse().map_err(|_| bad())?,
+            "--draft-vocab" => s.draft.vocab = Some(value.parse().map_err(|_| bad())?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -159,7 +160,14 @@ impl SpecOptions {
         Ok(match &self.source {
             DraftSource::Mtp => {
                 let k = self.drafts(&model.config, 3);
-                Box::new(Mtp::load(d, target_path, model, capacity, k)?)
+                Box::new(Mtp::load(
+                    d,
+                    target_path,
+                    model,
+                    capacity,
+                    k,
+                    self.draft.vocab,
+                )?)
             }
             DraftSource::Checkpoint(dir) => {
                 let (config, _, _) =

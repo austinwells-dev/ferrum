@@ -3,12 +3,16 @@
 //! conversation are compared with a fresh session that computes the same
 //! prefix/suffix split from scratch.
 //!
-//! usage: hybrid_session_check MODEL.gguf
+//! usage: hybrid_session_check MODEL.gguf [--draft mtp|DIR]
+//!
+//! With --draft both sessions speculate with their own drafter, which also
+//! checks that drafters follow extensions, snapshot rewinds and resets.
 use ferrum::{
     Result,
     hybrid::{
         self,
         plan::PlanOptions,
+        runtime::{DraftSource, SpecOptions},
         session::{SamplingParams, Session},
     },
 };
@@ -31,6 +35,15 @@ fn main() -> Result<()> {
     let eos = &loaded.eos_ids;
     let mut cached = Session::new(&d, model, 4096, 2)?;
     let mut fresh = Session::new(&d, model, 4096, 0)?;
+    if let Some(i) = args.iter().position(|a| a == "--draft") {
+        let spec = SpecOptions::new(DraftSource::parse(&args[i + 1]));
+        let path = std::path::Path::new(&args[1]);
+        for session in [&mut cached, &mut fresh] {
+            let drafter = spec.build(&d, path, &loaded, 4096)?;
+            println!("drafter {}", drafter.name());
+            session.set_drafter(&d, model, drafter)?;
+        }
+    }
     let base = "<|im_start|>user\nList three prime numbers and explain why each is prime.<|im_end|>\n<|im_start|>assistant\n";
     let p1 = tok.encode(base)?;
     let first = cached.generate(&d, model, &p1, 40, &greedy, eos, &mut |_| Ok(true))?;
@@ -68,10 +81,13 @@ fn main() -> Result<()> {
         let same = a.tokens == b.tokens;
         ok &= same;
         println!(
-            "{name:<13} prompt {:>4} tokens, reused {:>4}: {}",
+            "{name:<13} prompt {:>4} tokens, reused {:>4}: {} ({} tokens, {} verify steps, acceptance {:.2})",
             prompt.len(),
             a.reused_tokens,
-            if same { "identical" } else { "DIFFERENT" }
+            if same { "identical" } else { "DIFFERENT" },
+            a.tokens.len(),
+            cached.spec_stats.steps,
+            cached.spec_stats.acceptance_length()
         );
         if !same {
             println!("  cached: {:?}\n  fresh:  {:?}", a.tokens, b.tokens);

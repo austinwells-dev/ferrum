@@ -55,6 +55,12 @@ fn main() -> Result<()> {
         max_drafts: (drafts > 0).then_some(drafts),
         draft: DraftOptions {
             confidence_min: get("--pmin", "0").parse().expect("pmin"),
+            vocab: get("--vocab", "0").parse().ok().filter(|&v: &usize| v > 0),
+            quant: if get("--quant", "q8_0") == "q4_0" {
+                ferrum::hybrid::draft::DraftQuant::Q4_0
+            } else {
+                ferrum::hybrid::draft::DraftQuant::Q8_0
+            },
             ..Default::default()
         },
     };
