@@ -2,7 +2,10 @@
 //! represents, recurrent-state snapshots for prefix reuse across requests,
 //! and the sampling/generation loop.
 #![forbid(unsafe_code)]
-use super::engine::{HybridModel, HybridState, Output, Penalties, Produced};
+use super::{
+    engine::{HybridModel, HybridState, Output, Penalties, Produced, RowOutput, RowsProduced},
+    speculative::{Drafter, SpecStats},
+};
 use crate::{DType, Error, MetalDevice, Result, Tensor};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -142,6 +145,13 @@ pub struct Session {
     tokens: Vec<u32>,
     snapshots: Vec<Snapshot>,
     clock: u64,
+    drafter: Option<Box<dyn Drafter>>,
+    /// Use the drafter for the next generations (it keeps ingesting either way).
+    pub speculate: bool,
+    /// The drafter must rewind to this length before its next use.
+    drafter_rewind: Option<usize>,
+    /// Acceptance statistics of the latest generation.
+    pub spec_stats: SpecStats,
 }
 
 impl Session {
@@ -171,7 +181,67 @@ impl Session {
             tokens: Vec::new(),
             snapshots: slots,
             clock: 0,
+            drafter: None,
+            speculate: false,
+            drafter_rewind: None,
+            spec_stats: SpecStats::default(),
         })
+    }
+
+    /// Attach a drafter (enabling the target's verify buffers) and clear the
+    /// session. Generation speculates while `speculate` is true.
+    pub fn set_drafter(
+        &mut self,
+        d: &MetalDevice,
+        model: &HybridModel,
+        drafter: Box<dyn Drafter>,
+    ) -> Result<()> {
+        model.enable_speculation(d, &drafter.geometry())?;
+        self.drafter = Some(drafter);
+        self.speculate = true;
+        self.reset();
+        Ok(())
+    }
+
+    pub fn drafter(&self) -> Option<&dyn Drafter> {
+        self.drafter.as_deref()
+    }
+
+    /// Apply a pending drafter rewind.
+    fn sync_drafter(&mut self, d: &MetalDevice, model: &HybridModel) -> Result<()> {
+        if let (Some(len), Some(drafter)) = (self.drafter_rewind.take(), self.drafter.as_mut()) {
+            drafter.rewind(d, model, len)?;
+        }
+        Ok(())
+    }
+
+    /// Forward `tokens` (no output) and let the drafter ingest them.
+    fn extend(&mut self, d: &MetalDevice, model: &HybridModel, tokens: &[u32]) -> Result<()> {
+        let pos = self.state.len();
+        model.forward(d, &mut self.state, tokens, Output::None)?;
+        self.tokens.extend_from_slice(tokens);
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.ingest(d, model, pos, tokens)?;
+        }
+        Ok(())
+    }
+
+    /// Forward `tokens` with an output for the last one, and let the drafter
+    /// ingest them.
+    fn step(
+        &mut self,
+        d: &MetalDevice,
+        model: &HybridModel,
+        tokens: &[u32],
+        output: Output,
+    ) -> Result<Produced> {
+        let pos = self.state.len();
+        let produced = model.forward(d, &mut self.state, tokens, output)?;
+        self.tokens.extend_from_slice(tokens);
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.ingest(d, model, pos, tokens)?;
+        }
+        Ok(produced)
     }
     pub fn len(&self) -> usize {
         self.tokens.len()
@@ -200,6 +270,9 @@ impl Session {
         for s in &mut self.snapshots {
             s.position = 0;
             s.stamp = 0;
+        }
+        if self.drafter.is_some() {
+            self.drafter_rewind = Some(0);
         }
     }
 
@@ -235,6 +308,9 @@ impl Session {
                 self.state
                     .restore_recurrent(d, &snapshot.tensors, position)?;
                 self.tokens.truncate(position);
+                if self.drafter.is_some() {
+                    self.drafter_rewind = Some(position);
+                }
                 // Snapshots past the restore point describe a discarded branch.
                 for s in &mut self.snapshots {
                     if s.position > position {
@@ -263,6 +339,9 @@ impl Session {
         self.state.save_recurrent(d, &slot.tensors)?;
         slot.position = position;
         slot.stamp = self.clock;
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.snapshot(d, position)?;
+        }
         Ok(())
     }
 
@@ -282,9 +361,9 @@ impl Session {
             )));
         }
         let reused = self.reuse_prefix(d, tokens)?;
+        self.sync_drafter(d, model)?;
         for piece in tokens[reused..].chunks(model.chunk()) {
-            model.forward(d, &mut self.state, piece, Output::None)?;
-            self.tokens.extend_from_slice(piece);
+            self.extend(d, model, piece)?;
         }
         self.snapshot(d)?;
         Ok(reused)
@@ -317,6 +396,8 @@ impl Session {
         }
         let start = Instant::now();
         let reused = self.reuse_prefix(d, prompt)?;
+        self.sync_drafter(d, model)?;
+        self.spec_stats = SpecStats::default();
         hooks.begin(prompt.len(), reused);
         let mut rng = ChaCha8Rng::seed_from_u64(params.seed);
         let mut generated: Vec<u32> = Vec::new();
@@ -334,8 +415,7 @@ impl Session {
         let (body, tail) = prompt[reused..].split_at(prompt.len() - reused - 1);
         let mut processed = 0;
         for piece in body.chunks(model.chunk()) {
-            model.forward(d, &mut self.state, piece, Output::None)?;
-            self.tokens.extend_from_slice(piece);
+            self.extend(d, model, piece)?;
             processed += piece.len();
             if !hooks.prefill(processed, body.len() + 1) {
                 return Ok(Completion {
@@ -349,13 +429,13 @@ impl Session {
             }
         }
         self.snapshot(d)?;
-        let produced = model.forward(d, &mut self.state, tail, output(&generated))?;
-        self.tokens.extend_from_slice(tail);
+        let produced = self.step(d, model, tail, output(&generated))?;
         hooks.prefill(body.len() + 1, body.len() + 1);
         let prefill = start.elapsed();
         let decode_start = Instant::now();
         let mut next = select(produced, params, &mut rng)?;
-        let stop = loop {
+        let speculate = self.speculate && self.drafter.is_some();
+        let stop = 'generation: loop {
             if eos.contains(&next) {
                 break StopReason::Eos;
             }
@@ -374,10 +454,102 @@ impl Session {
             if self.state.len() + feed.len() > self.capacity() {
                 break StopReason::ContextFull;
             }
-            let produced = model.forward(d, &mut self.state, &feed, output(&generated))?;
-            self.tokens.extend_from_slice(&feed);
-            generated.extend_from_slice(&feed[1..]);
-            next = select(produced, params, &mut rng)?;
+            // Speculative step: draft after `next`, verify, keep the prefix
+            // the target agrees with (rejection sampling when sampling).
+            let room = self.capacity() - self.state.len() - 1;
+            let k = if speculate && feed.len() == 1 {
+                let drafter = self.drafter.as_ref().expect("speculate implies a drafter");
+                drafter
+                    .max_drafts()
+                    .min(max_tokens - generated.len())
+                    .min(room)
+            } else {
+                0
+            };
+            let drafts = if k > 0 {
+                let t0 = Instant::now();
+                let pos = self.state.len();
+                let drafter = self.drafter.as_mut().expect("speculate implies a drafter");
+                let drafts = drafter.draft(d, model, pos, next, k)?;
+                self.spec_stats.draft_seconds += t0.elapsed().as_secs_f64();
+                drafts
+            } else {
+                Vec::new()
+            };
+            if drafts.is_empty() {
+                let produced = self.step(d, model, &feed, output(&generated))?;
+                generated.extend_from_slice(&feed[1..]);
+                next = select(produced, params, &mut rng)?;
+                continue;
+            }
+            let t0 = Instant::now();
+            let mut rows = vec![next];
+            rows.extend_from_slice(&drafts);
+            let row_output = if params.uses_candidates() {
+                let mut seen = generated.clone();
+                let mut per_row = Vec::with_capacity(rows.len());
+                for i in 0..rows.len() {
+                    if i > 0 {
+                        seen.push(drafts[i - 1]);
+                    }
+                    per_row.push(penalties(params, &seen));
+                }
+                RowOutput::Candidates(per_row)
+            } else {
+                RowOutput::Argmax
+            };
+            let verified = model.verify(d, &mut self.state, &rows, row_output)?;
+            let (accepted, bonus) = accept(verified, &drafts, params, &mut rng)?;
+            self.spec_stats.verify_seconds += t0.elapsed().as_secs_f64();
+            self.spec_stats.record(drafts.len(), accepted);
+            // Emit the accepted drafts one by one; the anchor row is always kept.
+            let mut keep = 1;
+            let mut stopped = None;
+            let mut inject = None;
+            for &token in &drafts[..accepted] {
+                if eos.contains(&token) {
+                    stopped = Some(StopReason::Eos);
+                    break;
+                }
+                generated.push(token);
+                match hooks.token(token)? {
+                    Flow::Stop => {
+                        stopped = Some(StopReason::Stopped);
+                        break;
+                    }
+                    Flow::Inject(extra) => {
+                        inject = Some((token, extra));
+                        break;
+                    }
+                    Flow::Continue => {}
+                }
+                if generated.len() >= max_tokens {
+                    stopped = Some(StopReason::Length);
+                    break;
+                }
+                keep += 1;
+            }
+            let pos = self.state.len();
+            model.commit(d, &mut self.state, keep)?;
+            self.tokens.extend_from_slice(&rows[..keep]);
+            if let Some(drafter) = self.drafter.as_mut() {
+                drafter.ingest(d, model, pos, &rows[..keep])?;
+            }
+            if let Some(reason) = stopped {
+                break 'generation reason;
+            }
+            if let Some((token, extra)) = inject {
+                let mut feed = vec![token];
+                feed.extend(extra);
+                if self.state.len() + feed.len() > self.capacity() {
+                    break StopReason::ContextFull;
+                }
+                let produced = self.step(d, model, &feed, output(&generated))?;
+                generated.extend_from_slice(&feed[1..]);
+                next = select(produced, params, &mut rng)?;
+                continue;
+            }
+            next = bonus;
         };
         Ok(Completion {
             tokens: generated,
@@ -387,6 +559,52 @@ impl Session {
             prefill,
             decode: decode_start.elapsed(),
         })
+    }
+}
+
+/// Decide how many drafts the target accepts and the token that follows
+/// them. Greedy: drafts must equal the target's argmax. Sampling: draft i is
+/// accepted with the target's probability of it (the drafter's proposal is
+/// deterministic); on rejection the replacement is drawn from the target's
+/// distribution with the draft removed, so the output has exactly the
+/// target's distribution.
+fn accept(
+    verified: RowsProduced,
+    drafts: &[u32],
+    params: &SamplingParams,
+    rng: &mut ChaCha8Rng,
+) -> Result<(usize, u32)> {
+    match verified {
+        RowsProduced::Tokens(targets) => {
+            let accepted = drafts
+                .iter()
+                .zip(&targets)
+                .take_while(|(a, b)| a == b)
+                .count();
+            Ok((accepted, targets[accepted]))
+        }
+        RowsProduced::Candidates(mut rows) => {
+            for (i, &draft) in drafts.iter().enumerate() {
+                let dist = distribution(&mut rows[i], params)?;
+                let p = dist
+                    .iter()
+                    .find(|(t, _)| *t == draft)
+                    .map_or(0., |(_, p)| *p);
+                if params.temperature == 0. {
+                    if p < 1. {
+                        return Ok((i, dist[0].0));
+                    }
+                    continue;
+                }
+                if rng.random::<f64>() < p {
+                    continue;
+                }
+                let rest: Vec<(u32, f64)> = dist.into_iter().filter(|(t, _)| *t != draft).collect();
+                return Ok((i, draw(&rest, rng)));
+            }
+            let dist = distribution(&mut rows[drafts.len()], params)?;
+            Ok((drafts.len(), draw(&dist, rng)))
+        }
     }
 }
 
@@ -418,12 +636,22 @@ pub(crate) fn sample(
     params: &SamplingParams,
     rng: &mut impl Rng,
 ) -> Result<u32> {
+    let dist = distribution(candidates, params)?;
+    if params.temperature == 0. {
+        return Ok(dist[0].0);
+    }
+    Ok(draw(&dist, rng))
+}
+
+/// The sampling distribution over candidates (unnormalized probabilities,
+/// most likely first). Greedy keeps only the top token with probability 1.
+fn distribution(candidates: &mut [(u32, f32)], params: &SamplingParams) -> Result<Vec<(u32, f64)>> {
     if candidates.is_empty() {
         return Err(Error::Parameter("no finite logits to sample".into()));
     }
     candidates.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     if params.temperature == 0. {
-        return Ok(candidates[0].0);
+        return Ok(vec![(candidates[0].0, 1.)]);
     }
     let keep = if params.top_k > 0 {
         params.top_k.min(candidates.len())
@@ -451,14 +679,24 @@ pub(crate) fn sample(
         }
     }
     let mass: f64 = probs[..keep].iter().sum();
-    let mut draw = rng.random::<f64>() * mass;
-    for (i, p) in probs[..keep].iter().enumerate() {
-        if draw < *p {
-            return Ok(candidates[i].0);
+    Ok(candidates[..keep]
+        .iter()
+        .zip(&probs)
+        .map(|((t, _), p)| (*t, p / mass))
+        .collect())
+}
+
+/// Draw from an (unnormalized) distribution.
+fn draw(dist: &[(u32, f64)], rng: &mut impl Rng) -> u32 {
+    let mass: f64 = dist.iter().map(|(_, p)| p).sum();
+    let mut left = rng.random::<f64>() * mass;
+    for &(t, p) in dist {
+        if left < p {
+            return t;
         }
-        draw -= p;
+        left -= p;
     }
-    Ok(candidates[keep - 1].0)
+    dist[dist.len() - 1].0
 }
 
 #[cfg(test)]

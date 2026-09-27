@@ -6,9 +6,11 @@ pub mod bench;
 pub mod chat;
 pub mod config;
 pub mod engine;
+pub mod mtp;
 pub mod plan;
 pub mod runtime;
 pub mod session;
+pub mod speculative;
 pub mod weights;
 
 pub use config::{HybridConfig, Variant};

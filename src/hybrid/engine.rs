@@ -159,32 +159,32 @@ impl HybridState {
 
 /// Per-chunk activation buffers, allocated once for the largest chunk.
 pub(crate) struct Scratch {
-    chunk: usize,
-    x: [Tensor; 2],
-    xn: Tensor,
-    mix: Tensor,
-    qg: Tensor,
-    k: Tensor,
-    v: Tensor,
-    q: Tensor,
-    att: Tensor,
-    attn_partial: Tensor,
-    attn_ml: Tensor,
-    qkv: Tensor,
-    z: Tensor,
-    alpha: Tensor,
-    beta: Tensor,
-    g: Tensor,
-    b: Tensor,
-    conv: Tensor,
-    delta: Tensor,
-    gated: Tensor,
-    ffn_gate: Tensor,
-    ffn_up: Tensor,
-    ffn_act: Tensor,
-    logits: Tensor,
-    token: Tensor,
-    candidates: Tensor,
+    pub(crate) chunk: usize,
+    pub(crate) x: [Tensor; 2],
+    pub(crate) xn: Tensor,
+    pub(crate) mix: Tensor,
+    pub(crate) qg: Tensor,
+    pub(crate) k: Tensor,
+    pub(crate) v: Tensor,
+    pub(crate) q: Tensor,
+    pub(crate) att: Tensor,
+    pub(crate) attn_partial: Tensor,
+    pub(crate) attn_ml: Tensor,
+    pub(crate) qkv: Tensor,
+    pub(crate) z: Tensor,
+    pub(crate) alpha: Tensor,
+    pub(crate) beta: Tensor,
+    pub(crate) g: Tensor,
+    pub(crate) b: Tensor,
+    pub(crate) conv: Tensor,
+    pub(crate) delta: Tensor,
+    pub(crate) gated: Tensor,
+    pub(crate) ffn_gate: Tensor,
+    pub(crate) ffn_up: Tensor,
+    pub(crate) ffn_act: Tensor,
+    pub(crate) logits: Tensor,
+    pub(crate) token: Tensor,
+    pub(crate) candidates: Tensor,
     moe: Option<MoeScratch>,
 }
 
@@ -915,7 +915,7 @@ impl HybridModel {
     }
 
     /// Copy `m` rows of a layer output into its column block of the features.
-    fn capture(
+    pub(crate) fn capture(
         &self,
         d: &MetalDevice,
         src: &Tensor,
@@ -1134,6 +1134,30 @@ impl HybridModel {
         m: usize,
         pos: usize,
     ) -> Result<()> {
+        let kc = state.k[layer]
+            .as_ref()
+            .expect("attention layer has K cache");
+        let vc = state.v[layer]
+            .as_ref()
+            .expect("attention layer has V cache");
+        self.attention_with(d, s, a, kc, vc, layer, xn, out, m, pos)
+    }
+
+    /// Gated attention of `m` rows at `pos..` against explicit K/V caches.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn attention_with(
+        &self,
+        d: &MetalDevice,
+        s: &Scratch,
+        a: &AttentionWeights,
+        kc: &Tensor,
+        vc: &Tensor,
+        layer: usize,
+        xn: &Tensor,
+        out: &Tensor,
+        m: usize,
+        pos: usize,
+    ) -> Result<()> {
         let c = &self.config;
         let q_width = c.heads * c.head_dim;
         let kv_width = c.kv_heads * c.head_dim;
@@ -1145,12 +1169,6 @@ impl HybridModel {
         self.project(d, &a.q, xn, m, &qg)?;
         self.project(d, &a.k, xn, m, &k)?;
         self.project(d, &a.v, xn, m, &v)?;
-        let kc = state.k[layer]
-            .as_ref()
-            .expect("attention layer has K cache");
-        let vc = state.v[layer]
-            .as_ref()
-            .expect("attention layer has V cache");
         let prep = Params::default()
             .u(m)?
             .u(c.heads)?
@@ -1699,7 +1717,7 @@ impl HybridModel {
         )
     }
 
-    fn dense_ffn(
+    pub(crate) fn dense_ffn(
         &self,
         d: &MetalDevice,
         s: &Scratch,
@@ -1741,7 +1759,7 @@ impl HybridModel {
         Ok(())
     }
 
-    fn fill_zero(&self, d: &MetalDevice, t: &Tensor) -> Result<()> {
+    pub(crate) fn fill_zero(&self, d: &MetalDevice, t: &Tensor) -> Result<()> {
         // Zero through the GPU so the write is ordered with queued work.
         let n = t.numel();
         d.dispatch_hybrid(
@@ -1755,7 +1773,13 @@ impl HybridModel {
         )
     }
 
-    fn get_rows(&self, d: &MetalDevice, w: &Matrix, ids: &Tensor, y: &Tensor) -> Result<()> {
+    pub(crate) fn get_rows(
+        &self,
+        d: &MetalDevice,
+        w: &Matrix,
+        ids: &Tensor,
+        y: &Tensor,
+    ) -> Result<()> {
         let tokens = ids.numel();
         let name = match w.format {
             Format::Q4K => "h_get_rows_q4_k",
@@ -1777,7 +1801,14 @@ impl HybridModel {
         )
     }
 
-    fn rmsnorm(&self, d: &MetalDevice, x: &Tensor, w: &Tensor, y: &Tensor, m: usize) -> Result<()> {
+    pub(crate) fn rmsnorm(
+        &self,
+        d: &MetalDevice,
+        x: &Tensor,
+        w: &Tensor,
+        y: &Tensor,
+        m: usize,
+    ) -> Result<()> {
         let n = self.config.hidden;
         d.dispatch_hybrid(
             "h_rmsnorm",
@@ -1791,7 +1822,7 @@ impl HybridModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn add_rmsnorm(
+    pub(crate) fn add_rmsnorm(
         &self,
         d: &MetalDevice,
         x: &Tensor,

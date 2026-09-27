@@ -353,3 +353,88 @@ pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Resu
         layers,
     })
 }
+
+/// The NextN/MTP block after the trunk (`blk.{layers}`): the token embedding
+/// and the previous hidden state are normalized, concatenated and projected,
+/// then pass one gated-attention layer with a dense FFN; `head_norm` feeds
+/// the shared LM head.
+pub struct MtpWeights {
+    pub eh_proj: Matrix,
+    pub enorm: Tensor,
+    pub hnorm: Tensor,
+    pub head_norm: Tensor,
+    pub attn_norm: Tensor,
+    pub post_norm: Tensor,
+    pub attention: AttentionWeights,
+    pub ffn: DenseFfn,
+}
+
+impl MtpWeights {
+    pub fn byte_size(&self) -> usize {
+        let a = &self.attention;
+        [
+            &self.eh_proj,
+            &a.q,
+            &a.k,
+            &a.v,
+            &a.o,
+            &self.ffn.gate,
+            &self.ffn.up,
+            &self.ffn.down,
+        ]
+        .iter()
+        .map(|m| m.byte_size())
+        .sum::<usize>()
+            + [
+                &self.enorm,
+                &self.hnorm,
+                &self.head_norm,
+                &self.attn_norm,
+                &self.post_norm,
+                &a.q_norm,
+                &a.k_norm,
+            ]
+            .iter()
+            .map(|t| t.byte_size())
+            .sum::<usize>()
+    }
+}
+
+/// Load the first MTP block, if the GGUF has one with a dense FFN.
+pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Result<MtpWeights> {
+    let i = c.layers;
+    let n = |s: &str| format!("blk.{i}.{s}");
+    if !file.tensors().contains_key(&n("nextn.eh_proj.weight")) {
+        return Err(Error::Gguf("the GGUF has no NextN/MTP block".into()));
+    }
+    if file.tensors().contains_key(&n("ffn_gate_exps.weight")) {
+        return Err(Error::Gguf(
+            "MTP blocks with routed experts are not supported".into(),
+        ));
+    }
+    let ffn_width = file.tensor(&n("ffn_gate.weight"))?.dimensions[1];
+    let mut l = Loader { device, file };
+    let q = c.heads * c.head_dim;
+    let kv = c.kv_heads * c.head_dim;
+    Ok(MtpWeights {
+        eh_proj: l.matrix(&n("nextn.eh_proj.weight"), c.hidden, 2 * c.hidden)?,
+        enorm: l.vector(&n("nextn.enorm.weight"), c.hidden)?,
+        hnorm: l.vector(&n("nextn.hnorm.weight"), c.hidden)?,
+        head_norm: l.vector(&n("nextn.shared_head_norm.weight"), c.hidden)?,
+        attn_norm: l.vector(&n("attn_norm.weight"), c.hidden)?,
+        post_norm: l.vector(&n("post_attention_norm.weight"), c.hidden)?,
+        attention: AttentionWeights {
+            q: l.matrix(&n("attn_q.weight"), 2 * q, c.hidden)?,
+            k: l.matrix(&n("attn_k.weight"), kv, c.hidden)?,
+            v: l.matrix(&n("attn_v.weight"), kv, c.hidden)?,
+            o: l.matrix(&n("attn_output.weight"), c.hidden, q)?,
+            q_norm: l.vector(&n("attn_q_norm.weight"), c.head_dim)?,
+            k_norm: l.vector(&n("attn_k_norm.weight"), c.head_dim)?,
+        },
+        ffn: DenseFfn {
+            gate: l.matrix(&n("ffn_gate.weight"), ffn_width, c.hidden)?,
+            up: l.matrix(&n("ffn_up.weight"), ffn_width, c.hidden)?,
+            down: l.matrix(&n("ffn_down.weight"), c.hidden, ffn_width)?,
+        },
+    })
+}
