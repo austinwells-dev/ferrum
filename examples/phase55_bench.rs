@@ -412,6 +412,57 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let q5_0_gemv_ksplit = match request.get("q5_0_gemv_ksplit") {
+        None | Some(Value::Null) => {
+            device.set_q5_0_gemv_ksplit(2)?;
+            2
+        }
+        Some(Value::Number(simds)) => {
+            let simds = simds.as_u64().ok_or_else(|| {
+                Error::Parameter("request field q5_0_gemv_ksplit must be an integer".into())
+            })? as usize;
+            device.set_q5_0_gemv_ksplit(simds)?;
+            simds
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field q5_0_gemv_ksplit must be an integer".into(),
+            ));
+        }
+    };
+    let k_quant_gemv_ksplit = match request.get("k_quant_gemv_ksplit") {
+        None | Some(Value::Null) => {
+            device.set_k_quant_gemv_ksplit(8)?;
+            8
+        }
+        Some(Value::Number(simds)) => {
+            let simds = simds.as_u64().ok_or_else(|| {
+                Error::Parameter("request field k_quant_gemv_ksplit must be an integer".into())
+            })? as usize;
+            device.set_k_quant_gemv_ksplit(simds)?;
+            simds
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field k_quant_gemv_ksplit must be an integer".into(),
+            ));
+        }
+    };
+    let fuse_swiglu = match request.get("fuse_swiglu") {
+        None | Some(Value::Null) => {
+            device.set_fuse_swiglu(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_fuse_swiglu(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field fuse_swiglu must be a boolean".into(),
+            ));
+        }
+    };
     let q5_1_gemv_n4 = match request.get("q5_1_gemv_n4") {
         None | Some(Value::Null) => {
             device.set_q5_1_gemv_n4(true)?;
@@ -796,6 +847,9 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "q6_k_expert_project_8rows": q6_k_expert_project_8rows,
         "q5_k_mpp_tile_k64": q5_k_mpp_tile_k64,
         "q5_0_gemv_n4": q5_0_gemv_n4,
+        "q5_0_gemv_ksplit": q5_0_gemv_ksplit,
+        "k_quant_gemv_ksplit": k_quant_gemv_ksplit,
+        "fuse_swiglu": fuse_swiglu,
         "q5_1_gemv_n4": q5_1_gemv_n4,
         "q5_k_gemv_8rows": q5_k_gemv_8rows,
         "moe_gpu_routing_prefill": moe_gpu_routing_prefill,

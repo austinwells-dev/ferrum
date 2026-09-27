@@ -16,6 +16,83 @@ const DENSE_MPP_PAIRED: &[&str] = &[
 ];
 
 impl MetalDevice {
+    /// Whether `swiglu_q5_0` can replace gate, up, and `silu_mul` for `x`.
+    pub(crate) fn can_fuse_swiglu(
+        &self,
+        x: &Tensor,
+        gate: &crate::quantization::QuantizedMatrix,
+        up: &crate::quantization::QuantizedMatrix,
+    ) -> bool {
+        use crate::quantization::QuantizationFormat;
+        let dims = x.shape().dimensions();
+        self.fuse_swiglu()
+            && self.q5_0_ksplit() > 0
+            && !self.reference_math()
+            && dims.len() == 2
+            && dims[0] == 1
+            && dims[1] == gate.columns()
+            && dims[1] <= u32::MAX as usize - 32
+            && gate.format() == QuantizationFormat::Q5_0
+            && up.format() == QuantizationFormat::Q5_0
+            && gate.rows() == up.rows()
+            && gate.columns() == up.columns()
+    }
+    /// Decode SwiGLU: `silu(x Gᵀ) * (x Uᵀ)` for Q5_0 gate/up in one kernel,
+    /// bit-identical to the K-split projections followed by `silu_mul`.
+    pub(crate) fn swiglu_q5_0(
+        &self,
+        x: &Tensor,
+        gate: &crate::quantization::QuantizedMatrix,
+        up: &crate::quantization::QuantizedMatrix,
+    ) -> Result<Output> {
+        if !self.can_fuse_swiglu(x, gate, up) {
+            return Err(Error::Shape("fused SwiGLU operands do not match".into()));
+        }
+        if !self.owns(x.buffer()) || !self.owns(gate.buffer()) || !self.owns(up.buffer()) {
+            return Err(Error::DeviceMismatch);
+        }
+        let profile_start = self.profiling().then(std::time::Instant::now);
+        let wait_before = profile_start
+            .map(|_| self.counters().wait)
+            .unwrap_or_default();
+        let dims = [1, gate.rows()];
+        let tensor = Tensor::output(self, &dims, x.dtype())?;
+        let mut p = [0; 9];
+        p[0] = index(x.numel())?;
+        p[1] = 1;
+        p[2] = index(gate.columns())?;
+        p[3] = index(gate.rows())?;
+        p[4] = x.dtype() as u32;
+        p[8] = index(self.q5_0_ksplit())?;
+        let timing = self.dispatch(
+            "q5_0_gemv_swiglu",
+            &[x.binding(), gate.binding(), up.binding(), tensor.binding()],
+            &p,
+            [gate.rows(), 1],
+            false,
+        )?;
+        let metrics = Metrics {
+            operation: "q5_0_gemv_swiglu",
+            shape: crate::tensor::Shape::new(dims)?,
+            dtype: x.dtype(),
+            bytes_read: x.byte_size() + gate.byte_size() + up.byte_size(),
+            bytes_written: tensor.byte_size(),
+            allocation_bytes: tensor.storage_info().allocation_bytes,
+            timing,
+        };
+        if let Some(start) = profile_start {
+            self.record_profile(
+                "q5_0_gemv_swiglu",
+                start
+                    .elapsed()
+                    .saturating_sub(self.counters().wait - wait_before),
+                std::time::Duration::ZERO,
+                metrics.allocation_bytes,
+                &metrics.timing,
+            );
+        }
+        Ok(Output { tensor, metrics })
+    }
     pub(crate) fn project_quantized(
         &self,
         a: &Tensor,
@@ -86,7 +163,9 @@ impl MetalDevice {
             (QuantizationFormat::Q4_0, false, true) => "q4_0_gemm_mpp",
             (QuantizationFormat::Q4_0, false, false) => "q4_0_gemm",
             (QuantizationFormat::Q5_0, true, _) => {
-                if self.use_q5_0_gemv_n4(weight.rows()) {
+                if self.q5_0_ksplit() > 0 {
+                    "q5_0_gemv_ksplit"
+                } else if self.use_q5_0_gemv_n4(weight.rows()) {
                     "q5_0_gemv_n4"
                 } else {
                     "q5_0_gemv"
@@ -110,7 +189,9 @@ impl MetalDevice {
             }
             (QuantizationFormat::Q5_1, false, false) => "q5_1_gemm",
             (QuantizationFormat::Q4_K, true, _) => {
-                if self.use_q4_k_factored(weight.columns()) {
+                if self.use_q4_k_factored(weight.columns()) && self.k_quant_gemv_ksplit() > 0 {
+                    "q4_k_gemv_ksplit"
+                } else if self.use_q4_k_factored(weight.columns()) {
                     "q4_k_gemv_factored"
                 } else if self.use_q4_k_gemv_8rows(weight.rows()) {
                     "q4_k_gemv_8rows"
@@ -144,7 +225,9 @@ impl MetalDevice {
             }
             (QuantizationFormat::Q5_K, false, false) => "q5_k_gemm",
             (QuantizationFormat::Q6_K, true, _) => {
-                if self.use_q6_k_factored(weight.columns()) {
+                if self.use_q6_k_factored(weight.columns()) && self.k_quant_gemv_ksplit() > 0 {
+                    "q6_k_gemv_ksplit"
+                } else if self.use_q6_k_factored(weight.columns()) {
                     "q6_k_gemv_factored"
                 } else if self.use_q6_k_gemv_8rows(weight.rows()) {
                     "q6_k_gemv_8rows"
@@ -170,6 +253,19 @@ impl MetalDevice {
             }
             (QuantizationFormat::MlxAffine4Group64, false, false) => "mlx_affine4_gemm",
         };
+        match name {
+            "q5_0_gemv_ksplit" => p[8] = index(self.q5_0_ksplit())?,
+            "q4_k_gemv_ksplit" | "q6_k_gemv_ksplit" => {
+                // Q4_K lanes cover four super-blocks per pass, Q6_K two.
+                let per_pass = if name == "q4_k_gemv_ksplit" { 4 } else { 2 };
+                let passes = (weight.columns() / 256)
+                    .div_ceil(per_pass)
+                    .next_power_of_two();
+                let cap = if weight.rows() >= 4096 { 2 } else { 8 };
+                p[8] = index(passes.min(cap).min(self.k_quant_gemv_ksplit()))?;
+            }
+            _ => {}
+        }
         if name.starts_with("q4_k_gemm_mpp")
             || name.starts_with("q8_0_gemm_mpp")
             || matches!(name, "q6_k_gemm_mpp" | "q5_0_gemm_mpp")
@@ -1965,6 +2061,15 @@ mod q5_tests {
         columns: usize,
         format: QuantizationFormat,
     ) -> QuantizedMatrix {
+        let bytes = packed_bytes(rows, columns, format);
+        QuantizedMatrix::from_reader(device, rows, columns, format, |destination| {
+            destination.copy_from_slice(&bytes);
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    fn packed_bytes(rows: usize, columns: usize, format: QuantizationFormat) -> Vec<u8> {
         assert!(matches!(
             format,
             QuantizationFormat::Q5_0 | QuantizationFormat::Q5_1
@@ -1997,11 +2102,7 @@ mod q5_tests {
                 assert_eq!(qh_offset + 4 + 16, block_bytes);
             }
         }
-        QuantizedMatrix::from_reader(device, rows, columns, format, |destination| {
-            destination.copy_from_slice(&bytes);
-            Ok(())
-        })
-        .unwrap()
+        bytes
     }
 
     fn q5_value(row: usize, column: usize, format: QuantizationFormat) -> f32 {
@@ -2068,6 +2169,7 @@ mod q5_tests {
     #[test]
     fn q5_0_gemv_n4_reuses_activations_and_covers_output_tail() {
         let d = MetalDevice::new().unwrap();
+        d.set_q5_0_gemv_ksplit(0).unwrap();
         assert!(d.use_q5_0_gemv_n4(128));
         assert!(!d.use_q5_0_gemv_n4(127));
         for (n, k) in [(131, 512), (4864, 896)] {
@@ -2085,6 +2187,169 @@ mod q5_tests {
                     "Q5_0 ({n}, {k}) index {index}: actual={actual}, expected={expected}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn q5_0_swiglu_matches_separate_kernels_bitwise() {
+        let d = MetalDevice::new().unwrap();
+        for (n, k) in [(131, 896), (4864, 896), (6, 1440)] {
+            let gate = packed(&d, n, k, QuantizationFormat::Q5_0);
+            let up = {
+                // A second, distinct weight: rows shifted by one.
+                let bytes = packed_bytes(n + 1, k, QuantizationFormat::Q5_0);
+                let row = k / 32 * 22;
+                QuantizedMatrix::from_reader(&d, n, k, QuantizationFormat::Q5_0, |dst| {
+                    dst.copy_from_slice(&bytes[row..]);
+                    Ok(())
+                })
+                .unwrap()
+            };
+            let x = Tensor::from_f32(&d, [1, k], DType::BF16, &input(1, k)).unwrap();
+            for simds in [1, 2, 4, 8] {
+                d.set_q5_0_gemv_ksplit(simds).unwrap();
+                let g = d.project_quantized(&x, &gate).unwrap().tensor;
+                let u = d.project_quantized(&x, &up).unwrap().tensor;
+                let separate = d.silu_mul(&g, &u).unwrap().tensor.to_f32();
+                let fused = d.swiglu_q5_0(&x, &gate, &up).unwrap();
+                assert_eq!(fused.metrics.operation, "q5_0_gemv_swiglu");
+                let fused = fused.tensor.to_f32();
+                for (index, (a, b)) in fused.iter().zip(&separate).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "({n}, {k}) simds {simds} index {index}"
+                    );
+                }
+            }
+            d.set_q5_0_gemv_ksplit(2).unwrap();
+        }
+    }
+
+    /// Decode MLP front half at Qwen2.5-0.5B shape: separate gate/up/silu_mul
+    /// against the fused SwiGLU kernel, 24 distinct weight pairs.
+    #[test]
+    #[ignore = "microbenchmark; run with --ignored --nocapture"]
+    fn bench_q5_0_swiglu() {
+        let d = MetalDevice::new().unwrap();
+        let (n, k) = (4864, 896);
+        let pairs: Vec<_> = (0..24)
+            .map(|_| {
+                (
+                    packed(&d, n, k, QuantizationFormat::Q5_0),
+                    packed(&d, n, k, QuantizationFormat::Q5_0),
+                )
+            })
+            .collect();
+        let x = Tensor::from_f32(&d, [1, k], DType::BF16, &input(1, k)).unwrap();
+        for fused in [false, true] {
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let start = std::time::Instant::now();
+                let execution = d.execution().unwrap();
+                let mut last = None;
+                for _ in 0..8 {
+                    for (gate, up) in &pairs {
+                        last = Some(if fused {
+                            d.swiglu_q5_0(&x, gate, up).unwrap().tensor
+                        } else {
+                            let g = d.project_quantized(&x, gate).unwrap().tensor;
+                            let u = d.project_quantized(&x, up).unwrap().tensor;
+                            d.silu_mul(&g, &u).unwrap().tensor
+                        });
+                    }
+                }
+                drop(execution);
+                std::hint::black_box(last.unwrap().to_f32());
+                best = best.min(start.elapsed().as_secs_f64() / 8.0);
+            }
+            println!(
+                "swiglu fused={fused}: {:.1} us/layer",
+                best * 1e6 / pairs.len() as f64
+            );
+        }
+    }
+
+    #[test]
+    fn q5_0_gemv_ksplit_covers_row_and_block_tails() {
+        let d = MetalDevice::new().unwrap();
+        assert!(d.set_q5_0_gemv_ksplit(3).is_err());
+        // 131 rows leave a partial four-row tile; 28 and 45 blocks leave
+        // partial 16-block strides for every SIMD group count.
+        for (n, k) in [(131, 896), (5, 1440), (128, 512)] {
+            let weight = packed(&d, n, k, QuantizationFormat::Q5_0);
+            let values = input(1, k);
+            let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+            let expected = expected(&values, 1, n, k, QuantizationFormat::Q5_0);
+            for simds in [1, 2, 4, 8] {
+                d.set_q5_0_gemv_ksplit(simds).unwrap();
+                let output = d.project_quantized(&x, &weight).unwrap();
+                assert_eq!(output.metrics.operation, "q5_0_gemv_ksplit");
+                for (index, (actual, expected)) in
+                    output.tensor.to_f32().iter().zip(&expected).enumerate()
+                {
+                    assert!(
+                        (actual - expected).abs() <= 5.0e-5,
+                        "Q5_0 K-split {simds} ({n}, {k}) index {index}: actual={actual}, expected={expected}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Steady-state Q5_0 GEMV bandwidth at Qwen2.5-0.5B shapes: 24 distinct
+    /// weights (like 24 layers, beyond the system cache) projected back to back.
+    #[test]
+    #[ignore = "microbenchmark; run with --ignored --nocapture"]
+    fn bench_q5_0_gemv_bandwidth() {
+        let d = MetalDevice::new().unwrap();
+        for (label, n, k) in [("gate", 4864, 896), ("q", 896, 896), ("kv", 128, 896)] {
+            let x = Tensor::from_f32(&d, [1, k], DType::BF16, &input(1, k)).unwrap();
+            for simds in [0usize, 2, 4] {
+                let bytes = packed_bytes(n, k, QuantizationFormat::Q5_0);
+                let weights: Vec<_> = (0..24)
+                    .map(|_| {
+                        QuantizedMatrix::from_reader(&d, n, k, QuantizationFormat::Q5_0, |dst| {
+                            dst.copy_from_slice(&bytes);
+                            Ok(())
+                        })
+                        .unwrap()
+                    })
+                    .collect();
+                d.set_q5_0_gemv_ksplit(simds).unwrap();
+                let check = d
+                    .project_quantized(&x, &weights[0])
+                    .unwrap()
+                    .tensor
+                    .to_f32();
+                println!(
+                    "{label} simds={simds} checksum={:08x}",
+                    check
+                        .iter()
+                        .fold(0u32, |h, v| h.rotate_left(5) ^ v.to_bits())
+                );
+                let bytes = (n * k / 32 * 22 * weights.len()) as f64;
+                let mut best = f64::MAX;
+                for _ in 0..7 {
+                    let start = std::time::Instant::now();
+                    let execution = d.execution().unwrap();
+                    let mut last = None;
+                    for _ in 0..8 {
+                        for weight in &weights {
+                            last = Some(d.project_quantized(&x, weight).unwrap().tensor);
+                        }
+                    }
+                    drop(execution);
+                    std::hint::black_box(last.unwrap().to_f32());
+                    best = best.min(start.elapsed().as_secs_f64() / 8.0);
+                }
+                println!(
+                    "{label} simds={simds} n={n} k={k}: {:.1} us/projection, {:.1} GB/s",
+                    best * 1e6 / weights.len() as f64,
+                    bytes / best / 1e9
+                );
+            }
+            d.set_q5_0_gemv_ksplit(2).unwrap();
         }
     }
 
@@ -2514,6 +2779,70 @@ mod qk_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn q4_k_gemv_ksplit_covers_row_and_block_tails() {
+        let d = MetalDevice::new().unwrap();
+        assert!(d.set_k_quant_gemv_ksplit(3).is_err());
+        // 133 rows leave a partial four-row tile; 10 and 19 super-blocks
+        // leave partial strides for every SIMD group count.
+        for (n, k) in [(133, 2560), (6, 4864)] {
+            let weight = packed(&d, n, k, QuantizationFormat::Q4_K);
+            let values = input(1, k);
+            let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+            let reference = expected(&values, 1, n, k, QuantizationFormat::Q4_K);
+            for simds in [1, 2, 4, 8] {
+                d.set_k_quant_gemv_ksplit(simds).unwrap();
+                let output = d.project_quantized(&x, &weight).unwrap();
+                assert_eq!(output.metrics.operation, "q4_k_gemv_ksplit");
+                for (index, (actual, reference)) in
+                    output.tensor.to_f32().iter().zip(&reference).enumerate()
+                {
+                    assert!(
+                        (actual - reference).abs() <= 1.0e-3 * reference.abs().max(1.0),
+                        "Q4_K K-split {simds} ({n}, {k}) index {index}: actual={actual}, expected={reference}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Steady-state down-projection GEMV bandwidth (896 x 4864, 24 weights).
+    #[test]
+    #[ignore = "microbenchmark; run with --ignored --nocapture"]
+    fn bench_q4_k_gemv_ksplit_bandwidth() {
+        let d = MetalDevice::new().unwrap();
+        for (n, k) in [(896, 4864), (2048, 2048), (8192, 2048)] {
+            let weights: Vec<_> = (0..24)
+                .map(|_| packed(&d, n, k, QuantizationFormat::Q4_K))
+                .collect();
+            let x = Tensor::from_f32(&d, [1, k], DType::BF16, &input(1, k)).unwrap();
+            let bytes = (weights[0].byte_size() * weights.len()) as f64;
+            for simds in [0usize, 2, 4, 8] {
+                d.set_k_quant_gemv_ksplit(simds).unwrap();
+                let mut best = f64::MAX;
+                for _ in 0..7 {
+                    let start = std::time::Instant::now();
+                    let execution = d.execution().unwrap();
+                    let mut last = None;
+                    for _ in 0..8 {
+                        for weight in &weights {
+                            last = Some(d.project_quantized(&x, weight).unwrap().tensor);
+                        }
+                    }
+                    drop(execution);
+                    std::hint::black_box(last.unwrap().to_f32());
+                    best = best.min(start.elapsed().as_secs_f64() / 8.0);
+                }
+                println!(
+                    "Q4_K {n}x{k} simds={simds}: {:.1} us/projection, {:.1} GB/s",
+                    best * 1e6 / weights.len() as f64,
+                    bytes / best / 1e9
+                );
+            }
+        }
+        d.set_k_quant_gemv_ksplit(0).unwrap();
     }
 
     #[test]
@@ -2975,6 +3304,7 @@ mod qk_tests {
     #[test]
     fn q4_k_factored_gemv_matches_reference_across_blocks_and_row_tails() {
         let d = MetalDevice::new().unwrap();
+        d.set_k_quant_gemv_ksplit(0).unwrap();
         assert!(d.use_q4_k_factored(256));
         assert!(!d.use_q4_k_factored(384));
         for (n, k) in [(1, 256), (7, 512), (133, 1024), (130, 2048), (9, 4864)] {
@@ -3637,6 +3967,68 @@ mod q6_k_tests {
     }
 
     #[test]
+    fn q6_k_gemv_ksplit_covers_row_and_block_tails() {
+        let d = MetalDevice::new().unwrap();
+        assert!(d.set_k_quant_gemv_ksplit(3).is_err());
+        // 133 rows leave a partial four-row tile; 10 and 19 super-blocks
+        // leave partial strides for every SIMD group count.
+        for (n, k) in [(133, 2560), (6, 4864)] {
+            let weight = packed(&d, n, k);
+            let values = input(1, k);
+            let x = Tensor::from_f32(&d, [1, k], DType::F32, &values).unwrap();
+            let reference = expected(&values, 1, n, k);
+            for simds in [1, 2, 4, 8] {
+                d.set_k_quant_gemv_ksplit(simds).unwrap();
+                let output = d.project_quantized(&x, &weight).unwrap();
+                assert_eq!(output.metrics.operation, "q6_k_gemv_ksplit");
+                for (index, (actual, reference)) in
+                    output.tensor.to_f32().iter().zip(&reference).enumerate()
+                {
+                    assert!(
+                        (actual - reference).abs() <= 1.0e-3 * reference.abs().max(1.0),
+                        "Q6_K K-split {simds} ({n}, {k}) index {index}: actual={actual}, expected={reference}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Steady-state down-projection GEMV bandwidth (896 x 4864, 24 weights).
+    #[test]
+    #[ignore = "microbenchmark; run with --ignored --nocapture"]
+    fn bench_q6_k_gemv_ksplit_bandwidth() {
+        let d = MetalDevice::new().unwrap();
+        for (n, k) in [(896, 4864), (2048, 2048), (8192, 2048)] {
+            let weights: Vec<_> = (0..24).map(|_| packed(&d, n, k)).collect();
+            let x = Tensor::from_f32(&d, [1, k], DType::BF16, &input(1, k)).unwrap();
+            let bytes = (weights[0].byte_size() * weights.len()) as f64;
+            for simds in [0usize, 2, 4, 8] {
+                d.set_k_quant_gemv_ksplit(simds).unwrap();
+                let mut best = f64::MAX;
+                for _ in 0..7 {
+                    let start = std::time::Instant::now();
+                    let execution = d.execution().unwrap();
+                    let mut last = None;
+                    for _ in 0..8 {
+                        for weight in &weights {
+                            last = Some(d.project_quantized(&x, weight).unwrap().tensor);
+                        }
+                    }
+                    drop(execution);
+                    std::hint::black_box(last.unwrap().to_f32());
+                    best = best.min(start.elapsed().as_secs_f64() / 8.0);
+                }
+                println!(
+                    "Q6_K {n}x{k} simds={simds}: {:.1} us/projection, {:.1} GB/s",
+                    best * 1e6 / weights.len() as f64,
+                    bytes / best / 1e9
+                );
+            }
+        }
+        d.set_k_quant_gemv_ksplit(0).unwrap();
+    }
+
+    #[test]
     fn q6_k_gemv_and_gemm_cover_superblock_and_batch_tails() {
         let d = MetalDevice::new().unwrap();
         let (n, k) = (5, 512);
@@ -3681,6 +4073,7 @@ mod q6_k_tests {
     #[test]
     fn q6_k_factored_gemv_matches_reference_across_blocks_and_row_tails() {
         let d = MetalDevice::new().unwrap();
+        d.set_k_quant_gemv_ksplit(0).unwrap();
         assert!(d.use_q6_k_factored(256));
         assert!(!d.use_q6_k_factored(384));
         for (n, k) in [(1, 256), (7, 512), (133, 1792), (9, 2048)] {

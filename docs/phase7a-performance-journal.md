@@ -2354,3 +2354,90 @@ Qwen2.5 Q4_K_M reaches 0.807x (512) and 0.911x (1,024) llama.cpp prefill. Qwen3 
 | LFM2.5-8B-A1B Q4_K_M | 0.87–1.01x | 0.88x / 0.87x | 0.89x / 0.70x | Meets it |
 | Qwen3 Q8_0 | 0.81–0.86x | 0.84x / 0.98x | 0.66x / 0.62x | Short-context decode is borderline; short/128 prefill below 0.70x |
 | Qwen2.5 Q4_K_M | 0.73–0.79x | 0.81–0.83x / 0.91–0.94x | 0.68x / 0.66x | Decode below 0.85x; short/128 prefill below 0.70x |
+
+## Experiment 70: K-split M=1 GEMVs for Q5_0, Q4_K, and Q6_K (retained)
+
+Status: retained. `set_q5_0_gemv_ksplit` defaults to two SIMD groups, and `set_k_quant_gemv_ksplit` defaults to a cap of eight. Setting either to 0 restores the row-owning kernels.
+
+**Diagnosis.** A Qwen2.5 Q4_K_M decode profile had the Q5_0 projections at 44% of GPU time, lm_head at 24%, and down_proj at 17%. A new steady-state microbenchmark (`bench_q5_0_gemv_bandwidth`, 24 distinct weights back to back in one execution) measured:
+
+| Projection | Bandwidth | Time per projection |
+|---|---:|---:|
+| Q5_0 gate/up (4,864×896) | 98 GB/s | 30 µs |
+| Q5_0 q/o (896×896) | 64 GB/s | 8 µs |
+| Q5_0 k/v (128×896) | 19 GB/s | 4 µs |
+| Q4_K down (896×4,864) | 76 GB/s | 32 µs |
+| Q6_K down (896×4,864) | 93 GB/s | 38 µs |
+
+**Rejected first: planar Q5_0.** Splitting the 22-byte blocks at load time into scale, high-bit, and nibble arrays gives each lane one aligned `uint2` load. It was bit-identical but 2% slower on gate/up, so load instruction count is not the limit.
+
+**Change.** The row-owning kernels give down_proj only 56 threadgroups (16 rows each) and walk its 19 super-blocks in 5 (Q4_K) or 10 (Q6_K) serial passes per SIMD group. The new `q5_0_gemv_ksplit`, `q4_k_gemv_ksplit`, and `q6_k_gemv_ksplit` kernels give each threadgroup four output rows, shared by all its SIMD groups. Each SIMD group takes an interleaved stride of blocks with the same per-lane arithmetic, and the partial sums are reduced through threadgroup memory.
+- **Q5_0** always uses two SIMD groups. Four was slower on gate/up.
+- **Q4_K and Q6_K** use enough SIMD groups to cover the super-blocks in about one pass, rounded up to a power of two and capped at 8. The cap drops to 2 at 4,096 or more output rows, since eight groups slowed the 8,192×2,048 Q4_K shape by 25%.
+
+The count travels to the dispatch in `params[8]`.
+
+Microbenchmark after the change:
+
+| Projection | Before | After | Change |
+|---|---:|---:|---:|
+| Q5_0 gate/up | 30 µs | 30 µs | −4% |
+| Q5_0 q/o | 8.5 µs | 7.4 µs | −13% |
+| Q5_0 k/v | 3.9 µs | 2.8 µs | −25% |
+| Q4_K down | 32 µs | 23.7 µs | −26% |
+| Q6_K down | 38 µs | 30 µs | −21% |
+| Q4_K 2,048×2,048 (LFM-like, 2 groups) | 23.0 µs | 22.8 µs | ≈0 |
+| Q6_K 2,048×2,048 (LFM-like, 4 groups) | 31.5 µs | 28.4 µs | −10% |
+
+Q5_0 K-split outputs are bit-identical to the row-owning kernel on the checked shapes. The Q4_K/Q6_K reduction order changes, so outputs differ at rounding level. Tests `q5_0_gemv_ksplit_covers_row_and_block_tails` and `q4_k/q6_k_gemv_ksplit_covers_row_and_block_tails` cover row tails, partial block strides, and every group count.
+
+**Measurement note.** These pairs ran with `PHASE7A_PREFLIGHT_IGNORE=dasd` (see Experiments 65–69). Ratios against the saved llama.cpp rows are indicative. Raw: `qwen2.5-q4_k_m-gemv-ksplit-ab.jsonl`, `qwen2.5-q6_k-gemv-ksplit-ab.jsonl`, `lfm2.5-8b-a1b-gemv-ksplit-ab.jsonl`. Control and candidate are the same binary; the control sets both K-split options to 0.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_K_M / Short | 937.8->929.7 / 1,406.7 `[0.667->0.661; 0.999]` | 178.8->182.8 / 238.8 `[0.749->0.765; 1.028]` | 153.3->157.8 / 197.5 `[0.776->0.799; 1.029]` | 22.4->22.6 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 4,505.9->4,538.9 / 6,989.8 `[0.645->0.649; 0.991]` | 179.8->191.7 / 230.7 `[0.779->0.831; 1.067]` | 145.4->149.1 / 187.6 `[0.775->0.795; 1.028]` | 28.4->28.2 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 7,432.2->7,412.9 / 9,336.9 `[0.796->0.794; 0.993]` | 172.9->177.0 / 233.5 `[0.740->0.758; 1.017]` | 105.4->106.2 / 133.5 `[0.789->0.796; 1.021]` | 68.9->69.1 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 7,860.0->7,859.3 / 8,844.2 `[0.889->0.889; 0.996]` | 165.3->173.1 / 236.5 `[0.699->0.732; 1.047]` | 74.7->75.9 / 90.0 `[0.831->0.844; 1.010]` | 130.3->130.3 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 968.0->935.8 / 1,385.7 `[0.699->0.675; 0.979]` | 189.0->195.1 / 244.3 `[0.774->0.799; 1.032]` | 183.2->188.5 / 221.8 `[0.826->0.850; 1.029]` | 21.7->22.4 / 15.4 | 0/5; 0/5; 0/5 |
+| Qwen2.5 Q6_K / Short | 924.7->925.6 / 1,478.6 `[0.625->0.626; 1.005]` | 157.3->159.2 / 199.1 `[0.790->0.800; 1.012]` | 138.2->139.9 / 173.9 `[0.794->0.804; 1.012]` | 22.7->22.7 / 14.5 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q6_K / 128-token prompt | 4,535.4->4,536.3 / 7,068.9 `[0.642->0.642; 1.000]` | 156.1->158.8 / 201.8 `[0.773->0.787; 1.018]` | 131.3->133.0 / 168.2 `[0.781->0.791; 1.007]` | 28.2->28.2 / 18.4 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 512-token prompt | 7,485.9->7,520.8 / 9,643.1 `[0.776->0.780; 0.993]` | 151.8->154.6 / 203.2 `[0.747->0.761; 1.017]` | 98.3->98.5 / 125.0 `[0.786->0.788; 0.998]` | 68.4->68.1 / 53.4 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / 1,024-token prompt | 7,927.1->7,957.8 / 9,077.0 `[0.873->0.877; 1.005]` | 146.9->148.9 / 197.2 `[0.745->0.755; 1.009]` | 71.0->71.7 / 86.3 `[0.822->0.831; 1.015]` | 129.2->128.7 / 113.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q6_K / Sustained decode | 963.4->931.5 / 1,451.0 `[0.664->0.642; 0.965]` | 168.0->168.7 / 202.7 `[0.829->0.832; 1.043]` | 162.4->164.4 / 191.2 `[0.849->0.859; 1.027]` | 21.8->22.5 / 14.7 | 0/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / Short | 184.4->185.1 / 215.6 `[0.856->0.859; 0.963]` | 85.1->87.3 / 86.4 `[0.985->1.010; 0.982]` | 68.0->69.6 / 72.5 `[0.939->0.961; 0.957]` | 59.6->59.4 / 51.2 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 1,017.9->1,003.2 / 1,511.1 `[0.674->0.664; 0.986]` | 85.7->84.3 / 98.2 `[0.873->0.858; 1.011]` | 53.8->53.4 / 67.5 `[0.797->0.792; 0.993]` | 125.7->127.6 / 84.9 | 5/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 1,808.0->1,797.2 / 2,108.3 `[0.858->0.852; 1.014]` | 84.7->86.3 / 97.5 `[0.869->0.885; 1.019]` | 35.8->36.0 / 41.2 `[0.869->0.872; 1.019]` | 283.2->284.9 / 243.1 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 1,803.5->1,798.6 / 2,141.5 `[0.842->0.840; 1.006]` | 83.2->85.1 / 96.4 `[0.863->0.883; 1.017]` | 22.3->22.4 / 25.8 `[0.864->0.870; 1.011]` | 567.8->569.3 / 478.4 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 186.7->187.4 / 233.7 `[0.799->0.802; 1.004]` | 86.2->88.2 / 101.2 `[0.852->0.871; 1.015]` | 83.4->86.1 / 95.7 `[0.872->0.900; 1.015]` | 58.9->58.7 / 47.3 | 0/5; 5/5; 0/5 |
+
+**Result.**
+- **Qwen2.5 Q4_K_M decode** rose 1.7–6.7%. Sustained decode went from 189.0 to 195.1 tok/s, which is 0.80x llama.cpp.
+- **Qwen2.5 Q6_K decode** rose 0.9–4.3%.
+- **LFM2.5** is neutral within noise (−1.8% to +2.6%).
+- **Prefill** does not use these kernels. The −3.5% on the Qwen sustained-case prefill is noise: per-pair times overlap completely (21.4–23.6 ms in both variants).
+- **Token IDs.** The changed reduction order diverges the long greedy decode (0/5 sustained ID matches between control and candidate), as expected for rounding-level changes.
+
+## Experiment 71: Fused decode SwiGLU for Q5_0 gate/up (retained)
+
+Status: retained (`fuse_swiglu`, default on). The fusion applies to M=1, bias-free Q5_0 gate and up projections of the same shape, with Q5_0 K-split enabled and not in reference-math mode.
+
+**Change.** `q5_0_gemv_swiglu` computes four gate rows and the matching four up rows per threadgroup from each shared activation fragment, using the K-split structure of Experiment 70. Each projection is rounded to storage exactly as the separate kernels store it, then combined with `silu_mul`'s formula. One kernel replaces two GEMVs and one elementwise kernel, and removes a dependency level.
+
+Outputs are bit-identical:
+- `q5_0_swiglu_matches_separate_kernels_bitwise` covers row tails and every SIMD group count.
+- `tests/fusion_parity.rs` now also toggles this fusion on real Qwen2.5 and Qwen3 GGUFs.
+
+Microbenchmark (`bench_q5_0_swiglu`, 24 layers at 4,864×896): 66.0 -> 53.6 µs per layer.
+
+Raw: `qwen2.5-q4_k_m-fused-swiglu-ab.jsonl` (dasd-exempt preflight; llama.cpp ratios indicative).
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_K_M / Short | 934.5->931.1 / 1,406.7 `[0.664->0.662; 0.996]` | 184.5->193.5 / 238.8 `[0.773->0.810; 1.064]` | 156.9->159.9 / 197.5 `[0.795->0.809; 1.011]` | 22.5->22.6 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 4,439.5->4,478.8 / 6,989.8 `[0.635->0.641; 1.004]` | 185.0->183.5 / 230.7 `[0.802->0.795; 0.975]` | 147.8->148.7 / 187.6 `[0.788->0.793; 1.005]` | 28.8->28.6 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 7,418.6->7,582.6 / 9,336.9 `[0.795->0.812; 1.023]` | 176.5->178.0 / 233.5 `[0.756->0.762; 1.023]` | 106.0->107.5 / 133.5 `[0.794->0.805; 1.015]` | 69.0->67.5 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 7,985.1->7,972.0 / 8,844.2 `[0.903->0.901; 0.989]` | 168.3->170.2 / 236.5 `[0.712->0.720; 1.008]` | 76.2->76.3 / 90.0 `[0.847->0.848; 1.001]` | 128.2->128.4 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 920.3->975.4 / 1,385.7 `[0.664->0.704; 1.058]` | 188.5->201.2 / 244.3 `[0.771->0.823; 1.023]` | 186.9->192.1 / 221.8 `[0.843->0.866; 1.015]` | 22.8->21.5 / 15.4 | 5/5; 0/5; 0/5 |
+
+**Result.** Paired decode ratios were +6.4% (short), −2.5% (128 tokens), +2.3% (512 tokens), +0.8% (1,024 tokens), and +2.3% (sustained). Sustained decode went from 188.5 to 201.2 tok/s (0.82x llama.cpp). The in-situ gain is smaller than the microbenchmark because gate and up already overlapped under concurrent dispatch.

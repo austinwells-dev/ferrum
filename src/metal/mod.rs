@@ -374,6 +374,9 @@ pub struct MetalDevice {
     mlx_affine4_gemv_quad: Cell<bool>,
     split_k_gemv: Cell<bool>,
     q5_0_gemv_n4: Cell<bool>,
+    q5_0_ksplit: Cell<usize>,
+    k_quant_ksplit: Cell<usize>,
+    fuse_swiglu: Cell<bool>,
     q5_1_gemv_n4: Cell<bool>,
     q4_0_gemv_8rows: Cell<bool>,
     q4_k_gemv_8rows: Cell<bool>,
@@ -481,6 +484,9 @@ impl MetalDevice {
             mlx_affine4_gemv_quad: Cell::new(true),
             split_k_gemv: Cell::new(true),
             q5_0_gemv_n4: Cell::new(true),
+            q5_0_ksplit: Cell::new(2),
+            k_quant_ksplit: Cell::new(8),
+            fuse_swiglu: Cell::new(true),
             q5_1_gemv_n4: Cell::new(true),
             q4_0_gemv_8rows: Cell::new(true),
             q4_k_gemv_8rows: Cell::new(true),
@@ -777,6 +783,67 @@ impl MetalDevice {
     }
     pub(crate) fn use_q5_0_gemv_n4(&self, output_rows: usize) -> bool {
         self.q5_0_gemv_n4.get() && output_rows >= 128
+    }
+    /// K-split Q5_0 M=1 GEMV: SIMD groups sharing each four-row tile
+    /// (0 restores the row-owning kernels; 1, 2, 4, or 8 otherwise).
+    pub fn set_q5_0_gemv_ksplit(&self, simds: usize) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change Q5_0 GEMV during execution".into(),
+            ));
+        }
+        if !matches!(simds, 0 | 1 | 2 | 4 | 8) {
+            return Err(Error::Parameter(
+                "Q5_0 K-split SIMD groups must be 0, 1, 2, 4, or 8".into(),
+            ));
+        }
+        self.q5_0_ksplit.set(simds);
+        Ok(())
+    }
+    pub(crate) fn q5_0_ksplit(&self) -> usize {
+        self.q5_0_ksplit.get()
+    }
+    /// K-split factored Q4_K/Q6_K M=1 GEMV: the most SIMD groups that may share
+    /// each four-row tile (0 restores the row-owning kernels; 1, 2, 4, or 8).
+    /// Each projection uses enough groups to cover its super-blocks in about
+    /// one pass, and at most two once there are 4,096 or more output rows.
+    pub fn set_k_quant_gemv_ksplit(&self, simds: usize) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change K-quant GEMV during execution".into(),
+            ));
+        }
+        if !matches!(simds, 0 | 1 | 2 | 4 | 8) {
+            return Err(Error::Parameter(
+                "K-quant K-split SIMD groups must be 0, 1, 2, 4, or 8".into(),
+            ));
+        }
+        self.k_quant_ksplit.set(simds);
+        Ok(())
+    }
+    pub(crate) fn k_quant_gemv_ksplit(&self) -> usize {
+        self.k_quant_ksplit.get()
+    }
+    /// Fuse decode gate/up Q5_0 projections with SiLU-multiply (bit-identical).
+    pub fn set_fuse_swiglu(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change fusion policy during execution".into(),
+            ));
+        }
+        self.fuse_swiglu.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn fuse_swiglu(&self) -> bool {
+        self.fuse_swiglu.get()
+    }
+    /// K-split GEMVs carry their SIMD groups per threadgroup in `params[8]`.
+    fn ksplit_simds(name: &str, params: &[u32; 9]) -> Option<usize> {
+        matches!(
+            name,
+            "q5_0_gemv_ksplit" | "q5_0_gemv_swiglu" | "q4_k_gemv_ksplit" | "q6_k_gemv_ksplit"
+        )
+        .then(|| (params[8] as usize).clamp(1, 8))
     }
     /// Select the four-output-row-per-SIMD Q5_1 M=1 GEMV path.
     pub fn set_q5_1_gemv_n4(&self, enabled: bool) -> Result<()> {
@@ -1619,6 +1686,7 @@ impl MetalDevice {
             | "expert_project_q6_k_grouped" => (5, 1),
             "lfm2_short_conv" => (4, 2),
             "add_rmsnorm" => (3, 2),
+            "q5_0_gemv_swiglu" => (3, 1),
             "rope_split_table_bias" => (3, 1),
             "lfm2_split3" => (1, 3),
             _ => (2, 1),
@@ -1759,6 +1827,8 @@ impl MetalDevice {
             128
         } else if matches!(name, "q5_0_gemv_n4" | "q5_1_gemv_n4") {
             64
+        } else if let Some(simds) = Self::ksplit_simds(name, params) {
+            32 * simds
         } else {
             32
         };
@@ -2113,6 +2183,19 @@ impl MetalDevice {
                     },
                     MTLSize {
                         width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
+            } else if let Some(simds) = Self::ksplit_simds(name, params) {
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0].div_ceil(4),
+                        height: 1,
+                        depth: 1,
+                    },
+                    MTLSize {
+                        width: 32 * simds,
                         height: 1,
                         depth: 1,
                     },

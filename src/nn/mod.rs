@@ -197,6 +197,31 @@ pub struct Mlp {
 }
 impl Mlp {
     pub fn forward(&self, d: &MetalDevice, x: &Tensor) -> Result<Tensor> {
+        if let (
+            MatrixWeight::Quantized(gate),
+            MatrixWeight::Quantized(up),
+            None,
+            None,
+            [.., last],
+        ) = (
+            &self.gate.weight,
+            &self.up.weight,
+            &self.gate.bias,
+            &self.up.bias,
+            x.shape().dimensions(),
+        ) {
+            let flat = x.reshape([x.numel() / last, *last])?;
+            if d.can_fuse_swiglu(&flat, gate, up) {
+                let mut dims = x.shape().dimensions().to_vec();
+                if let Some(last) = dims.last_mut() {
+                    *last = self.gate.output;
+                }
+                let hidden = d.profile_projection("gate_up_proj", || {
+                    d.swiglu_q5_0(&flat, gate, up)?.tensor.reshape(dims)
+                })?;
+                return d.profile_projection("down_proj", || self.down.forward(d, &hidden));
+            }
+        }
         let gate = d.profile_projection("gate_proj", || self.gate.forward(d, x))?;
         let up = d.profile_projection("up_proj", || self.up.forward(d, x))?;
         let hidden = d.silu_mul(&gate, &up)?.tensor;

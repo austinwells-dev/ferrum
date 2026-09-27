@@ -28,6 +28,7 @@ fn check(path: std::ffi::OsString) {
     for fused in [false, true] {
         device.set_fuse_add_rmsnorm(fused).unwrap();
         device.set_fuse_rope_cache(fused).unwrap();
+        device.set_fuse_swiglu(fused).unwrap();
         outputs.push(run(&device, &loaded.model, &prompt));
     }
     assert_eq!(outputs[0].len(), outputs[1].len());

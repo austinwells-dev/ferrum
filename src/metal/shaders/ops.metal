@@ -589,6 +589,96 @@ kernel void q5_0_gemv_n4(ARGS, uint tid [[thread_index_in_threadgroup]], uint gr
         if(first_row+3<uint(p[3])) store(c,first_row+3,p[4],total3);
     }
 }
+// K-split Q5_0 GEMV: every SIMD group of the threadgroup owns the same four
+// output rows and a disjoint stride of blocks, so short-K projections get
+// more threadgroups and shorter per-SIMD dependency chains.
+kernel void q5_0_gemv_ksplit(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]],
+                             uint simds [[simdgroups_per_threadgroup]]) {
+    uint lane=tid%32, simd=tid/32;
+    uint first_row=group*4;
+    uint ix=lane/2, il=(lane%2)*8;
+    uint k=p[2], blocks=k/32;
+    float sum0=0.0f, sum1=0.0f, sum2=0.0f, sum3=0.0f;
+    float y[16];
+    for(uint block=simd*16+ix;block<blocks;block+=16*simds) {
+        uint column=block*32+il;
+        float sumy=0.0f;
+        for(uint i=0;i<8;i+=2) {
+            float y0=load(a,column+i+0,p[4]);
+            float y1=load(a,column+i+1,p[4]);
+            float y16=load(a,column+i+16,p[4]);
+            float y17=load(a,column+i+17,p[4]);
+            sumy+=(y0+y1)+(y16+y17);
+            y[i+0]=y0;
+            y[i+1]=y1/256.0f;
+            y[i+8]=y16/16.0f;
+            y[i+9]=y17/4096.0f;
+        }
+        device const uchar* w=b+first_row*blocks*22+block*22;
+        if(first_row+0<uint(p[3])) sum0+=q5_0_block_dot_y(w,sumy,y,il);
+        if(first_row+1<uint(p[3])) sum1+=q5_0_block_dot_y(w+blocks*22,sumy,y,il);
+        if(first_row+2<uint(p[3])) sum2+=q5_0_block_dot_y(w+2*blocks*22,sumy,y,il);
+        if(first_row+3<uint(p[3])) sum3+=q5_0_block_dot_y(w+3*blocks*22,sumy,y,il);
+    }
+    threadgroup float partial[8][4];
+    float t0=simd_sum(sum0), t1=simd_sum(sum1), t2=simd_sum(sum2), t3=simd_sum(sum3);
+    if(lane==0) { partial[simd][0]=t0; partial[simd][1]=t1; partial[simd][2]=t2; partial[simd][3]=t3; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid<4 && first_row+tid<uint(p[3])) {
+        float total=0.0f;
+        for(uint s=0;s<simds;s++) total+=partial[s][tid];
+        store(c,first_row+tid,p[4],total);
+    }
+}
+// Decode SwiGLU: gate and up rows of one four-row tile share each activation
+// fragment; each projection is rounded to storage exactly as the separate
+// K-split GEMVs store it, then combined with silu_mul's formula.
+kernel void q5_0_gemv_swiglu(device const uchar* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
+                             device const uchar* u [[buffer(2)]], device uchar* c [[buffer(3)]],
+                             constant uint* p [[buffer(4)]],
+                             uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]],
+                             uint simds [[simdgroups_per_threadgroup]]) {
+    uint lane=tid%32, simd=tid/32;
+    uint first_row=group*4, n=p[3];
+    uint ix=lane/2, il=(lane%2)*8;
+    uint k=p[2], blocks=k/32;
+    float g[4]={0.0f,0.0f,0.0f,0.0f}, v[4]={0.0f,0.0f,0.0f,0.0f};
+    float y[16];
+    for(uint block=simd*16+ix;block<blocks;block+=16*simds) {
+        uint column=block*32+il;
+        float sumy=0.0f;
+        for(uint i=0;i<8;i+=2) {
+            float y0=load(a,column+i+0,p[4]);
+            float y1=load(a,column+i+1,p[4]);
+            float y16=load(a,column+i+16,p[4]);
+            float y17=load(a,column+i+17,p[4]);
+            sumy+=(y0+y1)+(y16+y17);
+            y[i+0]=y0;
+            y[i+1]=y1/256.0f;
+            y[i+8]=y16/16.0f;
+            y[i+9]=y17/4096.0f;
+        }
+        ulong offset=ulong(first_row)*blocks*22+block*22;
+        for(uint r=0;r<4;r++) {
+            if(first_row+r<n) {
+                g[r]+=q5_0_block_dot_y(b+offset+r*blocks*22,sumy,y,il);
+                v[r]+=q5_0_block_dot_y(u+offset+r*blocks*22,sumy,y,il);
+            }
+        }
+    }
+    threadgroup float partial[8][8];
+    float totals[8];
+    for(uint r=0;r<4;r++) { totals[r]=simd_sum(g[r]); totals[4+r]=simd_sum(v[r]); }
+    if(lane==0) for(uint r=0;r<8;r++) partial[simd][r]=totals[r];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid<4 && first_row+tid<n) {
+        float gate=0.0f, up=0.0f;
+        for(uint s=0;s<simds;s++) { gate+=partial[s][tid]; up+=partial[s][4+tid]; }
+        float x=round_storage(gate,p[4]);
+        float sigmoid=x>=0?1.f/(1.f+exp(-x)):exp(x)/(1.f+exp(x));
+        store(c,first_row+tid,p[4],round_storage(x*sigmoid,p[4])*round_storage(up,p[4]));
+    }
+}
 inline float q5_1_block_dot_y(device const uchar* block, float sumy,
                               thread const float* y, uint il) {
     float scale=float(*((device const half*)block));
@@ -898,11 +988,12 @@ kernel void q4_k_gemv_8rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint
 template<uint R>
 inline void q4_k_factored_rows(device const uchar* a, uint abase, uint dtype,
                                device const uchar* w, uint first, uint rows,
-                               uint blocks, uint lane, thread float* out) {
+                               uint blocks, uint lane, thread float* out,
+                               uint split=0, uint splits=1) {
     uint ix=lane/8, it=lane%8, iq=it/4, ir=it%4;
     float sums[R];
     for(uint r=0;r<R;r++) sums[r]=0.f;
-    for(uint ib=ix;ib<blocks;ib+=4) {
+    for(uint ib=split*4+ix;ib<blocks;ib+=4*splits) {
         uint y0=abase+ib*256+64*iq+8*ir;
         float yl[16], yh[16];
         float4 sumy=0.f;
@@ -948,6 +1039,27 @@ inline void q4_k_factored_rows(device const uchar* a, uint abase, uint dtype,
     }
     for(uint r=0;r<R;r++) out[r]=simd_sum(sums[r]);
 }
+// Dense M=1 K-split: all SIMD groups of the threadgroup share four output
+// rows and interleave super-blocks, so short outputs (896-row down
+// projections) still fill the GPU.
+#define K_SPLIT_GEMV(NAME, ROWS) \
+kernel void NAME(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]], \
+                 uint simds [[simdgroups_per_threadgroup]]) { \
+    uint lane=tid%32, simd=tid/32, row0=group*4, n=p[3]; \
+    if(row0>=n) return; \
+    uint valid=min(4u,n-row0); \
+    float out[4]; \
+    ROWS<4>(a,0,p[4],b,row0,valid,p[2]/256,lane,out,simd,simds); \
+    threadgroup float partial[8][4]; \
+    if(lane==0) for(uint r=0;r<4;r++) partial[simd][r]=out[r]; \
+    threadgroup_barrier(mem_flags::mem_threadgroup); \
+    if(tid<valid) { \
+        float total=0.0f; \
+        for(uint s=0;s<simds;s++) total+=partial[s][tid]; \
+        store(c,row0+tid,p[4],total); \
+    } \
+}
+K_SPLIT_GEMV(q4_k_gemv_ksplit, q4_k_factored_rows)
 // Dense M=1: four rows per SIMD group, sixteen rows per 128-thread group.
 kernel void q4_k_gemv_factored(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
     uint lane=tid%32, row0=group*16+(tid/32)*4, n=p[3];
@@ -1280,12 +1392,13 @@ kernel void q6_k_gemv_8rows(ARGS, uint tid [[thread_index_in_threadgroup]], uint
 template<uint R>
 inline void q6_k_factored_rows(device const uchar* a, uint abase, uint dtype,
                                device const uchar* w, uint first, uint rows,
-                               uint blocks, uint lane, thread float* out) {
+                               uint blocks, uint lane, thread float* out,
+                               uint split=0, uint splits=1) {
     uint t=lane/2, ix=lane%2, ip=t/8, il=t%8, l0=4*il;
     uint is=8*ip+l0/16, yo=128*ip+l0, qlo=64*ip+l0, qho=128+32*ip+l0;
     float sums[R];
     for(uint r=0;r<R;r++) sums[r]=0.f;
-    for(uint ib=ix;ib<blocks;ib+=2) {
+    for(uint ib=split*2+ix;ib<blocks;ib+=2*splits) {
         uint y0=abase+ib*256+yo;
         float y[16];
         for(uint l=0;l<4;l++) {
@@ -1315,6 +1428,7 @@ inline void q6_k_factored_rows(device const uchar* a, uint abase, uint dtype,
     }
     for(uint r=0;r<R;r++) out[r]=simd_sum(sums[r]);
 }
+K_SPLIT_GEMV(q6_k_gemv_ksplit, q6_k_factored_rows)
 // Dense M=1: four rows per SIMD group, sixteen rows per 128-thread group.
 kernel void q6_k_gemv_factored(ARGS, uint tid [[thread_index_in_threadgroup]], uint group [[threadgroup_position_in_grid]]) {
     uint lane=tid%32, row0=group*16+(tid/32)*4, n=p[3];
