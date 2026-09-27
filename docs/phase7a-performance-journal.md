@@ -2215,3 +2215,142 @@ Retained configuration (variant 4) against the committed baseline. llama.cpp ref
 - Prefill rose 24.5% at the short prompt, 33.1% at 128 tokens, and 5.2–5.3% at 512 and 1,024 tokens. Short first-token latency went from 95.1 to 76.6 ms (llama.cpp: 51.2 ms).
 - 512/1,024-token prefill is now 0.88x / 0.87x llama.cpp, and decode is 0.87–1.01x.
 - Short and 128-token prefill are 0.67x and 0.69x; the remaining gap is GPU work (75 ms for 11 tokens, dominated by per-assignment expert GEMV).
+
+## Experiment 65: Grouped small-batch expert GEMV (retained)
+
+Status: retained (`moe_expert_grouped`, default on). Applies to BF16 activations with Q4_K or Q6_K experts when the batch has at least 16 rows.
+
+**Change.** Short and 128-token LFM2.5 prefill was dominated by per-assignment expert GEMV: each routed (row, expert) pair ran the factored Q4_K/Q6_K kernel separately, so an expert's weight rows were streamed once per assignment. `expert_project_q4_k_grouped` and `expert_project_q6_k_grouped` take the routing ids, per-expert counts, and bases. Each threadgroup owns 16 output rows of one expert and loops over every assignment routed to that expert, calling the same `q*_factored_rows<4>` body. Each weight row is then read once per expert rather than once per assignment. Results are written to the assignment's original slot, and the per-row arithmetic is unchanged, so outputs are bit-identical to the direct kernel (`q4_k_grouped_experts_match_direct_bitwise`, `q6_k_grouped_experts_match_direct_bitwise`).
+
+**Measurement note.** `/usr/libexec/dasd` sat at about 100% of one core for hours during these runs. It is not caused by Ferrum. These pairs ran with `PHASE7A_PREFLIGHT_IGNORE=dasd`, which leaves the per-process and total limits in force for every other process. Control and candidate are interleaved under the same load, so the C->N ratios are valid relative comparisons. The llama.cpp ratios use the saved 1ab7e5a rows, which were measured without that load; treat them as indicative until they are re-measured on a quiet machine.
+
+Raw: `lfm2.5-8b-a1b-grouped-experts-ab.jsonl` and `.run.log`. Control and candidate are the same binary with the toggle off and on.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| LFM2.5-8B-A1B Q4_K_M / Short | 144.8->191.1 / 215.6 `[0.672->0.887; 1.320]` | 89.4->87.2 / 86.4 `[1.035->1.009; 0.971]` | 66.4->70.4 / 72.5 `[0.916->0.972; 1.059]` | 76.0->57.6 / 51.2 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 128-token prompt | 1,054.7->1,051.9 / 1,511.1 `[0.698->0.696; 0.998]` | 87.4->87.4 / 98.2 `[0.890->0.890; 0.998]` | 55.8->55.7 / 67.5 `[0.826->0.826; 0.999]` | 121.4->121.7 / 84.9 | 5/5; 0/5; 0/5 |
+| LFM2.5-8B-A1B Q4_K_M / 512-token prompt | 1,861.6->1,863.2 / 2,108.3 `[0.883->0.884; 1.005]` | 86.5->86.1 / 97.5 `[0.887->0.883; 0.994]` | 36.8->36.8 / 41.2 `[0.891->0.892; 0.999]` | 275.0->274.8 / 243.1 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / 1,024-token prompt | 1,892.5->1,862.6 / 2,141.5 `[0.884->0.870; 0.981]` | 84.8->84.7 / 96.4 `[0.879->0.878; 0.999]` | 23.2->23.1 / 25.8 `[0.902->0.896; 0.996]` | 541.1->549.8 / 478.4 | 5/5; 5/5; 5/5 |
+| LFM2.5-8B-A1B Q4_K_M / Sustained decode | 143.8->195.0 / 233.7 `[0.615->0.834; 1.337]` | 88.7->88.0 / 101.2 `[0.877->0.870; 0.998]` | 85.3->85.7 / 95.7 `[0.891->0.895; 1.009]` | 76.5->56.4 / 47.3 | 5/5; 0/5; 0/5 |
+
+**Result.** Short-prompt prefill rose 32% (144.8 -> 191.1 tok/s; 0.67x -> 0.89x llama.cpp) and first-token latency fell from 76.0 to 57.6 ms (llama.cpp: 51.2 ms). The 128-token prompt and longer prompts already take the TensorOps expert path, so they are unchanged. Decode is unchanged.
+
+## Experiment 66: Residual add fused with the next RMSNorm (rejected as a default)
+
+Status: implemented and bit-identical, but off by default (`fuse_add_rmsnorm`), because it did not move performance.
+
+**Hypothesis.** Qwen decode runs about 15 dependent kernel levels per layer. At roughly 3.6 us per level, that is about 1.3 ms per token. Removing levels should shorten decode.
+
+**Change.** `add_rmsnorm` writes the residual sum and its RMSNorm in one kernel. Pre-norm layers chain the closing add of layer `l` into the input norm of layer `l + 1` (or the final norm), which removes one level per layer. It uses the same storage rounding and reduction order as the separate kernels, so logits are bit-identical (`fused_add_rmsnorm_matches_separate_kernels_bitwise`, and `tests/fusion_parity.rs` on real Qwen2.5 and Qwen3 GGUFs over 300 prefill tokens and 8 decode steps).
+
+**Measurement note.** `/usr/libexec/dasd` sat at about 100% of one core for hours during these runs. It is not caused by Ferrum. These pairs ran with `PHASE7A_PREFLIGHT_IGNORE=dasd`, which leaves the per-process and total limits in force for every other process. Control and candidate are interleaved under the same load, so the C->N ratios are valid relative comparisons. The llama.cpp ratios use the saved 1ab7e5a rows, which were measured without that load; treat them as indicative until they are re-measured on a quiet machine.
+
+Raw: `qwen2.5-q4_k_m-fuse-add-rmsnorm-ab.jsonl`, `qwen3-0.6b-q8_0-fuse-add-rmsnorm-ab.jsonl`.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_K_M / Short | 906.8->914.0 / 1,406.7 `[0.645->0.650; 1.008]` | 173.9->172.8 / 238.8 `[0.728->0.723; 0.998]` | 148.2->147.3 / 197.5 `[0.750->0.746; 1.000]` | 23.2->23.0 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 4,450.8->4,452.2 / 6,989.8 `[0.637->0.637; 0.991]` | 170.4->172.3 / 230.7 `[0.738->0.747; 1.014]` | 139.8->140.2 / 187.6 `[0.745->0.748; 0.999]` | 28.8->28.8 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 7,559.9->7,636.5 / 9,336.9 `[0.810->0.818; 1.023]` | 168.0->167.9 / 233.5 `[0.720->0.719; 0.999]` | 103.0->103.7 / 133.5 `[0.772->0.777; 1.007]` | 67.7->67.0 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 8,163.1->8,145.9 / 8,844.2 `[0.923->0.921; 0.999]` | 161.1->161.9 / 236.5 `[0.681->0.685; 1.004]` | 75.3->75.1 / 90.0 `[0.836->0.834; 1.002]` | 125.4->125.7 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 907.4->919.8 / 1,385.7 `[0.655->0.664; 1.006]` | 177.4->178.5 / 244.3 `[0.726->0.731; 1.006]` | 174.3->174.8 / 221.8 `[0.786->0.788; 1.008]` | 23.1->22.8 / 15.4 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / Short | 828.3->827.0 / 1,258.3 `[0.658->0.657; 0.995]` | 140.4->140.4 / 164.5 `[0.854->0.853; 1.001]` | 122.4->121.9 / 143.8 `[0.851->0.848; 0.996]` | 25.4->25.4 / 17.0 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 3,738.4->3,747.9 / 6,001.2 `[0.623->0.625; 0.995]` | 137.5->137.6 / 163.8 `[0.840->0.840; 0.982]` | 113.9->113.2 / 138.8 `[0.821->0.816; 0.987]` | 34.2->34.2 / 21.6 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / 512-token prompt | 5,942.5->5,997.3 / 7,099.6 `[0.837->0.845; 1.001]` | 128.0->128.2 / 154.9 `[0.826->0.828; 1.002]` | 76.3->77.1 / 95.2 `[0.802->0.810; 1.011]` | 86.2->85.4 / 72.4 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 5,962.1->5,989.7 / 6,283.2 `[0.949->0.953; 1.005]` | 113.8->114.9 / 143.3 `[0.794->0.802; 1.010]` | 52.2->52.6 / 61.1 `[0.855->0.860; 1.004]` | 171.8->171.0 / 163.2 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 833.9->829.7 / 1,241.8 `[0.671->0.668; 1.014]` | 144.1->142.3 / 164.7 `[0.875->0.864; 0.989]` | 141.9->139.7 / 157.4 `[0.902->0.888; 0.990]` | 25.2->25.3 / 17.2 | 5/5; 0/5; 0/5 |
+
+**Result.** Every row is within about ±1.5%. Removing one level per layer is not measurable, so level count alone does not explain the decode gap. The code is kept behind the toggle for later combination with larger fusions.
+
+## Experiment 67: RoPE written directly into KV-cache slots, with the bias folded in (retained)
+
+Status: retained (`fuse_rope_cache`, default on; requires batching and the RoPE table).
+
+**Change.** Previously the K projection was biased, rotated into a transient, then copied into the KV cache; V was biased and then copied. Now:
+- `rope_split_table_bias` adds the projection bias and rotates in one kernel.
+- `KvCache::append_with` hands the kernel the cache slot views, so rotated K lands directly in the cache.
+- V goes through `Linear::forward_unbiased`, and `bias_add_into` writes the biased V straight into its slot.
+
+Q gets the same bias-plus-rotation kernel. Biases fold only when the attention has no per-head q/k norms, since those norms must see the biased projection. The bias add is rounded to storage before the rotation, as in the separate kernels, so outputs are bit-identical (`tests/fusion_parity.rs`).
+
+**Measurement note.** `/usr/libexec/dasd` sat at about 100% of one core for hours during these runs. It is not caused by Ferrum. These pairs ran with `PHASE7A_PREFLIGHT_IGNORE=dasd`, which leaves the per-process and total limits in force for every other process. Control and candidate are interleaved under the same load, so the C->N ratios are valid relative comparisons. The llama.cpp ratios use the saved 1ab7e5a rows, which were measured without that load; treat them as indicative until they are re-measured on a quiet machine.
+
+Raw: `qwen2.5-q4_k_m-fuse-rope-cache-ab.jsonl`, `qwen3-0.6b-q8_0-fuse-rope-cache-ab.jsonl`.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_K_M / Short | 923.5->959.4 / 1,406.7 `[0.657->0.682; 1.030]` | 174.9->187.2 / 238.8 `[0.732->0.784; 1.070]` | 148.5->159.7 / 197.5 `[0.752->0.809; 1.069]` | 22.7->21.9 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 4,427.0->4,635.5 / 6,989.8 `[0.633->0.663; 1.045]` | 171.8->183.5 / 230.7 `[0.744->0.795; 1.067]` | 139.5->148.7 / 187.6 `[0.744->0.793; 1.064]` | 28.9->27.6 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 7,586.8->7,750.5 / 9,336.9 `[0.813->0.830; 1.018]` | 167.9->178.6 / 233.5 `[0.719->0.765; 1.063]` | 103.4->108.2 / 133.5 `[0.775->0.811; 1.044]` | 67.5->66.1 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 8,175.3->8,277.9 / 8,844.2 `[0.924->0.936; 1.003]` | 161.0->171.6 / 236.5 `[0.681->0.726; 1.066]` | 75.2->77.9 / 90.0 `[0.836->0.865; 1.031]` | 125.3->123.7 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 927.9->975.0 / 1,385.7 `[0.670->0.704; 1.043]` | 178.8->190.2 / 244.3 `[0.732->0.779; 1.068]` | 175.1->186.9 / 221.8 `[0.790->0.843; 1.067]` | 22.6->21.5 / 15.4 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / Short | 823.3->833.8 / 1,258.3 `[0.654->0.663; 1.014]` | 141.4->141.9 / 164.5 `[0.859->0.863; 0.999]` | 122.9->123.5 / 143.8 `[0.855->0.859; 1.003]` | 25.5->25.2 / 17.0 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 3,722.4->3,758.8 / 6,001.2 `[0.620->0.626; 1.008]` | 137.9->139.1 / 163.8 `[0.842->0.849; 1.008]` | 113.2->114.2 / 138.8 `[0.816->0.823; 1.006]` | 34.4->34.1 / 21.6 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / 512-token prompt | 5,992.2->5,968.4 / 7,099.6 `[0.844->0.841; 0.986]` | 128.4->129.0 / 154.9 `[0.829->0.833; 1.002]` | 77.1->77.1 / 95.2 `[0.810->0.810; 1.000]` | 85.4->85.8 / 72.4 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 6,057.0->6,250.5 / 6,283.2 `[0.964->0.995; 1.032]` | 114.9->119.8 / 143.3 `[0.802->0.836; 1.042]` | 52.8->54.6 / 61.1 `[0.864->0.894; 1.034]` | 169.1->163.8 / 163.2 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 827.7->816.7 / 1,241.8 `[0.667->0.658; 0.987]` | 144.7->143.0 / 164.7 `[0.879->0.868; 0.988]` | 142.0->140.3 / 157.4 `[0.902->0.892; 0.987]` | 25.4->25.7 / 17.2 | 5/5; 0/5; 0/5 |
+
+**Result.**
+- **Qwen2.5 Q4_K_M:** decode rose 6.3–7.0% at every context (sustained 178.8 -> 190.2 tok/s, 0.73x -> 0.78x). Short and 128-token prefill rose 3–4.5%.
+- **Qwen3:** neutral, as expected. It has no projection biases and per-head q/k norms, so only the cache copy is removed.
+
+Experiment 66 removed a level without a gain, while this change gained. That suggests the win comes from removing the separate bias and copy passes over the projections rather than from shortening the dependency chain.
+
+## Experiment 68: 16-bit loads in the Q5_0 GEMV block dot (retained)
+
+Status: retained.
+
+**Change.** Qwen2.5 Q4_K_M stores some tensors as Q5_0, whose 22-byte blocks are only 2-byte aligned. `q5_0_block_dot_y` read the high-bit word and quant bytes one byte at a time. It now reads them as `ushort` words: `qh = words[1] | words[2] << 16` and one 16-bit load per pair of quant bytes. Arithmetic is unchanged.
+
+**Measurement note.** `/usr/libexec/dasd` sat at about 100% of one core for hours during these runs. It is not caused by Ferrum. These pairs ran with `PHASE7A_PREFLIGHT_IGNORE=dasd`, which leaves the per-process and total limits in force for every other process. Control and candidate are interleaved under the same load, so the C->N ratios are valid relative comparisons. The llama.cpp ratios use the saved 1ab7e5a rows, which were measured without that load; treat them as indicative until they are re-measured on a quiet machine.
+
+Raw: `qwen2.5-q4_k_m-q5_0-word-loads-ab.jsonl`. Control is the previous binary; the candidate differs only in this kernel.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_K_M / Short | 927.5->920.4 / 1,406.7 `[0.659->0.654; 0.999]` | 168.5->175.1 / 238.8 `[0.705->0.733; 1.029]` | 144.7->149.7 / 197.5 `[0.733->0.758; 1.029]` | 22.6->22.8 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 4,440.1->4,386.8 / 6,989.8 `[0.635->0.628; 0.993]` | 165.5->171.4 / 230.7 `[0.717->0.743; 1.036]` | 136.0->139.1 / 187.6 `[0.725->0.742; 1.022]` | 28.8->29.2 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 7,634.3->7,536.1 / 9,336.9 `[0.818->0.807; 0.987]` | 162.3->167.5 / 233.5 `[0.695->0.718; 1.043]` | 101.5->102.6 / 133.5 `[0.761->0.769; 1.014]` | 67.1->67.9 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 8,083.3->8,061.7 / 8,844.2 `[0.914->0.912; 0.998]` | 156.4->161.5 / 236.5 `[0.661->0.683; 1.034]` | 73.6->74.7 / 90.0 `[0.818->0.830; 1.015]` | 126.7->127.0 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 917.0->912.2 / 1,385.7 `[0.662->0.658; 0.987]` | 171.8->177.5 / 244.3 `[0.703->0.727; 1.032]` | 168.9->174.0 / 221.8 `[0.761->0.784; 1.032]` | 22.9->23.0 / 15.4 | 5/5; 0/5; 0/5 |
+
+**Result.** Decode rose 2.9–4.3% at every context, and prefill is unchanged. This is the Q5_0 step the user sequenced after prefill. A full Q5_0 re-layout to 4-byte alignment at load time is the remaining option.
+
+## Experiment 69: Residency set and keep-alive on the Qwen models (retained)
+
+Experiment 64 was measured on LFM2.5. These pairs compare the same candidate binary with `FERRUM_KEEP_ALIVE=0 FERRUM_RESIDENT_WEIGHTS=0` against its defaults.
+
+**Measurement note.** `/usr/libexec/dasd` sat at about 100% of one core for hours during these runs. It is not caused by Ferrum. These pairs ran with `PHASE7A_PREFLIGHT_IGNORE=dasd`, which leaves the per-process and total limits in force for every other process. Control and candidate are interleaved under the same load, so the C->N ratios are valid relative comparisons. The llama.cpp ratios use the saved 1ab7e5a rows, which were measured without that load; treat them as indicative until they are re-measured on a quiet machine.
+
+Raw: `qwen2.5-q4_k_m-residency-keepalive-ab.jsonl`, `qwen3-0.6b-q8_0-residency-keepalive-ab.jsonl`.
+
+| Model / workload | Prefill tok/s C->N / L | Cached decode tok/s C->N / L | Complete generation tok/s C->N / L | First-token ms C->N / L | IDs |
+|---|---:|---:|---:|---:|---:|
+| Qwen2.5 Q4_K_M / Short | 758.9->934.0 / 1,406.7 `[0.540->0.664; 1.231]` | 174.7->172.6 / 238.8 `[0.731->0.723; 0.999]` | 143.0->148.1 / 197.5 `[0.724->0.750; 1.032]` | 27.7->22.5 / 15.2 | 5/5; 0/5; 0/5 |
+| Qwen2.5 Q4_K_M / 128-token prompt | 3,797.2->4,401.8 / 6,989.8 `[0.543->0.630; 1.164]` | 171.2->173.1 / 230.7 `[0.742->0.750; 1.010]` | 134.5->139.5 / 187.6 `[0.717->0.744; 1.038]` | 33.7->29.1 / 18.6 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 512-token prompt | 7,028.1->7,536.0 / 9,336.9 `[0.753->0.807; 1.068]` | 168.1->165.5 / 233.5 `[0.720->0.709; 0.978]` | 100.0->102.4 / 133.5 `[0.749->0.767; 1.024]` | 72.9->67.9 / 55.1 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / 1,024-token prompt | 7,765.1->8,056.0 / 8,844.2 `[0.878->0.911; 1.035]` | 160.8->161.1 / 236.5 `[0.680->0.681; 1.008]` | 72.8->74.7 / 90.0 `[0.809->0.830; 1.027]` | 131.9->127.1 / 116.0 | 5/5; 5/5; 5/5 |
+| Qwen2.5 Q4_K_M / Sustained decode | 765.7->916.7 / 1,385.7 `[0.553->0.662; 1.204]` | 176.9->178.1 / 244.3 `[0.724->0.729; 1.007]` | 172.7->174.8 / 221.8 `[0.779->0.788; 1.011]` | 27.4->22.9 / 15.4 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / Short | 697.1->831.8 / 1,258.3 `[0.554->0.661; 1.200]` | 141.0->140.7 / 164.5 `[0.857->0.855; 0.992]` | 118.4->121.6 / 143.8 `[0.823->0.845; 1.031]` | 30.1->25.2 / 17.0 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 128-token prompt | 3,240.8->3,713.7 / 6,001.2 `[0.540->0.619; 1.154]` | 138.7->138.4 / 163.8 `[0.847->0.845; 0.996]` | 109.9->113.3 / 138.8 `[0.792->0.817; 1.025]` | 39.5->34.5 / 21.6 | 5/5; 0/5; 0/5 |
+| Qwen3 Q8_0 / 512-token prompt | 5,618.2->5,958.7 / 7,099.6 `[0.791->0.839; 1.061]` | 126.7->127.7 / 154.9 `[0.818->0.824; 1.005]` | 74.9->76.5 / 95.2 `[0.787->0.803; 1.020]` | 91.1->85.9 / 72.4 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / 1,024-token prompt | 5,873.6->6,141.6 / 6,283.2 `[0.935->0.977; 1.047]` | 113.8->116.7 / 143.3 `[0.794->0.814; 1.027]` | 51.7->52.5 / 61.1 `[0.846->0.859; 1.015]` | 174.3->166.7 / 163.2 | 5/5; 5/5; 5/5 |
+| Qwen3 Q8_0 / Sustained decode | 703.9->828.3 / 1,241.8 `[0.567->0.667; 1.167]` | 144.3->142.4 / 164.7 `[0.876->0.864; 0.997]` | 140.6->139.6 / 157.4 `[0.894->0.887; 0.998]` | 29.8->25.4 / 17.2 | 5/5; 0/5; 0/5 |
+
+**Result.** Prefill rose as follows, and decode is unchanged:
+
+| Model | Short | 128 tokens | 512 tokens | 1,024 tokens |
+|---|---:|---:|---:|---:|
+| Qwen2.5 | +23% | +16% | +7% | +3.5% |
+| Qwen3 | +20% | +15% | +6% | +5% |
+
+Qwen2.5 Q4_K_M reaches 0.807x (512) and 0.911x (1,024) llama.cpp prefill. Qwen3 reaches 0.839x and 0.977x.
+
+**Gate status after Experiments 65–69** (llama.cpp ratios indicative, see the measurement note):
+
+| Model | Decode | 512 / 1,024 prefill | Short / 128 prefill | Gate |
+|---|---|---|---|---|
+| LFM2.5-8B-A1B Q4_K_M | 0.87–1.01x | 0.88x / 0.87x | 0.89x / 0.70x | Meets it |
+| Qwen3 Q8_0 | 0.81–0.86x | 0.84x / 0.98x | 0.66x / 0.62x | Short-context decode is borderline; short/128 prefill below 0.70x |
+| Qwen2.5 Q4_K_M | 0.73–0.79x | 0.81–0.83x / 0.91–0.94x | 0.68x / 0.66x | Decode below 0.85x; short/128 prefill below 0.70x |

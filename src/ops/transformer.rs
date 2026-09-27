@@ -426,6 +426,75 @@ impl MetalDevice {
         }
         self.run("rope_split", a, None, d, p, [a.numel() / 2, 1])
     }
+    /// Table-driven RoPE into a caller-provided tensor (for example a KV-cache
+    /// slot), optionally folding a projection bias in first. Bit-identical to
+    /// `bias_add` followed by `rope_split` and a copy into `out`.
+    pub(crate) fn rope_split_into(
+        &self,
+        a: &Tensor,
+        bias: Option<&Tensor>,
+        offset: usize,
+        theta: f32,
+        out: &Tensor,
+    ) -> Result<()> {
+        let d = a.shape().dimensions();
+        if d.len() != 3 || d[2] == 0 || !d[2].is_multiple_of(2) || out.shape() != a.shape() {
+            return Err(Error::Parameter(
+                "RoPE destination must match [S,H,even D]".into(),
+            ));
+        }
+        if out.dtype() != a.dtype()
+            || bias
+                .is_some_and(|b| b.dtype() != a.dtype() || b.shape().dimensions() != [d[1] * d[2]])
+        {
+            return Err(Error::DType);
+        }
+        let table = self.rope_table(a, offset, d[0], d[2], theta)?;
+        let mut p = [0; 9];
+        p[0] = index(a.numel())?;
+        p[1] = index(d[1])?;
+        p[4] = a.dtype() as u32;
+        p[5] = index(offset)?;
+        p[6] = index(d[2])?;
+        p[8] = theta.to_bits();
+        match bias {
+            Some(bias) => self.dispatch(
+                "rope_split_table_bias",
+                &[a.binding(), table.binding(), bias.binding(), out.binding()],
+                &p,
+                [a.numel() / 2, 1],
+                false,
+            )?,
+            None => self.dispatch(
+                "rope_split_table",
+                &[a.binding(), table.binding(), out.binding()],
+                &p,
+                [a.numel() / 2, 1],
+                false,
+            )?,
+        };
+        Ok(())
+    }
+    /// `bias_add` writing into a caller-provided tensor (a KV-cache slot).
+    pub(crate) fn bias_add_into(&self, a: &Tensor, bias: &Tensor, out: &Tensor) -> Result<()> {
+        let w = width(a)?;
+        if bias.shape().dimensions() != [w] || out.numel() != a.numel() || out.dtype() != a.dtype()
+        {
+            return Err(Error::Shape("bias must match last dimension".into()));
+        }
+        let mut p = [0; 9];
+        p[0] = index(a.numel())?;
+        p[1] = index(w)?;
+        p[4] = a.dtype() as u32;
+        self.dispatch(
+            "bias_add",
+            &[a.binding(), bias.binding(), out.binding()],
+            &p,
+            [a.numel(), 1],
+            false,
+        )?;
+        Ok(())
+    }
     /// Cos/sin table for positions `offset..offset+rows`, built once per
     /// execution and shared by every q/k rotation with the same geometry.
     fn rope_table(
@@ -1021,6 +1090,53 @@ mod fusion_tests {
             values[299] = f32::INFINITY;
             let logits = Tensor::from_f32(&d, [1, 300], dtype, &values).unwrap();
             assert_eq!(d.argmax_rows(&logits).unwrap().to_f32()[1].to_bits(), 1);
+        }
+    }
+    #[test]
+    fn fused_add_rmsnorm_matches_separate_kernels_bitwise() {
+        let d = MetalDevice::new().unwrap();
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        for dtype in [DType::F32, DType::F16, DType::BF16] {
+            for (rows, width) in [(1, 896), (37, 2048), (5, 64), (3, 1000)] {
+                let n = rows * width;
+                let a = Tensor::from_f32(
+                    &d,
+                    [rows, width],
+                    dtype,
+                    &crate::reference::deterministic(n),
+                )
+                .unwrap();
+                let b = Tensor::from_f32(
+                    &d,
+                    [rows, width],
+                    dtype,
+                    &crate::reference::deterministic(n + 11)[11..],
+                )
+                .unwrap();
+                let w = Tensor::from_f32(
+                    &d,
+                    [width],
+                    dtype,
+                    &crate::reference::deterministic(width + 3)[3..]
+                        .iter()
+                        .map(|v| 1. + v)
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+                let residual = d.add(&a, &b).unwrap().tensor;
+                let normed = d.rmsnorm(&residual, &w, 1e-6).unwrap().tensor;
+                let (fused_residual, fused_normed) = d.add_rmsnorm(&a, &b, &w, 1e-6).unwrap();
+                assert_eq!(
+                    bits(&fused_residual),
+                    bits(&residual),
+                    "{dtype:?} {rows}x{width}"
+                );
+                assert_eq!(
+                    bits(&fused_normed),
+                    bits(&normed),
+                    "{dtype:?} {rows}x{width}"
+                );
+            }
         }
     }
     #[test]
@@ -3077,6 +3193,52 @@ mod qk_tests {
     }
 
     #[test]
+    fn q4_k_grouped_experts_match_direct_bitwise() {
+        let d = MetalDevice::new().unwrap();
+        d.set_moe_expert_tensorops(false).unwrap();
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let (experts, rows_per_expert, columns) = (5, 133, 768);
+        let weight = QuantizedExpertMatrix::new(
+            packed(
+                &d,
+                experts * rows_per_expert,
+                columns,
+                QuantizationFormat::Q4_K,
+            ),
+            experts,
+            rows_per_expert,
+        )
+        .unwrap();
+        for assignments in [16, 44, 97] {
+            let expert_ids = (0..assignments)
+                .map(|a| if a % 7 == 0 { 4 } else { a % 3 })
+                .collect::<Vec<_>>();
+            let x = Tensor::from_f32(
+                &d,
+                [assignments, columns],
+                DType::BF16,
+                &input(assignments, columns),
+            )
+            .unwrap();
+            let metadata = expert_ids
+                .iter()
+                .enumerate()
+                .flat_map(|(a, &e)| [f32::from_bits(e as u32), f32::from_bits(a as u32), 1.0])
+                .collect::<Vec<_>>();
+            let metadata = Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata).unwrap();
+            d.set_moe_expert_grouped(false).unwrap();
+            let direct = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            d.set_moe_expert_grouped(true).unwrap();
+            let grouped = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            assert_eq!(bits(&grouped), bits(&direct), "assignments={assignments}");
+        }
+    }
+
+    #[test]
     fn q4_k_tensorops_fast_dequant_is_bit_identical() {
         let d = MetalDevice::new().unwrap();
         if !d.mpp_projection() {
@@ -3670,6 +3832,47 @@ mod q6_k_tests {
         };
         let weight = packed(&d, 517, 768);
         check(&weight, 600, 768, "q6_k_gemm_mpp");
+    }
+
+    #[test]
+    fn q6_k_grouped_experts_match_direct_bitwise() {
+        let d = MetalDevice::new().unwrap();
+        d.set_moe_expert_tensorops(false).unwrap();
+        let bits = |t: &Tensor| t.to_f32().iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+        let (experts, rows_per_expert, columns) = (5, 133, 768);
+        let weight = QuantizedExpertMatrix::new(
+            packed(&d, experts * rows_per_expert, columns),
+            experts,
+            rows_per_expert,
+        )
+        .unwrap();
+        for assignments in [16, 44, 97] {
+            let expert_ids = (0..assignments)
+                .map(|a| if a % 7 == 0 { 4 } else { a % 3 })
+                .collect::<Vec<_>>();
+            let x = Tensor::from_f32(
+                &d,
+                [assignments, columns],
+                DType::BF16,
+                &input(assignments, columns),
+            )
+            .unwrap();
+            let metadata = expert_ids
+                .iter()
+                .enumerate()
+                .flat_map(|(a, &e)| [f32::from_bits(e as u32), f32::from_bits(a as u32), 1.0])
+                .collect::<Vec<_>>();
+            let metadata = Tensor::from_f32(&d, [assignments, 3], DType::F32, &metadata).unwrap();
+            d.set_moe_expert_grouped(false).unwrap();
+            let direct = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            d.set_moe_expert_grouped(true).unwrap();
+            let grouped = d
+                .expert_project_quantized(&x, &metadata, &weight, columns, experts)
+                .unwrap();
+            assert_eq!(bits(&grouped), bits(&direct), "assignments={assignments}");
+        }
     }
 
     #[test]

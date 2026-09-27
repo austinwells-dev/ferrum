@@ -215,12 +215,6 @@ impl KvCache {
         Ok(offset)
     }
     pub fn append(&mut self, d: &MetalDevice, layer: usize, k: &Tensor, v: &Tensor) -> Result<()> {
-        if self.kinds.get(layer) != Some(&CacheLayerKind::KeyValue) {
-            return Err(Error::Cache(
-                "K/V append targets a non-attention layer".into(),
-            ));
-        }
-        let offset = self.layer_len(layer)?;
         let dims = k.shape().dimensions();
         if dims.len() != 3 || dims[1..] != [self.heads, self.dim] || k.shape() != v.shape() {
             return Err(Error::Cache(
@@ -233,6 +227,28 @@ impl KvCache {
         if !d.owns(k.buffer()) || !d.owns(v.buffer()) {
             return Err(Error::DeviceMismatch);
         }
+        self.append_with(d, layer, dims[0], |k_slot, v_slot| {
+            d.write_kv(k, k_slot)?;
+            d.write_kv(v, v_slot)
+        })
+    }
+    /// Reserve `rows` new K/V rows and let `write` fill the two `[rows, KV
+    /// heads, head dim]` slots directly (for example RoPE writing rotated K).
+    /// The slots are unpublished until `write` succeeds.
+    pub(crate) fn append_with(
+        &mut self,
+        d: &MetalDevice,
+        layer: usize,
+        rows: usize,
+        write: impl FnOnce(&Tensor, &Tensor) -> Result<()>,
+    ) -> Result<()> {
+        if self.kinds.get(layer) != Some(&CacheLayerKind::KeyValue) {
+            return Err(Error::Cache(
+                "K/V append targets a non-attention layer".into(),
+            ));
+        }
+        let offset = self.layer_len(layer)?;
+        let dims = [rows, self.heads, self.dim];
         if offset
             .checked_add(dims[0])
             .is_none_or(|n| n > self.capacity)
@@ -277,8 +293,10 @@ impl KvCache {
         // Reserve before any fallible dispatch; failures can never authorize reuse
         // of a range that an already encoded command might still write.
         entry.reserved.set(end);
-        d.write_kv(k, &entry.storage.0.view(offset * row, dims)?)?;
-        d.write_kv(v, &entry.storage.1.view(offset * row, dims)?)?;
+        write(
+            &entry.storage.0.view(offset * row, dims)?,
+            &entry.storage.1.view(offset * row, dims)?,
+        )?;
         self.layers[layer] = Some(LayerCache {
             active: (
                 entry.storage.0.view(0, [end, self.heads, self.dim])?,

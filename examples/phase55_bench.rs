@@ -648,6 +648,51 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
             ));
         }
     };
+    let moe_expert_grouped = match request.get("moe_expert_grouped") {
+        None | Some(Value::Null) => {
+            device.set_moe_expert_grouped(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_moe_expert_grouped(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field moe_expert_grouped must be a boolean".into(),
+            ));
+        }
+    };
+    let fuse_add_rmsnorm = match request.get("fuse_add_rmsnorm") {
+        None | Some(Value::Null) => {
+            device.set_fuse_add_rmsnorm(false)?;
+            false
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_fuse_add_rmsnorm(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field fuse_add_rmsnorm must be a boolean".into(),
+            ));
+        }
+    };
+    let fuse_rope_cache = match request.get("fuse_rope_cache") {
+        None | Some(Value::Null) => {
+            device.set_fuse_rope_cache(true)?;
+            true
+        }
+        Some(Value::Bool(enabled)) => {
+            device.set_fuse_rope_cache(*enabled)?;
+            *enabled
+        }
+        Some(_) => {
+            return Err(Error::Parameter(
+                "request field fuse_rope_cache must be a boolean".into(),
+            ));
+        }
+    };
     let expert_tensorops = match request.get("moe_expert_tensorops") {
         None | Some(Value::Null) => device.moe_expert_tensorops_enabled(),
         Some(Value::Bool(enabled)) => {
@@ -761,6 +806,9 @@ fn handle(device: &MetalDevice, model: &BenchModel, request: &Value) -> Result<V
         "mpp_fast_dequant": mpp_fast_dequant,
         "dense_mpp_tile_pairs": dense_mpp_tile_pairs,
         "rope_table": rope_table,
+        "fuse_add_rmsnorm": fuse_add_rmsnorm,
+        "fuse_rope_cache": fuse_rope_cache,
+        "moe_expert_grouped": moe_expert_grouped,
         "resident_weights": device.resident_weights(),
         "keep_alive": std::env::var("FERRUM_KEEP_ALIVE").as_deref() != Ok("0"),
         "arena_epoch_reuse": arena_epoch_reuse,

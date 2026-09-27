@@ -96,6 +96,31 @@ kernel void rmsnorm(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[t
     for(uint j=tid;j<w;j+=256) store(c,base+j,p[4],load(a,base+j,p[4])*inv*load(b,j,p[4]));
 
 }
+// Residual add fused with the following RMSNorm. Writes the storage-rounded
+// sum (exactly `add`) and normalizes it with rmsnorm's partition and
+// reduction order, so both outputs are bit-identical to the two kernels.
+kernel void add_rmsnorm(device const uchar* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
+                        device const uchar* weight [[buffer(2)]], device uchar* residual [[buffer(3)]],
+                        device uchar* c [[buffer(4)]], constant uint* p [[buffer(5)]],
+                        uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
+    threadgroup float partial[8];
+    uint w=p[1], base=row*w, lane=tid%32, simd=tid/32;
+    float sum=0;
+    for(uint j=tid;j<w;j+=256) {
+        float x=round_storage(load(a,base+j,p[4])+load(b,base+j,p[4]),p[4]);
+        store(residual,base+j,p[4],x);
+        sum+=x*x;
+    }
+    sum=simd_sum(sum);
+    if(lane==0) partial[simd]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sum=simd_sum(lane<8?partial[lane]:0.f);
+    float inv=rsqrt(sum/float(w)+as_type<float>(p[7]));
+    for(uint j=tid;j<w;j+=256) {
+        float x=round_storage(load(a,base+j,p[4])+load(b,base+j,p[4]),p[4]);
+        store(c,base+j,p[4],x*inv*load(weight,j,p[4]));
+    }
+}
 kernel void softmax(ARGS, uint tid [[thread_index_in_threadgroup]], uint row [[threadgroup_position_in_grid]]) {
     threadgroup float partial[8];
     uint w=p[1], base=row*w, lane=tid%32, simd=tid/32;
@@ -263,6 +288,18 @@ kernel void rope_split_table(ARGS, uint pair [[thread_position_in_grid]]) {
     uint i=head*p[6]+j, t=(head/p[1])*halfdim+j;
     float co=((device const float*)b)[2*t], si=((device const float*)b)[2*t+1];
     float x=load(a,i,p[4]), y=load(a,i+halfdim,p[4]);
+    store(c,i,p[4],x*co-y*si); store(c,i+halfdim,p[4],x*si+y*co);
+}
+// Table-driven RoPE with the projection bias folded in: each input element is
+// round(x + bias) exactly as `bias_add` stores it, then rotated.
+kernel void rope_split_table_bias(device const uchar* a [[buffer(0)]], device const uchar* b [[buffer(1)]],
+                                  device const uchar* bias [[buffer(2)]], device uchar* c [[buffer(3)]],
+                                  constant uint* p [[buffer(4)]], uint pair [[thread_position_in_grid]]) {
+    uint halfdim=p[6]/2, head=pair/halfdim, j=pair%halfdim;
+    uint i=head*p[6]+j, t=(head/p[1])*halfdim+j, row=p[1]*p[6];
+    float co=((device const float*)b)[2*t], si=((device const float*)b)[2*t+1];
+    float x=round_storage(load(a,i,p[4])+load(bias,i%row,p[4]),p[4]);
+    float y=round_storage(load(a,i+halfdim,p[4])+load(bias,(i+halfdim)%row,p[4]),p[4]);
     store(c,i,p[4],x*co-y*si); store(c,i+halfdim,p[4],x*si+y*co);
 }
 kernel void rope_split(ARGS, uint pair [[thread_position_in_grid]]) {
@@ -483,12 +520,14 @@ kernel void q5_0_gemv(ARGS, uint tid [[thread_index_in_threadgroup]], uint group
 }
 inline float q5_0_block_dot_y(device const uchar* block, float sumy,
                               thread const float* y, uint il) {
+    // Blocks start at even offsets (22-byte stride) and il, i are even, so the
+    // high-bit word and nibble pairs load as aligned 16-bit values.
+    device const ushort* words=(device const ushort*)block;
     float scale=float(*((device const half*)block));
-    uint qh=uint(block[2]) | (uint(block[3])<<8) | (uint(block[4])<<16) | (uint(block[5])<<24);
+    uint qh=uint(words[1]) | (uint(words[2])<<16);
     float acc0=0.0f, acc1=0.0f, acc2=0.0f, acc3=0.0f;
     for(uint i=0;i<8;i+=2) {
-        uint qs_index=6+il+i;
-        uint qs=uint(block[qs_index]) | (uint(block[qs_index+1])<<8);
+        uint qs=uint(words[(6+il+i)/2]);
         uint q0=(qs&0x000f) | (((qh>>(i+il))&1)<<4);
         uint q1=(qs&0x0f00) | (((qh>>(i+1+il))&1)<<12);
         uint q2=(qs&0x00f0) | (((qh>>(i+il+16))&1)<<8);
@@ -917,6 +956,22 @@ kernel void q4_k_gemv_factored(ARGS, uint tid [[thread_index_in_threadgroup]], u
     q4_k_factored_rows<4>(a,0,p[4],b,row0,min(4u,n-row0),p[2]/256,lane,out);
     if(lane==0) for(uint r=0;r<min(4u,n-row0);r++) store(c,row0+r,p[4],out[r]);
 }
+// Expert-grouped small batches: one threadgroup owns a 16-row block of one
+// expert and walks that expert's routed rows (compacted expert-major by the
+// TensorOps pre-pass), so repeated weight reads hit cache instead of DRAM.
+// Per-row arithmetic is the factored kernel's, so results are bit-identical.
+#define EXPERT_GROUPED_ARGS device const uchar* a [[buffer(0)]], device const uchar* b [[buffer(1)]], device const uint* ids [[buffer(2)]], device const uint* counts [[buffer(3)]], device const uint* bases [[buffer(4)]], device uchar* c [[buffer(5)]], constant uint* p [[buffer(6)]]
+kernel void expert_project_q4_k_grouped(EXPERT_GROUPED_ARGS, uint tid [[thread_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+    uint expert=group.z, lane=tid%32, row0=group.x*16+(tid/32)*4;
+    uint k=p[2], rows=p[3];
+    if(expert>=p[5] || row0>=rows) return;
+    uint count=counts[expert], base=bases[expert], valid=min(4u,rows-row0);
+    for(uint r=0;r<count;r++) {
+        float out[4];
+        q4_k_factored_rows<4>(a,(base+r)*k,2,b,expert*rows+row0,valid,k/256,lane,out);
+        if(lane==0) for(uint v=0;v<valid;v++) store(c,ids[base+r]*rows+row0+v,2,out[v]);
+    }
+}
 // Sparse experts: four rows per SIMD group, sixteen rows per 128-thread group.
 kernel void expert_project_q4_k_factored(EXPERT_PROJECT_ARGS,
                                          uint tid [[thread_index_in_threadgroup]],
@@ -1267,6 +1322,17 @@ kernel void q6_k_gemv_factored(ARGS, uint tid [[thread_index_in_threadgroup]], u
     float out[4];
     q6_k_factored_rows<4>(a,0,p[4],b,row0,min(4u,n-row0),p[2]/256,lane,out);
     if(lane==0) for(uint r=0;r<min(4u,n-row0);r++) store(c,row0+r,p[4],out[r]);
+}
+kernel void expert_project_q6_k_grouped(EXPERT_GROUPED_ARGS, uint tid [[thread_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+    uint expert=group.z, lane=tid%32, row0=group.x*16+(tid/32)*4;
+    uint k=p[2], rows=p[3];
+    if(expert>=p[5] || row0>=rows) return;
+    uint count=counts[expert], base=bases[expert], valid=min(4u,rows-row0);
+    for(uint r=0;r<count;r++) {
+        float out[4];
+        q6_k_factored_rows<4>(a,(base+r)*k,2,b,expert*rows+row0,valid,k/256,lane,out);
+        if(lane==0) for(uint v=0;v<valid;v++) store(c,ids[base+r]*rows+row0+v,2,out[v]);
+    }
 }
 // Sparse experts: four rows per SIMD group, sixteen rows per 128-thread group.
 kernel void expert_project_q6_k_factored(EXPERT_PROJECT_ARGS,

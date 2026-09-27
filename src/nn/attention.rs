@@ -43,38 +43,93 @@ impl Attention {
             return Err(Error::Shape("attention needs [S,hidden]".into()));
         }
         let offset = cache.layer_len(layer)?;
-        let mut q = d.profile_projection("q_proj", || self.q.forward(d, x))?;
-        let mut k = d.profile_projection("k_proj", || self.k.forward(d, x))?;
-        if self.qk_norm_layout == QkNormLayout::Projection {
-            if let Some(norm) = &self.q_norm {
-                q = norm.forward(d, &q)?;
-            }
-            if let Some(norm) = &self.k_norm {
-                k = norm.forward(d, &k)?;
-            }
-        }
-        let mut q = q.reshape([s, self.q_heads, self.head_dim])?;
-        let mut k = k.reshape([s, self.kv_heads, self.head_dim])?;
-        let v = d
-            .profile_projection("v_proj", || self.v.forward(d, x))?
-            .reshape([s, self.kv_heads, self.head_dim])?;
-        if self.qk_norm_layout == QkNormLayout::PerHead {
-            if let Some(norm) = &self.q_norm {
-                q = norm.forward(d, &q)?;
-            }
-            if let Some(norm) = &self.k_norm {
-                k = norm.forward(d, &k)?;
-            }
-        }
         let prefix = format!("layer.{layer}");
-        for (name, t) in [("q", &q), ("k", &k), ("v", &v)] {
-            record(&mut trace, format!("{prefix}.{name}"), t);
-        }
-        let q = d.rope_split(&q, offset, self.theta)?.tensor;
-        let k = d.rope_split(&k, offset, self.theta)?.tensor;
-        record(&mut trace, format!("{prefix}.rope_q"), &q);
-        record(&mut trace, format!("{prefix}.rope_k"), &k);
-        cache.append(d, layer, &k, &v)?;
+        // Fused path: RoPE writes K straight into its cache slot and V lands in
+        // its slot directly; projection biases fold into those kernels when no
+        // q/k norm sits in between. Bit-identical to the unfused sequence.
+        let fused = trace.is_none() && !d.reference_math() && d.fuse_rope_cache();
+        let q = if fused {
+            let fold = self.q_norm.is_none() && self.k_norm.is_none();
+            let project = |linear: &crate::nn::Linear, name: &'static str| {
+                d.profile_projection(name, || {
+                    if fold {
+                        linear.forward_unbiased(d, x)
+                    } else {
+                        linear.forward(d, x)
+                    }
+                })
+            };
+            let (q_bias, k_bias) = if fold {
+                (self.q.bias(), self.k.bias())
+            } else {
+                (None, None)
+            };
+            let mut q = project(&self.q, "q_proj")?;
+            let mut k = project(&self.k, "k_proj")?;
+            if self.qk_norm_layout == QkNormLayout::Projection {
+                if let Some(norm) = &self.q_norm {
+                    q = norm.forward(d, &q)?;
+                }
+                if let Some(norm) = &self.k_norm {
+                    k = norm.forward(d, &k)?;
+                }
+            }
+            let mut q = q.reshape([s, self.q_heads, self.head_dim])?;
+            let mut k = k.reshape([s, self.kv_heads, self.head_dim])?;
+            let v = d.profile_projection("v_proj", || self.v.forward_unbiased(d, x))?;
+            if self.qk_norm_layout == QkNormLayout::PerHead {
+                if let Some(norm) = &self.q_norm {
+                    q = norm.forward(d, &q)?;
+                }
+                if let Some(norm) = &self.k_norm {
+                    k = norm.forward(d, &k)?;
+                }
+            }
+            let rotated_q = crate::Tensor::output(d, q.shape().dimensions(), q.dtype())?;
+            d.rope_split_into(&q, q_bias, offset, self.theta, &rotated_q)?;
+            cache.append_with(d, layer, s, |k_slot, v_slot| {
+                d.rope_split_into(&k, k_bias, offset, self.theta, k_slot)?;
+                match self.v.bias() {
+                    Some(bias) => d.bias_add_into(&v, bias, v_slot),
+                    None => d.write_kv(&v, v_slot),
+                }
+            })?;
+            rotated_q
+        } else {
+            let offset = cache.layer_len(layer)?;
+            let mut q = d.profile_projection("q_proj", || self.q.forward(d, x))?;
+            let mut k = d.profile_projection("k_proj", || self.k.forward(d, x))?;
+            if self.qk_norm_layout == QkNormLayout::Projection {
+                if let Some(norm) = &self.q_norm {
+                    q = norm.forward(d, &q)?;
+                }
+                if let Some(norm) = &self.k_norm {
+                    k = norm.forward(d, &k)?;
+                }
+            }
+            let mut q = q.reshape([s, self.q_heads, self.head_dim])?;
+            let mut k = k.reshape([s, self.kv_heads, self.head_dim])?;
+            let v = d
+                .profile_projection("v_proj", || self.v.forward(d, x))?
+                .reshape([s, self.kv_heads, self.head_dim])?;
+            if self.qk_norm_layout == QkNormLayout::PerHead {
+                if let Some(norm) = &self.q_norm {
+                    q = norm.forward(d, &q)?;
+                }
+                if let Some(norm) = &self.k_norm {
+                    k = norm.forward(d, &k)?;
+                }
+            }
+            for (name, t) in [("q", &q), ("k", &k), ("v", &v)] {
+                record(&mut trace, format!("{prefix}.{name}"), t);
+            }
+            let q = d.rope_split(&q, offset, self.theta)?.tensor;
+            let k = d.rope_split(&k, offset, self.theta)?.tensor;
+            record(&mut trace, format!("{prefix}.rope_q"), &q);
+            record(&mut trace, format!("{prefix}.rope_k"), &k);
+            cache.append(d, layer, &k, &v)?;
+            q
+        };
         let (k, v) = cache
             .active(layer)?
             .ok_or_else(|| Error::Cache("missing active K/V".into()))?;

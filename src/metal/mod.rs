@@ -383,6 +383,9 @@ pub struct MetalDevice {
     dense_mpp_tile_pairs: Cell<bool>,
     rope_table: Cell<bool>,
     arena_epoch_reuse: Cell<bool>,
+    moe_expert_grouped: Cell<bool>,
+    fuse_add_rmsnorm: Cell<bool>,
+    fuse_rope_cache: Cell<bool>,
     resident_weights: Cell<bool>,
     keep_alive: RefCell<Option<KeepAlive>>,
     residency: Option<Retained<ProtocolObject<dyn MTLResidencySet>>>,
@@ -487,6 +490,9 @@ impl MetalDevice {
             dense_mpp_tile_pairs: Cell::new(true),
             rope_table: Cell::new(true),
             arena_epoch_reuse: Cell::new(true),
+            moe_expert_grouped: Cell::new(true),
+            fuse_add_rmsnorm: Cell::new(false),
+            fuse_rope_cache: Cell::new(true),
             resident_weights: Cell::new(true),
             keep_alive: RefCell::new(None),
             residency,
@@ -884,6 +890,47 @@ impl MetalDevice {
             buffer.resident = Some(set.clone());
         }
         Ok(buffer)
+    }
+    /// Write rotated K (and V, with folded biases) straight into KV-cache slots.
+    /// Active only inside a batched execution with the RoPE table enabled.
+    pub fn set_fuse_rope_cache(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change fusion policy during execution".into(),
+            ));
+        }
+        self.fuse_rope_cache.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn fuse_rope_cache(&self) -> bool {
+        self.fuse_rope_cache.get() && self.batching.get() && self.rope_table.get()
+    }
+    /// Fuse each residual add with the RMSNorm that consumes it. Off by default:
+    /// bit-identical but performance-neutral on Qwen2.5 and Qwen3 (Experiment 66).
+    pub fn set_fuse_add_rmsnorm(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change fusion policy during execution".into(),
+            ));
+        }
+        self.fuse_add_rmsnorm.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn fuse_add_rmsnorm(&self) -> bool {
+        self.fuse_add_rmsnorm.get()
+    }
+    /// Group small-batch quantized expert projections by expert.
+    pub fn set_moe_expert_grouped(&self, enabled: bool) -> Result<()> {
+        if self.batching.get() {
+            return Err(Error::Parameter(
+                "cannot change expert grouping during execution".into(),
+            ));
+        }
+        self.moe_expert_grouped.set(enabled);
+        Ok(())
+    }
+    pub(crate) fn moe_expert_grouped(&self) -> bool {
+        self.moe_expert_grouped.get()
     }
     /// Recycle transient storage retired earlier in the current encoding epoch.
     pub fn set_arena_epoch_reuse(&self, enabled: bool) -> Result<()> {
@@ -1567,8 +1614,12 @@ impl MetalDevice {
             | "expert_project_q5_k_mpp"
             | "expert_project_q6_k_mpp"
             | "expert_project_q4_k_mpp_k64"
-            | "expert_project_q6_k_mpp_k64" => (5, 1),
+            | "expert_project_q6_k_mpp_k64"
+            | "expert_project_q4_k_grouped"
+            | "expert_project_q6_k_grouped" => (5, 1),
             "lfm2_short_conv" => (4, 2),
+            "add_rmsnorm" => (3, 2),
+            "rope_split_table_bias" => (3, 1),
             "lfm2_split3" => (1, 3),
             _ => (2, 1),
         };
@@ -1636,6 +1687,7 @@ impl MetalDevice {
             || matches!(
                 name,
                 "rmsnorm"
+                    | "add_rmsnorm"
                     | "softmax"
                     | "attention_softmax"
                     | "attention_softmax_prefix"
@@ -1935,6 +1987,28 @@ impl MetalDevice {
                         depth: 1,
                     },
                 );
+            } else if matches!(
+                name,
+                "expert_project_q4_k_grouped" | "expert_project_q6_k_grouped"
+            ) {
+                if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 128
+                {
+                    return Err(Error::Dispatch(
+                        "grouped expert projection requires 32-wide SIMD".into(),
+                    ));
+                }
+                encoder.dispatchThreadgroups_threadsPerThreadgroup(
+                    MTLSize {
+                        width: grid[0].div_ceil(16),
+                        height: 1,
+                        depth: params[5] as usize,
+                    },
+                    MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                );
             } else if name == "mlx_affine4_gemv_quad" {
                 if p.raw.threadExecutionWidth() != 32 || p.raw.maxTotalThreadsPerThreadgroup() < 32
                 {
@@ -1999,6 +2073,7 @@ impl MetalDevice {
             } else if matches!(
                 name,
                 "rmsnorm"
+                    | "add_rmsnorm"
                     | "softmax"
                     | "attention_softmax"
                     | "attention_softmax_prefix"

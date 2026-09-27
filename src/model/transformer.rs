@@ -40,11 +40,35 @@ impl DecoderLayer {
         cache: &mut KvCache,
         layer: usize,
         policy: &ArchitecturePolicy,
-        mut trace: Option<&mut Trace>,
+        trace: Option<&mut Trace>,
     ) -> Result<Tensor> {
+        Ok(self
+            .forward_chained(d, x, None, None, cache, layer, policy, trace)?
+            .0)
+    }
+    /// Pre-norm layers can take their input norm precomputed and hand the next
+    /// norm forward: the closing residual add is fused with `next_norm`, which
+    /// removes one dependency level per layer. Bit-identical but performance-neutral,
+    /// so it is off by default (Experiment 66).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_chained(
+        &self,
+        d: &MetalDevice,
+        x: &Tensor,
+        pre_normed: Option<Tensor>,
+        next_norm: Option<&RmsNorm>,
+        cache: &mut KvCache,
+        layer: usize,
+        policy: &ArchitecturePolicy,
+        mut trace: Option<&mut Trace>,
+    ) -> Result<(Tensor, Option<Tensor>)> {
+        let mut next_normed = None;
         let output = match policy.residual_topology {
             ResidualTopology::PreNorm => {
-                let norm = self.input_norm.forward(d, x)?;
+                let norm = match pre_normed {
+                    Some(norm) => norm,
+                    None => self.input_norm.forward(d, x)?,
+                };
                 record(&mut trace, format!("layer.{layer}.norm"), &norm);
                 let operator = self.apply_operator(d, &norm, cache, layer, trace.as_deref_mut())?;
                 let operator = if policy.residual_multiplier == 1. {
@@ -52,8 +76,13 @@ impl DecoderLayer {
                 } else {
                     d.scale(&operator, policy.residual_multiplier)?.tensor
                 };
-                let residual = d.add(x, &operator)?.tensor;
-                let norm = self.post_norm.forward(d, &residual)?;
+                let (residual, norm) = if d.fuse_add_rmsnorm() && !d.reference_math() {
+                    d.add_rmsnorm(x, &operator, &self.post_norm.weight, self.post_norm.epsilon)?
+                } else {
+                    let residual = d.add(x, &operator)?.tensor;
+                    let norm = self.post_norm.forward(d, &residual)?;
+                    (residual, norm)
+                };
                 record(&mut trace, format!("layer.{layer}.post_norm"), &norm);
                 let mlp = self.feed_forward.forward(d, &norm)?;
                 record(&mut trace, format!("layer.{layer}.mlp"), &mlp);
@@ -62,7 +91,15 @@ impl DecoderLayer {
                 } else {
                     d.scale(&mlp, policy.residual_multiplier)?.tensor
                 };
-                d.add(&residual, &mlp)?.tensor
+                match next_norm {
+                    Some(next) => {
+                        let (output, normed) =
+                            d.add_rmsnorm(&residual, &mlp, &next.weight, next.epsilon)?;
+                        next_normed = Some(normed);
+                        output
+                    }
+                    None => d.add(&residual, &mlp)?.tensor,
+                }
             }
             ResidualTopology::PostNorm => {
                 let operator = self.apply_operator(d, x, cache, layer, trace.as_deref_mut())?;
@@ -76,7 +113,7 @@ impl DecoderLayer {
             }
         };
         record(&mut trace, format!("layer.{layer}.output"), &output);
-        Ok(output)
+        Ok((output, next_normed))
     }
 }
 pub struct Transformer {
@@ -313,10 +350,35 @@ impl Transformer {
             x = d.scale(&x, self.policy.embedding_multiplier)?.tensor;
         }
         record(&mut trace, "embedding", &x);
+        // Chain each layer's closing add into the next norm (or the final norm).
+        let chain = trace.is_none()
+            && d.fuse_add_rmsnorm()
+            && !d.reference_math()
+            && self.policy.residual_topology == ResidualTopology::PreNorm;
+        let mut pre_normed = None;
         for (l, layer) in self.layers.iter().enumerate() {
-            x = layer.forward(d, &x, &mut staged, l, &self.policy, trace.as_deref_mut())?;
+            let next_norm = chain.then(|| {
+                self.layers
+                    .get(l + 1)
+                    .map_or(&self.final_norm, |next| &next.input_norm)
+            });
+            let (output, normed) = layer.forward_chained(
+                d,
+                &x,
+                pre_normed.take(),
+                next_norm,
+                &mut staged,
+                l,
+                &self.policy,
+                trace.as_deref_mut(),
+            )?;
+            x = output;
+            pre_normed = normed;
         }
-        let x = self.final_norm.forward(d, &x)?;
+        let x = match pre_normed {
+            Some(normed) => normed,
+            None => self.final_norm.forward(d, &x)?,
+        };
         record(&mut trace, "final_hidden", &x);
         let head_input = if last_only {
             x.view(

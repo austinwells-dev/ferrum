@@ -1,0 +1,133 @@
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 184.6% of one core; largest process 33.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 174.6% of one core; largest process 31.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 174.1% of one core; largest process 31.3% of one core.
+phase55_bench ready: format=GGUF weights=485309184 packed=485166080 tensors=291
+phase55_bench ready: format=GGUF weights=485309184 packed=485166080 tensors=291
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 167.2% of one core; largest process 28.4% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 197.5% of one core; largest process 42.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 195.5% of one core; largest process 35.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 188.1% of one core; largest process 35.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 199.0% of one core; largest process 43.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 208.4% of one core; largest process 30.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 187.1% of one core; largest process 34.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 168.7% of one core; largest process 28.4% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 195.0% of one core; largest process 38.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 185.9% of one core; largest process 35.4% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 200.0% of one core; largest process 43.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 196.5% of one core; largest process 38.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 174.1% of one core; largest process 29.4% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 190.9% of one core; largest process 38.0% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 168.2% of one core; largest process 28.9% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 206.6% of one core; largest process 39.3% of one core.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 235.8% of one core; limit 220.0%).
+   49.7% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   34.3% of one core  /sbin/launchd
+   32.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper (Renderer).app/Contents/MacOS/Claude Helper (Renderer) --type=renderer --user-data-dir=/Users/austinwells/Library/Applica
+   29.4% of one core  /Applications/Claude.app/Contents/Frameworks/Claude Helper.app/Contents/MacOS/Claude Helper --type=gpu-process --user-data-dir=/Users/austinwells/Library/Application Support/Claude
+   16.4% of one core  /usr/libexec/PerfPowerServices
+Waiting 10s before checking again.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 189.3% of one core; largest process 37.0% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 176.1% of one core; largest process 30.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 187.1% of one core; largest process 36.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 187.1% of one core; largest process 31.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 203.0% of one core; largest process 42.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 189.5% of one core; largest process 36.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 181.1% of one core; largest process 31.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 197.2% of one core; largest process 42.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 165.7% of one core; largest process 26.9% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 185.1% of one core; largest process 35.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 181.1% of one core; largest process 31.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 191.0% of one core; largest process 39.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 187.6% of one core; largest process 35.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 184.1% of one core; largest process 33.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 191.0% of one core; largest process 39.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 178.1% of one core; largest process 29.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 200.5% of one core; largest process 37.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 176.1% of one core; largest process 30.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 183.6% of one core; largest process 36.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 170.6% of one core; largest process 29.4% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 197.0% of one core; largest process 40.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 179.1% of one core; largest process 33.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 184.1% of one core; largest process 35.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 192.3% of one core; largest process 39.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 181.1% of one core; largest process 33.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 192.5% of one core; largest process 39.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 180.1% of one core; largest process 31.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 186.6% of one core; largest process 36.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 170.1% of one core; largest process 26.9% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 185.1% of one core; largest process 33.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 167.7% of one core; largest process 25.9% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 190.0% of one core; largest process 37.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 177.1% of one core; largest process 32.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 190.5% of one core; largest process 39.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 176.6% of one core; largest process 29.4% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 197.5% of one core; largest process 40.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 194.0% of one core; largest process 42.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 190.5% of one core; largest process 34.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 205.5% of one core; largest process 45.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 183.1% of one core; largest process 37.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 175.6% of one core; largest process 30.3% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 187.1% of one core; largest process 34.8% of one core.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 183.6% of one core; largest process 35.3% of one core.

@@ -135,6 +135,29 @@ impl Linear {
     pub fn weight_bytes(&self) -> usize {
         self.weight.byte_size() + self.bias.as_ref().map_or(0, Tensor::byte_size)
     }
+    /// The projection without its bias, for callers that fold the bias into
+    /// a following kernel; returns the same `[.., out]` shape as `forward`.
+    pub(crate) fn forward_unbiased(&self, d: &MetalDevice, x: &Tensor) -> Result<Tensor> {
+        let dims = x.shape().dimensions();
+        if dims.is_empty() || dims.last() != Some(&self.input) {
+            return Err(Error::Shape(
+                "linear input last dimension differs from weight".into(),
+            ));
+        }
+        let mut out_dims = dims.to_vec();
+        *out_dims
+            .last_mut()
+            .ok_or_else(|| Error::Shape("linear rank".into()))? = self.output;
+        let x = x.reshape([x.numel() / self.input, self.input])?;
+        let projected = match &self.weight {
+            MatrixWeight::Dense(weight) => d.project(&x, weight)?,
+            MatrixWeight::Quantized(weight) => d.project_quantized(&x, weight)?,
+        };
+        projected.tensor.reshape(out_dims)
+    }
+    pub(crate) fn bias(&self) -> Option<&Tensor> {
+        self.bias.as_ref()
+    }
     pub fn forward(&self, d: &MetalDevice, x: &Tensor) -> Result<Tensor> {
         let dims = x.shape().dimensions();
         if dims.is_empty() || dims.last() != Some(&self.input) {

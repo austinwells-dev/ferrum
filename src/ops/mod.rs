@@ -256,6 +256,26 @@ impl MetalDevice {
                 input, metadata, weight, experts, features, rows, ggml_type, mpp_name,
             );
         }
+        // Below the TensorOps density, prompt batches still share experts: walk
+        // each expert's routed rows in one threadgroup so weights stay cached.
+        let grouped = self.moe_expert_grouped()
+            && x[0] >= 16
+            && input.dtype() == DType::BF16
+            && match ggml_type {
+                12 => self.use_q4_k_factored(features),
+                14 => self.use_q6_k_factored(features),
+                _ => false,
+            };
+        if grouped {
+            let name = if ggml_type == 12 {
+                "expert_project_q4_k_grouped"
+            } else {
+                "expert_project_q6_k_grouped"
+            };
+            return self.expert_project_quantized_mpp(
+                input, metadata, weight, experts, features, rows, ggml_type, name,
+            );
+        }
         let dispatch_name = match ggml_type {
             12 if self.use_q4_k_factored(features) => "expert_project_q4_k_factored",
             14 if self.use_q6_k_factored(features) => "expert_project_q6_k_factored",
@@ -738,6 +758,67 @@ impl MetalDevice {
     }
     pub fn add(&self, a: &Tensor, b: &Tensor) -> Result<Output> {
         self.binary("add", a, b)
+    }
+    /// `residual = a + b` (storage-rounded) and `rmsnorm(residual, weight)` in
+    /// one dispatch; bit-identical to `add` followed by `rmsnorm`.
+    pub(crate) fn add_rmsnorm(
+        &self,
+        a: &Tensor,
+        b: &Tensor,
+        weight: &Tensor,
+        eps: f32,
+    ) -> Result<(Tensor, Tensor)> {
+        let w = width(a)?;
+        if a.shape() != b.shape() || a.dtype() != b.dtype() || weight.dtype() != a.dtype() {
+            return Err(Error::Shape("fused add+RMSNorm operands must match".into()));
+        }
+        if weight.shape().dimensions() != [w] || w > u32::MAX as usize - 256 {
+            return Err(Error::Shape(
+                "RMSNorm weight must match the last dimension".into(),
+            ));
+        }
+        if !eps.is_finite() || eps <= 0. {
+            return Err(Error::Parameter(
+                "epsilon must be finite and positive".into(),
+            ));
+        }
+        if [a, b, weight].iter().any(|t| !self.owns(t.buffer())) {
+            return Err(Error::DeviceMismatch);
+        }
+        let dims = a.shape().dimensions();
+        let residual = Tensor::output(self, dims, a.dtype())?;
+        let normed = Tensor::output(self, dims, a.dtype())?;
+        let mut p = [0; 9];
+        p[0] = index(a.numel())?;
+        p[1] = index(w)?;
+        p[4] = a.dtype() as u32;
+        p[7] = eps.to_bits();
+        let start = self.profiling().then(std::time::Instant::now);
+        let timing = self.dispatch(
+            "add_rmsnorm",
+            &[
+                a.binding(),
+                b.binding(),
+                weight.binding(),
+                residual.binding(),
+                normed.binding(),
+            ],
+            &p,
+            [a.numel() / w, 1],
+            false,
+        )?;
+        if let Some(start) = start {
+            self.record_profile(
+                "add_rmsnorm",
+                start
+                    .elapsed()
+                    .saturating_sub(timing.synchronized.saturating_sub(timing.submission)),
+                std::time::Duration::ZERO,
+                residual.byte_size() + normed.byte_size(),
+                &timing,
+            );
+        }
+        Ok((residual, normed))
     }
     pub fn mul(&self, a: &Tensor, b: &Tensor) -> Result<Output> {
         self.binary("mul", a, b)

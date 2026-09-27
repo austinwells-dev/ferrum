@@ -34,6 +34,15 @@ def _cpu_seconds(value: str) -> float:
         raise ValueError(f"cannot parse ps CPU time {value!r}") from error
 
 
+def _ignored() -> set[str]:
+    """Executable basenames excluded via PHASE7A_PREFLIGHT_IGNORE (comma-separated).
+
+    Opt-in only, for a stuck system daemon during internal paired A/Bs; every
+    exemption is echoed on the preflight line so affected runs are identifiable.
+    """
+    return {name.strip() for name in os.environ.get("PHASE7A_PREFLIGHT_IGNORE", "").split(",") if name.strip()}
+
+
 def _snapshot() -> dict[int, ProcessSample]:
     result = subprocess.run(
         ["ps", "-A", "-o", "pid=,time=,command="],
@@ -51,7 +60,8 @@ def _snapshot() -> dict[int, ProcessSample]:
             cpu_seconds = _cpu_seconds(fields[1])
         except ValueError:
             continue
-        if pid != os.getpid():
+        executable = fields[2].split()[0].rsplit("/", 1)[-1] if fields[2] else ""
+        if pid != os.getpid() and executable not in _ignored():
             samples[pid] = ProcessSample(pid, cpu_seconds, fields[2])
     return samples
 
@@ -98,6 +108,9 @@ def _check(args: argparse.Namespace) -> bool:
         for percent, command in busiest:
             print(f"  {percent:5.1f}% of one core  {command[:180]}", file=sys.stderr)
         return False
+    ignored = sorted(_ignored())
+    if ignored:
+        print(f"CPU preflight exempting: {', '.join(ignored)}", flush=True)
     print(
         "CPU preflight passed: "
         f"peak total {total:.1f}% of one core; "
