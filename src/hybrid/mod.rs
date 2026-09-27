@@ -2,6 +2,7 @@
 //! linear attention interleaved with gated full attention, on a dedicated
 //! kernel library with preallocated state.
 #![forbid(unsafe_code)]
+pub mod bench;
 pub mod config;
 pub mod engine;
 pub mod weights;

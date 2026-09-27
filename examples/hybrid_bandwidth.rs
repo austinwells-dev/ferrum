@@ -9,7 +9,7 @@ fn main() -> ferrum::Result<()> {
         (262144, 1024),
         (8192, 256),
     ] {
-        let gbs = ferrum::hybrid::engine::bench_read_bandwidth(&d, 1 << 30, span, threads)?;
+        let gbs = ferrum::hybrid::bench::bench_read_bandwidth(&d, 1 << 30, span, threads)?;
         println!("1 GiB, {span:>7} B/threadgroup, {threads:>4} threads: {gbs:.1} GB/s");
     }
     Ok(())

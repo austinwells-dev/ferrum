@@ -70,7 +70,7 @@ fn ms(d: Duration) -> f64 {
 
 fn print_profile(label: &str, profile: ferrum::metal::Profile) {
     let mut entries: Vec<_> = profile.into_iter().collect();
-    entries.sort_by(|a, b| b.1.gpu.cmp(&a.1.gpu));
+    entries.sort_by_key(|e| std::cmp::Reverse(e.1.gpu));
     let total: Duration = entries.iter().map(|(_, e)| e.gpu).sum();
     eprintln!("{label}: GPU {:.2} ms total", ms(total));
     for (name, e) in entries.iter().take(24) {
