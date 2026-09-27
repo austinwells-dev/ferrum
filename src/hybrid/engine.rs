@@ -816,7 +816,7 @@ impl HybridModel {
         let group = c.heads / c.kv_heads;
         let rows = m * group;
         let keys = pos + m;
-        if std::env::var_os("FERRUM_HYBRID_REFERENCE_ATTENTION").is_some() {
+        if flags().reference_attention {
             let args = Params::default()
                 .u(m)?
                 .u(c.heads)?
@@ -835,9 +835,7 @@ impl HybridModel {
                 0,
             );
         }
-        if m >= MPP_ATTENTION_MIN_TOKENS
-            && std::env::var_os("FERRUM_HYBRID_SIMD_ATTENTION").is_none()
-        {
+        if m >= MPP_ATTENTION_MIN_TOKENS && !flags().simd_attention {
             let args = Params::default()
                 .u(m)?
                 .u(c.heads)?
@@ -858,15 +856,9 @@ impl HybridModel {
                 64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
             );
         }
-        if m == 1 && group <= 8 && std::env::var_os("FERRUM_HYBRID_SIMD_ATTENTION").is_none() {
-            let target: usize = std::env::var("FERRUM_HYBRID_SPLIT_TARGET")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DECODE_SPLIT_TARGET);
-            let min_keys: usize = std::env::var("FERRUM_HYBRID_SPLIT_MIN_KEYS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(DECODE_SPLIT_MIN_KEYS);
+        if m == 1 && group <= 8 && !flags().simd_attention {
+            let target = DECODE_SPLIT_TARGET;
+            let min_keys = DECODE_SPLIT_MIN_KEYS;
             let splits = (target / c.kv_heads)
                 .max(1)
                 .min(keys.div_ceil(min_keys))
@@ -909,14 +901,8 @@ impl HybridModel {
         let row_blocks = rows.div_ceil(8 * simds);
         // Split long key ranges across threadgroups when few query rows exist.
         let splits = if m * c.heads <= MAX_SPLIT_ROWS {
-            let target: usize = std::env::var("FERRUM_HYBRID_SPLIT_TARGET")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(SPLIT_TARGET_GROUPS);
-            let min_keys: usize = std::env::var("FERRUM_HYBRID_SPLIT_MIN_KEYS")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(SPLIT_MIN_KEYS);
+            let target = SPLIT_TARGET_GROUPS;
+            let min_keys = SPLIT_MIN_KEYS;
             let wanted = (target / (row_blocks * c.kv_heads)).max(1);
             wanted.min(keys.div_ceil(min_keys)).clamp(1, MAX_SPLITS)
         } else {
@@ -1097,7 +1083,7 @@ impl HybridModel {
             0,
         )?;
         self.dense_ffn(d, s, &f.shared, xn, &shared, m)?;
-        if std::env::var_os("FERRUM_HYBRID_DUMP").is_some() {
+        if flags().dump {
             d.synchronize()?;
             let picked: Vec<u32> = ids.to_f32().iter().map(|v| v.to_bits()).collect();
             eprintln!(
@@ -1293,7 +1279,7 @@ impl HybridModel {
     /// Debug aid (`FERRUM_HYBRID_DUMP=1`): complete queued work and print the
     /// sum of `t`, named like llama.cpp's eval-callback tensors.
     fn dump(&self, d: &MetalDevice, name: &str, layer: usize, t: &Tensor) -> Result<()> {
-        if std::env::var_os("FERRUM_HYBRID_DUMP").is_some() {
+        if flags().dump {
             d.synchronize()?;
             let values = t.to_f32();
             let sum: f64 = values.iter().map(|&v| v as f64).sum();
@@ -1426,10 +1412,7 @@ impl HybridModel {
                 64 * 32 * 2,
             );
         }
-        let (mut name, mut rows_per_group, mut simds, shared) = mv_kernel(w.format, false);
-        if let Some(variant) = kernel_variant(w.format) {
-            (name, rows_per_group, simds) = variant;
-        }
+        let (name, rows_per_group, simds, shared) = mv_kernel(w.format, false);
         d.dispatch_hybrid(
             name,
             &inputs,
@@ -1442,34 +1425,34 @@ impl HybridModel {
     }
 }
 
-/// `FERRUM_HYBRID_EXACT=1`: every projection uses the F32-activation GEMV
-/// kernels (no F16 GEMM tiles). Slow; a high-precision reference for evaluation.
-fn exact_math() -> bool {
-    static EXACT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *EXACT.get_or_init(|| std::env::var_os("FERRUM_HYBRID_EXACT").is_some_and(|v| v != "0"))
+/// Diagnostic switches, read once from the environment:
+/// - `FERRUM_HYBRID_EXACT=1`: every projection uses the F32-activation GEMV
+///   kernels (no F16 GEMM tiles). Slow; a high-precision evaluation reference.
+/// - `FERRUM_HYBRID_REFERENCE_ATTENTION=1`: scalar online-softmax attention.
+/// - `FERRUM_HYBRID_SIMD_ATTENTION=1`: simdgroup-matrix attention everywhere.
+/// - `FERRUM_HYBRID_DUMP=1`: print sums of intermediate tensors.
+struct Flags {
+    exact: bool,
+    reference_attention: bool,
+    simd_attention: bool,
+    dump: bool,
 }
 
-/// Experiment hook: `FERRUM_HYBRID_MV_Q4K=r1s4` (etc.) selects a GEMV shape.
-fn kernel_variant(format: Format) -> Option<(&'static str, usize, usize)> {
-    let key = match format {
-        Format::Q4K => "FERRUM_HYBRID_MV_Q4K",
-        Format::Q6K => "FERRUM_HYBRID_MV_Q6K",
-        _ => return None,
-    };
-    let v = std::env::var(key).ok()?;
-    let q4 = format == Format::Q4K;
-    Some(match (v.as_str(), q4) {
-        ("r1s2", true) => ("h_mv_q4_k_r1s2", 2, 2),
-        ("r1s4", true) => ("h_mv_q4_k_r1s4", 4, 4),
-        ("r2s4", true) => ("h_mv_q4_k_r2s4", 8, 4),
-        ("r4s2", true) => ("h_mv_q4_k_r4s2", 8, 2),
-        ("r4s1", true) => ("h_mv_q4_k_r4s1", 4, 1),
-        ("r1s2", false) => ("h_mv_q6_k_r1s2", 2, 2),
-        ("r1s4", false) => ("h_mv_q6_k_r1s4", 4, 4),
-        ("r2s4", false) => ("h_mv_q6_k_r2s4", 8, 4),
-        ("r4s2", false) => ("h_mv_q6_k_r4s2", 8, 2),
-        _ => return None,
+fn flags() -> &'static Flags {
+    static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
+    FLAGS.get_or_init(|| {
+        let on = |name: &str| std::env::var_os(name).is_some_and(|v| v != "0");
+        Flags {
+            exact: on("FERRUM_HYBRID_EXACT"),
+            reference_attention: on("FERRUM_HYBRID_REFERENCE_ATTENTION"),
+            simd_attention: on("FERRUM_HYBRID_SIMD_ATTENTION"),
+            dump: on("FERRUM_HYBRID_DUMP"),
+        }
     })
+}
+
+fn exact_math() -> bool {
+    flags().exact
 }
 
 /// Query tokens from which attention uses the TensorOps flash kernel.

@@ -201,6 +201,10 @@ off, greedy), with a passphrase at 10%, 50% and 90% depth:
 Device memory was 19,822.5 MiB after loading and 19,822.8 MiB after the three
 runs (plan: 19,921.7 MiB), so nothing grows with use.
 
+Swift 27B at its auto-fit budget, 91,225-token prompt, needle at 50%: correct
+answer, prefill 1,000 s (91 tok/s), decode 4.6 tok/s at that depth, device
+memory 23,193.5 → 23,193.8 MiB (plan 23,292.8 MiB).
+
 **Prefill at depth** (one 512-token chunk after a cached context):
 
 | Tiel | Ferrum | llama.cpp |

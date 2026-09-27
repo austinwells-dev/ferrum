@@ -698,15 +698,6 @@ kernel void NAME(constant ProjArgs & a [[buffer(3)]], device const char * w [[bu
     IMPL<NR0, NSG>(a, w, x, y, tgpig, tiisg, sgitg); \
 }
 MV_KERNEL(h_mv_q4_k, mv_q4_K, 2, 2)
-MV_KERNEL(h_mv_q4_k_r1s2, mv_q4_K, 1, 2)
-MV_KERNEL(h_mv_q4_k_r1s4, mv_q4_K, 1, 4)
-MV_KERNEL(h_mv_q4_k_r2s4, mv_q4_K, 2, 4)
-MV_KERNEL(h_mv_q4_k_r4s2, mv_q4_K, 4, 2)
-MV_KERNEL(h_mv_q4_k_r4s1, mv_q4_K, 4, 1)
-MV_KERNEL(h_mv_q6_k_r1s2, mv_q6_K, 1, 2)
-MV_KERNEL(h_mv_q6_k_r1s4, mv_q6_K, 1, 4)
-MV_KERNEL(h_mv_q6_k_r2s4, mv_q6_K, 2, 4)
-MV_KERNEL(h_mv_q6_k_r4s2, mv_q6_K, 4, 2)
 MV_KERNEL(h_mv_q5_k, mv_q5_K, 1, 2)
 MV_KERNEL(h_mv_q6_k, mv_q6_K, 2, 2)
 MV_KERNEL(h_mv_q4_0, mv_q4_0, 4, 2)
