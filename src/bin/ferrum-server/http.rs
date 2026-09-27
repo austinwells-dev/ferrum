@@ -1,8 +1,14 @@
 //! Minimal HTTP/1.1: keep-alive, Content-Length and chunked request bodies,
 //! `Expect: 100-continue`, JSON responses and chunked streaming responses.
 use std::{
-    io::{BufRead, BufReader, Read, Write},
+    io::{self, BufRead, BufReader, Read, Write},
     net::TcpStream,
+    os::fd::AsRawFd,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
     time::Duration,
 };
 
@@ -226,4 +232,54 @@ pub fn configure(stream: &TcpStream) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(300)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
+}
+
+/// Set `cancel` as soon as the client closes the connection, without waiting
+/// for a write to fail: the first write after a hang-up usually still lands
+/// in the kernel's send buffer, and a slow prefill chunk may not write for
+/// seconds. Polls every 200 ms until the handler and the job both drop
+/// `cancel`.
+pub fn watch_hangup(stream: &TcpStream, id: u64, cancel: &Arc<AtomicBool>) {
+    let Ok(stream) = stream.try_clone() else {
+        return;
+    };
+    let cancel = Arc::downgrade(cancel);
+    thread::spawn(move || {
+        loop {
+            thread::sleep(Duration::from_millis(200));
+            let Some(cancel) = cancel.upgrade() else {
+                return;
+            };
+            if cancel.load(Ordering::SeqCst) {
+                return;
+            }
+            if peer_closed(&stream) {
+                crate::info!(Some(id), "client closed the connection; cancelling");
+                cancel.store(true, Ordering::SeqCst);
+                return;
+            }
+        }
+    });
+}
+
+/// A non-blocking peek: 0 bytes means the peer sent FIN; an error other than
+/// "would block" means the connection was reset. Pipelined request bytes
+/// are left in place for the next request.
+fn peer_closed(stream: &TcpStream) -> bool {
+    unsafe extern "C" {
+        fn recv(socket: i32, buffer: *mut u8, length: usize, flags: i32) -> isize;
+    }
+    const MSG_PEEK: i32 = 0x2;
+    const MSG_DONTWAIT: i32 = 0x80;
+    let mut byte = 0u8;
+    // SAFETY: a one-byte peek into a live local buffer on an open socket.
+    let n = unsafe { recv(stream.as_raw_fd(), &mut byte, 1, MSG_PEEK | MSG_DONTWAIT) };
+    match n {
+        0 => true,
+        n if n > 0 => false,
+        _ => !matches!(
+            io::Error::last_os_error().kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        ),
+    }
 }

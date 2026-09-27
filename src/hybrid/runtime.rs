@@ -108,7 +108,7 @@ impl Runtime {
     /// speed, then clear the session.
     pub fn warmup(&mut self) -> Result<()> {
         let model = &self.loaded.model;
-        let n = (model.chunk() + 2).min(self.session.capacity() - 3);
+        let n = 66.min(model.chunk() + 2).min(self.session.capacity() - 3);
         let prompt: Vec<u32> = (0..n as u32).map(|i| 1000 + (i * 7919) % 20000).collect();
         let result = self.session.generate(
             &self.device,

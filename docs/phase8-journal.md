@@ -232,7 +232,7 @@ batch-size dependence llama.cpp has.)
 `ferrum-server` is now a module tree under `src/bin/ferrum-server/`: `http`, `log`, `worker`, `openai` and `anthropic`. It is modelled on llama-server.
 
 - **Threading.** Each connection runs on its own thread with keep-alive. A single model thread takes jobs from a queue, so `/health`, `/slots` and `/metrics` answer immediately while a request is generating. The port is bound before the model loads, and `/health` returns 503 until loading finishes.
-- **Warmup.** After loading, the server warms up for about 1.8 s on Tiel with one chunk plus two decode steps. This compiles every pipeline, so the first request prefills at full speed (before this change it ran at 88 tok/s instead of about 650).
+- **Warmup.** After loading, the server runs a 66-token prompt plus two decode steps. This compiles every pipeline, so the first request prefills at full speed (before this change it ran at 88 tok/s instead of about 650). It takes 1.2 s on Tiel and 2.4 s on Swift. A full-chunk warmup took 7.8 s on Swift and brought no speedup: the first 510-token request ran at 176 tok/s on Swift and 1,007 tok/s on Tiel either way.
 - **Library hooks.** `Session::generate` takes `GenerationHooks`:
   - `begin` and `prefill(processed, total)`: returning false cancels between chunks, and the work already done stays cached.
   - `token -> Flow::{Continue, Stop, Inject}`
@@ -240,3 +240,9 @@ batch-size dependence llama.cpp has.)
   `Runtime::chat` takes `ChatHooks`. The reasoning budget injects `\n</think>\n\n` through `Flow::Inject`.
 - **Snapshot position.** The recurrent snapshot moved from the end of the prompt to `len - 1`. Reuse always recomputes the final prompt token, so a snapshot at `len` could never serve an identical retry: regenerating a 40K-token prompt re-prefilled all of it. A snapshot at `len - 1` serves both retries and ordinary conversation extensions, and it costs one single-token forward per request. `hybrid_session_check` gained a retry case, and it passes bit-exact on Tiel.
 - **Cancellation, measured.** A client disconnect 4 s into a 40K-token prefill stopped the request within one chunk, and 4,096 prefilled tokens were kept. The retry reused 5,120 tokens. Prefill ran at 504 tok/s over the remaining 35K tokens, with progress logged every 5 s.
+- **Hang-up detection.** Each job gets a watcher that peeks the socket every 200 ms (`recv` with `MSG_PEEK | MSG_DONTWAIT`). Before this, a disconnect was noticed only when a write failed. The first write after a hang-up usually lands in the kernel buffer, and a Swift prefill chunk takes 2.8 s, so the server noticed a disconnect 5 s late. Detection now takes at most 200 ms, and cancellation completes at the next chunk boundary.
+- **Swift server run** (auto context 101,120 tokens, predicted memory 23.00 GiB). Every feature worked:
+  - thinking off, low effort, a 16-token budget, and Anthropic `thinking.budget_tokens`
+  - streamed tool calls, and a retry that reused 48 of 49 prompt tokens
+  - a cancel at 2,560 of 9,273 tokens, followed by a retry that reused them and prefilled the remaining 6,713 at 160 tok/s
+  - `/health` answering in under 1 ms mid-prefill, with the second request queued

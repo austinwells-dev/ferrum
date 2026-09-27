@@ -246,7 +246,7 @@ pub fn messages(
         req.reasoning_budget
             .map_or(String::new(), |b| format!(", budget {b}"))
     );
-    let (rx, cancel) = server.submit(id, Work::Chat(Box::new(req)));
+    let (rx, cancel) = server.submit(id, Work::Chat(Box::new(req)), stream);
     let model = server.model_name();
     if !streaming {
         return openai::wait_json(stream, &rx, &cancel, id, keep_alive, |event| match event {

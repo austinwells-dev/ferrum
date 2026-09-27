@@ -365,7 +365,7 @@ pub fn chat(
     };
     let streaming = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
     info!(Some(id), "chat: {}", describe(&request, exclude, streaming));
-    let (rx, cancel) = server.submit(id, Work::Chat(Box::new(request)));
+    let (rx, cancel) = server.submit(id, Work::Chat(Box::new(request)), stream);
     let include_usage = body
         .pointer("/stream_options/include_usage")
         .and_then(Json::as_bool)
@@ -666,6 +666,7 @@ pub fn completion(
             sampling,
             stop,
         },
+        stream,
     );
     let model = server.model_name();
     let body_for = |text: &str, c: &Completion, stopped: bool, obj: &str| {

@@ -87,9 +87,15 @@ impl Server {
         self.name.clone()
     }
 
-    pub fn submit(&self, id: u64, work: Work) -> (Receiver<Event>, Arc<AtomicBool>) {
+    pub fn submit(
+        &self,
+        id: u64,
+        work: Work,
+        client: &TcpStream,
+    ) -> (Receiver<Event>, Arc<AtomicBool>) {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
+        http::watch_hangup(client, id, &cancel);
         let status = self.shared.status();
         let ahead = self.shared.queued.fetch_add(1, Ordering::SeqCst)
             + usize::from(status.busy_request.is_some());
