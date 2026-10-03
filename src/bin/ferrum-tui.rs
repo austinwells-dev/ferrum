@@ -7,8 +7,8 @@
 //! or `ferrum-server`. Settings are remembered in ~/.config/ferrum/tui.json.
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ferrum::{
-    hybrid::runtime::recommended_sampling,
-    loader::gguf::{GgufFile, MetadataValue},
+    hybrid::{config::HybridConfig, draft::DraftConfig},
+    loader::gguf::{GgufReader, MetadataValue},
 };
 use ratatui::{
     DefaultTerminal, Frame,
@@ -19,7 +19,7 @@ use ratatui::{
 };
 use serde_json::{Map, Value as Json, json};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     os::unix::process::CommandExt,
     path::{Path, PathBuf},
@@ -360,6 +360,29 @@ struct Model {
     name: String,
     origin: String,
     size: u64,
+    info: Option<Info>,
+    hybrid: Option<HybridConfig>,
+    /// Carries an MTP head ferrum can run (`--draft mtp`).
+    mtp: bool,
+    /// Why `--draft mtp` is unavailable.
+    mtp_why: String,
+    /// Why ferrum cannot run this file; None means it can.
+    problem: Option<String>,
+}
+
+fn make_model(path: PathBuf, name: String, size: u64) -> Model {
+    let checked = check(&path);
+    Model {
+        origin: origin_of(&path),
+        path,
+        name,
+        size,
+        info: checked.info,
+        hybrid: checked.hybrid,
+        mtp: checked.mtp,
+        mtp_why: checked.mtp_why,
+        problem: checked.problem,
+    }
 }
 
 #[derive(Clone)]
@@ -431,7 +454,14 @@ fn origin_of(path: &Path) -> String {
     path.parent().map(tilde).unwrap_or_default()
 }
 
-fn walk(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec<Model>) {
+/// A GGUF found on disk, before its header is checked.
+struct Cand {
+    path: PathBuf,
+    name: String,
+    size: u64,
+}
+
+fn walk(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec<Cand>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -470,14 +500,14 @@ fn walk(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec<Mod
         if !seen.insert(canonical) {
             continue;
         }
-        out.push(Model {
-            name: name
-                .trim_end_matches(".gguf")
-                .trim_end_matches(".GGUF")
-                .to_string(),
-            origin: origin_of(&path),
-            size: meta.len(),
+        let stem = name
+            .trim_end_matches(".gguf")
+            .trim_end_matches(".GGUF")
+            .to_string();
+        out.push(Cand {
             path,
+            name: stem,
+            size: meta.len(),
         });
     }
 }
@@ -495,6 +525,31 @@ struct Drafter {
     path: PathBuf,
     label: String,
     kind: &'static str,
+    config: Option<DraftConfig>,
+    /// Why this checkpoint cannot be loaded at all.
+    problem: Option<String>,
+}
+
+fn read_draft(dir: &Path) -> (Option<DraftConfig>, Option<String>) {
+    let root = if dir.join("config.json").exists() {
+        dir.to_path_buf()
+    } else {
+        let rev = fs::read_to_string(dir.join("refs/main")).unwrap_or_default();
+        dir.join("snapshots").join(rev.trim())
+    };
+    let Ok(raw) = fs::read(root.join("config.json")) else {
+        return (None, Some("no downloaded snapshot (config.json)".into()));
+    };
+    let config = serde_json::from_slice::<Json>(&raw)
+        .map_err(|e| e.to_string())
+        .and_then(|j| DraftConfig::from_json(&j).map_err(|e| e.to_string()));
+    match config {
+        Err(e) => (None, Some(e)),
+        Ok(_) if !root.join("model.safetensors").exists() => {
+            (None, Some("no model.safetensors".into()))
+        }
+        Ok(c) => (Some(c), None),
+    }
 }
 
 fn find_drafters(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec<Drafter>) {
@@ -512,7 +567,10 @@ fn find_drafters(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mu
         if is_drafter(&lower) && (hf || path.join("config.json").exists()) {
             let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             if seen.insert(canonical) {
+                let (config, problem) = read_draft(&path);
                 out.push(Drafter {
+                    config,
+                    problem,
                     label: origin_of(&path.join("x")),
                     kind: if lower.contains("dflash") {
                         "dflash"
@@ -542,35 +600,23 @@ fn scan_drafters(extra: &[String]) -> Vec<Drafter> {
     out
 }
 
-fn squash(s: &str) -> String {
-    s.chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .collect::<String>()
-        .to_ascii_lowercase()
-}
-
-/// Whether a drafter was trained for this model, judged by name
-/// (`Qwen3.8-27B-DSpark` drafts `Qwen3.8-27B-...`).
-fn drafter_fits(d: &Drafter, m: &Model) -> bool {
-    let repo = d
-        .label
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let cut = [
-        "-dspark",
-        "-dflash",
-        ".dspark",
-        "-speculator",
-        ".speculator",
-    ]
-    .iter()
-    .filter_map(|k| repo.find(k))
-    .min()
-    .unwrap_or(repo.len());
-    let target = squash(&repo[..cut]);
-    !target.is_empty() && squash(&format!("{} {}", m.name, m.origin)).contains(&target)
+/// Why this drafter cannot serve this model (the checks `DraftModel::load`
+/// makes against the target); None means it fits.
+fn drafter_problem(d: &Drafter, m: &Model) -> Option<String> {
+    if let Some(p) = &d.problem {
+        return Some(p.clone());
+    }
+    let (c, t) = (d.config.as_ref()?, m.hybrid.as_ref()?);
+    if c.hidden != t.hidden {
+        return Some(format!("hidden size {} ≠ model's {}", c.hidden, t.hidden));
+    }
+    if c.target_layers.iter().any(|&l| l >= t.layers) {
+        return Some("reads layers the model does not have".into());
+    }
+    if c.mask_token as usize >= t.vocab {
+        return Some("mask token outside the model's vocabulary".into());
+    }
+    None
 }
 
 fn roots(extra: &[String]) -> Vec<(PathBuf, usize)> {
@@ -609,24 +655,42 @@ fn scan(extra: &[String]) -> Vec<Model> {
             walk(&root, depth, &mut seen, &mut out);
         }
     }
-    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-    out
+    // Reading a header means parsing the whole tokenizer vocabulary, so check files in parallel.
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
+    let chunk = out.len().div_ceil(threads).max(1);
+    let mut models: Vec<Model> = std::thread::scope(|scope| {
+        let jobs: Vec<_> = out
+            .chunks(chunk)
+            .map(|part| {
+                scope.spawn(move || {
+                    part.iter()
+                        .map(|c| make_model(c.path.clone(), c.name.clone(), c.size))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        jobs.into_iter()
+            .flat_map(|j| j.join().unwrap_or_default())
+            .collect()
+    });
+    models.sort_by_key(|m| (m.problem.is_some(), m.name.to_lowercase()));
+    models
 }
 
-fn walk_file(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Model>) {
+fn walk_file(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Cand>) {
     let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
     let Ok(meta) = fs::metadata(path) else {
         return;
     };
     if seen.insert(canonical) {
-        out.push(Model {
-            name: path
-                .file_stem()
-                .map(|s| s.to_string_lossy().to_string())
-                .unwrap_or_default(),
-            origin: origin_of(path),
-            size: meta.len(),
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        out.push(Cand {
             path: path.to_path_buf(),
+            name: stem,
+            size: meta.len(),
         });
     }
 }
@@ -643,36 +707,185 @@ fn as_u64(v: &MetadataValue) -> Option<u64> {
     }
 }
 
-fn read_info(path: &Path) -> Option<Info> {
-    let file = GgufFile::open(path).ok()?;
+struct Checked {
+    info: Option<Info>,
+    hybrid: Option<HybridConfig>,
+    mtp: bool,
+    mtp_why: String,
+    problem: Option<String>,
+}
+
+fn type_name(id: u32) -> String {
+    match id {
+        0 => "F32",
+        1 => "F16",
+        2 => "Q4_0",
+        3 => "Q4_1",
+        6 => "Q5_0",
+        7 => "Q5_1",
+        8 => "Q8_0",
+        9 => "Q8_1",
+        10 => "Q2_K",
+        11 => "Q3_K",
+        12 => "Q4_K",
+        13 => "Q5_K",
+        14 => "Q6_K",
+        15 => "Q8_K",
+        16 => "IQ2_XXS",
+        17 => "IQ2_XS",
+        18 => "IQ3_XXS",
+        19 => "IQ1_S",
+        20 => "IQ4_NL",
+        21 => "IQ3_S",
+        22 => "IQ2_S",
+        23 => "IQ4_XS",
+        29 => "IQ1_M",
+        30 => "BF16",
+        n => return format!("type {n}"),
+    }
+    .to_string()
+}
+
+/// Weight types the hybrid engine has kernels for (see `hybrid::weights`).
+const SUPPORTED: [u32; 8] = [0, 2, 8, 12, 13, 14, 21, 23];
+
+/// Mirrors what `Runtime::load` requires, without reading any weights.
+fn check(path: &Path) -> Checked {
+    let blocked = |problem: String| Checked {
+        info: None,
+        hybrid: None,
+        mtp: false,
+        mtp_why: String::new(),
+        problem: Some(problem),
+    };
+    let opened = fs::File::open(path)
+        .map_err(|e| ferrum::Error::Gguf(format!("{}: {e}", path.display())))
+        .and_then(|f| GgufReader::from_reader(std::io::BufReader::with_capacity(1 << 20, f)));
+    let file = match opened {
+        Ok(f) => f,
+        Err(e) => {
+            let text = e.to_string();
+            let quant = text
+                .split("unsupported GGML tensor type ")
+                .nth(1)
+                .and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next())
+                .and_then(|n| n.parse::<u32>().ok());
+            return blocked(match quant {
+                Some(id) => format!("unsupported quant {}", type_name(id)),
+                None => format!("unreadable GGUF: {text}"),
+            });
+        }
+    };
     let md = file.metadata();
-    let arch = match md.get("general.architecture") {
-        Some(MetadataValue::String(s)) => s.clone(),
-        _ => return None,
+    let text = |key: &str| match md.get(key) {
+        Some(MetadataValue::String(s)) => Some(s.clone()),
+        _ => None,
+    };
+    let Some(arch) = text("general.architecture") else {
+        return blocked("no architecture in the GGUF header".into());
     };
     let get = |suffix: &str| md.get(&format!("{arch}.{suffix}")).and_then(as_u64);
-    let s = recommended_sampling(&file);
-    Some(Info {
-        name: match md.get("general.name") {
-            Some(MetadataValue::String(s)) => Some(s.clone()),
-            _ => None,
-        },
+    let float = |key: &str| match md.get(key) {
+        Some(MetadataValue::Float32(v)) => Some(*v),
+        Some(MetadataValue::Float64(v)) => Some(*v as f32),
+        _ => None,
+    };
+    // The GGUF's own sampling advice, with the same fallbacks as `recommended_sampling`.
+    let s = (
+        float("general.sampling.temp").unwrap_or(1.0),
+        float("general.sampling.top_p").unwrap_or(0.95),
+        md.get("general.sampling.top_k")
+            .and_then(as_u64)
+            .unwrap_or(20),
+        float("general.sampling.min_p").unwrap_or(0.),
+    );
+    let info = Info {
+        name: text("general.name"),
         layers: get("block_count"),
         experts: get("expert_count").filter(|n| *n > 0),
         train_ctx: get("context_length"),
         sampling: format!(
             "t {} · p {} · k {}{}",
-            s.temperature,
-            s.top_p,
-            s.top_k,
-            if s.min_p > 0. {
-                format!(" · min-p {}", s.min_p)
+            s.0,
+            s.1,
+            s.2,
+            if s.3 > 0. {
+                format!(" · min-p {}", s.3)
             } else {
                 String::new()
             }
         ),
-        arch,
-    })
+        arch: arch.clone(),
+    };
+    let has_mtp = get("nextn_predict_layers").is_some_and(|n| n > 0);
+    let mut result = Checked {
+        info: Some(info),
+        hybrid: None,
+        mtp: false,
+        mtp_why: "this GGUF has no MTP head".into(),
+        problem: None,
+    };
+    if !matches!(arch.as_str(), "qwen35" | "qwen35moe") {
+        result.problem = Some(format!("architecture {arch}: needs qwen35 or qwen35moe"));
+        return result;
+    }
+    if text("tokenizer.ggml.model").as_deref() != Some("gpt2")
+        || text("tokenizer.ggml.pre").as_deref() != Some("qwen35")
+    {
+        result.problem = Some("tokenizer is not the qwen35 gpt2 tokenizer".into());
+        return result;
+    }
+    let config = match HybridConfig::from_gguf(&file) {
+        Ok(c) => c,
+        Err(e) => {
+            result.problem = Some(e.to_string());
+            return result;
+        }
+    };
+    // Tensors of the trailing NextN/MTP block are only read for `--draft mtp`.
+    let (mut trunk, mut head): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+    for t in file.tensors().values() {
+        let supported = if t.dimensions.len() <= 1 {
+            t.type_id == 0
+        } else {
+            SUPPORTED.contains(&t.type_id)
+        };
+        if supported {
+            continue;
+        }
+        let layer = t
+            .name
+            .strip_prefix("blk.")
+            .and_then(|r| r.split('.').next())
+            .and_then(|n| n.parse::<usize>().ok());
+        if layer.is_some_and(|l| l >= config.layers) {
+            head.push(t.type_id);
+        } else {
+            trunk.push(t.type_id);
+        }
+    }
+    let names = |mut ids: Vec<u32>| {
+        ids.sort_unstable();
+        ids.dedup();
+        ids.into_iter()
+            .map(type_name)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if !trunk.is_empty() {
+        result.problem = Some(format!(
+            "unsupported quant {} (runs Q4_0 Q8_0 Q4_K Q5_K Q6_K IQ3_S IQ4_XS)",
+            names(trunk)
+        ));
+        return result;
+    }
+    if has_mtp && head.is_empty() {
+        result.mtp = true;
+    } else if has_mtp {
+        result.mtp_why = format!("MTP head uses unsupported quant {}", names(head));
+    }
+    result.hybrid = Some(config);
+    result
 }
 
 fn config_path() -> PathBuf {
@@ -694,9 +907,23 @@ struct Fav {
     values: Map<String, Json>,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Fit {
+    Plain,
+    Fits,
+    Blocked,
+}
+
+struct Opt {
+    value: String,
+    label: String,
+    /// What the option is; for blocked options, why it cannot be used.
+    note: String,
+    fit: Fit,
+}
+
 struct Picker {
-    /// (value, label, note, fits the selected model)
-    options: Vec<(String, String, String, bool)>,
+    options: Vec<Opt>,
     cur: usize,
 }
 
@@ -723,7 +950,6 @@ struct App {
     editing: Editing,
     buffer: String,
     extra: Vec<String>,
-    infos: HashMap<PathBuf, Option<Info>>,
     drafters: Vec<Drafter>,
     favs: Vec<Fav>,
     fav_cursor: usize,
@@ -760,7 +986,11 @@ impl App {
             .map(expand)
             .or_else(|| saved["model"].as_str().map(PathBuf::from));
         let cursor = want
-            .and_then(|w| models.iter().position(|m| m.path == w))
+            .and_then(|w| {
+                models
+                    .iter()
+                    .position(|m| m.path == w && m.problem.is_none())
+            })
             .unwrap_or(0);
         let drafters = scan_drafters(&extra);
         let favs = saved["favorites"]
@@ -790,7 +1020,6 @@ impl App {
             editing: Editing::No,
             buffer: String::new(),
             extra,
-            infos: HashMap::new(),
             drafters,
             favs,
             fav_cursor: 0,
@@ -808,7 +1037,7 @@ impl App {
         }
         let config = json!({
             "mode": if self.mode == Mode::Serve { "serve" } else { "chat" },
-            "model": self.models.get(self.cursor).map(|m| m.path.display().to_string()),
+            "model": self.selected().map(|m| m.path.display().to_string()),
             "values": values,
             "extra": self.extra,
             "favorites": self.favs.iter().map(|f| json!({
@@ -829,11 +1058,35 @@ impl App {
         .ok();
     }
 
+    /// The model under the cursor, if ferrum can run it.
+    fn selected(&self) -> Option<&Model> {
+        self.models.get(self.cursor).filter(|m| m.problem.is_none())
+    }
+
+    fn runnable(&self) -> usize {
+        self.models.iter().filter(|m| m.problem.is_none()).count()
+    }
+
+    /// Drop a drafter the newly selected model cannot use.
     fn load_info(&mut self) {
-        if let Some(m) = self.models.get(self.cursor) {
-            self.infos
-                .entry(m.path.clone())
-                .or_insert_with(|| read_info(&m.path));
+        let Some(m) = self.selected() else {
+            return;
+        };
+        let current = self.value("draft").to_string();
+        let reason = match current.as_str() {
+            "" | "off" => None,
+            "mtp" => (!m.mtp).then(|| m.mtp_why.clone()),
+            path => self
+                .drafters
+                .iter()
+                .find(|d| d.path.display().to_string() == path)
+                .and_then(|d| drafter_problem(d, m)),
+        };
+        if let Some(why) = reason {
+            if let Some(f) = self.fields.iter_mut().find(|f| f.key == "draft") {
+                f.value = "off".into();
+            }
+            self.status = Some((format!("drafter turned off: {why}"), false));
         }
     }
 
@@ -863,7 +1116,7 @@ impl App {
     fn command(&self) -> (&'static str, Vec<String>) {
         let serve = self.mode == Mode::Serve;
         let mut args: Vec<String> = Vec::new();
-        if let Some(m) = self.models.get(self.cursor) {
+        if let Some(m) = self.selected() {
             args.extend(["--model".into(), m.path.display().to_string()]);
         }
         let draft = self.value("draft");
@@ -927,8 +1180,17 @@ impl App {
     }
 
     fn draft_values(&self) -> Vec<String> {
-        let mut v = vec!["off".to_string(), "mtp".to_string()];
-        v.extend(self.drafters.iter().map(|d| d.path.display().to_string()));
+        let mut v = vec!["off".to_string()];
+        let model = self.selected();
+        if model.is_some_and(|m| m.mtp) {
+            v.push("mtp".to_string());
+        }
+        v.extend(
+            self.drafters
+                .iter()
+                .filter(|d| model.is_some_and(|m| drafter_problem(d, m).is_none()))
+                .map(|d| d.path.display().to_string()),
+        );
         v
     }
 
@@ -947,46 +1209,38 @@ impl App {
     }
 
     fn open_picker(&mut self) {
-        let model = self.models.get(self.cursor);
-        let mut options = vec![
-            (
-                "off".to_string(),
-                "Off".to_string(),
-                "no speculation".to_string(),
-                false,
-            ),
-            (
-                "mtp".to_string(),
-                "MTP".to_string(),
-                "head built into the GGUF".to_string(),
-                false,
-            ),
-        ];
-        let mut found: Vec<_> = self
-            .drafters
-            .iter()
-            .map(|d| {
-                let fits = model.is_some_and(|m| drafter_fits(d, m));
-                (
-                    d.path.display().to_string(),
-                    d.label.clone(),
-                    d.kind.to_string(),
-                    fits,
-                )
-            })
-            .collect();
-        found.sort_by_key(|o| !o.3);
-        options.extend(found);
-        options.push((
-            String::new(),
-            "Custom path…".into(),
-            "type a directory".into(),
-            false,
-        ));
+        let model = self.selected();
+        let opt = |value: &str, label: &str, note: &str, fit: Fit| Opt {
+            value: value.into(),
+            label: label.into(),
+            note: note.into(),
+            fit,
+        };
+        let mut options = vec![opt("off", "Off", "no speculation", Fit::Plain)];
+        options.push(match model {
+            Some(m) if m.mtp => opt("mtp", "MTP", "head built into the GGUF", Fit::Plain),
+            Some(m) => opt("mtp", "MTP", &m.mtp_why, Fit::Blocked),
+            None => opt("mtp", "MTP", "no model selected", Fit::Blocked),
+        });
+        let (mut fits, mut blocked) = (Vec::new(), Vec::new());
+        for d in &self.drafters {
+            let why = match model {
+                Some(m) => drafter_problem(d, m),
+                None => Some("no model selected".into()),
+            };
+            let path = d.path.display().to_string();
+            match why {
+                None => fits.push(opt(&path, &d.label, d.kind, Fit::Fits)),
+                Some(why) => blocked.push(opt(&path, &d.label, &why, Fit::Blocked)),
+            }
+        }
+        options.extend(fits);
+        options.push(opt("", "Custom path…", "type a directory", Fit::Plain));
+        options.extend(blocked);
         let current = self.value("draft");
         let cur = options
             .iter()
-            .position(|o| !o.0.is_empty() && o.0 == current)
+            .position(|o| !o.value.is_empty() && o.value == current && o.fit != Fit::Blocked)
             .unwrap_or(0);
         self.picker = Some(Picker { options, cur });
     }
@@ -995,12 +1249,21 @@ impl App {
         let Some(p) = &mut self.picker else {
             return;
         };
+        let open = |p: &Picker, i: usize| p.options[i].fit != Fit::Blocked;
         match code {
-            KeyCode::Up | KeyCode::Char('k') => p.cur = p.cur.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => p.cur = (p.cur + 1).min(p.options.len() - 1),
+            KeyCode::Up | KeyCode::Char('k') => {
+                if let Some(i) = (0..p.cur).rev().find(|&i| open(p, i)) {
+                    p.cur = i;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(i) = (p.cur + 1..p.options.len()).find(|&i| open(p, i)) {
+                    p.cur = i;
+                }
+            }
             KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
             KeyCode::Enter => {
-                let value = p.options[p.cur].0.clone();
+                let value = p.options[p.cur].value.clone();
                 self.picker = None;
                 let Some(i) = self.fields.iter().position(|f| f.key == "draft") else {
                     return;
@@ -1017,8 +1280,8 @@ impl App {
     }
 
     fn save_favorite(&mut self, name: &str) {
-        let Some(model) = self.models.get(self.cursor) else {
-            self.status = Some(("pick a model first".into(), false));
+        let Some(model) = self.selected() else {
+            self.status = Some(("pick a compatible model first".into(), false));
             return;
         };
         let mut values = Map::new();
@@ -1056,11 +1319,15 @@ impl App {
         }
         self.mode = if fav.serve { Mode::Serve } else { Mode::Chat };
         let name = fav.name.clone();
-        match self
+        let found = self
             .models
             .iter()
-            .position(|m| m.path.display().to_string() == fav.model)
-        {
+            .position(|m| m.path.display().to_string() == fav.model);
+        match found {
+            Some(at) if self.models[at].problem.is_some() => {
+                let why = self.models[at].problem.clone().unwrap_or_default();
+                self.status = Some((format!("{name:?}: model unsupported ({why})"), false));
+            }
             Some(at) => {
                 self.cursor = at;
                 self.load_info();
@@ -1164,7 +1431,7 @@ impl App {
     }
 
     fn rescan(&mut self, focus: Option<&Path>) {
-        let keep = self.models.get(self.cursor).map(|m| m.path.clone());
+        let keep = self.selected().map(|m| m.path.clone());
         self.models = scan(&self.extra);
         self.drafters = scan_drafters(&self.extra);
         let target = focus
@@ -1174,14 +1441,31 @@ impl App {
                     .position(|m| m.path == p || m.path.starts_with(p))
             })
             .or_else(|| keep.and_then(|k| self.models.iter().position(|m| m.path == k)));
-        self.cursor = target.unwrap_or(0);
-        self.status = Some((format!("{} models found", self.models.len()), true));
+        self.cursor = target
+            .filter(|&t| self.models[t].problem.is_none())
+            .unwrap_or(0);
+        self.status = Some((
+            format!(
+                "{} models, {} supported",
+                self.models.len(),
+                self.runnable()
+            ),
+            true,
+        ));
         self.load_info();
     }
 
     fn launch(&mut self) -> Option<Outcome> {
-        if self.models.is_empty() {
-            self.status = Some(("no model selected: press a to add a path".into(), false));
+        if self.selected().is_none() {
+            let why = match self.models.get(self.cursor) {
+                Some(m) => format!(
+                    "{} can't run: {}",
+                    m.name,
+                    m.problem.clone().unwrap_or_default()
+                ),
+                None => "no model found: press a to add a path".into(),
+            };
+            self.status = Some((why, false));
             return None;
         }
         self.save();
@@ -1428,7 +1712,13 @@ impl App {
 
     fn draw_models(&self, f: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Models;
-        let block = self.panel(&format!("Models ({})", self.models.len()), focused);
+        let unsupported = self.models.len() - self.runnable();
+        let title = if unsupported > 0 {
+            format!("Models ({} · {unsupported} unsupported)", self.runnable())
+        } else {
+            format!("Models ({})", self.runnable())
+        };
+        let block = self.panel(&title, focused);
         let inner = block.inner(area);
         f.render_widget(block, area);
         if self.models.is_empty() {
@@ -1449,6 +1739,7 @@ impl App {
         let mut lines: Vec<Line> = Vec::new();
         for (i, m) in self.models.iter().enumerate().skip(top).take(per_page) {
             let on = i == self.cursor;
+            let bad = m.problem.is_some();
             let bg = if on { SELECTED } else { Color::Reset };
             let size = gib(m.size);
             let quant = quant_of(&m.name).unwrap_or_default();
@@ -1463,9 +1754,15 @@ impl App {
                 Span::styled(
                     format!("{:<name_w$}", clip(&m.name, name_w)),
                     Style::new()
-                        .fg(if on { Color::White } else { TEXT })
+                        .fg(if bad {
+                            DIM
+                        } else if on {
+                            Color::White
+                        } else {
+                            TEXT
+                        })
                         .bg(bg)
-                        .add_modifier(if on {
+                        .add_modifier(if on && !bad {
                             Modifier::BOLD
                         } else {
                             Modifier::empty()
@@ -1474,14 +1771,23 @@ impl App {
                 Span::styled(format!(" {tail} "), Style::new().fg(DIM).bg(bg)),
             ]));
             lines.push(Line::from(vec![
-                Span::styled(if on { " ▌" } else { "  " }, Style::new().fg(EMBER).bg(bg)),
+                Span::styled(
+                    if on { " ▌" } else { "  " },
+                    Style::new().fg(if bad { BAD } else { EMBER }).bg(bg),
+                ),
                 Span::styled(
                     format!(
                         "{:<w$}",
-                        clip(&m.origin, width.saturating_sub(4)),
+                        clip(
+                            &match &m.problem {
+                                Some(why) => format!("✗ {why}"),
+                                None => m.origin.clone(),
+                            },
+                            width.saturating_sub(4)
+                        ),
                         w = width.saturating_sub(4)
                     ),
-                    Style::new().fg(FAINT).bg(bg),
+                    Style::new().fg(if bad { BAD } else { FAINT }).bg(bg),
                 ),
                 Span::styled("  ", Style::new().bg(bg)),
             ]));
@@ -1573,21 +1879,40 @@ impl App {
             .enumerate()
             .skip(top)
             .take(rows)
-            .map(|(i, (_, label, note, fits))| {
+            .map(|(i, o)| {
                 let on = i == p.cur;
                 let bg = if on { SELECTED } else { Color::Reset };
-                let mark = if *fits { "✓ fits model" } else { "" };
-                let label_w = width.saturating_sub(note.chars().count() + mark.chars().count() + 7);
+                let blocked = o.fit == Fit::Blocked;
+                let mark = if o.fit == Fit::Fits {
+                    "✓ fits model"
+                } else {
+                    ""
+                };
+                let note_w =
+                    width.saturating_sub(o.label.chars().count() + mark.chars().count() + 8);
+                let label_w = width
+                    .saturating_sub(note_w.min(o.note.chars().count()) + mark.chars().count() + 7);
                 Line::from(vec![
                     Span::styled(
                         if on { " ▌ " } else { "   " },
                         Style::new().fg(EMBER).bg(bg),
                     ),
                     Span::styled(
-                        format!("{:<label_w$}", clip(label, label_w)),
-                        Style::new().fg(if on { Color::White } else { TEXT }).bg(bg),
+                        format!("{:<label_w$}", clip(&o.label, label_w)),
+                        Style::new()
+                            .fg(if blocked {
+                                FAINT
+                            } else if on {
+                                Color::White
+                            } else {
+                                TEXT
+                            })
+                            .bg(bg),
                     ),
-                    Span::styled(format!(" {note} "), Style::new().fg(DIM).bg(bg)),
+                    Span::styled(
+                        format!(" {} ", clip(&o.note, note_w.max(10))),
+                        Style::new().fg(if blocked { BAD } else { DIM }).bg(bg),
+                    ),
                     Span::styled(format!("{mark} "), Style::new().fg(GOOD).bg(bg)),
                 ])
             })
@@ -1606,7 +1931,7 @@ impl App {
         let Some(m) = self.models.get(self.cursor) else {
             return;
         };
-        let info = self.infos.get(&m.path).and_then(|i| i.as_ref());
+        let info = m.info.as_ref();
         let row = |k: &str, v: String| {
             Line::from(vec![
                 Span::styled(format!(" {k:<9}"), Style::new().fg(DIM)),
@@ -1640,7 +1965,13 @@ impl App {
             }
             None => lines.push(row("arch", "unreadable GGUF header".into())),
         }
-        lines.push(row("size", gib(m.size)));
+        lines.push(match &m.problem {
+            None => row("size", format!("{} · ✓ supported", gib(m.size))),
+            Some(why) => Line::from(vec![
+                Span::styled(" status   ", Style::new().fg(DIM)),
+                Span::styled(clip(&format!("✗ {why}"), w), Style::new().fg(BAD)),
+            ]),
+        });
         lines.push(row("path", clip(&tilde(&m.path), w)));
         f.render_widget(Paragraph::new(lines), inner);
     }
@@ -1787,12 +2118,19 @@ impl App {
             .filter(|_| self.focus == Focus::Settings)
             .map(|i| self.fields[i].help)
             .unwrap_or("Pick a model, adjust settings, then launch.");
+        let note = match self
+            .models
+            .get(self.cursor)
+            .and_then(|m| m.problem.as_ref())
+        {
+            Some(why) => Line::styled(
+                format!(" ✗ can't run this model: {why}"),
+                Style::new().fg(BAD),
+            ),
+            None => Line::styled(format!(" {hint}"), Style::new().fg(DIM)),
+        };
         f.render_widget(
-            Paragraph::new(vec![
-                Line::from(cmd),
-                Line::styled(format!(" {hint}"), Style::new().fg(DIM)),
-            ])
-            .wrap(Wrap { trim: false }),
+            Paragraph::new(vec![Line::from(cmd), note]).wrap(Wrap { trim: false }),
             inner,
         );
     }

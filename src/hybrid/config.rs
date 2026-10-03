@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 use crate::{
     Error, Result,
-    loader::gguf::{GgufFile, MetadataValue},
+    loader::gguf::{GgufReader, MetadataValue},
 };
 use std::collections::BTreeMap;
 
@@ -50,7 +50,7 @@ pub struct HybridConfig {
 }
 
 impl HybridConfig {
-    pub fn from_gguf(file: &GgufFile) -> Result<Self> {
+    pub fn from_gguf<R: std::io::Read + std::io::Seek>(file: &GgufReader<R>) -> Result<Self> {
         let md = file.metadata();
         let arch = string(md, "general.architecture")?;
         let variant = match arch {
