@@ -42,6 +42,45 @@ pub struct AgentOpts {
     pub compact: bool,
 }
 
+/// A fresh folder for one chat session: `<root>/<date-time>-<model>`, never one that exists.
+pub fn session_dir(root: &str, model: &str) -> PathBuf {
+    let root = expand(if root.trim().is_empty() {
+        "~/ferrum-workspace"
+    } else {
+        root.trim()
+    });
+    let stamp = Command::new("/bin/date")
+        .arg("+%Y%m%d-%H%M%S")
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .unwrap_or_default();
+    let slug: String = model
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .split('-')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("-")
+        .chars()
+        .take(28)
+        .collect();
+    let base = format!("{stamp}-{slug}");
+    let mut dir = root.join(&base);
+    let mut n = 2;
+    while dir.exists() {
+        dir = root.join(format!("{base}-{n}"));
+        n += 1;
+    }
+    dir
+}
+
 /// Where an agent keeps its scratch home, temp files and attachments: outside the project.
 fn agent_state_dir(project: &Path) -> PathBuf {
     let name = project
@@ -421,7 +460,7 @@ pub const COMMANDS: [(&str, &str); 15] = [
     ("/paste", "attach the clipboard (image, files or text)"),
     ("/screenshot", "drag out a screen region to attach"),
     ("/detach", "remove the attachments"),
-    ("/workspace", "show the sandbox folder"),
+    ("/workspace", "show this chat's sandbox folder"),
     ("/exit", "leave the chat"),
 ];
 
@@ -555,12 +594,9 @@ impl Chat {
             .unwrap_or_default();
         let history = Vec::new();
         let (think, show) = (opts.think, opts.show_thinking);
-        let (system, tools, workspace, network) = (
-            opts.system.clone(),
-            opts.tools,
-            opts.workspace.clone(),
-            opts.network,
-        );
+        let (system, tools, network) = (opts.system.clone(), opts.tools, opts.network);
+        // Each chat gets its own sandbox folder inside the configured one.
+        let workspace = session_dir(&opts.workspace, &label).display().to_string();
         let (agent, sandbox) = match &opts.agent {
             Some(a) => {
                 let mut sb =
@@ -2433,5 +2469,30 @@ impl App {
             }
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_session_gets_its_own_folder() {
+        let root = std::env::temp_dir().join(format!("ferrum-sessions-{}", std::process::id()));
+        let root_s = root.display().to_string();
+        let a = session_dir(&root_s, "Qwen3.8-27B-UD-Q4_K_XL");
+        assert!(a.starts_with(&root));
+        let name = a.file_name().unwrap().to_string_lossy().to_string();
+        assert!(name.ends_with("qwen3-8-27b-ud-q4-k-xl"), "{name}");
+        assert!(
+            name.chars().next().unwrap().is_ascii_digit(),
+            "starts with the date: {name}"
+        );
+        // A folder that already exists is never reused, even in the same second.
+        fs::create_dir_all(&a).unwrap();
+        let b = session_dir(&root_s, "Qwen3.8-27B-UD-Q4_K_XL");
+        assert_ne!(a, b);
+        assert!(!b.exists());
+        let _ = fs::remove_dir_all(root);
     }
 }

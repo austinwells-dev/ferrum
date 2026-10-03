@@ -304,12 +304,12 @@ pub fn fields() -> Vec<Field> {
         ),
         field(
             "workspace",
-            "Workspace folder",
+            "Sandboxes folder",
             "Agent tools",
             ChatOnly,
             text(&[]),
             "~/ferrum-workspace",
-            "The only folder the tools can write to (Enter to change). Attachments are copied into it.",
+            "Each chat gets its own subfolder here, the only place its tools can write. Attachments are copied into it.",
         ),
         field(
             "network",
