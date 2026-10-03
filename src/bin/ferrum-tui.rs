@@ -257,7 +257,7 @@ fn fields() -> Vec<Field> {
             Both,
             text(&["off", "mtp"]),
             "off",
-            "Lossless speedup: off, mtp (built into the GGUF) or a drafter directory (Enter).",
+            "Lossless speedup. ←→ cycles, Enter opens the picker of detected DSpark/DFlash drafters.",
         ),
         field(
             "draft_max",
@@ -460,6 +460,8 @@ fn walk(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec<Mod
             || lower.contains("vocab")
             || lower.contains("mmproj")
             || later_shard
+            || is_drafter(&lower)
+            || is_drafter(&origin_of(&path).to_ascii_lowercase())
             || meta.len() < (32 << 20)
         {
             continue;
@@ -480,7 +482,98 @@ fn walk(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec<Mod
     }
 }
 
-fn scan(extra: &[String]) -> Vec<Model> {
+/// Speculative-decoding checkpoints (and MTP heads) are not chat models.
+fn is_drafter(lower: &str) -> bool {
+    lower.contains("dspark")
+        || lower.contains("dflash")
+        || lower.contains("speculator")
+        || lower.starts_with("mtp-")
+}
+
+struct Drafter {
+    /// The checkpoint directory (an HF cache entry works as is).
+    path: PathBuf,
+    label: String,
+    kind: &'static str,
+}
+
+fn find_drafters(dir: &Path, depth: usize, seen: &mut HashSet<PathBuf>, out: &mut Vec<Drafter>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || !path.is_dir() {
+            continue;
+        }
+        let lower = name.to_ascii_lowercase();
+        let hf = lower.starts_with("models--");
+        if is_drafter(&lower) && (hf || path.join("config.json").exists()) {
+            let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if seen.insert(canonical) {
+                out.push(Drafter {
+                    label: origin_of(&path.join("x")),
+                    kind: if lower.contains("dflash") {
+                        "dflash"
+                    } else {
+                        "dspark"
+                    },
+                    path,
+                });
+            }
+        } else if !hf
+            && depth > 0
+            && !matches!(name.as_str(), "node_modules" | "target" | "Library")
+        {
+            find_drafters(&path, depth - 1, seen, out);
+        }
+    }
+}
+
+fn scan_drafters(extra: &[String]) -> Vec<Drafter> {
+    let (mut seen, mut out) = (HashSet::new(), Vec::new());
+    for (root, depth) in roots(extra) {
+        if root.is_dir() {
+            find_drafters(&root, depth, &mut seen, &mut out);
+        }
+    }
+    out.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    out
+}
+
+fn squash(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_lowercase()
+}
+
+/// Whether a drafter was trained for this model, judged by name
+/// (`Qwen3.8-27B-DSpark` drafts `Qwen3.8-27B-...`).
+fn drafter_fits(d: &Drafter, m: &Model) -> bool {
+    let repo = d
+        .label
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let cut = [
+        "-dspark",
+        "-dflash",
+        ".dspark",
+        "-speculator",
+        ".speculator",
+    ]
+    .iter()
+    .filter_map(|k| repo.find(k))
+    .min()
+    .unwrap_or(repo.len());
+    let target = squash(&repo[..cut]);
+    !target.is_empty() && squash(&format!("{} {}", m.name, m.origin)).contains(&target)
+}
+
+fn roots(extra: &[String]) -> Vec<(PathBuf, usize)> {
     let h = home();
     let mut roots: Vec<(PathBuf, usize)> = Vec::new();
     if let Ok(env) = std::env::var("FERRUM_MODELS") {
@@ -503,9 +596,13 @@ fn scan(extra: &[String]) -> Vec<Model> {
         (h.join(".cache/lm-studio/models"), 4),
         (h.join(".lmstudio/models"), 4),
     ]);
+    roots
+}
+
+fn scan(extra: &[String]) -> Vec<Model> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
-    for (root, depth) in roots {
+    for (root, depth) in roots(extra) {
         if root.is_file() {
             walk_file(&root, &mut seen, &mut out);
         } else {
@@ -584,14 +681,30 @@ fn config_path() -> PathBuf {
 
 #[derive(PartialEq)]
 enum Focus {
+    Favorites,
     Models,
     Settings,
+}
+
+/// A saved setup: model, mode and every setting, drafter included.
+struct Fav {
+    name: String,
+    model: String,
+    serve: bool,
+    values: Map<String, Json>,
+}
+
+struct Picker {
+    /// (value, label, note, fits the selected model)
+    options: Vec<(String, String, String, bool)>,
+    cur: usize,
 }
 
 enum Editing {
     No,
     Field(usize),
     AddPath,
+    FavName,
 }
 
 enum Outcome {
@@ -611,6 +724,10 @@ struct App {
     buffer: String,
     extra: Vec<String>,
     infos: HashMap<PathBuf, Option<Info>>,
+    drafters: Vec<Drafter>,
+    favs: Vec<Fav>,
+    fav_cursor: usize,
+    picker: Option<Picker>,
     status: Option<(String, bool)>,
 }
 
@@ -645,6 +762,20 @@ impl App {
         let cursor = want
             .and_then(|w| models.iter().position(|m| m.path == w))
             .unwrap_or(0);
+        let drafters = scan_drafters(&extra);
+        let favs = saved["favorites"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .map(|v| Fav {
+                        name: v["name"].as_str().unwrap_or("favorite").to_string(),
+                        model: v["model"].as_str().unwrap_or("").to_string(),
+                        serve: v["mode"] == "serve",
+                        values: v["values"].as_object().cloned().unwrap_or_default(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
         let mut app = App {
             mode: if saved["mode"] == "serve" {
                 Mode::Serve
@@ -660,6 +791,10 @@ impl App {
             buffer: String::new(),
             extra,
             infos: HashMap::new(),
+            drafters,
+            favs,
+            fav_cursor: 0,
+            picker: None,
             status: None,
         };
         app.load_info();
@@ -676,6 +811,12 @@ impl App {
             "model": self.models.get(self.cursor).map(|m| m.path.display().to_string()),
             "values": values,
             "extra": self.extra,
+            "favorites": self.favs.iter().map(|f| json!({
+                "name": f.name,
+                "model": f.model,
+                "mode": if f.serve { "serve" } else { "chat" },
+                "values": f.values,
+            })).collect::<Vec<_>>(),
         });
         let path = config_path();
         if let Some(dir) = path.parent() {
@@ -785,7 +926,164 @@ impl App {
         (if serve { "ferrum-server" } else { "ferrum-cli" }, args)
     }
 
+    fn draft_values(&self) -> Vec<String> {
+        let mut v = vec!["off".to_string(), "mtp".to_string()];
+        v.extend(self.drafters.iter().map(|d| d.path.display().to_string()));
+        v
+    }
+
+    fn draft_label(&self, value: &str) -> String {
+        match self
+            .drafters
+            .iter()
+            .find(|d| d.path.display().to_string() == value)
+        {
+            Some(d) => format!("{} ({})", d.label, d.kind),
+            None => match value.rsplit('/').next() {
+                Some(last) if value.contains('/') => format!("…/{last}"),
+                _ => value.to_string(),
+            },
+        }
+    }
+
+    fn open_picker(&mut self) {
+        let model = self.models.get(self.cursor);
+        let mut options = vec![
+            (
+                "off".to_string(),
+                "Off".to_string(),
+                "no speculation".to_string(),
+                false,
+            ),
+            (
+                "mtp".to_string(),
+                "MTP".to_string(),
+                "head built into the GGUF".to_string(),
+                false,
+            ),
+        ];
+        let mut found: Vec<_> = self
+            .drafters
+            .iter()
+            .map(|d| {
+                let fits = model.is_some_and(|m| drafter_fits(d, m));
+                (
+                    d.path.display().to_string(),
+                    d.label.clone(),
+                    d.kind.to_string(),
+                    fits,
+                )
+            })
+            .collect();
+        found.sort_by_key(|o| !o.3);
+        options.extend(found);
+        options.push((
+            String::new(),
+            "Custom path…".into(),
+            "type a directory".into(),
+            false,
+        ));
+        let current = self.value("draft");
+        let cur = options
+            .iter()
+            .position(|o| !o.0.is_empty() && o.0 == current)
+            .unwrap_or(0);
+        self.picker = Some(Picker { options, cur });
+    }
+
+    fn picker_key(&mut self, code: KeyCode) {
+        let Some(p) = &mut self.picker else {
+            return;
+        };
+        match code {
+            KeyCode::Up | KeyCode::Char('k') => p.cur = p.cur.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => p.cur = (p.cur + 1).min(p.options.len() - 1),
+            KeyCode::Esc | KeyCode::Char('q') => self.picker = None,
+            KeyCode::Enter => {
+                let value = p.options[p.cur].0.clone();
+                self.picker = None;
+                let Some(i) = self.fields.iter().position(|f| f.key == "draft") else {
+                    return;
+                };
+                if value.is_empty() {
+                    self.buffer = String::new();
+                    self.editing = Editing::Field(i);
+                } else {
+                    self.fields[i].value = value;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn save_favorite(&mut self, name: &str) {
+        let Some(model) = self.models.get(self.cursor) else {
+            self.status = Some(("pick a model first".into(), false));
+            return;
+        };
+        let mut values = Map::new();
+        for f in self.fields.iter().filter(|f| !f.value.is_empty()) {
+            values.insert(f.key.into(), json!(f.value));
+        }
+        let fav = Fav {
+            name: name.to_string(),
+            model: model.path.display().to_string(),
+            serve: self.mode == Mode::Serve,
+            values,
+        };
+        match self.favs.iter().position(|f| f.name == name) {
+            Some(i) => self.favs[i] = fav,
+            None => {
+                self.favs.push(fav);
+                self.fav_cursor = self.favs.len() - 1;
+            }
+        }
+        self.status = Some((format!("saved favorite {name:?}"), true));
+        self.save();
+    }
+
+    fn load_favorite(&mut self, i: usize) {
+        let Some(fav) = self.favs.get(i) else {
+            return;
+        };
+        for f in &mut self.fields {
+            f.value = fav
+                .values
+                .get(f.key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+        }
+        self.mode = if fav.serve { Mode::Serve } else { Mode::Chat };
+        let name = fav.name.clone();
+        match self
+            .models
+            .iter()
+            .position(|m| m.path.display().to_string() == fav.model)
+        {
+            Some(at) => {
+                self.cursor = at;
+                self.load_info();
+                self.status = Some((format!("loaded {name:?}"), true));
+            }
+            None => self.status = Some((format!("{name:?}: model file not found"), false)),
+        }
+        self.sel = 0;
+        self.focus = Focus::Settings;
+    }
+
     fn step(&mut self, idx: usize, dir: i32) {
+        if self.fields[idx].key == "draft" {
+            let opts = self.draft_values();
+            let cur = match self.fields[idx].value.as_str() {
+                "" => "off",
+                v => v,
+            };
+            let at = opts.iter().position(|o| o == cur).unwrap_or(0) as i32;
+            self.fields[idx].value =
+                opts[(at + dir).rem_euclid(opts.len() as i32) as usize].clone();
+            return;
+        }
         let f = &mut self.fields[idx];
         match &f.kind {
             Kind::Cycle(opts) => {
@@ -854,6 +1152,12 @@ impl App {
                     self.rescan(Some(&path));
                 }
             }
+            Editing::FavName => {
+                let name = self.buffer.trim().to_string();
+                if !name.is_empty() {
+                    self.save_favorite(&name);
+                }
+            }
             Editing::No => {}
         }
         self.buffer.clear();
@@ -862,6 +1166,7 @@ impl App {
     fn rescan(&mut self, focus: Option<&Path>) {
         let keep = self.models.get(self.cursor).map(|m| m.path.clone());
         self.models = scan(&self.extra);
+        self.drafters = scan_drafters(&self.extra);
         let target = focus
             .and_then(|p| {
                 self.models
@@ -888,6 +1193,10 @@ impl App {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.save();
             return Some(Outcome::Quit);
+        }
+        if self.picker.is_some() {
+            self.picker_key(key.code);
+            return None;
         }
         if !matches!(self.editing, Editing::No) {
             match key.code {
@@ -926,14 +1235,41 @@ impl App {
                 self.buffer.clear();
             }
             KeyCode::Char('r') => self.rescan(None),
+            KeyCode::Char('f') => {
+                self.buffer = self
+                    .models
+                    .get(self.cursor)
+                    .map(|m| m.name.clone())
+                    .unwrap_or_default();
+                self.editing = Editing::FavName;
+            }
             KeyCode::Tab | KeyCode::BackTab => {
-                self.focus = if self.focus == Focus::Models {
-                    Focus::Settings
-                } else {
-                    Focus::Models
-                };
+                let order = [Focus::Favorites, Focus::Models, Focus::Settings];
+                let at = order.iter().position(|f| *f == self.focus).unwrap_or(0);
+                let back = key.code == KeyCode::BackTab;
+                let next = (at + if back { 2 } else { 1 }) % 3;
+                self.focus = order.into_iter().nth(next).unwrap_or(Focus::Models);
             }
             code => match self.focus {
+                Focus::Favorites => match code {
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        self.fav_cursor = self.fav_cursor.saturating_sub(1)
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        self.fav_cursor =
+                            (self.fav_cursor + 1).min(self.favs.len().saturating_sub(1))
+                    }
+                    KeyCode::Enter | KeyCode::Right => self.load_favorite(self.fav_cursor),
+                    KeyCode::Char('x') | KeyCode::Delete | KeyCode::Backspace => {
+                        if self.fav_cursor < self.favs.len() {
+                            let gone = self.favs.remove(self.fav_cursor);
+                            self.fav_cursor = self.fav_cursor.saturating_sub(1);
+                            self.status = Some((format!("removed {:?}", gone.name), true));
+                            self.save();
+                        }
+                    }
+                    _ => {}
+                },
                 Focus::Models => match code {
                     KeyCode::Up | KeyCode::Char('k') => {
                         self.cursor = self.cursor.saturating_sub(1);
@@ -972,6 +1308,7 @@ impl App {
                         KeyCode::Enter | KeyCode::Char(' ') => {
                             if let Some(i) = self.current_field() {
                                 match self.fields[i].kind {
+                                    _ if self.fields[i].key == "draft" => self.open_picker(),
                                     Kind::Cycle(_) => self.step(i, 1),
                                     _ => {
                                         self.buffer = self.fields[i].value.clone();
@@ -1002,14 +1339,22 @@ impl App {
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
                 .areas(body);
-        let [list, details] =
-            Layout::vertical([Constraint::Min(6), Constraint::Length(9)]).areas(left);
+        let [favs, list, details] = Layout::vertical([
+            Constraint::Length(6),
+            Constraint::Min(5),
+            Constraint::Length(8),
+        ])
+        .areas(left);
+        self.draw_favorites(f, favs);
         self.draw_models(f, list);
         self.draw_details(f, details);
         self.draw_settings(f, right);
         self.draw_command(f, command);
         self.draw_footer(f, footer);
-        if matches!(self.editing, Editing::AddPath) {
+        if self.picker.is_some() {
+            self.draw_picker(f);
+        }
+        if matches!(self.editing, Editing::AddPath | Editing::FavName) {
             self.draw_add_path(f);
         }
     }
@@ -1144,6 +1489,116 @@ impl App {
         f.render_widget(Paragraph::new(lines), inner);
     }
 
+    fn draw_favorites(&self, f: &mut Frame, area: Rect) {
+        let focused = self.focus == Focus::Favorites;
+        let block = self.panel(&format!("Favorites ({})", self.favs.len()), focused);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        if self.favs.is_empty() {
+            f.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(" Press f to save the current", Style::new().fg(DIM)),
+                    Line::styled(
+                        " model and settings, drafter included.",
+                        Style::new().fg(DIM),
+                    ),
+                ]),
+                inner,
+            );
+            return;
+        }
+        let per_page = inner.height as usize;
+        let top = (self.fav_cursor + 1).saturating_sub(per_page);
+        let width = inner.width as usize;
+        let lines: Vec<Line> = self
+            .favs
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(per_page)
+            .map(|(i, fav)| {
+                let on = focused && i == self.fav_cursor;
+                let bg = if on { SELECTED } else { Color::Reset };
+                let draft = match fav.values.get("draft").and_then(|v| v.as_str()) {
+                    None | Some("off") | Some("") => String::new(),
+                    Some("mtp") => " ⚡mtp".to_string(),
+                    Some(p) => format!(
+                        " ⚡{}",
+                        self.drafters
+                            .iter()
+                            .find(|d| d.path.display().to_string() == p)
+                            .map(|d| d.kind)
+                            .unwrap_or("draft")
+                    ),
+                };
+                let tail = format!("{}{} ", if fav.serve { "serve" } else { "chat" }, draft);
+                let name_w = width.saturating_sub(tail.chars().count() + 4);
+                Line::from(vec![
+                    Span::styled(if on { " ▌" } else { "  " }, Style::new().fg(EMBER).bg(bg)),
+                    Span::styled("★ ", Style::new().fg(GOLD).bg(bg)),
+                    Span::styled(
+                        format!("{:<name_w$}", clip(&fav.name, name_w)),
+                        Style::new().fg(if on { Color::White } else { TEXT }).bg(bg),
+                    ),
+                    Span::styled(tail, Style::new().fg(DIM).bg(bg)),
+                ])
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
+    fn draw_picker(&self, f: &mut Frame) {
+        let Some(p) = &self.picker else {
+            return;
+        };
+        let area = f.area();
+        let w = area.width.saturating_sub(8).min(76);
+        let h = (p.options.len() as u16 + 4).min(area.height.saturating_sub(2));
+        let rect = Rect::new(
+            area.x + (area.width - w) / 2,
+            area.y + (area.height - h) / 2,
+            w,
+            h,
+        );
+        f.render_widget(Clear, rect);
+        let block = self.panel("Drafter", true);
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let rows = inner.height.saturating_sub(1) as usize;
+        let top = (p.cur + 1).saturating_sub(rows);
+        let width = inner.width as usize;
+        let mut lines: Vec<Line> = p
+            .options
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(rows)
+            .map(|(i, (_, label, note, fits))| {
+                let on = i == p.cur;
+                let bg = if on { SELECTED } else { Color::Reset };
+                let mark = if *fits { "✓ fits model" } else { "" };
+                let label_w = width.saturating_sub(note.chars().count() + mark.chars().count() + 7);
+                Line::from(vec![
+                    Span::styled(
+                        if on { " ▌ " } else { "   " },
+                        Style::new().fg(EMBER).bg(bg),
+                    ),
+                    Span::styled(
+                        format!("{:<label_w$}", clip(label, label_w)),
+                        Style::new().fg(if on { Color::White } else { TEXT }).bg(bg),
+                    ),
+                    Span::styled(format!(" {note} "), Style::new().fg(DIM).bg(bg)),
+                    Span::styled(format!("{mark} "), Style::new().fg(GOOD).bg(bg)),
+                ])
+            })
+            .collect();
+        lines.push(Line::styled(
+            " ↑↓ choose · enter select · esc cancel",
+            Style::new().fg(FAINT),
+        ));
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+
     fn draw_details(&self, f: &mut Frame, area: Rect) {
         let block = self.panel("Details", false);
         let inner = block.inner(area);
@@ -1266,6 +1721,8 @@ impl App {
             (format!("{}▏", self.buffer), true)
         } else if fl.value.is_empty() {
             (fl.default.to_string(), false)
+        } else if fl.key == "draft" {
+            (self.draft_label(&fl.value), true)
         } else if matches!(fl.kind, Kind::Text { secret: true, .. }) {
             ("•".repeat(fl.value.chars().count().min(16)), true)
         } else {
@@ -1356,6 +1813,7 @@ impl App {
                 ("⌫", "reset"),
                 ("tab", "pane"),
                 ("m", "chat/serve"),
+                ("f", "favorite"),
                 ("a", "add path"),
                 ("l", "launch"),
                 ("q", "quit"),
@@ -1386,7 +1844,17 @@ impl App {
             5,
         );
         f.render_widget(Clear, rect);
-        let block = self.panel("Add model file or folder", true);
+        let (title, hint) = match self.editing {
+            Editing::FavName => (
+                "Save as favorite",
+                " name this setup (same name overwrites)",
+            ),
+            _ => (
+                "Add model file or folder",
+                " a .gguf file, or a folder to scan",
+            ),
+        };
+        let block = self.panel(title, true);
         let inner = block.inner(rect);
         f.render_widget(block, rect);
         f.render_widget(
@@ -1395,7 +1863,7 @@ impl App {
                     Span::styled(" ❯ ", Style::new().fg(EMBER)),
                     Span::styled(format!("{}▏", self.buffer), Style::new().fg(Color::White)),
                 ]),
-                Line::styled(" a .gguf file, or a folder to scan", Style::new().fg(DIM)),
+                Line::styled(hint, Style::new().fg(DIM)),
             ]),
             inner,
         );
