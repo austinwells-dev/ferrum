@@ -66,10 +66,7 @@ impl App {
                 format!("PLAN  {done}/{total}")
             }));
             if g.todos.is_empty() {
-                lines.push(Line::styled(
-                    " the agent plans multi-step work here",
-                    Style::new().fg(FAINT),
-                ));
+                lines.push(Line::styled(" steps appear here", Style::new().fg(FAINT)));
             }
             for t in g.todos.iter().take(10) {
                 let (mark, style) = match t.state {
@@ -135,7 +132,7 @@ impl App {
                 lines.push(Line::styled(format!(" {used} / {cap} tokens"), dim));
             }
             None => lines.push(Line::styled(
-                " measured after each reply",
+                " shown after each reply",
                 Style::new().fg(FAINT),
             )),
         }
@@ -156,6 +153,35 @@ impl App {
                 ));
             }
         }
+        let lines: Vec<Line> = lines.into_iter().map(|l| fit(l, w)).collect();
         f.render_widget(Paragraph::new(lines), inner);
     }
+}
+
+/// Cut a line to `width` columns, ending in an ellipsis, so nothing is clipped mid-word by the border.
+fn fit(line: Line<'static>, width: usize) -> Line<'static> {
+    let total: usize = line.spans.iter().map(|s| text_width(&s.content)).sum();
+    if total <= width {
+        return line;
+    }
+    let mut left = width.saturating_sub(1);
+    let mut spans = Vec::new();
+    for span in line.spans {
+        if left == 0 {
+            break;
+        }
+        let mut kept = String::new();
+        for c in span.content.chars() {
+            let cw = cw(c);
+            if cw > left {
+                left = 0;
+                break;
+            }
+            kept.push(c);
+            left -= cw;
+        }
+        spans.push(Span::styled(kept, span.style));
+    }
+    spans.push(Span::styled("…", Style::new().fg(FAINT)));
+    Line::from(spans)
 }
