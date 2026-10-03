@@ -76,7 +76,7 @@ fn styled(s: &str, style: Style) -> Vec<Sc> {
 fn inline(s: &str, base: Style) -> Vec<Sc> {
     let chars: Vec<char> = s.chars().collect();
     let (mut out, mut i) = (Vec::new(), 0);
-    let (mut code, mut bold) = (false, false);
+    let (mut code, mut bold, mut italic) = (false, false, false);
     while i < chars.len() {
         let c = chars[i];
         if c == '`' {
@@ -89,12 +89,28 @@ fn inline(s: &str, base: Style) -> Vec<Sc> {
             i += 2;
             continue;
         }
+        if !code && c == '*' {
+            let next_word = chars
+                .get(i + 1)
+                .is_some_and(|n| !n.is_whitespace() && *n != '*');
+            let prev_word = i > 0 && !chars[i - 1].is_whitespace();
+            if (!italic && next_word) || (italic && prev_word) {
+                italic = !italic;
+                i += 1;
+                continue;
+            }
+        }
         let style = if code {
             Style::new().fg(GOLD).bg(CODE_BG)
-        } else if bold {
-            base.add_modifier(Modifier::BOLD)
         } else {
-            base
+            let mut st = base;
+            if bold {
+                st = st.add_modifier(Modifier::BOLD);
+            }
+            if italic {
+                st = st.add_modifier(Modifier::ITALIC);
+            }
+            st
         };
         out.push((c, style));
         i += 1;

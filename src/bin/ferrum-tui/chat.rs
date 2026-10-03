@@ -293,6 +293,17 @@ pub enum Phase {
     Failed(String),
 }
 
+/// Slash commands offered by the palette: (text to insert, description).
+pub const COMMANDS: [(&str, &str); 7] = [
+    ("/reset", "clear the conversation"),
+    ("/think on", "turn reasoning on"),
+    ("/think off", "turn reasoning off"),
+    ("/thoughts", "show or hide the model's thinking"),
+    ("/stats", "speed and context of the last turn"),
+    ("/help", "list the commands"),
+    ("/exit", "leave the chat"),
+];
+
 pub struct Chat {
     tx: Sender<ToWorker>,
     rx: Receiver<FromWorker>,
@@ -319,6 +330,8 @@ pub struct Chat {
     max_top: Cell<usize>,
     page: Cell<usize>,
     last_stats: String,
+    palette_sel: usize,
+    palette_off: bool,
 }
 
 impl Chat {
@@ -367,6 +380,8 @@ impl Chat {
             max_top: Cell::new(0),
             page: Cell::new(10),
             last_stats: String::new(),
+            palette_sel: 0,
+            palette_off: false,
         })
     }
 
@@ -375,6 +390,36 @@ impl Chat {
         self.cancel.store(true, Ordering::SeqCst);
         drop(self.tx);
         self.handle.take()
+    }
+
+    /// Commands matching what is typed after a leading `/`.
+    pub fn palette(&self) -> Vec<(&'static str, &'static str)> {
+        if self.phase != Phase::Ready
+            || self.palette_off
+            || !self.input.starts_with('/')
+            || self.input.contains('\n')
+        {
+            return Vec::new();
+        }
+        let q = self.input.to_lowercase();
+        let word = q.trim_start_matches('/');
+        let mut out: Vec<_> = COMMANDS
+            .iter()
+            .filter(|(n, _)| n.starts_with(&q))
+            .copied()
+            .collect();
+        out.extend(
+            COMMANDS
+                .iter()
+                .filter(|(n, _)| !n.starts_with(&q) && n.contains(word))
+                .copied(),
+        );
+        out
+    }
+
+    fn set_input(&mut self, text: &str) {
+        self.input = text.to_string();
+        self.cursor = self.input.chars().count();
     }
 
     pub fn generating(&self) -> bool {
@@ -543,12 +588,26 @@ impl Chat {
                     .unwrap_or_default();
                 self.note(format!("{s}{ctx}"));
             }
-            "/help" | "/?" => self.note(
-                "/reset  clear the conversation     /think on|off  toggle reasoning\n\
-                 /stats  last turn's speed          /exit  leave the chat\n\
-                 ctrl-t  show or hide the model's thinking\n\
-                 alt+enter or a trailing \\ makes a new line",
-            ),
+            "/thoughts" => {
+                self.show_thinking = !self.show_thinking;
+                self.note(format!(
+                    "thinking is now {}",
+                    if self.show_thinking {
+                        "shown"
+                    } else {
+                        "hidden"
+                    }
+                ));
+            }
+            "/help" | "/?" => {
+                let mut text = String::from("type / to see the commands as you type\n");
+                for (name, what) in COMMANDS {
+                    text += &format!("{name:<12} {what}\n");
+                }
+                text += "ctrl-t       show or hide the model's thinking\n";
+                text += "alt+enter or a trailing \\ makes a new line";
+                self.note(text);
+            }
             other => self.note(format!("unknown command {other} (try /help)")),
         }
         false
@@ -585,6 +644,17 @@ impl App {
     }
 
     pub fn chat_key(&mut self, key: KeyEvent) {
+        let before = self.chat.as_ref().map(|c| c.input.clone());
+        self.chat_key_inner(key);
+        if let (Some(c), Some(b)) = (self.chat.as_mut(), before) {
+            if c.input != b {
+                c.palette_sel = 0;
+                c.palette_off = false;
+            }
+        }
+    }
+
+    fn chat_key_inner(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -600,6 +670,31 @@ impl App {
                 self.leave_chat();
             }
             return;
+        }
+        let palette = chat.palette();
+        if !palette.is_empty() && !alt && !shift {
+            let n = palette.len();
+            let sel = chat.palette_sel.min(n - 1);
+            match key.code {
+                KeyCode::Up => {
+                    chat.palette_sel = (sel + n - 1) % n;
+                    return;
+                }
+                KeyCode::Down => {
+                    chat.palette_sel = (sel + 1) % n;
+                    return;
+                }
+                KeyCode::Tab => {
+                    chat.set_input(palette[sel].0);
+                    return;
+                }
+                KeyCode::Esc => {
+                    chat.palette_off = true;
+                    return;
+                }
+                KeyCode::Enter => chat.set_input(palette[sel].0),
+                _ => {}
+            }
         }
         match key.code {
             KeyCode::Esc => {
@@ -830,21 +925,85 @@ impl App {
             f.set_cursor_position((x.min(inner.x + inner.width.saturating_sub(1)), y));
         }
 
-        let keys: &[(&str, &str)] = match chat.phase {
-            Phase::Generating => &[
-                ("esc", "stop"),
-                ("pgup/pgdn", "scroll"),
-                ("ctrl-t", "thinking"),
-            ],
-            Phase::Ready => &[
-                ("enter", "send"),
-                ("alt+enter", "new line"),
-                ("pgup/pgdn", "scroll"),
-                ("ctrl-t", "thinking"),
-                ("/help", "commands"),
-                ("esc", "leave"),
-            ],
-            _ => &[("esc", "back")],
+        let items = chat.palette();
+        if !items.is_empty() {
+            let n = items.len().min(7);
+            let sel = chat.palette_sel.min(items.len() - 1);
+            let h = (n as u16 + 2).min(input.y.saturating_sub(area.y));
+            let rect = Rect::new(input.x, input.y - h, input.width.min(70), h);
+            f.render_widget(Clear, rect);
+            let block = panel("commands", true);
+            let inner = block.inner(rect);
+            f.render_widget(block, rect);
+            let typed = chat.input.chars().count();
+            let top = (sel + 1).saturating_sub(inner.height as usize);
+            let lines: Vec<Line> = items
+                .iter()
+                .enumerate()
+                .skip(top)
+                .take(inner.height as usize)
+                .map(|(i, (name, what))| {
+                    let on = i == sel;
+                    let bg = if on { SELECTED } else { Color::Reset };
+                    let hit = name.to_lowercase().starts_with(&chat.input.to_lowercase());
+                    let split = if hit {
+                        typed.min(name.chars().count())
+                    } else {
+                        0
+                    };
+                    let (head, tail): (String, String) = (
+                        name.chars().take(split).collect(),
+                        name.chars().skip(split).collect(),
+                    );
+                    let pad = " ".repeat(14usize.saturating_sub(name.chars().count()));
+                    Line::from(vec![
+                        Span::styled(
+                            if on { " ▌ " } else { "   " },
+                            Style::new().fg(EMBER).bg(bg),
+                        ),
+                        Span::styled(
+                            head,
+                            Style::new().fg(GOLD).bg(bg).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            tail,
+                            Style::new().fg(if on { Color::White } else { TEXT }).bg(bg),
+                        ),
+                        Span::styled(pad, Style::new().bg(bg)),
+                        Span::styled(
+                            format!("{:<w$}", what, w = inner.width.saturating_sub(18) as usize),
+                            Style::new().fg(if on { GOLD } else { DIM }).bg(bg),
+                        ),
+                    ])
+                })
+                .collect();
+            f.render_widget(Paragraph::new(lines), inner);
+        }
+
+        let keys: &[(&str, &str)] = if !items.is_empty() {
+            &[
+                ("↑↓", "choose"),
+                ("tab", "complete"),
+                ("enter", "run"),
+                ("esc", "close"),
+            ]
+        } else {
+            match chat.phase {
+                Phase::Generating => &[
+                    ("esc", "stop"),
+                    ("pgup/pgdn", "scroll"),
+                    ("ctrl-t", "thinking"),
+                ],
+                Phase::Ready => &[
+                    ("enter", "send"),
+                    ("alt+enter", "new line"),
+                    ("pgup/pgdn", "scroll"),
+                    ("ctrl-t", "thinking"),
+                    ("/help", "commands"),
+                    ("esc", "leave"),
+                ],
+                _ => &[("esc", "back")],
+            }
         };
         keys_footer(f, footer, keys, &self.status);
     }
@@ -987,7 +1146,7 @@ impl App {
         let text_area = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
         f.render_widget(Paragraph::new(visible), text_area);
         if max_top > 0 {
-            let mut state = ratatui::widgets::ScrollbarState::new(max_top + h)
+            let mut state = ratatui::widgets::ScrollbarState::new(max_top + 1)
                 .position(top)
                 .viewport_content_length(h);
             f.render_stateful_widget(
