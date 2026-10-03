@@ -16,6 +16,7 @@ mod editor;
 mod fields;
 mod home;
 mod pick;
+mod search;
 mod serve;
 mod sessions;
 mod settings;

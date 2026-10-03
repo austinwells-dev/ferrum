@@ -43,7 +43,10 @@ impl ToolMode {
 
 /// Tools that change things or reach the network ask first in `ask` mode.
 pub fn needs_approval(name: &str) -> bool {
-    matches!(name, "bash" | "write_file" | "edit_file" | "fetch_url")
+    matches!(
+        name,
+        "bash" | "write_file" | "edit_file" | "fetch_url" | "web_search"
+    )
 }
 
 fn def(name: &str, description: &str, properties: Json, required: &[&str]) -> Json {
@@ -107,6 +110,12 @@ pub fn tool_defs(network: bool) -> Vec<Json> {
     ];
     if network {
         tools.push(def(
+            "web_search",
+            "Search the web; returns titles, links and snippets. Follow up with fetch_url.",
+            json!({"query": {"type": "string", "description": "Search terms."}}),
+            &["query"],
+        ));
+        tools.push(def(
             "fetch_url",
             "Download a web page or file over HTTP(S) and return it as text (HTML is reduced to readable text).",
             json!({
@@ -136,6 +145,7 @@ pub fn summary(name: &str, args: &Map<String, Json>) -> String {
     match name {
         "bash" => s("command").lines().next().unwrap_or("").to_string(),
         "fetch_url" => s("url").to_string(),
+        "web_search" => s("query").to_string(),
         "list_dir" if s("path").is_empty() => ".".to_string(),
         _ => s("path").to_string(),
     }
@@ -182,6 +192,7 @@ pub struct Sandbox {
     /// Scratch home, temp and attachment folders; outside the project for agents.
     pub state: PathBuf,
     pub network: bool,
+    pub search: crate::search::Config,
     /// Command output longer than this is clipped (agents offload it instead).
     pub output_limit: usize,
 }
@@ -211,6 +222,7 @@ impl Sandbox {
             workspace,
             state,
             network,
+            search: Default::default(),
             output_limit: MAX_OUTPUT,
         })
     }
@@ -377,6 +389,10 @@ impl Sandbox {
             "edit_file" => self.edit_file(args),
             "list_dir" => self.list_dir(args),
             "fetch_url" => self.fetch_url(args, cancel),
+            "web_search" if !self.network => Err("the network is turned off for this chat".into()),
+            "web_search" => {
+                crate::search::search(&self.search, arg_str(args, "query").unwrap_or(""))
+            }
             other => Err(format!("unknown tool {other}")),
         };
         match result {

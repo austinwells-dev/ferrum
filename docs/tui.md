@@ -35,6 +35,20 @@ The Agents tab is a local coding agent that works on a real project folder. Pick
 
 `/plan on` makes the agent read-only until you run `/plan off`.
 
+### Web search
+
+`web_search` is available in Chat and Agents whenever *Network* is on. Choose the back end in the setup (*Web search*, *Search URL*, *Search API key*):
+
+| Provider | Needs | Notes |
+|---|---|---|
+| `duckduckgo` | nothing | Default. Scrapes DuckDuckGo's HTML results |
+| `instant` | nothing | DuckDuckGo's answer API. Summaries and related topics only, often empty for ordinary queries |
+| `searxng` | *Search URL*, e.g. `http://localhost:8080` | Needs `json` under `search.formats` in the server's `settings.yml` |
+| `brave` | *Search API key* | Brave Search API |
+| `custom` | *Search URL* with `{query}` (and optionally `{key}`) | Any GET endpoint that returns JSON with a `results` list of `title`, `url` and `content` |
+
+Write the key as `$NAME` to read it from an environment variable instead of saving it in `tui.json`. The search request is made from your setting, never from model output, and runs outside the sandbox so that a SearXNG server on this Mac or LAN can be reached. The model only supplies the query. `ask` mode asks before each search.
+
 ### Sandbox
 
 Every command and download runs inside a macOS Seatbelt sandbox (`sandbox-exec`, profile in [`sandbox.sb`](../src/bin/ferrum-tui/sandbox.sb)):

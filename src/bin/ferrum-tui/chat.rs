@@ -33,6 +33,7 @@ pub struct ChatOpts {
     pub tools: ToolMode,
     pub workspace: String,
     pub network: bool,
+    pub search: crate::search::Config,
     pub agent: Option<AgentOpts>,
 }
 
@@ -152,6 +153,11 @@ impl ChatOpts {
             },
             workspace: app.value("workspace").to_string(),
             network: app.value("network") != "off",
+            search: crate::search::Config::new(
+                app.value("search"),
+                app.value("search_url"),
+                app.value("search_key"),
+            ),
             agent: if app.mode == Mode::Agent {
                 let project = match app.value("project") {
                     "" => std::env::current_dir().map_err(|e| e.to_string())?,
@@ -569,6 +575,7 @@ pub struct Chat {
     pub tools: ToolMode,
     workspace: String,
     network: bool,
+    search: crate::search::Config,
     sandbox: Option<Sandbox>,
     pub attachments: Vec<Attachment>,
     /// Tool rounds since the last user message.
@@ -607,6 +614,7 @@ impl Chat {
         let history = Vec::new();
         let (think, show) = (opts.think, opts.show_thinking);
         let (system, tools, network) = (opts.system.clone(), opts.tools, opts.network);
+        let search = opts.search.clone();
         // Each chat gets its own sandbox folder inside the configured one.
         let workspace = session_dir(&opts.workspace, &label).display().to_string();
         let (agent, sandbox) = match &opts.agent {
@@ -614,6 +622,7 @@ impl Chat {
                 let mut sb =
                     Sandbox::with_state(a.project.clone(), agent_state_dir(&a.project), network)?;
                 sb.output_limit = coding::AGENT_OUTPUT_LIMIT;
+                sb.search = search.clone();
                 let mut agent = Agent {
                     project: a.project.clone(),
                     shared: coding::new_shared(),
@@ -678,6 +687,7 @@ impl Chat {
             tools,
             workspace,
             network,
+            search,
             sandbox,
             attachments: Vec::new(),
             rounds: 0,
@@ -823,7 +833,9 @@ impl Chat {
 
     pub fn sandbox(&mut self) -> Result<Sandbox, String> {
         if self.sandbox.is_none() {
-            self.sandbox = Some(Sandbox::new(&self.workspace, self.network)?);
+            let mut sb = Sandbox::new(&self.workspace, self.network)?;
+            sb.search = self.search.clone();
+            self.sandbox = Some(sb);
         }
         Ok(self.sandbox.clone().expect("just created"))
     }
@@ -2275,6 +2287,7 @@ impl App {
                     "write_file" => "  wants to write a file",
                     "edit_file" => "  wants to edit a file",
                     "fetch_url" => "  wants to download",
+                    "web_search" => "  wants to search the web",
                     _ => "  wants to run",
                 },
                 Style::new().fg(DIM),
@@ -2297,6 +2310,7 @@ impl App {
         match name.as_str() {
             "bash" => add(s("command"), Style::new().fg(GOLD), 6),
             "fetch_url" => add(s("url"), Style::new().fg(GOLD), 2),
+            "web_search" => add(s("query"), Style::new().fg(GOLD), 2),
             "write_file" => {
                 add(
                     &format!("{} ({} lines)", s("path"), s("content").lines().count()),

@@ -545,7 +545,7 @@ fn tree(dir: &Path, depth: usize, level: usize, out: &mut String, count: &mut us
     }
 }
 
-fn url_encode(s: &str) -> String {
+pub fn url_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
@@ -845,36 +845,7 @@ fn run(
             if !sb.network {
                 return Err("the network is turned off for this session".into());
             }
-            let query = arg_str(args, "query")?;
-            let url = format!("https://html.duckduckgo.com/html/?q={}", url_encode(query));
-            let (code, out, killed) = sb.run(
-                &[
-                    "/usr/bin/curl",
-                    "-sSL",
-                    "--max-time",
-                    "20",
-                    "-A",
-                    "Mozilla/5.0 (Macintosh) ferrum",
-                    "--",
-                    &url,
-                ],
-                Duration::from_secs(25),
-                cancel,
-            )?;
-            if killed || code != Some(0) {
-                return Err(format!("search failed: {}", out.trim()));
-            }
-            let results = parse_search(&out);
-            if results.is_empty() {
-                return Ok("no results".into());
-            }
-            Ok(results
-                .iter()
-                .take(8)
-                .enumerate()
-                .map(|(i, (t, u, s))| format!("{}. {t}\n   {u}\n   {s}", i + 1))
-                .collect::<Vec<_>>()
-                .join("\n"))
+            crate::search::search(&sb.search, arg_str(args, "query")?)
         }
         "fetch_url" => {
             let mut a = args.clone();
