@@ -87,11 +87,11 @@ To make generation faster, add a drafter: `--draft mtp` uses the prediction head
 
 `ferrum-tui` opens on a home screen with five sections:
 
-- **Chat.** Streaming markdown, a separate reasoning view, file and image attachments, and optional agent tools.
-- **Agents.** A local coding agent that works in a project folder. It can read, grep, edit, run commands and checks, and keep a plan, all inside a Seatbelt sandbox and with an approval mode you choose.
+- **Chat.** Streaming markdown, a separate reasoning view, file and image attachments, optional agent tools, and `/new` and `/resume` for saved sessions.
+- **Agents.** A local coding agent that works in a project folder. It can read, grep, edit, run commands and checks, search the web (DuckDuckGo, SearXNG, Brave or your own endpoint) and keep a plan, all inside a Seatbelt sandbox and with an approval mode you choose.
 - **Serve.** Starts `ferrum-server` and shows its endpoint, health and live log.
 - **Benchmark.** Finds the fastest drafter and draft depth for a model on *your* Mac. It checks that every candidate's output matches plain decoding and saves the winner as a favorite.
-- **Settings.** Model folders, favorites and startup options.
+- **Settings.** Model folders, favorites, the web search provider and startup options.
 
 Setups (model, sampling, drafter) are saved as favorites. The [TUI guide](docs/tui.md) covers the agent tools, the sandbox, context management and the benchmark in detail.
 
