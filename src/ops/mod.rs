@@ -228,9 +228,8 @@ impl MetalDevice {
         let dims = [x[0], rows];
         let shape = crate::tensor::Shape::new(dims)?;
         index(shape.numel())?;
-        let tensorops_min_rows = experts
-            .checked_mul(self.moe_expert_tensorops_min_routes_per_expert())
-            .unwrap_or(usize::MAX);
+        let tensorops_min_rows =
+            experts.saturating_mul(self.moe_expert_tensorops_min_routes_per_expert());
         let use_tensorops = input.dtype() == DType::BF16
             && self.moe_expert_tensorops_enabled()
             && x[0] >= tensorops_min_rows
@@ -333,6 +332,7 @@ impl MetalDevice {
         Ok(tensor)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn expert_project_quantized_mpp(
         &self,
         input: &Tensor,

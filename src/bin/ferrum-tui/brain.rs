@@ -153,7 +153,7 @@ pub fn repo_map(root: &Path) -> String {
         );
     }
     let mut langs: Vec<_> = counts.into_iter().collect();
-    langs.sort_by(|a, b| b.1.cmp(&a.1));
+    langs.sort_by_key(|l| std::cmp::Reverse(l.1));
     let shown: Vec<String> = langs
         .iter()
         .take(6)
@@ -355,13 +355,13 @@ pub fn snapshot(history: &[Json], shared: &Shared, project: &Path) -> String {
             crate::agent::clip_output(first.trim(), 600)
         );
     }
-    if users.len() > 1 {
-        if let Some(last) = users.last() {
-            s += &format!(
-                "latest request: {}\n",
-                crate::agent::clip_output(last.trim(), 600)
-            );
-        }
+    if users.len() > 1
+        && let Some(last) = users.last()
+    {
+        s += &format!(
+            "latest request: {}\n",
+            crate::agent::clip_output(last.trim(), 600)
+        );
     }
     if !shared.todos.is_empty() {
         s += "plan:\n";

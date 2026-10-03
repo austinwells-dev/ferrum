@@ -26,7 +26,7 @@ pub fn draw_splash(f: &mut Frame, t: f32) {
     let k = (t / 1.15).clamp(0.0, 1.0);
     let eased = 1.0 - (1.0 - k).powi(3);
     let reveal = eased * (WORD_W as f32 + 10.0);
-    let sweep = (t > 1.4).then(|| (t - 1.4) * 38.0 - 6.0);
+    let sweep = (t > 1.4).then_some((t - 1.4) * 38.0 - 6.0);
     draw_wordmark(f, x0, y0, Some(reveal), sweep);
 
     for c in 0..(reveal as u16).min(WORD_W) {

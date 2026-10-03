@@ -136,22 +136,22 @@ impl App {
                 Style::new().fg(FAINT),
             )),
         }
-        if let Ok(g) = &shared {
-            if g.store.saved > 0 || g.evicted > 0 || g.compactions > 0 {
-                lines.push(Line::styled(
-                    format!(" kept out: {} KB", (g.store.saved) / 1024),
-                    Style::new().fg(GOOD),
-                ));
-                lines.push(Line::styled(
-                    format!(
-                        " {} stored · {} elided · {}×compact",
-                        g.store.len(),
-                        g.evicted,
-                        g.compactions
-                    ),
-                    Style::new().fg(FAINT),
-                ));
-            }
+        if let Ok(g) = &shared
+            && (g.store.saved > 0 || g.evicted > 0 || g.compactions > 0)
+        {
+            lines.push(Line::styled(
+                format!(" kept out: {} KB", (g.store.saved) / 1024),
+                Style::new().fg(GOOD),
+            ));
+            lines.push(Line::styled(
+                format!(
+                    " {} stored · {} elided · {}×compact",
+                    g.store.len(),
+                    g.evicted,
+                    g.compactions
+                ),
+                Style::new().fg(FAINT),
+            ));
         }
         let lines: Vec<Line> = lines.into_iter().map(|l| fit(l, w)).collect();
         f.render_widget(Paragraph::new(lines), inner);

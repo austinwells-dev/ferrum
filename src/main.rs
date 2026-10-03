@@ -58,7 +58,7 @@ fn main() -> Result<()> {
         }
         other => {
             return Err(ferrum::Error::Parameter(format!(
-                "unknown command {other}; use info, smoke, transformer-smoke or run"
+                "unknown command {other}; use info, smoke, transformer-smoke, run, profile or hybrid"
             )));
         }
     }

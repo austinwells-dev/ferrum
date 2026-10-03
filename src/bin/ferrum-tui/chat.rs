@@ -725,13 +725,13 @@ impl Chat {
                 &a.map,
                 a.notes.as_deref(),
             ));
-        } else if self.tools != ToolMode::Off {
-            if let Ok(sb) = self.sandbox() {
-                if !system.is_empty() {
-                    system.push_str("\n\n");
-                }
-                system.push_str(&agent::system_prompt(&sb.workspace, self.network));
+        } else if self.tools != ToolMode::Off
+            && let Ok(sb) = self.sandbox()
+        {
+            if !system.is_empty() {
+                system.push_str("\n\n");
             }
+            system.push_str(&agent::system_prompt(&sb.workspace, self.network));
         }
         let mut messages = Vec::new();
         if !system.is_empty() {
@@ -1144,10 +1144,10 @@ impl Chat {
         turn.attachments = attachments.iter().map(|a| a.chip()).collect();
         self.turns.push(turn);
         self.rounds = 0;
-        if let Some(a) = &self.agent {
-            if let Ok(mut g) = a.shared.lock() {
-                g.new_message();
-            }
+        if let Some(a) = &self.agent
+            && let Ok(mut g) = a.shared.lock()
+        {
+            g.new_message();
         }
         self.start_turn();
     }
@@ -1212,17 +1212,17 @@ impl Chat {
             ),
             None => "context use is measured after each reply".to_string(),
         };
-        if let Some(a) = &self.agent {
-            if let Ok(g) = a.shared.lock() {
-                s += &format!(
-                    "\n{} long outputs stored, {} KB kept out of the context\n{} old outputs elided ({} KB) · {} compaction(s)",
-                    g.store.len(),
-                    g.store.saved / 1024,
-                    g.evicted,
-                    g.evicted_bytes / 1024,
-                    g.compactions
-                );
-            }
+        if let Some(a) = &self.agent
+            && let Ok(g) = a.shared.lock()
+        {
+            s += &format!(
+                "\n{} long outputs stored, {} KB kept out of the context\n{} old outputs elided ({} KB) · {} compaction(s)",
+                g.store.len(),
+                g.store.saved / 1024,
+                g.evicted,
+                g.evicted_bytes / 1024,
+                g.compactions
+            );
         }
         s
     }
@@ -1236,10 +1236,10 @@ impl Chat {
         self.turns.clear();
         self.ctx = None;
         self.last_stats.clear();
-        if let Some(a) = &self.agent {
-            if let Ok(mut g) = a.shared.lock() {
-                g.reset_conversation();
-            }
+        if let Some(a) = &self.agent
+            && let Ok(mut g) = a.shared.lock()
+        {
+            g.reset_conversation();
         }
         let _ = self.tx.send(ToWorker::Reset);
     }
@@ -1504,10 +1504,10 @@ impl Chat {
 
 impl App {
     pub fn leave_chat(&mut self) {
-        if let Some(chat) = self.chat.take() {
-            if let Some(h) = chat.close() {
-                self.closing.push(h);
-            }
+        if let Some(chat) = self.chat.take()
+            && let Some(h) = chat.close()
+        {
+            self.closing.push(h);
         }
         self.screen = Screen::Pick;
     }
@@ -1515,11 +1515,11 @@ impl App {
     pub fn chat_key(&mut self, key: KeyEvent) {
         let before = self.chat.as_ref().map(|c| c.input.clone());
         self.chat_key_inner(key);
-        if let (Some(c), Some(b)) = (self.chat.as_mut(), before) {
-            if c.input != b {
-                c.palette_sel = 0;
-                c.palette_off = false;
-            }
+        if let (Some(c), Some(b)) = (self.chat.as_mut(), before)
+            && c.input != b
+        {
+            c.palette_sel = 0;
+            c.palette_off = false;
         }
     }
 

@@ -237,7 +237,7 @@ pub fn scan_drafters(extra: &[String]) -> Vec<Drafter> {
             find_drafters(&root, depth, &mut seen, &mut out);
         }
     }
-    out.sort_by(|a, b| a.label.to_lowercase().cmp(&b.label.to_lowercase()));
+    out.sort_by_key(|a| a.label.to_lowercase());
     out
 }
 

@@ -2871,7 +2871,7 @@ mod qk_tests {
                         bytes
                             .push((((row * 7 + block_index * 3 + index * 5) % 15) as i8 - 7) as u8);
                     }
-                    let d = 0.015625 + row as f32 * 0.000244140625;
+                    let d = 0.015625 + row as f32 / 4096.0;
                     bytes.extend_from_slice(&half::f16::from_f32(d).to_bits().to_le_bytes());
                     assert_eq!(bytes.len() - block_start, format.block_bytes());
                     continue;
@@ -2931,7 +2931,7 @@ mod qk_tests {
             let q = i32::from(low | (high << 4)) - 32;
             let scale_index = half_block * 8 + slice * 2 + lane / 16;
             let scale = ((row * 7 + block * 3 + scale_index * 5) % 15) as i8 - 7;
-            let d = 0.015625 + row as f32 * 0.000244140625;
+            let d = 0.015625 + row as f32 / 4096.0;
             return d * f32::from(scale) * q as f32;
         }
         let chunk = within / 64;

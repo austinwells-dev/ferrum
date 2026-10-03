@@ -261,14 +261,14 @@ impl App {
         let clean = text.replace("\r\n", "\n").replace('\r', "\n");
         if !matches!(self.editing, Editing::No) {
             self.buffer.push_str(&clean.replace('\n', " "));
-        } else if self.screen == Screen::Chat {
-            if let Some(c) = self.chat.as_mut() {
-                let dropped = attach::parse_dropped(&clean);
-                if !dropped.is_empty() && c.accepts_input() {
-                    c.attach_paths(&dropped);
-                } else {
-                    c.insert_str(&clean);
-                }
+        } else if self.screen == Screen::Chat
+            && let Some(c) = self.chat.as_mut()
+        {
+            let dropped = attach::parse_dropped(&clean);
+            if !dropped.is_empty() && c.accepts_input() {
+                c.attach_paths(&dropped);
+            } else {
+                c.insert_str(&clean);
             }
         }
     }

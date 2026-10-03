@@ -179,11 +179,6 @@ pub fn read_only(name: &str) -> bool {
     )
 }
 
-/// Tools that ask first in `ask` mode (and, except edits, in `edits` mode).
-pub fn mutating(name: &str) -> bool {
-    matches!(name, "write_file" | "edit_file")
-}
-
 pub fn needs_approval(name: &str, mode: ToolMode) -> bool {
     match mode {
         ToolMode::Off | ToolMode::Auto => false,
@@ -444,7 +439,7 @@ pub fn glob_match(pattern: &str, text: &str) -> bool {
     go(&p, &t)
 }
 
-fn walk(dir: &Path, root: &Path, out: &mut Vec<PathBuf>, cap: usize) {
+fn walk(dir: &Path, out: &mut Vec<PathBuf>, cap: usize) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
@@ -459,7 +454,7 @@ fn walk(dir: &Path, root: &Path, out: &mut Vec<PathBuf>, cap: usize) {
         let Ok(kind) = e.file_type() else { continue };
         if kind.is_dir() {
             if !IGNORED.contains(&name.as_str()) && !name.starts_with(".git") {
-                walk(&path, root, out, cap);
+                walk(&path, out, cap);
             }
         } else if kind.is_file() {
             out.push(path);
@@ -703,7 +698,7 @@ fn run(
             let pattern = arg_str(args, "pattern")?;
             let root = sb.resolve(args.get("path").and_then(Json::as_str).unwrap_or(""))?;
             let mut files = Vec::new();
-            walk(&root, &root, &mut files, 20_000);
+            walk(&root, &mut files, 20_000);
             let by_name = !pattern.contains('/');
             let mut found: Vec<String> = files
                 .iter()

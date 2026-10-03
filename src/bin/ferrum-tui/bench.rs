@@ -260,7 +260,7 @@ fn load(
     }
     let attempt = |depth: Option<usize>| {
         let spec = cand.spec(depth);
-        Runtime::load_speculative(&plan.model, options.clone(), spec.as_ref())
+        Runtime::load_speculative(&plan.model, options, spec.as_ref())
     };
     match attempt(depth) {
         Ok(rt) => Ok(rt),
@@ -362,10 +362,10 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
                 Some(baseline_hashes == hashes)
             };
             let tps = tokens as f64 / secs;
-            if let Some(d) = depth {
-                if winner.as_ref().is_none_or(|(_, _, best)| tps > *best) {
-                    winner = Some((cand.clone(), d, tps));
-                }
+            if let Some(d) = depth
+                && winner.as_ref().is_none_or(|(_, _, best)| tps > *best)
+            {
+                winner = Some((cand.clone(), d, tps));
             }
             send(Event::Row(Row {
                 cand: ci,

@@ -159,12 +159,12 @@ impl App {
     }
 
     pub fn leave_bench(&mut self) {
-        if let Some(mut b) = self.bench.take() {
-            if let Some(mut run) = b.run.take() {
-                run.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(h) = run.handle.take() {
-                    self.closing.push(h);
-                }
+        if let Some(mut b) = self.bench.take()
+            && let Some(mut run) = b.run.take()
+        {
+            run.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            if let Some(h) = run.handle.take() {
+                self.closing.push(h);
             }
         }
         self.screen = Screen::Home;
@@ -258,10 +258,10 @@ impl App {
         }
         if done {
             b.phase = BenchPhase::Results;
-            if let Some(mut run) = b.run.take() {
-                if let Some(h) = run.handle.take() {
-                    let _ = h.join();
-                }
+            if let Some(mut run) = b.run.take()
+                && let Some(h) = run.handle.take()
+            {
+                let _ = h.join();
             }
             self.finish_bench();
         }
@@ -336,13 +336,12 @@ impl App {
         match phase {
             BenchPhase::Setup => self.bench_setup_key(key),
             BenchPhase::Running => {
-                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                    if let Some(b) = self.bench.as_mut() {
-                        if let Some(run) = &b.run {
-                            run.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                            b.stopping = true;
-                        }
-                    }
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                    && let Some(b) = self.bench.as_mut()
+                    && let Some(run) = &b.run
+                {
+                    run.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                    b.stopping = true;
                 }
             }
             BenchPhase::Results => match key.code {

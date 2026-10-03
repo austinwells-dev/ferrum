@@ -138,11 +138,11 @@ impl Serve {
                 self.lines.drain(..MAX_LINES / 4);
             }
         }
-        if self.exit.is_none() {
-            if let Ok(Some(status)) = self.child.try_wait() {
-                self.exit = Some(status.to_string());
-                self.ready = false;
-            }
+        if self.exit.is_none()
+            && let Ok(Some(status)) = self.child.try_wait()
+        {
+            self.exit = Some(status.to_string());
+            self.ready = false;
         }
         if !self.ready && self.exit.is_none() && self.probed.elapsed() > Duration::from_millis(400)
         {

@@ -63,8 +63,8 @@ fn parse() -> Result<Options> {
                     "{}",
                     include_str!("ferrum-cli.rs")
                         .lines()
-                        .take(17)
-                        .map(|l| l.trim_start_matches("//!").trim_start_matches(' '))
+                        .map_while(|l| l.strip_prefix("//!"))
+                        .map(|l| l.strip_prefix(' ').unwrap_or(l))
                         .collect::<Vec<_>>()
                         .join("\n")
                 );
