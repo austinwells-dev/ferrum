@@ -83,6 +83,7 @@ impl App {
             status: None,
             chat: None,
             serve: None,
+            bench: None,
             closing: Vec::new(),
         };
         app.load_info();

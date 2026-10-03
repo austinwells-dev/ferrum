@@ -6,6 +6,8 @@
 mod agent;
 mod app;
 mod attach;
+mod bench;
+mod benchui;
 mod brain;
 mod catalog;
 mod chat;
@@ -45,6 +47,7 @@ pub use std::{
 };
 
 pub use agent::ToolMode;
+pub use benchui::BenchState;
 pub use catalog::*;
 pub use chat::Chat;
 pub use fields::*;
@@ -66,6 +69,7 @@ pub enum Screen {
     Settings,
     Chat,
     Serve,
+    Bench,
 }
 
 /// Why the editor is open: decides what launching does.
@@ -153,6 +157,7 @@ pub struct App {
     pub status: Option<(String, bool)>,
     pub chat: Option<Chat>,
     pub serve: Option<Serve>,
+    pub bench: Option<BenchState>,
     /// Chat workers that were told to stop and may still be unloading.
     pub closing: Vec<std::thread::JoinHandle<()>>,
 }
@@ -175,13 +180,14 @@ impl App {
                     s.pump();
                 }
             }
+            Screen::Bench => self.bench_tick(),
             _ => {}
         }
     }
 
     pub fn poll_interval(&self) -> Duration {
         Duration::from_millis(match self.screen {
-            Screen::Splash | Screen::Home | Screen::Chat | Screen::Serve => 33,
+            Screen::Splash | Screen::Home | Screen::Chat | Screen::Serve | Screen::Bench => 33,
             _ => 200,
         })
     }
@@ -195,6 +201,7 @@ impl App {
             Screen::Settings => self.draw_settings_screen(f),
             Screen::Chat => self.draw_chat(f),
             Screen::Serve => self.draw_serve(f),
+            Screen::Bench => self.draw_bench(f),
         }
         if self.picker.is_some() {
             self.draw_picker(f);
@@ -232,6 +239,7 @@ impl App {
             match self.screen {
                 Screen::Chat => self.chat_key(key),
                 Screen::Serve => self.leave_serve(),
+                Screen::Bench => self.leave_bench(),
                 _ => self.quit = true,
             }
             return;
@@ -245,6 +253,7 @@ impl App {
             Screen::Settings => self.settings_key(key),
             Screen::Chat => self.chat_key(key),
             Screen::Serve => self.serve_key(key),
+            Screen::Bench => self.bench_key(key),
         }
     }
 

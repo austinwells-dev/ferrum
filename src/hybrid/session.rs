@@ -172,6 +172,9 @@ pub struct Session {
     drafter: Option<Box<dyn Drafter>>,
     /// Use the drafter for the next generations (it keeps ingesting either way).
     pub speculate: bool,
+    /// Propose at most this many drafts per step (None: the drafter's own
+    /// maximum). Lets a benchmark sweep depths without reloading the drafter.
+    pub depth_cap: Option<usize>,
     /// The drafter must rewind to this length before its next use.
     drafter_rewind: Option<usize>,
     /// Acceptance statistics of the latest generation.
@@ -209,6 +212,7 @@ impl Session {
             clock: 0,
             drafter: None,
             speculate: false,
+            depth_cap: None,
             drafter_rewind: None,
             spec_stats: SpecStats::default(),
             pending_media: Vec::new(),
@@ -516,6 +520,7 @@ impl Session {
                 let drafter = self.drafter.as_ref().expect("speculate implies a drafter");
                 drafter
                     .max_drafts()
+                    .min(self.depth_cap.unwrap_or(usize::MAX))
                     .min(max_tokens - generated.len())
                     .min(room)
             } else {

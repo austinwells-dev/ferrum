@@ -135,15 +135,43 @@ pub struct Drafter {
     pub config: Option<DraftConfig>,
     /// Why this checkpoint cannot be loaded at all.
     pub problem: Option<String>,
+    /// Rows in its Markov output head, i.e. the vocabulary it was trained on.
+    pub head_rows: Option<usize>,
 }
 
-pub fn read_draft(dir: &Path) -> (Option<DraftConfig>, Option<String>) {
-    let root = if dir.join("config.json").exists() {
+/// The folder holding `config.json` (an HF cache entry resolves to its newest snapshot).
+fn draft_root(dir: &Path) -> PathBuf {
+    if dir.join("config.json").exists() {
         dir.to_path_buf()
     } else {
         let rev = fs::read_to_string(dir.join("refs/main")).unwrap_or_default();
         dir.join("snapshots").join(rev.trim())
-    };
+    }
+}
+
+/// Vocabulary rows of the drafter's Markov head, read from the safetensors
+/// header alone (no weights are loaded).
+pub fn head_rows(dir: &Path) -> Option<usize> {
+    use std::io::Read;
+    let mut file = fs::File::open(draft_root(dir).join("model.safetensors")).ok()?;
+    let mut len = [0u8; 8];
+    file.read_exact(&mut len).ok()?;
+    let n = u64::from_le_bytes(len) as usize;
+    if n == 0 || n > 64 << 20 {
+        return None;
+    }
+    let mut header = vec![0u8; n];
+    file.read_exact(&mut header).ok()?;
+    let json: Json = serde_json::from_slice(&header).ok()?;
+    json.as_object()?
+        .iter()
+        .find(|(k, _)| k.ends_with("markov_w2.weight"))
+        .and_then(|(_, v)| v["shape"][0].as_u64())
+        .map(|r| r as usize)
+}
+
+pub fn read_draft(dir: &Path) -> (Option<DraftConfig>, Option<String>) {
+    let root = draft_root(dir);
     let Ok(raw) = fs::read(root.join("config.json")) else {
         return (None, Some("no downloaded snapshot (config.json)".into()));
     };
@@ -181,6 +209,7 @@ pub fn find_drafters(
             if seen.insert(canonical) {
                 let (config, problem) = read_draft(&path);
                 out.push(Drafter {
+                    head_rows: head_rows(&path),
                     config,
                     problem,
                     label: origin_of(&path.join("x")),
@@ -227,6 +256,12 @@ pub fn drafter_problem(d: &Drafter, m: &Model) -> Option<String> {
     }
     if c.mask_token as usize >= t.vocab {
         return Some("mask token outside the model's vocabulary".into());
+    }
+    if let Some(rows) = d.head_rows.filter(|&r| r < t.vocab) {
+        return Some(format!(
+            "trained on a {rows}-token vocabulary, the model has {}",
+            t.vocab
+        ));
     }
     None
 }

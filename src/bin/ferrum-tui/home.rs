@@ -1,10 +1,11 @@
 //! Home screen: the wordmark and four big buttons.
 use crate::*;
 
-const BUTTONS: [(&str, &str, &str); 5] = [
+const BUTTONS: [(&str, &str, &str); 6] = [
     ("◆", "Chat", "talk to a model right here"),
     ("▣", "Agents", "a coding agent for your project"),
     ("◈", "Serve", "OpenAI & Anthropic compatible API"),
+    ("◷", "Benchmark", "find the fastest drafter and depth"),
     ("⚙", "Settings", "folders, favorites, startup"),
     ("✕", "Quit", "see you soon"),
 ];
@@ -18,7 +19,7 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
                 self.home_sel = (self.home_sel + 1) % BUTTONS.len()
             }
-            KeyCode::Char(c @ '1'..='5') => {
+            KeyCode::Char(c @ '1'..='6') => {
                 self.home_sel = c as usize - '1' as usize;
                 self.home_activate();
             }
@@ -34,6 +35,10 @@ impl App {
                 self.home_sel = 2;
                 self.home_activate();
             }
+            KeyCode::Char('b') => {
+                self.home_sel = 3;
+                self.home_activate();
+            }
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
             KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => self.home_activate(),
             _ => {}
@@ -45,7 +50,8 @@ impl App {
             0 => self.open_pick(Mode::Chat),
             1 => self.open_pick(Mode::Agent),
             2 => self.open_pick(Mode::Serve),
-            3 => {
+            3 => self.open_bench(),
+            4 => {
                 self.set_sel = 0;
                 self.screen = Screen::Settings;
             }
@@ -58,7 +64,7 @@ impl App {
         let t = self.elapsed();
         let boxed = area.height >= 30;
         let (btn_h, gap): (u16, u16) = if boxed { (3, 0) } else { (1, 1) };
-        let buttons_h = 5 * btn_h + 4 * gap;
+        let buttons_h = 6 * btn_h + 5 * gap;
         let total = 5 + 2 + 2 + buttons_h + 2;
         let top = area.y + area.height.saturating_sub(total + 1) / 2;
         let x0 = area.x + area.width.saturating_sub(35) / 2;
@@ -132,7 +138,7 @@ impl App {
             &[
                 ("↑↓", "move"),
                 ("enter", "select"),
-                ("1-5", "jump"),
+                ("1-6", "jump"),
                 ("q", "quit"),
             ],
             &self.status,

@@ -41,6 +41,8 @@ It opens with a short startup animation, then a home screen with **Chat**, **Ser
 
 *Context optimisers* keep a small local context useful: long tool output is stored and searchable (BM25) and the model gets a short excerpt plus a handle (`ctx_search`, `ctx_read`; `bash` takes an `intent` to return just the relevant lines); re-reading an unchanged file returns a notice; old tool output is elided in one batch at 55% context (so the prompt cache is rebuilt once, not every turn) and the session is snapshotted at 80%; repeated identical tool calls are stopped; the system prompt carries a repo map, the commands available on the machine, and your `AGENTS.md`/`CLAUDE.md`. `/ctx` shows what was saved, `/compact` snapshots on demand.
 
+**Benchmark tab (TUI).** Finds the fastest speculative-decoding setup for a model on *this* Mac. Pick a model; it lists plain decoding, the MTP head (if the GGUF has a usable one) and every drafter that is compatible with the model (checked by hidden size, layers and vocabulary). Each drafter is loaded once and its draft depth swept (`quick` tries a few depths, `full` every depth), measuring greedy decode speed on three prompts (code, prose, structured data) and the mean tokens accepted per verify step. Every run is compared with the no-drafter output; rows whose text differs are shown with `≠` and are not recommended. An optional stage also sweeps the prefill chunk size. Results are ranked with the speedup over plain decoding, remembered per machine and model (`~/.config/ferrum/bench.json`), and `s` / `v` save the winner as a Chat/Agents favorite or a Serve favorite (including the chunk size).
+
 Ferrum never downloads anything. You supply the model files yourself.
 
 ## Supported models
