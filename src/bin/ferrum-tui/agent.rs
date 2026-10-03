@@ -16,6 +16,8 @@ const MAX_OUTPUT: usize = 12_000;
 pub enum ToolMode {
     Off,
     Ask,
+    /// Edits and reads run freely; commands and downloads ask.
+    Edits,
     Auto,
 }
 
@@ -23,6 +25,7 @@ impl ToolMode {
     pub fn parse(s: &str) -> Self {
         match s {
             "ask" => Self::Ask,
+            "edits" => Self::Edits,
             "auto" => Self::Auto,
             _ => Self::Off,
         }
@@ -32,6 +35,7 @@ impl ToolMode {
         match self {
             Self::Off => "off",
             Self::Ask => "ask",
+            Self::Edits => "edits",
             Self::Auto => "auto",
         }
     }
@@ -173,8 +177,13 @@ pub fn clip_output(s: &str, max: usize) -> String {
 
 #[derive(Clone)]
 pub struct Sandbox {
+    /// The only folder the agent can change (besides `state`).
     pub workspace: PathBuf,
+    /// Scratch home, temp and attachment folders; outside the project for agents.
+    pub state: PathBuf,
     pub network: bool,
+    /// Command output longer than this is clipped (agents offload it instead).
+    pub output_limit: usize,
 }
 
 impl Sandbox {
@@ -185,16 +194,29 @@ impl Sandbox {
         } else {
             workspace.trim()
         });
-        for sub in [".tmp", ".home", ".attachments"] {
-            fs::create_dir_all(dir.join(sub))
-                .map_err(|e| format!("cannot create workspace {}: {e}", dir.display()))?;
-        }
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create workspace {}: {e}", dir.display()))?;
         let workspace = fs::canonicalize(&dir).map_err(|e| e.to_string())?;
-        Ok(Self { workspace, network })
+        Self::with_state(workspace.clone(), workspace, network)
+    }
+
+    /// A sandbox whose scratch folders live in `state` (created if needed).
+    pub fn with_state(workspace: PathBuf, state: PathBuf, network: bool) -> Result<Self, String> {
+        for sub in [".tmp", ".home", ".attachments"] {
+            fs::create_dir_all(state.join(sub))
+                .map_err(|e| format!("cannot create {}: {e}", state.display()))?;
+        }
+        let state = fs::canonicalize(&state).map_err(|e| e.to_string())?;
+        Ok(Self {
+            workspace,
+            state,
+            network,
+            output_limit: MAX_OUTPUT,
+        })
     }
 
     pub fn attachments(&self) -> PathBuf {
-        self.workspace.join(".attachments")
+        self.state.join(".attachments")
     }
 
     /// Resolve a path the model gave us, refusing anything outside the workspace.
@@ -226,7 +248,7 @@ impl Sandbox {
             }
         }
         let real = fs::canonicalize(&probe).map_err(|e| e.to_string())?;
-        if !real.starts_with(&self.workspace) {
+        if !real.starts_with(&self.workspace) && !real.starts_with(self.attachments()) {
             return Err(format!(
                 "{p} is outside the workspace ({})",
                 self.workspace.display()
@@ -235,19 +257,21 @@ impl Sandbox {
         Ok(norm)
     }
 
-    fn rel(&self, path: &Path) -> String {
+    pub fn rel(&self, path: &Path) -> String {
         path.strip_prefix(&self.workspace)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| path.display().to_string())
     }
 
     /// `program args…` wrapped in `sandbox-exec` with a scrubbed environment.
-    fn command(&self, argv: &[&str]) -> Command {
+    pub fn command(&self, argv: &[&str]) -> Command {
         let mut c = Command::new("/usr/bin/sandbox-exec");
         c.arg("-p")
             .arg(PROFILE)
             .arg("-D")
             .arg(format!("WORKSPACE={}", self.workspace.display()))
+            .arg("-D")
+            .arg(format!("STATE={}", self.state.display()))
             .arg("-D")
             .arg(format!("HOME={}", home().display()))
             .arg("-D")
@@ -265,8 +289,8 @@ impl Sandbox {
                     h = home().display()
                 ),
             )
-            .env("HOME", self.workspace.join(".home"))
-            .env("TMPDIR", self.workspace.join(".tmp"))
+            .env("HOME", self.state.join(".home"))
+            .env("TMPDIR", self.state.join(".tmp"))
             .env("CARGO_HOME", home().join(".cargo"))
             .env("RUSTUP_HOME", home().join(".rustup"))
             .env("LANG", "en_US.UTF-8")
@@ -282,7 +306,7 @@ impl Sandbox {
     }
 
     /// Run a command line; returns (exit code or None if killed, combined output).
-    fn run(
+    pub fn run(
         &self,
         argv: &[&str],
         timeout: Duration,
@@ -361,7 +385,7 @@ impl Sandbox {
         }
     }
 
-    fn bash(&self, args: &Map<String, Json>, cancel: &AtomicBool) -> Result<String, String> {
+    pub fn bash(&self, args: &Map<String, Json>, cancel: &AtomicBool) -> Result<String, String> {
         let command = arg_str(args, "command")?;
         let secs = arg_int(args, "timeout_secs").unwrap_or(60).clamp(1, 300) as u64;
         let script = format!("exec 2>&1\n{command}");
@@ -370,7 +394,7 @@ impl Sandbox {
             Duration::from_secs(secs),
             cancel,
         )?;
-        let mut text = clip_output(out.trim_end(), MAX_OUTPUT);
+        let mut text = clip_output(out.trim_end(), self.output_limit);
         if !text.is_empty() {
             text.push('\n');
         }
@@ -388,7 +412,7 @@ impl Sandbox {
         }
     }
 
-    fn read_file(&self, args: &Map<String, Json>) -> Result<String, String> {
+    pub fn read_file(&self, args: &Map<String, Json>) -> Result<String, String> {
         let path = self.resolve(arg_str(args, "path")?)?;
         let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", self.rel(&path)))?;
         if bytes.contains(&0) {
@@ -416,7 +440,7 @@ impl Sandbox {
         Ok(clip_output(&out, 24_000))
     }
 
-    fn write_file(&self, args: &Map<String, Json>) -> Result<String, String> {
+    pub fn write_file(&self, args: &Map<String, Json>) -> Result<String, String> {
         let path = self.resolve(arg_str(args, "path")?)?;
         let content = arg_str(args, "content")?;
         if let Some(dir) = path.parent() {
@@ -431,7 +455,7 @@ impl Sandbox {
         ))
     }
 
-    fn edit_file(&self, args: &Map<String, Json>) -> Result<String, String> {
+    pub fn edit_file(&self, args: &Map<String, Json>) -> Result<String, String> {
         let path = self.resolve(arg_str(args, "path")?)?;
         let (old, new) = (arg_str(args, "old_text")?, arg_str(args, "new_text")?);
         if old.is_empty() {
@@ -456,14 +480,17 @@ impl Sandbox {
         }
     }
 
-    fn list_dir(&self, args: &Map<String, Json>) -> Result<String, String> {
+    pub fn list_dir(&self, args: &Map<String, Json>) -> Result<String, String> {
         let path = self.resolve(args.get("path").and_then(Json::as_str).unwrap_or(""))?;
         let mut entries: Vec<(bool, String, u64)> = fs::read_dir(&path)
             .map_err(|e| format!("{}: {e}", self.rel(&path)))?
             .flatten()
             .filter_map(|e| {
                 let name = e.file_name().to_string_lossy().to_string();
-                if path == self.workspace && matches!(name.as_str(), ".home" | ".tmp") {
+                if path == self.workspace
+                    && self.state == self.workspace
+                    && matches!(name.as_str(), ".home" | ".tmp")
+                {
                     return None;
                 }
                 let meta = e.metadata().ok()?;
@@ -489,7 +516,11 @@ impl Sandbox {
         Ok(out)
     }
 
-    fn fetch_url(&self, args: &Map<String, Json>, cancel: &AtomicBool) -> Result<String, String> {
+    pub fn fetch_url(
+        &self,
+        args: &Map<String, Json>,
+        cancel: &AtomicBool,
+    ) -> Result<String, String> {
         if !self.network {
             return Err("the network is turned off for this chat".into());
         }

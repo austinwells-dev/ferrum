@@ -3,6 +3,8 @@
 //! tokens as they arrive.
 use crate::agent::{self, Sandbox, ToolMode};
 use crate::attach::{self, Attachment, Clip};
+use crate::brain::{self, Ponytail};
+use crate::coding::{self, SharedRef};
 use crate::*;
 use ferrum::hybrid::{
     plan::PlanOptions,
@@ -31,6 +33,26 @@ pub struct ChatOpts {
     pub tools: ToolMode,
     pub workspace: String,
     pub network: bool,
+    pub agent: Option<AgentOpts>,
+}
+
+pub struct AgentOpts {
+    pub project: PathBuf,
+    pub ponytail: Ponytail,
+    pub compact: bool,
+}
+
+/// Where an agent keeps its scratch home, temp files and attachments: outside the project.
+fn agent_state_dir(project: &Path) -> PathBuf {
+    let name = project
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "project".into());
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in project.display().to_string().bytes() {
+        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
+    }
+    home().join(format!(".ferrum/agents/{name}-{:08x}", h as u32))
 }
 
 impl ChatOpts {
@@ -81,9 +103,32 @@ impl ChatOpts {
             budget: count("budget"),
             overrides,
             spec,
-            tools: ToolMode::parse(app.value("tools")),
+            tools: if app.mode == Mode::Agent {
+                match app.value("agent_tools") {
+                    "" => ToolMode::Edits,
+                    v => ToolMode::parse(v),
+                }
+            } else {
+                ToolMode::parse(app.value("tools"))
+            },
             workspace: app.value("workspace").to_string(),
             network: app.value("network") != "off",
+            agent: if app.mode == Mode::Agent {
+                let project = match app.value("project") {
+                    "" => std::env::current_dir().map_err(|e| e.to_string())?,
+                    p => expand(p),
+                };
+                if !project.is_dir() {
+                    return Err(format!("{} is not a folder", project.display()));
+                }
+                Some(AgentOpts {
+                    project: fs::canonicalize(&project).map_err(|e| e.to_string())?,
+                    ponytail: Ponytail::parse(app.value("ponytail")),
+                    compact: app.value("compact") != "off",
+                })
+            } else {
+                None
+            },
         })
     }
 }
@@ -315,6 +360,7 @@ pub enum ToolState {
 pub struct ToolView {
     pub id: String,
     pub name: String,
+    pub args: Map<String, Json>,
     pub summary: String,
     pub state: ToolState,
     pub output: String,
@@ -378,6 +424,71 @@ pub const COMMANDS: [(&str, &str); 15] = [
     ("/exit", "leave the chat"),
 ];
 
+/// Extra state of a coding-agent session.
+pub struct Agent {
+    pub project: PathBuf,
+    pub shared: SharedRef,
+    pub ponytail: Ponytail,
+    pub plan: bool,
+    pub compact: bool,
+    map: String,
+    notes: Option<String>,
+    pub branch: Option<String>,
+    pub dirty: usize,
+    /// The model asked the user something: stop after this round.
+    asked: bool,
+}
+
+impl Agent {
+    fn refresh_git(&mut self) {
+        self.branch = brain::git_branch(&self.project);
+        self.dirty = brain::git_dirty(&self.project);
+    }
+}
+
+/// Commands in an agent session.
+pub const AGENT_COMMANDS: [(&str, &str); 24] = [
+    (
+        "/plan on",
+        "read-only: explore and write a plan, change nothing",
+    ),
+    ("/plan off", "let the agent make changes again"),
+    (
+        "/review",
+        "ponytail: find over-engineering in your uncommitted diff",
+    ),
+    ("/audit", "ponytail: find code that does not need to exist"),
+    (
+        "/debt",
+        "ponytail: ledger of the shortcuts marked `ponytail:`",
+    ),
+    ("/ponytail full", "minimal-code guidance: the full ladder"),
+    ("/ponytail lite", "minimal-code guidance: light touch"),
+    (
+        "/ponytail ultra",
+        "minimal-code guidance: delete before adding",
+    ),
+    ("/ponytail off", "no minimal-code guidance"),
+    ("/compact", "snapshot the session and clear old history now"),
+    ("/ctx", "context use and what was saved"),
+    ("/todo", "show the agent's plan"),
+    (
+        "/tools edits",
+        "file edits run freely; commands and downloads ask",
+    ),
+    ("/tools ask", "confirm every change"),
+    ("/tools auto", "never ask"),
+    ("/reset", "clear the conversation"),
+    ("/think on", "turn reasoning on"),
+    ("/think off", "turn reasoning off"),
+    ("/thoughts", "show or hide the model's thinking"),
+    ("/attach ", "attach a file by path"),
+    ("/paste", "attach the clipboard (image, files or text)"),
+    ("/screenshot", "drag out a screen region to attach"),
+    ("/help", "list the commands"),
+    ("/exit", "leave the agent"),
+];
+
 pub struct Chat {
     tx: Sender<ToWorker>,
     rx: Receiver<FromWorker>,
@@ -424,6 +535,7 @@ pub struct Chat {
     tool_cancel: Arc<AtomicBool>,
     aborted: bool,
     flash: Option<(String, bool, Instant)>,
+    pub agent: Option<Agent>,
 }
 
 /// Most tool rounds the model may chain after one message.
@@ -448,6 +560,39 @@ impl Chat {
             opts.workspace.clone(),
             opts.network,
         );
+        let (agent, sandbox) = match &opts.agent {
+            Some(a) => {
+                let mut sb =
+                    Sandbox::with_state(a.project.clone(), agent_state_dir(&a.project), network)?;
+                sb.output_limit = coding::AGENT_OUTPUT_LIMIT;
+                let mut agent = Agent {
+                    project: a.project.clone(),
+                    shared: coding::new_shared(),
+                    ponytail: a.ponytail,
+                    plan: false,
+                    compact: a.compact,
+                    map: format!("{}{}", brain::repo_map(&a.project), brain::env_notes()),
+                    notes: brain::instructions(&a.project),
+                    branch: None,
+                    dirty: 0,
+                    asked: false,
+                };
+                agent.refresh_git();
+                (Some(agent), Some(sb))
+            }
+            None => (None, None),
+        };
+        let label = match &agent {
+            Some(a) => format!(
+                "{} · {}",
+                a.project
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                label
+            ),
+            None => label,
+        };
         let flag = cancel.clone();
         let handle = std::thread::Builder::new()
             .name("ferrum-chat".into())
@@ -484,7 +629,7 @@ impl Chat {
             tools,
             workspace,
             network,
-            sandbox: None,
+            sandbox,
             attachments: Vec::new(),
             rounds: 0,
             call_seq: 0,
@@ -495,6 +640,7 @@ impl Chat {
             tool_cancel: Arc::new(AtomicBool::new(false)),
             aborted: false,
             flash: None,
+            agent,
         })
     }
 
@@ -516,14 +662,18 @@ impl Chat {
         }
         let q = self.input.to_lowercase();
         let word = q.trim_start_matches('/');
-        let mut out: Vec<_> = COMMANDS
+        let list: &[(&'static str, &'static str)] = if self.agent.is_some() {
+            &AGENT_COMMANDS
+        } else {
+            &COMMANDS
+        };
+        let mut out: Vec<_> = list
             .iter()
             .filter(|(n, _)| n.starts_with(&q))
             .copied()
             .collect();
         out.extend(
-            COMMANDS
-                .iter()
+            list.iter()
                 .filter(|(n, _)| !n.starts_with(&q) && n.contains(word))
                 .copied(),
         );
@@ -536,6 +686,10 @@ impl Chat {
     }
 
     /// The model is writing or its tools are running.
+    pub fn ctx_use(&self) -> Option<(usize, usize)> {
+        self.ctx
+    }
+
     pub fn generating(&self) -> bool {
         matches!(self.phase, Phase::Generating | Phase::Tools)
     }
@@ -558,7 +712,19 @@ impl Chat {
     /// Messages for the model: the system prompt (plus the tool briefing) and the history.
     fn messages_for_send(&mut self) -> Vec<Json> {
         let mut system = self.system.clone().unwrap_or_default();
-        if self.tools != ToolMode::Off {
+        if let Some(a) = &self.agent {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(&brain::system_prompt(
+                &a.project,
+                a.ponytail,
+                a.plan,
+                self.network,
+                &a.map,
+                a.notes.as_deref(),
+            ));
+        } else if self.tools != ToolMode::Off {
             if let Ok(sb) = self.sandbox() {
                 if !system.is_empty() {
                     system.push_str("\n\n");
@@ -577,6 +743,8 @@ impl Chat {
     fn tool_defs(&self) -> Vec<Json> {
         if self.tools == ToolMode::Off {
             Vec::new()
+        } else if let Some(a) = &self.agent {
+            coding::tool_defs(a.plan, self.network)
         } else {
             agent::tool_defs(self.network)
         }
@@ -584,6 +752,7 @@ impl Chat {
 
     /// Send the history to the model and show an empty reply being written.
     fn start_turn(&mut self) {
+        self.maybe_compact();
         let messages = self.messages_for_send();
         let tools = self.tool_defs();
         self.turns.push(Turn::new(Role::Assistant, String::new()));
@@ -620,7 +789,9 @@ impl Chat {
             match msg {
                 FromWorker::Stage(s) => self.phase = Phase::Loading(s),
                 FromWorker::Ready(info) => {
-                    self.label = info.name.clone();
+                    if self.agent.is_none() {
+                        self.label = info.name.clone();
+                    }
                     self.info = Some(*info);
                     self.phase = Phase::Ready;
                     self.since = Instant::now();
@@ -724,6 +895,7 @@ impl Chat {
                 let mut turn = Turn::new(Role::Tool, String::new());
                 turn.tool = Some(ToolView {
                     id: id.clone(),
+                    args: args.clone(),
                     summary: agent::summary(&name, &args),
                     name: name.clone(),
                     state: ToolState::Queued,
@@ -781,7 +953,11 @@ impl Chat {
         let Some(call) = self.queue.pop_front() else {
             return self.finish_round();
         };
-        if self.tools == ToolMode::Ask && agent::needs_approval(&call.2) {
+        let needs = match &self.agent {
+            Some(_) => coding::needs_approval(&call.2, self.tools),
+            None => self.tools == ToolMode::Ask && agent::needs_approval(&call.2),
+        };
+        if needs {
             self.set_tool(call.0, ToolState::Waiting, "");
             self.approval = Some(call);
             return;
@@ -807,9 +983,25 @@ impl Chat {
         self.exec_rx = Some(rx);
         self.tool_cancel.store(false, Ordering::SeqCst);
         let cancel = self.tool_cancel.clone();
+        let coder = self.agent.as_ref().map(|a| (a.shared.clone(), a.plan));
         std::thread::spawn(move || {
             let started = Instant::now();
-            let (ok, out) = sb.execute(&name, &args, &cancel);
+            let (ok, out) = match coder {
+                Some((shared, plan)) => {
+                    if plan && !coding::read_only(&name) {
+                        (false, "error: plan mode is on, so nothing can be changed. Finish the plan; the user will turn plan mode off to carry it out.".to_string())
+                    } else if shared
+                        .lock()
+                        .map(|mut g| g.is_loop(&name, &args))
+                        .unwrap_or(false)
+                    {
+                        (false, "error: you already made this exact call twice. Do something different, or ask the user.".to_string())
+                    } else {
+                        coding::execute(&shared, &sb, &name, &args, &cancel)
+                    }
+                }
+                None => sb.execute(&name, &args, &cancel),
+            };
             let _ = tx.send((idx, ok, out, started.elapsed().as_secs_f32()));
         });
     }
@@ -822,6 +1014,23 @@ impl Chat {
             t.secs = secs;
         }
         self.tool_message(idx, &out);
+        let question = self
+            .turns
+            .get(idx)
+            .and_then(|t| t.tool.as_ref())
+            .filter(|t| t.name == "ask_user")
+            .and_then(|t| {
+                t.args
+                    .get("question")
+                    .and_then(Json::as_str)
+                    .map(str::to_string)
+            });
+        if let (Some(q), Some(a)) = (question, self.agent.as_mut()) {
+            a.asked = true;
+            let mut turn = Turn::new(Role::Assistant, format!("**{q}**"));
+            turn.done = true;
+            self.turns.push(turn);
+        }
         self.next_tool();
     }
 
@@ -844,6 +1053,15 @@ impl Chat {
 
     fn finish_round(&mut self) {
         self.history.append(&mut self.tool_msgs);
+        if let Some(a) = self.agent.as_mut() {
+            a.refresh_git();
+            if std::mem::take(&mut a.asked) {
+                self.aborted = false;
+                self.rounds = 0;
+                self.end_generation();
+                return;
+            }
+        }
         if self.aborted {
             self.aborted = false;
             self.rounds = 0;
@@ -891,6 +1109,12 @@ impl Chat {
     }
 
     fn submit(&mut self, text: String) {
+        self.submit_with(text.clone(), text);
+    }
+
+    /// Send `body` to the model while the transcript shows the shorter `display`.
+    fn submit_with(&mut self, display: String, body: String) {
+        let text = body;
         let attachments = std::mem::take(&mut self.attachments);
         let sees = self.sees_images();
         let mut content = String::new();
@@ -915,11 +1139,91 @@ impl Chat {
             json!({"role": "user", "content": pictures})
         };
         self.history.push(message);
-        let mut turn = Turn::new(Role::User, text);
+        let mut turn = Turn::new(Role::User, display);
         turn.attachments = attachments.iter().map(|a| a.chip()).collect();
         self.turns.push(turn);
         self.rounds = 0;
+        if let Some(a) = &self.agent {
+            if let Ok(mut g) = a.shared.lock() {
+                g.new_message();
+            }
+        }
         self.start_turn();
+    }
+
+    /// Free context before a turn when it is filling up. Old tool output is
+    /// elided in one batch (so the model's cache is rebuilt once, not every
+    /// turn); when that is not enough the session is snapshotted.
+    fn maybe_compact(&mut self) {
+        let Some((used, cap)) = self.ctx else { return };
+        let Some(a) = &self.agent else { return };
+        if !a.compact || cap == 0 {
+            return;
+        }
+        let ratio = used as f64 / cap as f64;
+        if ratio >= 0.80 {
+            self.compact_now("context is 80% full");
+        } else if ratio >= 0.55 {
+            let Some(a) = &self.agent else { return };
+            let Ok(mut g) = a.shared.lock() else { return };
+            let (n, saved) = brain::evict_old(&mut self.history, &mut g.store, 6);
+            if n > 0 {
+                g.evicted += n;
+                g.evicted_bytes += saved;
+                g.forget_reads();
+                drop(g);
+                self.ctx = None;
+                self.note(format!(
+                    "context {:.0}% full: elided {n} old tool outputs ({} KB); ctx_read brings any back",
+                    ratio * 100.0,
+                    saved / 1024
+                ));
+            }
+        }
+    }
+
+    fn compact_now(&mut self, why: &str) {
+        let Some(a) = &self.agent else { return };
+        let project = a.project.clone();
+        let Ok(mut g) = a.shared.lock() else { return };
+        // Keep what the old output said reachable, then replace the history.
+        brain::evict_old(&mut self.history, &mut g.store, 0);
+        let removed = brain::compact(&mut self.history, &g, &project);
+        g.compactions += 1;
+        g.forget_reads();
+        drop(g);
+        self.ctx = None;
+        if removed > 0 {
+            self.note(format!(
+                "{why}: compacted the session into a snapshot ({} KB freed)",
+                removed / 1024
+            ));
+        } else {
+            self.note("nothing to compact yet");
+        }
+    }
+
+    fn ctx_report(&self) -> String {
+        let mut s = match self.ctx {
+            Some((u, c)) => format!(
+                "context {u} / {c} tokens ({:.0}%)",
+                u as f64 * 100.0 / c.max(1) as f64
+            ),
+            None => "context use is measured after each reply".to_string(),
+        };
+        if let Some(a) = &self.agent {
+            if let Ok(g) = a.shared.lock() {
+                s += &format!(
+                    "\n{} long outputs stored, {} KB kept out of the context\n{} old outputs elided ({} KB) · {} compaction(s)",
+                    g.store.len(),
+                    g.store.saved / 1024,
+                    g.evicted,
+                    g.evicted_bytes / 1024,
+                    g.compactions
+                );
+            }
+        }
+        s
     }
 
     fn reset(&mut self) {
@@ -931,6 +1235,11 @@ impl Chat {
         self.turns.clear();
         self.ctx = None;
         self.last_stats.clear();
+        if let Some(a) = &self.agent {
+            if let Ok(mut g) = a.shared.lock() {
+                g.reset_conversation();
+            }
+        }
         let _ = self.tx.send(ToWorker::Reset);
     }
 
@@ -974,12 +1283,98 @@ impl Chat {
             }
             "/help" | "/?" => {
                 let mut text = String::from("type / to see the commands as you type\n");
-                for (name, what) in COMMANDS {
-                    text += &format!("{name:<12} {what}\n");
+                let list: &[(&str, &str)] = if self.agent.is_some() {
+                    &AGENT_COMMANDS
+                } else {
+                    &COMMANDS
+                };
+                for &(name, what) in list {
+                    text += &format!("{name:<16} {what}\n");
                 }
                 text += "ctrl-t       show or hide the model's thinking\n";
                 text += "alt+enter or a trailing \\ makes a new line";
                 self.note(text);
+            }
+            "/tools edits" if self.agent.is_some() => {
+                self.tools = ToolMode::Edits;
+                self.note("approvals: file edits run freely, commands and downloads ask");
+            }
+            "/plan on" | "/plan off" if self.agent.is_some() => {
+                let on = line.trim().ends_with("on");
+                if let Some(a) = self.agent.as_mut() {
+                    a.plan = on;
+                }
+                self.note(if on {
+                    "plan mode: the agent can only read and plan"
+                } else {
+                    "plan mode off: the agent can make changes"
+                });
+            }
+            "/review" if self.agent.is_some() => {
+                let project = self
+                    .agent
+                    .as_ref()
+                    .map(|a| a.project.clone())
+                    .unwrap_or_default();
+                match brain::git_diff(&project) {
+                    Some(diff) if !diff.trim().is_empty() => {
+                        self.submit_with("/review".into(), brain::review_prompt(&diff))
+                    }
+                    _ => self.note("no uncommitted changes to review"),
+                }
+            }
+            "/audit" if self.agent.is_some() => {
+                self.submit_with("/audit".into(), brain::AUDIT_PROMPT.into())
+            }
+            "/debt" if self.agent.is_some() => {
+                self.submit_with("/debt".into(), brain::DEBT_PROMPT.into())
+            }
+            "/compact" if self.agent.is_some() => self.compact_now("compacted on request"),
+            "/ctx" => {
+                let report = self.ctx_report();
+                self.note(report);
+            }
+            "/todo" if self.agent.is_some() => {
+                let text = self
+                    .agent
+                    .as_ref()
+                    .and_then(|a| a.shared.lock().ok())
+                    .map(|g| {
+                        if g.todos.is_empty() {
+                            "no plan yet".to_string()
+                        } else {
+                            g.todos
+                                .iter()
+                                .map(|t| {
+                                    let m = match t.state {
+                                        coding::TodoState::Done => "[x]",
+                                        coding::TodoState::Active => "[>]",
+                                        coding::TodoState::Pending => "[ ]",
+                                    };
+                                    format!("{m} {}", t.text)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    })
+                    .unwrap_or_default();
+                self.note(text);
+            }
+            l if l.starts_with("/ponytail") && self.agent.is_some() => {
+                let mode = l.trim_start_matches("/ponytail").trim();
+                if matches!(mode, "off" | "lite" | "full" | "ultra") {
+                    if let Some(a) = self.agent.as_mut() {
+                        a.ponytail = Ponytail::parse(mode);
+                    }
+                    self.note(format!("ponytail {mode}"));
+                } else {
+                    let cur = self
+                        .agent
+                        .as_ref()
+                        .map(|a| a.ponytail.label())
+                        .unwrap_or("off");
+                    self.note(format!("ponytail is {cur} (off, lite, full or ultra)"));
+                }
             }
             "/tools off" | "/tools ask" | "/tools auto" => {
                 self.tools = ToolMode::parse(line.trim().trim_start_matches("/tools "));
@@ -988,6 +1383,7 @@ impl Chat {
                     ToolMode::Ask => {
                         "tools on: I'll ask before writes, commands and downloads".to_string()
                     }
+                    ToolMode::Edits => "tools on: file edits run freely, commands ask".to_string(),
                     ToolMode::Auto => "tools on: they run without asking".to_string(),
                 });
             }
@@ -1298,7 +1694,14 @@ impl App {
         let Some(chat) = self.chat.as_ref() else {
             return;
         };
-        let area = f.area();
+        let full = f.area();
+        let (area, side) = if chat.agent.is_some() && full.width >= 112 {
+            let [main, side] =
+                Layout::horizontal([Constraint::Min(70), Constraint::Length(38)]).areas(full);
+            (main, Some(side))
+        } else {
+            (full, None)
+        };
         let content_w = (area.width.saturating_sub(2) as usize).min(110);
         let input_w = content_w.saturating_sub(6).max(8);
         let rows = wrap_rows(&chat.input, input_w);
@@ -1333,7 +1736,15 @@ impl App {
             }
         }
         let crumb = sub.join(" · ");
-        header(f, head, &["Chat", &crumb], vec![pill(state, color)]);
+        let title = if chat.agent.is_some() {
+            "Agents"
+        } else {
+            "Chat"
+        };
+        header(f, head, &[title, &crumb], vec![pill(state, color)]);
+        if let Some(side) = side {
+            self.draw_agent_side(f, side, chat);
+        }
 
         let col = |r: Rect| centered(r, content_w as u16 + 2, r.height);
         let mid = col(mid);
@@ -1741,10 +2152,19 @@ impl App {
                 lines.push(Line::styled(i.sampling.clone(), Style::new().fg(DIM)));
             }
             lines.push(Line::default());
-            lines.push(Line::styled(
-                "type a message below to begin",
-                Style::new().fg(TEXT),
-            ));
+            if chat.agent.is_some() {
+                for tip in [
+                    "describe a task: the agent explores, edits and tests in your project",
+                    "/plan on to plan first · /review to check your diff for bloat",
+                ] {
+                    lines.push(Line::styled(tip, Style::new().fg(TEXT)));
+                }
+            } else {
+                lines.push(Line::styled(
+                    "type a message below to begin",
+                    Style::new().fg(TEXT),
+                ));
+            }
             lines.push(Line::styled(
                 "/help for commands · alt+enter for a new line",
                 Style::new().fg(FAINT),
@@ -1834,7 +2254,40 @@ impl App {
                         ),
                         Span::styled(format!("  {tail}"), Style::new().fg(FAINT)),
                     ]));
-                    if matches!(tool.state, ToolState::Ok | ToolState::Failed)
+                    let diff_card = tool.state == ToolState::Ok
+                        && matches!(tool.name.as_str(), "edit_file" | "write_file");
+                    if diff_card {
+                        let s = |k: &str| tool.args.get(k).and_then(Json::as_str).unwrap_or("");
+                        let (minus, plus) = if tool.name == "edit_file" {
+                            (s("old_text"), s("new_text"))
+                        } else {
+                            ("", s("content"))
+                        };
+                        let bar = |text: &str, sign: char, color: Color| {
+                            let style = Style::new().fg(color);
+                            let chars: Vec<Sc> = format!("{sign} {text}")
+                                .chars()
+                                .map(|c| (c, style))
+                                .collect();
+                            let row = wrap_styled(&chars, width.saturating_sub(6), 0)
+                                .into_iter()
+                                .next()
+                                .unwrap_or_default();
+                            to_line(&row, vec![Span::styled("  │ ", Style::new().fg(FAINT))])
+                        };
+                        for (text, sign, color) in [(minus, '-', BAD), (plus, '+', GOOD)] {
+                            let all: Vec<&str> = text.lines().collect();
+                            for line in all.iter().take(6) {
+                                out.push(bar(line, sign, color));
+                            }
+                            if all.len() > 6 {
+                                out.push(Line::styled(
+                                    format!("  │ {sign} … {} more lines", all.len() - 6),
+                                    Style::new().fg(FAINT),
+                                ));
+                            }
+                        }
+                    } else if matches!(tool.state, ToolState::Ok | ToolState::Failed)
                         && !tool.output.is_empty()
                     {
                         let style = Style::new().fg(if tool.state == ToolState::Failed {
@@ -1844,6 +2297,7 @@ impl App {
                         });
                         let lines: Vec<&str> = tool.output.lines().collect();
                         for line in lines.iter().take(8) {
+                            let line = line.replace('\t', "  ");
                             let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
                             let row = wrap_styled(&chars, width.saturating_sub(6), 0)
                                 .into_iter()

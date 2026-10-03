@@ -16,11 +16,15 @@ impl App {
     }
 
     pub fn pick_entries(&self) -> Vec<Entry> {
-        let serve = self.mode == Mode::Serve;
+        let mode = self.mode;
         self.favs
             .iter()
             .enumerate()
-            .filter(|(_, f)| f.serve == serve)
+            // Agents can run any chat favorite too: it supplies the model and settings.
+            .filter(|(_, f)| match mode {
+                Mode::Agent => f.mode != Mode::Serve,
+                m => f.mode == m,
+            })
             .map(|(i, _)| Entry::Fav(i))
             .chain([Entry::Custom, Entry::OneTime])
             .collect()
@@ -47,7 +51,12 @@ impl App {
             KeyCode::Char('o') => self.open_editor(self.mode, Origin::OneTime),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') => match entry {
                 Entry::Fav(i) => {
+                    let wanted = self.mode;
                     if self.load_favorite(i) {
+                        // A chat favorite opened from Agents runs as an agent.
+                        if wanted == Mode::Agent {
+                            self.mode = Mode::Agent;
+                        }
                         self.start();
                     }
                 }
@@ -109,12 +118,11 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(f.area());
-        let serve = self.mode == Mode::Serve;
         header(
             f,
             head,
-            &[if serve { "Serve" } else { "Chat" }, "choose a setup"],
-            vec![pill(if serve { "SERVE" } else { "CHAT" }, EMBER)],
+            &[self.mode.label(), "choose a setup"],
+            vec![pill(self.mode.pill(), EMBER)],
         );
         let [list, preview] =
             Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)])
@@ -299,11 +307,7 @@ impl App {
                 lines.push(Line::styled(" SETTINGS", dim.add_modifier(Modifier::BOLD)));
                 let mut any = false;
                 for fl in &self.fields {
-                    let in_scope = match fl.scope {
-                        Scope::Both => true,
-                        Scope::Chat => !fav.serve,
-                        Scope::Serve => fav.serve,
-                    };
+                    let in_scope = fl.scope.applies(fav.mode);
                     let v = fav
                         .values
                         .get(fl.key)
@@ -334,7 +338,7 @@ impl App {
                 lines.push(Line::default());
                 lines.push(Line::styled(" COMMAND", dim.add_modifier(Modifier::BOLD)));
                 let (bin, args) = self.command_for(
-                    fav.serve,
+                    fav.mode,
                     self.fav_model(fav).map(|m| m.path.as_path()),
                     &|k| {
                         fav.values

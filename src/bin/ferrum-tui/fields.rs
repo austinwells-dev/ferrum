@@ -1,16 +1,67 @@
 use crate::*;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
     Chat,
     Serve,
+    Agent,
+}
+
+impl Mode {
+    pub fn parse(s: &str) -> Self {
+        match s {
+            "serve" => Self::Serve,
+            "agent" => Self::Agent,
+            _ => Self::Chat,
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Serve => "serve",
+            Self::Agent => "agent",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Chat => "Chat",
+            Self::Serve => "Serve",
+            Self::Agent => "Agents",
+        }
+    }
+
+    pub fn pill(self) -> &'static str {
+        match self {
+            Self::Chat => "CHAT",
+            Self::Serve => "SERVE",
+            Self::Agent => "AGENT",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Scope {
     Both,
+    /// Chat and agents.
     Chat,
+    /// Plain chat only.
+    ChatOnly,
     Serve,
+    Agent,
+}
+
+impl Scope {
+    pub fn applies(self, mode: Mode) -> bool {
+        match self {
+            Self::Both => true,
+            Self::Chat => matches!(mode, Mode::Chat | Mode::Agent),
+            Self::ChatOnly => mode == Mode::Chat,
+            Self::Serve => mode == Mode::Serve,
+            Self::Agent => mode == Mode::Agent,
+        }
+    }
 }
 
 pub enum Kind {
@@ -80,7 +131,7 @@ pub fn text(presets: &'static [&'static str]) -> Kind {
 }
 
 pub fn fields() -> Vec<Field> {
-    use Scope::{Both, Chat, Serve};
+    use Scope::{Agent, Both, Chat, ChatOnly, Serve};
     let m = "Model";
     let r = "Reasoning";
     let s = "Sampling";
@@ -246,7 +297,7 @@ pub fn fields() -> Vec<Field> {
             "tools",
             "Tools",
             "Agent tools",
-            Chat,
+            ChatOnly,
             Kind::Cycle(&["off", "ask", "auto"]),
             "off",
             "Let the model run commands and edit files in a sandbox. ask: approve writes, commands and downloads; auto: no prompts.",
@@ -255,7 +306,7 @@ pub fn fields() -> Vec<Field> {
             "workspace",
             "Workspace folder",
             "Agent tools",
-            Chat,
+            ChatOnly,
             text(&[]),
             "~/ferrum-workspace",
             "The only folder the tools can write to (Enter to change). Attachments are copied into it.",
@@ -268,6 +319,42 @@ pub fn fields() -> Vec<Field> {
             Kind::Cycle(&["on", "off"]),
             "on",
             "on lets the model fetch web pages and commands use the internet (never this Mac's own services).",
+        ),
+        field(
+            "project",
+            "Project folder",
+            "Coding agent",
+            Agent,
+            text(&[]),
+            "current folder",
+            "The folder the agent works in and can change (Enter to type a path). Default: where you started ferrum.",
+        ),
+        field(
+            "agent_tools",
+            "Approvals",
+            "Coding agent",
+            Agent,
+            Kind::Cycle(&["edits", "ask", "auto"]),
+            "edits",
+            "edits: file changes run freely, commands and downloads ask · ask: confirm every change · auto: never ask.",
+        ),
+        field(
+            "ponytail",
+            "Ponytail",
+            "Coding agent",
+            Agent,
+            Kind::Cycle(&["full", "lite", "ultra", "off"]),
+            "full",
+            "Minimal-code guidance every turn: lite, full (the decision ladder) or ultra (delete before adding).",
+        ),
+        field(
+            "compact",
+            "Context compaction",
+            "Coding agent",
+            Agent,
+            Kind::Cycle(&["on", "off"]),
+            "on",
+            "Elide old tool output and snapshot the session as the context fills.",
         ),
         field(
             "host",

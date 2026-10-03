@@ -3,11 +3,7 @@ use crate::*;
 impl App {
     pub fn visible(&self) -> Vec<usize> {
         (0..self.fields.len())
-            .filter(|&i| match self.fields[i].scope {
-                Scope::Both => true,
-                Scope::Chat => self.mode == Mode::Chat,
-                Scope::Serve => self.mode == Mode::Serve,
-            })
+            .filter(|&i| self.fields[i].scope.applies(self.mode))
             .collect()
     }
 
@@ -312,7 +308,6 @@ impl App {
             Constraint::Length(1),
         ])
         .areas(f.area());
-        let serve = self.mode == Mode::Serve;
         let what = match &self.origin {
             Origin::Custom => "new setup".to_string(),
             Origin::OneTime => "one-time run".to_string(),
@@ -321,8 +316,8 @@ impl App {
         header(
             f,
             head,
-            &[if serve { "Serve" } else { "Chat" }, &what],
-            vec![pill(if serve { "SERVE" } else { "CHAT" }, EMBER)],
+            &[self.mode.label(), &what],
+            vec![pill(self.mode.pill(), EMBER)],
         );
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -560,6 +555,7 @@ impl App {
         let title = match self.mode {
             Mode::Chat => "Chat settings",
             Mode::Serve => "Server settings",
+            Mode::Agent => "Agent settings",
         };
         let block = self.panel(title, focused);
         let inner = block.inner(area);
@@ -599,8 +595,10 @@ impl App {
         let label = match (self.mode, &self.origin) {
             (Mode::Chat, Origin::Custom) => "  ▶  Name & start chat",
             (Mode::Serve, Origin::Custom) => "  ▶  Name & start server",
+            (Mode::Agent, Origin::Custom) => "  ▶  Name & start agent",
             (Mode::Chat, _) => "  ▶  Start chat",
             (Mode::Serve, _) => "  ▶  Start server",
+            (Mode::Agent, _) => "  ▶  Start agent",
         };
         let style = if launch_on && focused {
             Style::new()

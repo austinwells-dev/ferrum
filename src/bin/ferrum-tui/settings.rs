@@ -180,10 +180,7 @@ impl App {
                 &mut lines,
                 n,
                 format!("★ {}", fav.name),
-                format!(
-                    "{} · enter rename · x delete",
-                    if fav.serve { "serve" } else { "chat" }
-                ),
+                format!("{} · enter rename · x delete", fav.mode.key()),
                 Style::new().fg(DIM),
             );
             n += 1;

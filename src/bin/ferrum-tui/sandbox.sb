@@ -1,5 +1,5 @@
 ;; Seatbelt profile for the chat agent's tools (sandbox-exec -p ... -D KEY=value).
-;; Parameters: WORKSPACE, HOME, NETWORK ("on" or "off").
+;; Parameters: WORKSPACE, STATE (scratch home/tmp/attachments), HOME, NETWORK ("on" or "off").
 (version 1)
 (allow default)
 
@@ -7,6 +7,7 @@
 (deny file-write*)
 (allow file-write*
     (subpath (param "WORKSPACE"))
+    (subpath (param "STATE"))
     (literal "/dev/null")
     (literal "/dev/zero")
     (literal "/dev/dtracehelper")

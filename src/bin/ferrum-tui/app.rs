@@ -43,7 +43,7 @@ impl App {
                     .map(|v| Fav {
                         name: v["name"].as_str().unwrap_or("favorite").to_string(),
                         model: v["model"].as_str().unwrap_or("").to_string(),
-                        serve: v["mode"] == "serve",
+                        mode: Mode::parse(v["mode"].as_str().unwrap_or("chat")),
                         values: v["values"].as_object().cloned().unwrap_or_default(),
                     })
                     .collect()
@@ -106,7 +106,7 @@ impl App {
             "favorites": self.favs.iter().map(|f| json!({
                 "name": f.name,
                 "model": f.model,
-                "mode": if f.serve { "serve" } else { "chat" },
+                "mode": f.mode.key(),
                 "values": f.values,
             })).collect::<Vec<_>>(),
         });
@@ -163,20 +163,19 @@ impl App {
 
     /// The binary and arguments for the current selection.
     pub fn command(&self) -> (&'static str, Vec<String>) {
-        self.command_for(
-            self.mode == Mode::Serve,
-            self.selected().map(|m| m.path.as_path()),
-            &|k| self.value(k).to_string(),
-        )
+        self.command_for(self.mode, self.selected().map(|m| m.path.as_path()), &|k| {
+            self.value(k).to_string()
+        })
     }
 
     /// The command line for any set of values (the editor's, or a favorite's).
     pub fn command_for(
         &self,
-        serve: bool,
+        mode: Mode,
         model: Option<&Path>,
         value: &dyn Fn(&str) -> String,
     ) -> (&'static str, Vec<String>) {
+        let serve = mode == Mode::Serve;
         let mut args: Vec<String> = Vec::new();
         if let Some(m) = model {
             args.extend(["--model".into(), m.display().to_string()]);
@@ -184,11 +183,7 @@ impl App {
         let draft = value("draft");
         let drafting = !draft.is_empty() && draft != "off";
         for f in &self.fields {
-            let in_scope = match f.scope {
-                Scope::Both => true,
-                Scope::Chat => !serve,
-                Scope::Serve => serve,
-            };
+            let in_scope = f.scope.applies(mode);
             let v = value(f.key);
             let is_default = match &f.kind {
                 Kind::Cycle(opts) => v.is_empty() || v == opts[0],
@@ -278,7 +273,7 @@ impl App {
         let fav = Fav {
             name: name.to_string(),
             model: model.path.display().to_string(),
-            serve: self.mode == Mode::Serve,
+            mode: self.mode,
             values: self.values_map(),
         };
         match self.favs.iter().position(|f| f.name == name) {
@@ -304,7 +299,7 @@ impl App {
                 .unwrap_or("")
                 .to_string();
         }
-        self.mode = if fav.serve { Mode::Serve } else { Mode::Chat };
+        self.mode = fav.mode;
         let name = fav.name.clone();
         let found = self
             .models
@@ -391,7 +386,7 @@ impl App {
         self.save();
         self.reap();
         let started = match self.mode {
-            Mode::Chat => Chat::start(self).map(|c| {
+            Mode::Chat | Mode::Agent => Chat::start(self).map(|c| {
                 self.chat = Some(c);
                 Screen::Chat
             }),

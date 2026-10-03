@@ -6,15 +6,19 @@
 mod agent;
 mod app;
 mod attach;
+mod brain;
 mod catalog;
 mod chat;
+mod coding;
 mod editor;
 mod fields;
 mod home;
 mod pick;
 mod serve;
 mod settings;
+mod side;
 mod splash;
+mod store;
 mod text;
 mod theme;
 mod ui;
@@ -85,7 +89,7 @@ pub enum Focus {
 pub struct Fav {
     pub name: String,
     pub model: String,
-    pub serve: bool,
+    pub mode: Mode,
     pub values: Map<String, Json>,
 }
 
