@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 use crate::{
     Error, Result,
-    loader::gguf::{GgufFile, MetadataValue},
+    loader::gguf::{GgufReader, MetadataValue},
 };
 use std::collections::BTreeMap;
 
@@ -37,6 +37,9 @@ pub struct HybridConfig {
     pub head_dim: usize,
     pub rope_dims: usize,
     pub rope_theta: f32,
+    /// Interleaved multi-axis RoPE sections (time, height, width, extra) used
+    /// to position image tokens; zeros when the GGUF declares none.
+    pub rope_sections: [usize; 4],
     pub eps: f32,
     /// Dense FFN width (unused by MoE layers).
     pub ffn: usize,
@@ -50,7 +53,7 @@ pub struct HybridConfig {
 }
 
 impl HybridConfig {
-    pub fn from_gguf(file: &GgufFile) -> Result<Self> {
+    pub fn from_gguf<R: std::io::Read + std::io::Seek>(file: &GgufReader<R>) -> Result<Self> {
         let md = file.metadata();
         let arch = string(md, "general.architecture")?;
         let variant = match arch {
@@ -132,6 +135,7 @@ impl HybridConfig {
             head_dim,
             rope_dims: uint(md, &key("rope.dimension_count"))?,
             rope_theta: float(md, &key("rope.freq_base"))?,
+            rope_sections: rope_sections(md, &key("rope.dimension_sections")),
             eps: float(md, &key("attention.layer_norm_rms_epsilon"))?,
             ffn: match variant {
                 Variant::Dense => uint(md, &key("feed_forward_length"))?,
@@ -228,6 +232,22 @@ fn string<'a>(md: &'a BTreeMap<String, MetadataValue>, key: &str) -> Result<&'a 
         Some(MetadataValue::String(s)) => Ok(s),
         _ => Err(Error::Config(format!("missing GGUF metadata {key}"))),
     }
+}
+
+/// `rope.dimension_sections` as four section sizes (zeros when absent).
+fn rope_sections(md: &BTreeMap<String, MetadataValue>, key: &str) -> [usize; 4] {
+    let mut out = [0; 4];
+    if let Some(MetadataValue::Array { values, .. }) = md.get(key) {
+        for (o, v) in out.iter_mut().zip(values) {
+            *o = match v {
+                MetadataValue::Uint32(v) => *v as usize,
+                MetadataValue::Int32(v) if *v >= 0 => *v as usize,
+                MetadataValue::Uint64(v) => *v as usize,
+                _ => 0,
+            };
+        }
+    }
+    out
 }
 
 pub(crate) fn uint(md: &BTreeMap<String, MetadataValue>, key: &str) -> Result<usize> {

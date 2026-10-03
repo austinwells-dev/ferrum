@@ -7,8 +7,9 @@
 //!            [--reasoning-budget N] [--hide-thinking]
 //!            [--draft mtp|DIR] [--draft-max N] [--draft-quant q8_0|q4_0]
 //!            [--draft-context N] [--draft-p-min P]
+//!            [--mmproj FILE|auto|none] [--image-tokens N] [--image-min-tokens N]
 //!
-//! Commands: /reset, /think on|off, /stats, /exit. End a line with `\` to
+//! Commands: /reset, /think on|off, /image PATH, /stats, /exit. End a line with `\` to
 //! continue the message on the next line.
 use ferrum::{
     Error, Result,
@@ -31,6 +32,9 @@ struct Options {
     reasoning_budget: Option<usize>,
     overrides: Vec<(String, String)>,
     spec: Option<SpecOptions>,
+    mmproj: Option<String>,
+    image_tokens: usize,
+    image_min_tokens: usize,
 }
 
 fn parse() -> Result<Options> {
@@ -45,6 +49,9 @@ fn parse() -> Result<Options> {
         reasoning_budget: None,
         overrides: Vec::new(),
         spec: None,
+        mmproj: None,
+        image_tokens: ferrum::vision::DEFAULT_MAX_TOKENS,
+        image_min_tokens: ferrum::vision::DEFAULT_MIN_TOKENS,
     };
     let mut args = std::env::args().skip(1);
     while let Some(key) = args.next() {
@@ -56,7 +63,7 @@ fn parse() -> Result<Options> {
                     "{}",
                     include_str!("ferrum-cli.rs")
                         .lines()
-                        .take(14)
+                        .take(17)
                         .map(|l| l.trim_start_matches("//!").trim_start_matches(' '))
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -85,6 +92,9 @@ fn parse() -> Result<Options> {
                         }
                     }
                     "--system" => o.system = Some(value.clone()),
+                    "--mmproj" => o.mmproj = Some(value.clone()),
+                    "--image-tokens" => o.image_tokens = number()?,
+                    "--image-min-tokens" => o.image_min_tokens = number()?,
                     "--max-tokens" | "-n" => o.max_tokens = number()?,
                     "--reasoning-effort" => o.effort = Some(value.clone()),
                     "--reasoning-budget" => o.reasoning_budget = Some(number()?),
@@ -123,14 +133,25 @@ fn main() {
 fn run() -> Result<()> {
     let o = parse()?;
     eprintln!("loading {} ...", o.model);
-    let mut rt = Runtime::load_speculative(
+    let mmproj = ferrum::vision::resolve_projector(o.model.as_ref(), o.mmproj.as_deref())?;
+    let mut rt = Runtime::load_multimodal(
         &o.model,
         PlanOptions {
             context: o.context,
             ..Default::default()
         },
         o.spec.as_ref(),
+        mmproj.as_deref(),
+        o.image_tokens,
     )?;
+    if let Some(vision) = rt.vision.as_mut() {
+        vision.model.min_tokens = o.image_min_tokens;
+        eprintln!(
+            "vision: {} (up to {} tokens per image; /image PATH attaches one)",
+            vision.path.display(),
+            vision.model.max_tokens
+        );
+    }
     if let Some(drafter) = rt.session.drafter() {
         eprintln!(
             "speculative decoding: {} ({} drafts per step, {:.2} GiB)",
@@ -178,6 +199,7 @@ fn run() -> Result<()> {
         messages.push(json!({"role": "system", "content": system}));
     }
     let mut think = o.think;
+    let mut attachments: Vec<Json> = Vec::new();
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let mut last_stats = String::from("no turns yet");
@@ -203,6 +225,7 @@ fn run() -> Result<()> {
             "" => continue,
             "/exit" | "/quit" => return Ok(()),
             "/reset" => {
+                attachments.clear();
                 messages.retain(|m| m["role"] == "system");
                 rt.session.reset();
                 eprintln!("(conversation cleared)");
@@ -223,7 +246,28 @@ fn run() -> Result<()> {
             }
             _ => {}
         }
-        messages.push(json!({"role": "user", "content": input}));
+        if let Some(path) = input.strip_prefix("/image ") {
+            let path = path.trim().trim_matches('\'');
+            match std::fs::read(path) {
+                Ok(bytes) if rt.supports_vision() => {
+                    attachments.push(ferrum::vision::media::image_part_from_bytes(&bytes));
+                    eprintln!(
+                        "(image attached: {} bytes; it goes with your next message)",
+                        bytes.len()
+                    );
+                }
+                Ok(_) => eprintln!("this model was loaded without a vision projector (--mmproj)"),
+                Err(e) => eprintln!("cannot read {path}: {e}"),
+            }
+            continue;
+        }
+        if attachments.is_empty() {
+            messages.push(json!({"role": "user", "content": input}));
+        } else {
+            let mut parts = std::mem::take(&mut attachments);
+            parts.push(json!({"type": "text", "text": input}));
+            messages.push(json!({"role": "user", "content": parts}));
+        }
         let mut vars = Map::new();
         vars.insert("enable_thinking".into(), Json::Bool(think));
         if let Some(effort) = &o.effort {
@@ -283,6 +327,11 @@ fn run() -> Result<()> {
             c.tokens.len() as f64 / c.decode.as_secs_f64().max(1e-9),
             c.stop
         );
+        if let Some(vision) = rt.vision.as_ref()
+            && !vision.last_encode.is_zero()
+        {
+            last_stats += &format!("; image encode {:.2} s", vision.last_encode.as_secs_f64());
+        }
         let spec = &rt.session.spec_stats;
         if spec.steps > 0 {
             last_stats += &format!(

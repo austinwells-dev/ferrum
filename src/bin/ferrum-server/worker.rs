@@ -53,6 +53,13 @@ pub enum Event {
     },
 }
 
+/// Vision projector settings for the model thread.
+pub struct Vision {
+    pub mmproj: Option<PathBuf>,
+    pub max_tokens: usize,
+    pub min_tokens: usize,
+}
+
 pub struct Job {
     pub id: u64,
     pub work: Work,
@@ -67,6 +74,8 @@ pub struct Status {
     pub load_error: Option<String>,
     pub model: String,
     pub context: usize,
+    /// Requests may carry images (a vision projector is loaded).
+    pub vision: bool,
     pub busy_request: Option<u64>,
     pub busy_phase: &'static str,
     pub session_tokens: usize,
@@ -110,12 +119,13 @@ pub fn spawn(
     options: PlanOptions,
     spec: Option<SpecOptions>,
     alias: Option<String>,
+    vision: Vision,
     shared: Arc<Shared>,
 ) -> Sender<Job> {
     let (tx, rx) = channel::<Job>();
     std::thread::Builder::new()
         .name("model".into())
-        .spawn(move || run(path, options, spec, alias, shared, rx))
+        .spawn(move || run(path, options, spec, alias, vision, shared, rx))
         .expect("spawn model thread");
     tx
 }
@@ -125,11 +135,18 @@ fn run(
     options: PlanOptions,
     spec: Option<SpecOptions>,
     alias: Option<String>,
+    vision: Vision,
     shared: Arc<Shared>,
     jobs: Receiver<Job>,
 ) {
     let start = Instant::now();
-    let mut rt = match Runtime::load_speculative(&path, options, spec.as_ref()) {
+    let mut rt = match Runtime::load_multimodal(
+        &path,
+        options,
+        spec.as_ref(),
+        vision.mmproj.as_deref(),
+        vision.max_tokens,
+    ) {
         Ok(rt) => rt,
         Err(e) => {
             error!(None, "failed to load {}: {e}", path.display());
@@ -188,6 +205,17 @@ fn run(
             gib(plan.draft_total(plan.context))
         );
     }
+    if let Some(v) = rt.vision.as_mut() {
+        v.model.min_tokens = vision.min_tokens;
+        info!(
+            None,
+            "vision: {} ({:.2} GiB; images take {}..{} tokens each)",
+            v.path.display(),
+            gib(v.model.weight_bytes()),
+            v.model.min_tokens.min(v.model.max_tokens),
+            v.model.max_tokens
+        );
+    }
     let warm = Instant::now();
     match rt.warmup() {
         Ok(()) => info!(None, "warmed up in {:.1} s", warm.elapsed().as_secs_f64()),
@@ -206,6 +234,7 @@ fn run(
         s.state = "ready";
         s.model = rt.model_name.clone();
         s.context = plan.context;
+        s.vision = rt.supports_vision();
         s.memory_budget_bytes = plan.budget;
         s.memory_predicted_bytes = plan.total();
         s.drafter = drafter.map(|(name, _)| name).unwrap_or_default();
@@ -245,6 +274,15 @@ fn run(
                 },
             ),
         }));
+        if let Some(v) = rt.vision.as_ref()
+            && !v.last_encode.is_zero()
+        {
+            info!(
+                Some(job.id),
+                "encoded images in {:.2} s",
+                v.last_encode.as_secs_f64()
+            );
+        }
         let event = match outcome {
             Ok(Ok(event)) => {
                 let completion = match &event {

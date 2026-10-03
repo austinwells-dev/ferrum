@@ -25,6 +25,8 @@ pub struct PlanOptions {
     pub snapshots: usize,
     /// Speculative drafter memory (`runtime::SpecOptions::memory`).
     pub draft: DraftMemory,
+    /// Vision projector weights and encoder buffers (`vision::projector_bytes`).
+    pub vision: usize,
 }
 
 /// Memory a speculative drafter adds: weights, verify and draft buffers,
@@ -46,6 +48,7 @@ impl Default for PlanOptions {
             logit_rows: 1,
             snapshots: 2,
             draft: DraftMemory::default(),
+            vision: 0,
         }
     }
 }
@@ -67,6 +70,8 @@ pub struct MemoryPlan {
     pub trained_context: usize,
     /// Speculative drafter (zero without one).
     pub draft: DraftMemory,
+    /// Vision projector (zero without one).
+    pub vision: usize,
 }
 
 /// Measured on the M5: pipelines, command buffers and small per-forward
@@ -97,6 +102,7 @@ impl MemoryPlan {
             + self.overhead
             + self.draft.weights
             + self.draft.fixed
+            + self.vision
     }
 }
 
@@ -150,6 +156,7 @@ pub fn plan(
         context: 0,
         trained_context: c.trained_context,
         draft: options.draft,
+        vision: options.vision,
     };
     let free = budget.saturating_sub(plan.fixed());
     let per_token = kv_per_token + options.draft.per_token;

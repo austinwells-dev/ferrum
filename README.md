@@ -25,6 +25,16 @@ cargo build --release
 ./target/release/ferrum-server --model /path/to/model.gguf --port 8080
 ```
 
+Or use the full-screen launcher:
+
+```sh
+./target/release/ferrum-tui        # alias it: alias ferrum='/path/to/ferrum/target/release/ferrum-tui'
+```
+
+It opens with a short startup animation, then a home screen with **Chat**, **Serve** and **Settings**. Choosing Chat or Serve lists your saved favorite setups (model, settings and a DSpark/DFlash drafter), plus **New setup** (saved as a favorite when you launch) and **One-time run**. Chat runs inside the TUI with streaming, markdown and a reasoning view; Serve starts `ferrum-server` and shows its endpoint, health and live log. Models, quants and drafters ferrum can't run are greyed out with the reason.
+
+**Agent tools and attachments (TUI chat).** Set *Tools* to `ask` or `auto` in a chat setup (or type `/tools ask`) and the model can read, write and edit files, run shell commands and fetch web pages. Commands and downloads run inside a macOS Seatbelt sandbox (`sandbox-exec`): the whole disk is read-only except the workspace folder (`~/ferrum-workspace` by default), keys and credentials such as `~/.ssh` are hidden, the network can be switched off, and the Mac's own localhost services are never reachable. In `ask` mode you approve each write, command or download. Attach files with `/attach PATH`, by dropping them on the terminal, or from the clipboard with Ctrl-V (files, screenshots or text); `/screenshot` grabs a screen region. Images are not seen by the model yet: the text in them is read with macOS Vision and sent instead.
+
 Ferrum never downloads anything. You supply the model files yourself.
 
 ## Supported models
@@ -84,6 +94,20 @@ Server-wide defaults: `--no-think`, `--reasoning-effort`, `--reasoning-budget`, 
 **Streaming.** Keep-alives prevent timeouts during long prompts. `return_progress` streams prompt-processing progress, and `stream_options.include_usage` adds a final usage chunk. If a client disconnects, generation stops right away and the work already done stays cached for a retry. If the model crashes mid-request, the session resets instead of the server going down.
 
 **Logging.** Each request logs one line on arrival, progress lines every few seconds, and a summary (cached/processed tokens, speeds, reasoning tokens, stop reason). Add `-v` to also log request bodies and outputs.
+
+## Vision (images)
+
+The Qwen3.5-family models can read images when you load the vision projector (the `mmproj*.gguf` published next to the model). Ferrum implements the Qwen3-VL projector (`qwen3vl_merger`): a ViT over 16x16 patches with 2-D rotary attention, a 2x2 merger and an MLP into the language model's width, all on Metal. Image tokens are positioned with the model's interleaved multi-axis RoPE, as in llama.cpp, and checked against it on the same prompts.
+
+A projector sitting in the same folder as the model, with a matching width, is loaded automatically (the `mmproj-BF16`/`F16` files from Hugging Face qualify). It takes about 1 GiB of the memory budget, and the auto-fitted context shrinks to make room.
+
+| Flag | Effect |
+|---|---|
+| `--mmproj FILE\|auto\|none` | Projector to load (default `auto`) |
+| `--image-tokens N` | Most context tokens one image may use (default 1024; larger images are scaled down) |
+| `--image-min-tokens N` | Scale small images up to at least N tokens (default 64; Qwen-VL reads fine print better at 1024) |
+
+Send images inline: OpenAI `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` parts, or Anthropic `{"type": "image", "source": {"type": "base64", ...}}` blocks. PNG, JPEG, GIF, WebP and BMP are decoded; remote URLs are rejected rather than fetched. `/props` reports `modalities.vision`, and a request with images to a model without a projector fails with a clear 400. Encoded images are cached, and the conversation cache is reused across turns as long as the same pictures sit in the same places. In `ferrum-cli`, `/image PATH` attaches a picture to your next message; in the TUI, attached images (paths, clipboard, screenshots) go to the model as pixels when a projector is present and fall back to OCR text otherwise. Design notes are in [docs/vision.md](docs/vision.md).
 
 ## Speculative decoding
 
@@ -241,6 +265,7 @@ Tensor operations are synchronous from the caller's point of view. Model forward
 
 ## Limitations
 
+- Vision supports the Qwen3-VL projector only (no video, DeepStack variants, Gemma or LLaVA projectors).
 - One request at a time (batch size 1), single-threaded contexts.
 - Tensor views must be contiguous. No paged attention or graph scheduler.
 - GPU math accumulates in F32, but a different summation order can change BF16 rounding, and occasionally which token wins a near-tie in greedy decoding.

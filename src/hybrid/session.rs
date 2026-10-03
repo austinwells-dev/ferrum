@@ -3,7 +3,9 @@
 //! and the sampling/generation loop.
 #![forbid(unsafe_code)]
 use super::{
-    engine::{HybridModel, HybridState, Output, Penalties, Produced, RowOutput, RowsProduced},
+    engine::{
+        HybridModel, HybridState, ImageSpan, Output, Penalties, Produced, RowOutput, RowsProduced,
+    },
     speculative::{Drafter, SpecStats},
 };
 use crate::{DType, Error, MetalDevice, Result, Tensor};
@@ -142,6 +144,25 @@ struct Snapshot {
     stamp: u64,
 }
 
+/// Shrink a reusable prefix of `common` tokens so it never cuts through an
+/// image or reuses a different one: pad tokens look alike whatever the
+/// picture, so an image counts only when the cache (`cached`) holds the same
+/// picture, at the same place, entirely inside the prefix.
+fn reusable_before_images(common: usize, cached: &[ImageSpan], media: &[ImageSpan]) -> usize {
+    for span in media {
+        if span.start >= common {
+            break;
+        }
+        let same = cached
+            .iter()
+            .any(|c| c.start == span.start && c.grid == span.grid && c.hash == span.hash);
+        if !same || span.end() > common {
+            return span.start;
+        }
+    }
+    common
+}
+
 pub struct Session {
     state: HybridState,
     /// Tokens represented by `state` (always `state.len()` of them).
@@ -155,6 +176,8 @@ pub struct Session {
     drafter_rewind: Option<usize>,
     /// Acceptance statistics of the latest generation.
     pub spec_stats: SpecStats,
+    /// Images of the next prompt, taken by the next `prefill`/`generate`.
+    pending_media: Vec<ImageSpan>,
 }
 
 impl Session {
@@ -188,7 +211,16 @@ impl Session {
             speculate: false,
             drafter_rewind: None,
             spec_stats: SpecStats::default(),
+            pending_media: Vec::new(),
         })
+    }
+
+    /// Declare the images of the next prompt: each span covers pad-token
+    /// positions whose embeddings the vision encoder produced. Spans must be
+    /// ordered, disjoint and lie inside the prompt. Consumed by the next
+    /// `prefill` or `generate`; without a call the prompt has no images.
+    pub fn set_media(&mut self, media: Vec<ImageSpan>) {
+        self.pending_media = media;
     }
 
     /// Attach a drafter (enabling the target's verify buffers) and clear the
@@ -281,18 +313,32 @@ impl Session {
 
     /// Bring the state to the longest reusable prefix of `prompt`, keeping at
     /// least the final prompt token to recompute. Returns the reused length.
-    fn reuse_prefix(&mut self, d: &MetalDevice, prompt: &[u32]) -> Result<usize> {
+    fn reuse_prefix(
+        &mut self,
+        d: &MetalDevice,
+        prompt: &[u32],
+        media: &[ImageSpan],
+    ) -> Result<usize> {
         if !self.state.is_valid() {
             self.reset();
         }
+        for (i, span) in media.iter().enumerate() {
+            let ordered = i == 0 || media[i - 1].end() <= span.start;
+            if span.is_empty() || span.end() > prompt.len() || !ordered {
+                return Err(Error::Parameter(
+                    "image spans must be ordered, disjoint and inside the prompt".into(),
+                ));
+            }
+        }
         let limit = prompt.len().saturating_sub(1);
-        let common = self
+        let mut common = self
             .tokens
             .iter()
             .zip(prompt)
             .take(limit)
             .take_while(|(a, b)| a == b)
             .count();
+        common = reusable_before_images(common, self.state.media(), media);
         if common == self.tokens.len() {
             return Ok(common);
         }
@@ -363,7 +409,9 @@ impl Session {
                 self.capacity()
             )));
         }
-        let reused = self.reuse_prefix(d, tokens)?;
+        let media = std::mem::take(&mut self.pending_media);
+        let reused = self.reuse_prefix(d, tokens, &media)?;
+        self.state.set_media(media);
         self.sync_drafter(d, model)?;
         for piece in tokens[reused..].chunks(model.chunk()) {
             self.extend(d, model, piece)?;
@@ -398,7 +446,9 @@ impl Session {
             )));
         }
         let start = Instant::now();
-        let reused = self.reuse_prefix(d, prompt)?;
+        let media = std::mem::take(&mut self.pending_media);
+        let reused = self.reuse_prefix(d, prompt, &media)?;
+        self.state.set_media(media);
         self.sync_drafter(d, model)?;
         self.spec_stats = SpecStats::default();
         hooks.begin(prompt.len(), reused);
@@ -773,5 +823,52 @@ mod tests {
             // exp(2-3)=0.37 < 0.5 of the top probability: only token 9 survives.
             assert_eq!(sample(&mut c, &min_p, &mut rng).unwrap(), 9);
         }
+    }
+}
+
+#[cfg(test)]
+mod media_tests {
+    use super::*;
+    use crate::{DType, MetalDevice};
+    use std::rc::Rc;
+
+    fn span(d: &MetalDevice, start: usize, grid: (usize, usize), hash: u64) -> ImageSpan {
+        ImageSpan {
+            start,
+            grid,
+            embedding: Rc::new(Tensor::zeros(d, [grid.0 * grid.1, 4], DType::F32).unwrap()),
+            hash,
+        }
+    }
+
+    #[test]
+    fn prefix_stops_before_a_changed_or_cut_image() {
+        let d = MetalDevice::new().unwrap();
+        let cached = [span(&d, 4, (2, 2), 7)];
+        // No images in the new prompt: the whole prefix is reusable.
+        assert_eq!(reusable_before_images(20, &cached, &[]), 20);
+        // The same image, fully inside the prefix.
+        assert_eq!(
+            reusable_before_images(20, &cached, &[span(&d, 4, (2, 2), 7)]),
+            20
+        );
+        // A different picture with the same size: reuse stops where it starts.
+        assert_eq!(
+            reusable_before_images(20, &cached, &[span(&d, 4, (2, 2), 8)]),
+            4
+        );
+        // The prefix ends inside the image: it cannot be partly reused.
+        assert_eq!(
+            reusable_before_images(6, &cached, &[span(&d, 4, (2, 2), 7)]),
+            4
+        );
+        // An image that starts after the prefix is irrelevant.
+        assert_eq!(
+            reusable_before_images(4, &cached, &[span(&d, 4, (2, 2), 9)]),
+            4
+        );
+        // Only the first mismatching image matters.
+        let new = [span(&d, 4, (2, 2), 7), span(&d, 12, (1, 3), 5)];
+        assert_eq!(reusable_before_images(30, &cached, &new), 12);
     }
 }

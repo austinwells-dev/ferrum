@@ -7,6 +7,7 @@ use super::{
     chat::{ChatTemplate, ParsedOutput, parse_output},
     config::uint,
     draft::{DraftModel, DraftOptions, DraftQuant},
+    engine::ImageSpan,
     engine::{SpecGeometry, spec_bytes},
     mtp::{Mtp, mtp_state_bytes, mtp_weight_bytes},
     plan::{DraftMemory, PlanOptions},
@@ -16,9 +17,27 @@ use super::{
 use crate::{
     Error, MetalDevice, Result,
     loader::gguf::{GgufFile, MetadataValue},
+    vision::{ImageEmbedding, VisionModel, media},
 };
 use serde_json::{Map, Value as Json};
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    rc::Rc,
+};
+
+/// The placeholder token a chat template emits for one image.
+const IMAGE_PAD: &str = "<|image_pad|>";
+/// Encoded images kept so a conversation does not re-encode its history.
+const IMAGE_CACHE: usize = 8;
+
+/// The vision projector next to the language model, and recent embeddings.
+pub struct Vision {
+    pub model: VisionModel,
+    pub path: PathBuf,
+    cache: Vec<(u64, Rc<ImageEmbedding>)>,
+    /// Time spent encoding (not cached) images for the latest request.
+    pub last_encode: std::time::Duration,
+}
 
 /// Where speculative drafts come from.
 #[derive(Debug, Clone, PartialEq)]
@@ -272,6 +291,8 @@ pub struct Runtime {
     pub model_name: String,
     /// Device bytes the drafter took (weights, buffers, verify buffers).
     pub draft_loaded_bytes: usize,
+    /// Present when a vision projector was loaded: requests may carry images.
+    pub vision: Option<Vision>,
 }
 
 impl Runtime {
@@ -304,10 +325,26 @@ impl Runtime {
     /// session speculates by default.
     pub fn load_speculative(
         path: impl AsRef<Path>,
-        mut options: PlanOptions,
+        options: PlanOptions,
         spec: Option<&SpecOptions>,
     ) -> Result<Self> {
+        Self::load_multimodal(path, options, spec, None, crate::vision::DEFAULT_MAX_TOKENS)
+    }
+
+    /// Like `load_speculative`, additionally loading the vision projector
+    /// `mmproj` (images then take at most `image_tokens` positions each). Its
+    /// memory is planned with the model so the context shrinks to fit it.
+    pub fn load_multimodal(
+        path: impl AsRef<Path>,
+        mut options: PlanOptions,
+        spec: Option<&SpecOptions>,
+        mmproj: Option<&Path>,
+        image_tokens: usize,
+    ) -> Result<Self> {
         let path = path.as_ref();
+        if let Some(mmproj) = mmproj {
+            options.vision = crate::vision::projector_bytes(mmproj);
+        }
         let device = MetalDevice::new()?;
         let file = GgufFile::open(path)?;
         let default_sampling = recommended_sampling(&file);
@@ -336,6 +373,33 @@ impl Runtime {
             session.set_drafter(&device, &loaded.model, drafter)?;
             draft_loaded_bytes = device.allocated_bytes().saturating_sub(before);
         }
+        let vision = match mmproj {
+            Some(mmproj) => {
+                let model = VisionModel::load(&device, mmproj, image_tokens)?;
+                if model.config.out_dim != loaded.model.config.hidden {
+                    return Err(Error::Config(format!(
+                        "{} projects to width {} but the language model is {} wide",
+                        mmproj.display(),
+                        model.config.out_dim,
+                        loaded.model.config.hidden
+                    )));
+                }
+                if loaded.model.config.rope_sections[1] == 0 {
+                    return Err(Error::Config(
+                        "the language model declares no multi-axis RoPE sections, so it cannot place images"
+                            .into(),
+                    ));
+                }
+                model.warm(&device)?;
+                Some(Vision {
+                    model,
+                    path: mmproj.to_owned(),
+                    cache: Vec::new(),
+                    last_encode: std::time::Duration::ZERO,
+                })
+            }
+            None => None,
+        };
         let model_name = path.file_stem().map_or_else(
             || loaded.model.config.name.clone(),
             |s| s.to_string_lossy().into_owned(),
@@ -348,14 +412,122 @@ impl Runtime {
             default_sampling,
             model_name,
             draft_loaded_bytes,
+            vision,
         })
     }
 
+    pub fn supports_vision(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// Encode `images` (cached by content), failing when no projector is loaded.
+    fn embed_images(&mut self, images: &[Vec<u8>]) -> Result<Vec<Rc<ImageEmbedding>>> {
+        if let Some(vision) = self.vision.as_mut() {
+            vision.last_encode = std::time::Duration::ZERO;
+        }
+        if images.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(vision) = self.vision.as_mut() else {
+            return Err(Error::Parameter(
+                "this model was loaded without a vision projector, so it cannot read images (load an mmproj file with --mmproj)"
+                    .into(),
+            ));
+        };
+        let mut out = Vec::with_capacity(images.len());
+        for bytes in images {
+            let key = crate::vision::content_hash(bytes);
+            if let Some(i) = vision.cache.iter().position(|(k, _)| *k == key) {
+                let hit = vision.cache.remove(i);
+                out.push(hit.1.clone());
+                vision.cache.push(hit);
+                continue;
+            }
+            let start = std::time::Instant::now();
+            let embedding = Rc::new(vision.model.encode(&self.device, bytes)?);
+            vision.last_encode += start.elapsed();
+            vision.cache.push((key, embedding.clone()));
+            if vision.cache.len() > IMAGE_CACHE {
+                vision.cache.remove(0);
+            }
+            out.push(embedding);
+        }
+        Ok(out)
+    }
+
+    /// Replace each image placeholder in `prompt` with one pad token per
+    /// image position, tokenize, and locate every image in the result.
+    fn expand_images(
+        &self,
+        prompt: &str,
+        images: &[Rc<ImageEmbedding>],
+    ) -> Result<(Vec<u32>, Vec<ImageSpan>)> {
+        let tokenizer = &self.loaded.tokenizer;
+        if images.is_empty() {
+            return Ok((tokenizer.encode(prompt)?, Vec::new()));
+        }
+        let mismatch = || {
+            Error::Parameter(
+                "the chat template's image placeholders do not match the attached images".into(),
+            )
+        };
+        let mut text = String::with_capacity(prompt.len());
+        let mut rest = prompt;
+        for image in images {
+            let at = rest.find(IMAGE_PAD).ok_or_else(mismatch)?;
+            text.push_str(&rest[..at]);
+            text.push_str(&IMAGE_PAD.repeat(image.tokens()));
+            rest = &rest[at + IMAGE_PAD.len()..];
+        }
+        if rest.contains(IMAGE_PAD) {
+            return Err(mismatch());
+        }
+        text.push_str(rest);
+        let tokens = tokenizer.encode(&text)?;
+        let pad = tokenizer.encode(IMAGE_PAD)?;
+        let [pad] = pad[..] else {
+            return Err(Error::Tokenizer(format!(
+                "{IMAGE_PAD} is not a single token"
+            )));
+        };
+        let mut spans = Vec::with_capacity(images.len());
+        let mut i = 0;
+        while i < tokens.len() {
+            if tokens[i] != pad {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < tokens.len() && tokens[i] == pad {
+                i += 1;
+            }
+            let image = images.get(spans.len()).ok_or_else(mismatch)?;
+            if i - start != image.tokens() {
+                return Err(mismatch());
+            }
+            spans.push(ImageSpan {
+                start,
+                grid: image.grid,
+                embedding: image.rows.clone(),
+                hash: image.hash,
+            });
+        }
+        if spans.len() != images.len() {
+            return Err(mismatch());
+        }
+        Ok((tokens, spans))
+    }
+
     pub fn render(&self, request: &ChatRequest) -> Result<String> {
+        let (messages, _) = media::take_images(&request.messages)?;
+        self.render_messages(&messages, request)
+    }
+
+    fn render_messages(&self, messages: &[Json], request: &ChatRequest) -> Result<String> {
         let mut vars = request.template_vars.clone();
         normalize_thinking(self.template.source(), &mut vars);
         self.template.render(
-            &request.messages,
+            messages,
             (!request.tools.is_empty()).then_some(&request.tools[..]),
             true,
             &vars,
@@ -364,10 +536,13 @@ impl Runtime {
 
     /// Run one chat turn, reusing whatever prefix the session already holds.
     pub fn chat(&mut self, request: &ChatRequest, hooks: impl ChatHooks) -> Result<ChatResult> {
-        let prompt_text = self.render(request)?;
+        let (messages, encoded) = media::take_images(&request.messages)?;
+        let images = self.embed_images(&encoded)?;
+        let prompt_text = self.render_messages(&messages, request)?;
         let starts_in_reasoning = prompt_text.trim_end().ends_with("<think>");
         let (result, text) = self.run(
             &prompt_text,
+            &images,
             request.max_tokens,
             &request.sampling,
             &request.stop,
@@ -416,7 +591,15 @@ impl Runtime {
         hooks: impl ChatHooks,
     ) -> Result<(Completion, String, bool)> {
         let ((completion, stopped, _, _, visible), text) = self.run(
-            prompt, max_tokens, sampling, stop, false, None, false, hooks,
+            prompt,
+            &[],
+            max_tokens,
+            sampling,
+            stop,
+            false,
+            None,
+            false,
+            hooks,
         )?;
         Ok((completion, if stopped { visible } else { text }, stopped))
     }
@@ -425,6 +608,7 @@ impl Runtime {
     fn run(
         &mut self,
         prompt_text: &str,
+        images: &[Rc<ImageEmbedding>],
         max_tokens: usize,
         sampling: &SamplingParams,
         stop: &[String],
@@ -433,7 +617,8 @@ impl Runtime {
         tools: bool,
         hooks: impl ChatHooks,
     ) -> Result<((Completion, bool, usize, bool, String), String)> {
-        let prompt = self.loaded.tokenizer.encode(prompt_text)?;
+        let (prompt, spans) = self.expand_images(prompt_text, images)?;
+        self.session.set_media(spans);
         let close_reasoning = self.loaded.tokenizer.encode("\n</think>\n\n")?;
         let tokenizer = &self.loaded.tokenizer;
         struct Driver<'a, H: ChatHooks> {

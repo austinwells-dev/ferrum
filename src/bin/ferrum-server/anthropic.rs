@@ -60,8 +60,13 @@ fn convert(body: &Json, id: u64) -> Result<(Vec<Json>, Vec<Json>), String> {
         match role {
             "user" => {
                 let mut text = Vec::new();
+                // Content parts in order, used instead of joined text when the message has images.
+                let mut parts = Vec::new();
                 for b in &blocks {
                     match b.get("type").and_then(Json::as_str) {
+                        Some("image") => {
+                            parts.push(json!({"type": "image", "source": b.get("source").cloned().unwrap_or(Json::Null)}));
+                        }
                         Some("tool_result") => {
                             let mut result = text_of(b.get("content").unwrap_or(&Json::Null));
                             if b.get("is_error").and_then(Json::as_bool) == Some(true) {
@@ -73,19 +78,24 @@ fn convert(body: &Json, id: u64) -> Result<(Vec<Json>, Vec<Json>), String> {
                                 "content": result
                             }));
                         }
-                        Some("text") => text.push(
-                            b.get("text")
+                        Some("text") => {
+                            let t = b
+                                .get("text")
                                 .and_then(Json::as_str)
                                 .unwrap_or_default()
-                                .to_owned(),
-                        ),
+                                .to_owned();
+                            parts.push(json!({"type": "text", "text": t}));
+                            text.push(t);
+                        }
                         Some(other) => {
                             warn!(Some(id), "ignoring unsupported user content block {other}")
                         }
                         None => {}
                     }
                 }
-                if !text.is_empty() {
+                if parts.iter().any(|p| p["type"] == "image") {
+                    messages.push(json!({"role": "user", "content": parts}));
+                } else if !text.is_empty() {
                     messages.push(json!({"role": "user", "content": text.join("\n")}));
                 }
             }
