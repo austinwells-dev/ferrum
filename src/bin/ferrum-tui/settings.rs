@@ -4,6 +4,9 @@ use crate::*;
 #[derive(Clone, Copy, PartialEq)]
 enum Row {
     Splash,
+    Search,
+    SearchUrl,
+    SearchKey,
     Folder(usize),
     AddFolder,
     Fav(usize),
@@ -11,11 +14,25 @@ enum Row {
 
 impl App {
     fn settings_rows(&self) -> Vec<Row> {
-        let mut rows = vec![Row::Splash];
+        let mut rows = vec![Row::Splash, Row::Search, Row::SearchUrl, Row::SearchKey];
         rows.extend((0..self.extra.len()).map(Row::Folder));
         rows.push(Row::AddFolder);
         rows.extend((0..self.favs.len()).map(Row::Fav));
         rows
+    }
+
+    fn cycle_search(&mut self, forward: bool) {
+        let all = search::PROVIDERS;
+        let at = all
+            .iter()
+            .position(|p| *p == self.search.provider)
+            .unwrap_or(0);
+        let next = if forward {
+            (at + 1) % all.len()
+        } else {
+            (at + all.len() - 1) % all.len()
+        };
+        self.search.provider = all[next].into();
     }
 
     pub fn settings_key(&mut self, key: KeyEvent) {
@@ -38,8 +55,22 @@ impl App {
                 self.editing = Editing::AddPath;
             }
             KeyCode::Left | KeyCode::Right if row == Row::Splash => self.splash = !self.splash,
+            KeyCode::Left | KeyCode::Right if row == Row::Search => {
+                self.cycle_search(key.code == KeyCode::Right)
+            }
             KeyCode::Enter | KeyCode::Char(' ') => match row {
                 Row::Splash => self.splash = !self.splash,
+                Row::Search => self.cycle_search(true),
+                Row::SearchUrl => {
+                    self.buffer = self.search.url.clone();
+                    self.fresh = true;
+                    self.editing = Editing::SearchUrl;
+                }
+                Row::SearchKey => {
+                    self.buffer = self.search.key.clone();
+                    self.fresh = true;
+                    self.editing = Editing::SearchKey;
+                }
                 Row::AddFolder => {
                     self.buffer.clear();
                     self.editing = Editing::AddPath;
@@ -134,8 +165,52 @@ impl App {
             Style::new().fg(EMBER).add_modifier(Modifier::BOLD),
         );
         lines.push(Line::default());
+        lines.push(title("WEB SEARCH"));
+        let bold = Style::new().fg(EMBER).add_modifier(Modifier::BOLD);
+        put_row(
+            &mut lines,
+            1,
+            "Provider".into(),
+            format!("‹ {} ›", self.search.provider),
+            bold,
+        );
+        put_row(
+            &mut lines,
+            2,
+            "Search URL".into(),
+            if self.search.url.is_empty() {
+                "not set".into()
+            } else {
+                clip(&self.search.url, 40)
+            },
+            Style::new().fg(DIM),
+        );
+        put_row(
+            &mut lines,
+            3,
+            "API key".into(),
+            match self.search.key.as_str() {
+                "" => "not set".into(),
+                k if k.starts_with('$') => k.to_string(),
+                _ => "•••• saved".into(),
+            },
+            Style::new().fg(DIM),
+        );
+        lines.push(Line::styled(
+            match self.search.provider.as_str() {
+                "searxng" => {
+                    "     your SearXNG address; its settings.yml must allow the json format"
+                }
+                "brave" => "     needs an API key; write $NAME to read it from the environment",
+                "custom" => "     a URL with {query} (and {key}); the answer must be JSON",
+                "instant" => "     DuckDuckGo's answer API: summaries only, often empty",
+                _ => "     DuckDuckGo's HTML results, no setup",
+            },
+            Style::new().fg(FAINT),
+        ));
+        lines.push(Line::default());
         lines.push(title("MODEL FOLDERS"));
-        let mut n = 1;
+        let mut n = 4;
         for p in &self.extra {
             put_row(
                 &mut lines,

@@ -172,6 +172,8 @@ impl App {
                     return;
                 }
             }
+            Editing::SearchUrl => self.search.url = self.buffer.trim().to_string(),
+            Editing::SearchKey => self.search.key = self.buffer.trim().to_string(),
             Editing::RenameFav(i) => {
                 let name = self.buffer.trim().to_string();
                 if name.is_empty() {

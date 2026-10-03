@@ -125,6 +125,8 @@ pub enum Editing {
     AddPath,
     FavName,
     RenameFav(usize),
+    SearchUrl,
+    SearchKey,
 }
 
 pub struct App {
@@ -132,6 +134,7 @@ pub struct App {
     pub started: Instant,
     pub quit: bool,
     pub splash: bool,
+    pub search: search::Config,
     pub mode: Mode,
     pub origin: Origin,
     pub home_sel: usize,
@@ -222,6 +225,18 @@ impl App {
                 &self.buffer,
             ),
             Editing::RenameFav(_) => input_popup(f, "Rename favorite", "new name", &self.buffer),
+            Editing::SearchUrl => input_popup(
+                f,
+                "Search URL",
+                "searxng: http://localhost:8080 · custom: a URL with {query}",
+                &self.buffer,
+            ),
+            Editing::SearchKey => input_popup(
+                f,
+                "Search API key",
+                "the key, or $ENV_VAR to read it from the environment",
+                &self.buffer,
+            ),
             _ => {}
         }
     }

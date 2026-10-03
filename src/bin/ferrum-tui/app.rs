@@ -60,6 +60,11 @@ impl App {
             started: Instant::now(),
             quit: false,
             splash,
+            search: search::Config::new(
+                saved["search"]["provider"].as_str().unwrap_or("duckduckgo"),
+                saved["search"]["url"].as_str().unwrap_or(""),
+                saved["search"]["key"].as_str().unwrap_or(""),
+            ),
             mode: Mode::Chat,
             origin: Origin::OneTime,
             home_sel: 0,
@@ -101,6 +106,7 @@ impl App {
     pub fn save(&self) {
         let config = json!({
             "splash": self.splash,
+            "search": {"provider": self.search.provider, "url": self.search.url, "key": self.search.key},
             "model": self.selected().map(|m| m.path.display().to_string()),
             "values": self.values_map(),
             "extra": self.extra,

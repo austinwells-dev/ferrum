@@ -37,7 +37,7 @@ The Agents tab is a local coding agent that works on a real project folder. Pick
 
 ### Web search
 
-`web_search` is available in Chat and Agents whenever *Network* is on. Choose the back end in the setup (*Web search*, *Search URL*, *Search API key*):
+`web_search` is available in Chat and Agents whenever *Network* is on. Choose the back end under **Settings → Web search** (*Provider*, *Search URL*, *API key*). It applies to every setup:
 
 | Provider | Needs | Notes |
 |---|---|---|

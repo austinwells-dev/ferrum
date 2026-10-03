@@ -153,11 +153,7 @@ impl ChatOpts {
             },
             workspace: app.value("workspace").to_string(),
             network: app.value("network") != "off",
-            search: crate::search::Config::new(
-                app.value("search"),
-                app.value("search_url"),
-                app.value("search_key"),
-            ),
+            search: app.search.clone(),
             agent: if app.mode == Mode::Agent {
                 let project = match app.value("project") {
                     "" => std::env::current_dir().map_err(|e| e.to_string())?,
