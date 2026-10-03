@@ -1916,7 +1916,9 @@ impl App {
                 chat.input.drain(a..b);
                 chat.cursor = i;
             }
-            KeyCode::Char('v') if ctrl => chat.paste_clipboard(),
+            KeyCode::Char('v') if ctrl || key.modifiers.contains(KeyModifiers::SUPER) => {
+                chat.paste_clipboard()
+            }
             KeyCode::Backspace => {
                 if chat.input.is_empty() && !chat.attachments.is_empty() {
                     chat.attachments.pop();

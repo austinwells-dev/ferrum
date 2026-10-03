@@ -266,7 +266,10 @@ impl App {
             && let Some(c) = self.chat.as_mut()
         {
             let dropped = attach::parse_dropped(&clean);
-            if !dropped.is_empty() && c.accepts_input() {
+            if clean.trim().is_empty() && c.accepts_input() {
+                // Cmd-V with an image (or nothing text-like) on the clipboard
+                c.paste_clipboard();
+            } else if !dropped.is_empty() && c.accepts_input() {
                 c.attach_paths(&dropped);
             } else {
                 c.insert_str(&clean);
