@@ -25,6 +25,12 @@ cargo build --release
 ./target/release/ferrum-server --model /path/to/model.gguf --port 8080
 ```
 
+Or use the interactive launcher, which finds your models, lets you tune every setting and starts chat or the server for you:
+
+```sh
+./target/release/ferrum-tui        # alias it: alias ferrum='/path/to/ferrum/target/release/ferrum-tui'
+```
+
 Ferrum never downloads anything. You supply the model files yourself.
 
 ## Supported models
