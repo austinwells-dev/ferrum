@@ -15,32 +15,5 @@ Type "export PATH=$PWD/target/release:$PATH && clear" Enter
 Show
 
 Type "ferrum-tui" Enter
-Sleep 4s            # startup animation
+Sleep 6s            # startup animation
 
-# Tour the home screen
-Down Sleep 600ms
-Down Sleep 600ms
-Down Sleep 600ms
-Down Sleep 600ms
-Up   Sleep 600ms
-
-# Benchmark tab
-Type "b"
-Sleep 3s
-Escape
-Sleep 1s
-
-# Settings tab
-Type "s"
-Sleep 3s
-Escape
-Sleep 1s
-
-# Chat setup list
-Type "c"
-Sleep 3s
-Escape
-Sleep 1s
-
-Type "q"
-Sleep 500ms

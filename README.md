@@ -5,6 +5,8 @@
 ![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange)
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
+![ferrum-tui demo](docs/media/ferrum-tui.gif)
+
 **A from-scratch LLM inference engine for Apple Silicon, written in Rust with hand-written Metal kernels.**
 
 Ferrum runs 27B–35B language models on a 32 GB Mac, faster than llama.cpp on the same GGUF files. It has no runtime dependency on MLX, llama.cpp, PyTorch, Python or Apple's MPS. Every kernel, from the quantized matrix multiplies to Gated DeltaNet linear attention and speculative-decoding verification, is its own Metal Shading Language code, driven from safe Rust.
