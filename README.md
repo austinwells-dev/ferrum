@@ -25,11 +25,13 @@ cargo build --release
 ./target/release/ferrum-server --model /path/to/model.gguf --port 8080
 ```
 
-Or use the interactive launcher, which finds your models, lets you tune every setting, save favorite setups (with a DSpark/DFlash drafter) and starts chat or the server for you:
+Or use the full-screen launcher:
 
 ```sh
 ./target/release/ferrum-tui        # alias it: alias ferrum='/path/to/ferrum/target/release/ferrum-tui'
 ```
+
+It opens with a short startup animation, then a home screen with **Chat**, **Serve** and **Settings**. Choosing Chat or Serve lists your saved favorite setups (model, settings and a DSpark/DFlash drafter), plus **New setup** (saved as a favorite when you launch) and **One-time run**. Chat runs inside the TUI with streaming, markdown and a reasoning view; Serve starts `ferrum-server` and shows its endpoint, health and live log. Models, quants and drafters ferrum can't run are greyed out with the reason.
 
 Ferrum never downloads anything. You supply the model files yourself.
 

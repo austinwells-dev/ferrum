@@ -667,6 +667,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.20",
  "tokenizers",
+ "unicode-width",
 ]
 
 [[package]]
