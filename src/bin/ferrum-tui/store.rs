@@ -62,6 +62,14 @@ impl Store {
         self.items.len()
     }
 
+    /// The stored outputs in order (ids are positions), for saving a session.
+    pub fn dump(&self) -> Vec<(String, String)> {
+        self.items
+            .iter()
+            .map(|i| (i.label.clone(), i.lines.join("\n")))
+            .collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }

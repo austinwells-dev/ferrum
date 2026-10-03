@@ -137,6 +137,56 @@ impl Shared {
         }
     }
 
+    /// Everything a resumed session needs besides the messages.
+    pub fn snapshot(&self) -> Json {
+        json!({
+            "todos": self.todos.iter().map(|t| json!({
+                "text": t.text,
+                "state": match t.state { TodoState::Done => "done", TodoState::Active => "active", TodoState::Pending => "pending" },
+            })).collect::<Vec<_>>(),
+            "touched": self.touched.iter().map(|(p, t)| (p.clone(), json!(if *t == Touch::Edited { "edited" } else { "read" }))).collect::<Map<String, Json>>(),
+            "store": self.store.dump().into_iter().map(|(l, t)| json!({"label": l, "text": t})).collect::<Vec<_>>(),
+            "saved": self.store.saved,
+            "evicted": self.evicted,
+            "evicted_bytes": self.evicted_bytes,
+            "compactions": self.compactions,
+        })
+    }
+
+    pub fn restore(&mut self, j: &Json) {
+        self.reset_conversation();
+        for t in j["todos"].as_array().into_iter().flatten() {
+            self.todos.push(Todo {
+                text: t["text"].as_str().unwrap_or("").into(),
+                state: match t["state"].as_str() {
+                    Some("done") => TodoState::Done,
+                    Some("active") => TodoState::Active,
+                    _ => TodoState::Pending,
+                },
+            });
+        }
+        for (p, how) in j["touched"].as_object().into_iter().flatten() {
+            self.touched.insert(
+                p.clone(),
+                if how == "edited" {
+                    Touch::Edited
+                } else {
+                    Touch::Read
+                },
+            );
+        }
+        for item in j["store"].as_array().into_iter().flatten() {
+            self.store.add(
+                item["label"].as_str().unwrap_or(""),
+                item["text"].as_str().unwrap_or(""),
+            );
+        }
+        self.store.saved = j["saved"].as_u64().unwrap_or(0) as usize;
+        self.evicted = j["evicted"].as_u64().unwrap_or(0) as usize;
+        self.evicted_bytes = j["evicted_bytes"].as_u64().unwrap_or(0) as usize;
+        self.compactions = j["compactions"].as_u64().unwrap_or(0) as usize;
+    }
+
     pub fn todo_counts(&self) -> (usize, usize) {
         (
             self.todos
@@ -1109,6 +1159,36 @@ mod tests {
         assert_eq!(g.touched.get("src/main.py"), Some(&Touch::Edited));
         drop(g);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_session_snapshot_round_trips() {
+        let mut g = Shared::default();
+        g.todos.push(Todo {
+            text: "fix it".into(),
+            state: TodoState::Active,
+        });
+        g.todos.push(Todo {
+            text: "test it".into(),
+            state: TodoState::Pending,
+        });
+        g.touch("a.py", Touch::Edited);
+        g.touch("b.py", Touch::Read);
+        let id = g.store.add("bash: ls", "one\ntwo\nthree\n");
+        g.store.saved = 1234;
+        g.compactions = 2;
+        let saved = g.snapshot();
+        let mut back = Shared::default();
+        back.restore(&saved);
+        assert_eq!(back.todos.len(), 2);
+        assert!(
+            back.todos[0].state == TodoState::Active && back.todos[1].state == TodoState::Pending
+        );
+        assert_eq!(back.touched.get("a.py"), Some(&Touch::Edited));
+        assert_eq!(back.touched.get("b.py"), Some(&Touch::Read));
+        // Stored output keeps its id, so elided-output stubs still resolve.
+        assert!(back.store.read(id, 2, 1).unwrap().contains("two"));
+        assert_eq!((back.store.saved, back.compactions), (1234, 2));
     }
 
     #[test]

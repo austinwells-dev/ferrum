@@ -17,6 +17,7 @@ mod fields;
 mod home;
 mod pick;
 mod serve;
+mod sessions;
 mod settings;
 mod side;
 mod splash;

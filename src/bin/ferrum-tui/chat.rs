@@ -446,8 +446,9 @@ pub enum Phase {
 }
 
 /// Slash commands offered by the palette: (text to insert, description).
-pub const COMMANDS: [(&str, &str); 15] = [
-    ("/reset", "clear the conversation"),
+pub const COMMANDS: &[(&str, &str)] = &[
+    ("/new", "start a new session (this one stays in /resume)"),
+    ("/resume", "pick up a past session"),
     ("/think on", "turn reasoning on"),
     ("/think off", "turn reasoning off"),
     ("/thoughts", "show or hide the model's thinking"),
@@ -487,7 +488,7 @@ impl Agent {
 }
 
 /// Commands in an agent session.
-pub const AGENT_COMMANDS: [(&str, &str); 24] = [
+pub const AGENT_COMMANDS: &[(&str, &str)] = &[
     (
         "/plan on",
         "read-only: explore and write a plan, change nothing",
@@ -518,7 +519,8 @@ pub const AGENT_COMMANDS: [(&str, &str); 24] = [
     ),
     ("/tools ask", "confirm every change"),
     ("/tools auto", "never ask"),
-    ("/reset", "clear the conversation"),
+    ("/new", "start a new session (this one stays in /resume)"),
+    ("/resume", "pick up a past session"),
     ("/think on", "turn reasoning on"),
     ("/think off", "turn reasoning off"),
     ("/thoughts", "show or hide the model's thinking"),
@@ -528,6 +530,12 @@ pub const AGENT_COMMANDS: [(&str, &str); 24] = [
     ("/help", "list the commands"),
     ("/exit", "leave the agent"),
 ];
+
+/// The `/resume` list.
+pub struct ResumeList {
+    pub items: Vec<sessions::Meta>,
+    pub sel: usize,
+}
 
 pub struct Chat {
     tx: Sender<ToWorker>,
@@ -576,6 +584,10 @@ pub struct Chat {
     aborted: bool,
     flash: Option<(String, bool, Instant)>,
     pub agent: Option<Agent>,
+    pub id: String,
+    created: u64,
+    title: Option<String>,
+    pub resume: Option<ResumeList>,
 }
 
 /// Most tool rounds the model may chain after one message.
@@ -678,6 +690,10 @@ impl Chat {
             aborted: false,
             flash: None,
             agent,
+            id: sessions::new_id(),
+            created: bench::now(),
+            title: None,
+            resume: None,
         })
     }
 
@@ -700,9 +716,9 @@ impl Chat {
         let q = self.input.to_lowercase();
         let word = q.trim_start_matches('/');
         let list: &[(&'static str, &'static str)] = if self.agent.is_some() {
-            &AGENT_COMMANDS
+            AGENT_COMMANDS
         } else {
-            &COMMANDS
+            COMMANDS
         };
         let mut out: Vec<_> = list
             .iter()
@@ -867,6 +883,7 @@ impl Chat {
     }
 
     fn end_generation(&mut self) {
+        self.persist();
         self.phase = Phase::Ready;
         self.gen_started = None;
         self.first_token = None;
@@ -1176,6 +1193,9 @@ impl Chat {
             json!({"role": "user", "content": pictures})
         };
         self.history.push(message);
+        if self.title.is_none() {
+            self.title = Some(clip(display.lines().next().unwrap_or(""), 70));
+        }
         let mut turn = Turn::new(Role::User, display);
         turn.attachments = attachments.iter().map(|a| a.chip()).collect();
         self.turns.push(turn);
@@ -1263,6 +1283,160 @@ impl Chat {
         s
     }
 
+    fn kind(&self) -> &'static str {
+        if self.agent.is_some() {
+            "agent"
+        } else {
+            "chat"
+        }
+    }
+
+    fn project_key(&self) -> String {
+        self.agent
+            .as_ref()
+            .map(|a| a.project.display().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Write this session to disk (nothing is saved before the first message).
+    pub fn persist(&self) {
+        if self.history.is_empty() {
+            return;
+        }
+        let state = |s: ToolState| match s {
+            ToolState::Ok => "ok",
+            ToolState::Failed => "failed",
+            ToolState::Denied => "denied",
+            _ => "interrupted",
+        };
+        let turns: Vec<Json> = self
+            .turns
+            .iter()
+            .map(|t| {
+                json!({
+                    "role": match t.role { Role::User => "user", Role::Assistant => "assistant", Role::Tool => "tool", Role::Note => "note" },
+                    "reasoning": t.reasoning, "content": t.content, "stats": t.stats,
+                    "error": t.error, "attachments": t.attachments,
+                    "tool": t.tool.as_ref().map(|v| json!({
+                        "id": v.id, "name": v.name, "args": v.args, "summary": v.summary,
+                        "state": state(v.state), "output": v.output, "secs": v.secs,
+                    })),
+                })
+            })
+            .collect();
+        let mut data = json!({
+            "id": self.id, "kind": self.kind(), "title": self.title,
+            "model": self.label, "project": self.project_key(), "workspace": self.workspace,
+            "created": self.created, "updated": bench::now(),
+            "turns": turns, "history": self.history,
+        });
+        if let Some(a) = &self.agent {
+            let mut agent = a.shared.lock().map(|g| g.snapshot()).unwrap_or(Json::Null);
+            agent["ponytail"] = json!(a.ponytail.label());
+            agent["plan"] = json!(a.plan);
+            data["agent"] = agent;
+        }
+        sessions::save(&self.id, &data);
+    }
+
+    /// Replace the conversation with a saved one.
+    fn restore(&mut self, j: &Json) {
+        self.history = j["history"].as_array().cloned().unwrap_or_default();
+        self.turns = j["turns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                let role = match t["role"].as_str() {
+                    Some("user") => Role::User,
+                    Some("assistant") => Role::Assistant,
+                    Some("tool") => Role::Tool,
+                    _ => Role::Note,
+                };
+                let mut turn = Turn::new(role, t["content"].as_str().unwrap_or("").into());
+                turn.done = true;
+                turn.reasoning = t["reasoning"].as_str().unwrap_or("").into();
+                turn.stats = t["stats"].as_str().map(str::to_string);
+                turn.error = t["error"].as_str().map(str::to_string);
+                turn.attachments = t["attachments"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                if let Some(v) = t["tool"].as_object() {
+                    turn.tool = Some(ToolView {
+                        id: v["id"].as_str().unwrap_or("").into(),
+                        name: v["name"].as_str().unwrap_or("").into(),
+                        args: v["args"].as_object().cloned().unwrap_or_default(),
+                        summary: v["summary"].as_str().unwrap_or("").into(),
+                        state: match v["state"].as_str() {
+                            Some("ok") => ToolState::Ok,
+                            Some("failed") => ToolState::Failed,
+                            _ => ToolState::Denied,
+                        },
+                        output: v["output"].as_str().unwrap_or("").into(),
+                        secs: v["secs"].as_f64().unwrap_or(0.0) as f32,
+                        started: None,
+                    });
+                }
+                turn
+            })
+            .collect();
+        self.id = j["id"].as_str().unwrap_or(&self.id).to_string();
+        self.created = j["created"].as_u64().unwrap_or(self.created);
+        self.title = j["title"].as_str().map(str::to_string);
+        if self.agent.is_none()
+            && let Some(w) = j["workspace"].as_str().filter(|w| !w.is_empty())
+        {
+            self.workspace = w.to_string();
+            self.sandbox = None;
+        }
+        if let Some(a) = self.agent.as_mut() {
+            if let Ok(mut g) = a.shared.lock() {
+                g.restore(&j["agent"]);
+            }
+            if let Some(p) = j["agent"]["ponytail"].as_str() {
+                a.ponytail = Ponytail::parse(p);
+            }
+            a.plan = j["agent"]["plan"].as_bool().unwrap_or(false);
+        }
+        self.queue.clear();
+        self.tool_msgs.clear();
+        self.attachments.clear();
+        self.approval = None;
+        self.rounds = 0;
+        self.ctx = None;
+        self.last_stats.clear();
+        self.follow = true;
+        let _ = self.tx.send(ToWorker::Reset);
+    }
+
+    /// Keep this session on disk and start a fresh one in the same loaded model.
+    fn new_session(&mut self) {
+        self.persist();
+        self.reset();
+        self.id = sessions::new_id();
+        self.created = bench::now();
+        self.title = None;
+        self.note("new session · the previous one is in /resume");
+    }
+
+    fn open_resume(&mut self) {
+        let project = self.agent.as_ref().map(|a| a.project.display().to_string());
+        let items: Vec<sessions::Meta> = sessions::list(self.kind(), project.as_deref())
+            .into_iter()
+            .filter(|m| m.id != self.id)
+            .collect();
+        if items.is_empty() {
+            self.note("no earlier sessions to resume");
+        } else {
+            self.resume = Some(ResumeList { items, sel: 0 });
+        }
+    }
+
     fn reset(&mut self) {
         self.history.clear();
         self.tool_msgs.clear();
@@ -1284,10 +1458,8 @@ impl Chat {
     fn command(&mut self, line: &str) -> bool {
         match line.trim() {
             "/exit" | "/quit" => return true,
-            "/reset" | "/clear" | "/new" => {
-                self.reset();
-                self.note("conversation cleared");
-            }
+            "/reset" | "/clear" | "/new" => self.new_session(),
+            "/resume" => self.open_resume(),
             "/think on" | "/think off" => {
                 self.think = line.trim().ends_with("on");
                 self.note(format!(
@@ -1321,9 +1493,9 @@ impl Chat {
             "/help" | "/?" => {
                 let mut text = String::from("type / to see the commands as you type\n");
                 let list: &[(&str, &str)] = if self.agent.is_some() {
-                    &AGENT_COMMANDS
+                    AGENT_COMMANDS
                 } else {
-                    &COMMANDS
+                    COMMANDS
                 };
                 for &(name, what) in list {
                     text += &format!("{name:<16} {what}\n");
@@ -1540,10 +1712,11 @@ impl Chat {
 
 impl App {
     pub fn leave_chat(&mut self) {
-        if let Some(chat) = self.chat.take()
-            && let Some(h) = chat.close()
-        {
-            self.closing.push(h);
+        if let Some(chat) = self.chat.take() {
+            chat.persist();
+            if let Some(h) = chat.close() {
+                self.closing.push(h);
+            }
         }
         self.screen = Screen::Pick;
     }
@@ -1573,6 +1746,46 @@ impl App {
                 || (ctrl && key.code == KeyCode::Char('c'))
             {
                 self.leave_chat();
+            }
+            return;
+        }
+        if let Some(list) = chat.resume.as_mut() {
+            let last = list.items.len() - 1;
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => list.sel = list.sel.saturating_sub(1),
+                KeyCode::Down | KeyCode::Char('j') => list.sel = (list.sel + 1).min(last),
+                KeyCode::Esc | KeyCode::Char('q') => chat.resume = None,
+                KeyCode::Enter => {
+                    let id = list.items[list.sel].id.clone();
+                    chat.resume = None;
+                    match sessions::load(&id) {
+                        Some(data) => {
+                            chat.persist();
+                            chat.restore(&data);
+                            let n = chat.history.iter().filter(|m| m["role"] == "user").count();
+                            chat.note(format!(
+                                "resumed {:?} ({n} messages) · the model re-reads it with your next message",
+                                chat.title.clone().unwrap_or_default()
+                            ));
+                        }
+                        None => chat.flash("that session could not be read", false),
+                    }
+                }
+                KeyCode::Char('x') | KeyCode::Delete => {
+                    let id = list.items[list.sel].id.clone();
+                    if self.armed.as_deref() == Some(id.as_str()) {
+                        sessions::delete(&id);
+                        list.items.remove(list.sel);
+                        list.sel = list.sel.min(list.items.len().saturating_sub(1));
+                        if list.items.is_empty() {
+                            chat.resume = None;
+                        }
+                    } else {
+                        self.confirm = Some(id);
+                        chat.flash("press x again to delete this session", false);
+                    }
+                }
+                _ => {}
             }
             return;
         }
@@ -1945,7 +2158,17 @@ impl App {
         if chat.approval.is_some() {
             self.draw_approval(f, input, chat);
         }
-        let keys: &[(&str, &str)] = if chat.approval.is_some() {
+        if let Some(list) = &chat.resume {
+            self.draw_resume(f, area, list);
+        }
+        let keys: &[(&str, &str)] = if chat.resume.is_some() {
+            &[
+                ("↑↓", "choose"),
+                ("enter", "resume"),
+                ("x", "delete"),
+                ("esc", "close"),
+            ]
+        } else if chat.approval.is_some() {
             &[
                 ("y", "allow once"),
                 ("a", "allow all this chat"),
@@ -1979,6 +2202,56 @@ impl App {
             }
         };
         keys_footer(f, footer, keys, &self.status);
+    }
+
+    fn draw_resume(&self, f: &mut Frame, area: Rect, list: &ResumeList) {
+        let w = area.width.saturating_sub(6).min(110);
+        let h = (list.items.len() as u16 + 4)
+            .min(area.height.saturating_sub(4))
+            .max(5);
+        let rect = centered(area, w, h);
+        f.render_widget(Clear, rect);
+        let block = panel("Resume a session", true);
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        let rows = inner.height.saturating_sub(1) as usize;
+        let top = (list.sel + 1).saturating_sub(rows);
+        let width = inner.width as usize;
+        let mut lines: Vec<Line> = list
+            .items
+            .iter()
+            .enumerate()
+            .skip(top)
+            .take(rows)
+            .map(|(i, m)| {
+                let on = i == list.sel;
+                let bg = if on { SELECTED } else { Color::Reset };
+                let tail = format!("{} msgs · {}", m.turns, crate::benchui::ago(m.updated));
+                let model = clip(&m.model, 24);
+                let title_w =
+                    width.saturating_sub(tail.chars().count() + model.chars().count() + 9);
+                Line::from(vec![
+                    Span::styled(
+                        if on { " ▌ " } else { "   " },
+                        Style::new().fg(EMBER).bg(bg),
+                    ),
+                    Span::styled(
+                        format!("{:<title_w$}", clip(&m.title, title_w)),
+                        Style::new().fg(if on { Color::White } else { TEXT }).bg(bg),
+                    ),
+                    Span::styled(format!("  {model}"), Style::new().fg(FAINT).bg(bg)),
+                    Span::styled(
+                        format!("  {tail} "),
+                        Style::new().fg(if on { GOLD } else { DIM }).bg(bg),
+                    ),
+                ])
+            })
+            .collect();
+        lines.push(Line::styled(
+            " resuming replaces this conversation; it stays saved",
+            Style::new().fg(FAINT),
+        ));
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_approval(&self, f: &mut Frame, input: Rect, chat: &Chat) {

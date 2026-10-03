@@ -63,7 +63,7 @@ fn push_wrapped(
     }
 }
 
-fn ago(secs: u64) -> String {
+pub fn ago(secs: u64) -> String {
     let d = bench::now().saturating_sub(secs);
     match d {
         0..=89 => "just now".into(),

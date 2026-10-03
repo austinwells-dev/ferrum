@@ -66,6 +66,10 @@ Local models have small contexts, so the agent works to keep its context useful:
 | `/audit` | Look for code in the repo that doesn't need to exist |
 | `/debt` | List the shortcuts marked `ponytail:` |
 
+## Sessions
+
+Every chat and agent session is saved after each reply to `~/.config/ferrum/sessions` (nothing is written before your first message). `/new` starts a fresh session in the model that is already loaded and keeps the old one; `/resume` lists earlier sessions (agents show only the ones for the current project), and Enter brings one back with its transcript, tool results and, for agents, its plan, touched files and stored output. The model re-reads the conversation with your next message. `x` twice deletes a session from the list.
+
 ## Serve
 
 Serve starts `ferrum-server` with the chosen setup and shows its endpoint, health and live log. See the [server guide](server.md).
