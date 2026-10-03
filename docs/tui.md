@@ -39,7 +39,7 @@ The Agents tab is a local coding agent that works on a real project folder. Pick
 
 Every command and download runs inside a macOS Seatbelt sandbox (`sandbox-exec`, profile in [`sandbox.sb`](../src/bin/ferrum-tui/sandbox.sb)):
 
-- the whole disk is read-only except the workspace: the project folder in Agents, `~/ferrum-workspace` in Chat,
+- the whole disk is read-only except the workspace: the project folder in Agents, and in Chat a folder of its own for every session (a new `<date>-<time>-<model>` subfolder of `~/ferrum-workspace`, set by *Sandboxes folder*),
 - keys and credentials such as `~/.ssh` are hidden,
 - the network can be switched off entirely,
 - localhost services on your Mac can never be reached.
