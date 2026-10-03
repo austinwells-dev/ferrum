@@ -1,0 +1,26 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    # Hosted macOS runners are virtual machines without a real Apple GPU, so CI
+    # builds, lints and compiles the tests; GPU tests run locally (docs/development.md).
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      # Pinned to the toolchain the code is developed on, so new lints don't break CI.
+      - uses: dtolnay/rust-toolchain@1.96.0
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo build --release --locked
+      - run: cargo test --no-run --locked

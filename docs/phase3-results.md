@@ -20,7 +20,7 @@ cargo run --release -- run --model "$FERRUM_QWEN_MODEL" \
 cargo test --release --test real_model -- --ignored --nocapture
 ```
 
-On this machine `$HOME` is `/Users/austinwells`. Ferrum accepts any local directory containing those five files, never downloads or contacts the Hub, and does not infer a revision from directory names. Users are responsible for supplying the pinned official snapshot. `hf cache verify` verified all five present files; its five-missing-files warning refers to intentionally omitted repository files. See [checksum verification](measurements/phase3/checkpoint-verification.txt). No `special_tokens_map.json` exists in this revision. Tokenizer vocabulary/merges are self-contained in tokenizer.json; separate vocab.json and merges.txt are unnecessary. Weights, caches, reference virtualenv, and Cargo output are ignored by Git.
+Ferrum accepts any local directory containing those five files, never downloads or contacts the Hub, and does not infer a revision from directory names. Users are responsible for supplying the pinned official snapshot. `hf cache verify` verified all five present files; its five-missing-files warning refers to intentionally omitted repository files. See [checksum verification](measurements/phase3/checkpoint-verification.txt). No `special_tokens_map.json` exists in this revision. Tokenizer vocabulary/merges are self-contained in tokenizer.json; separate vocab.json and merges.txt are unnecessary. Weights, caches, reference virtualenv, and Cargo output are ignored by Git.
 
 ## Inspected configuration
 

@@ -1,176 +1,110 @@
 # Ferrum
 
-Ferrum runs large language models locally on Apple Silicon Macs. It is written from scratch in Rust with its own Metal GPU kernels. It does not depend on MLX, llama.cpp, PyTorch, Python or MPSGraph at runtime.
+[![CI](https://github.com/austinwells-dev/ferrum/actions/workflows/ci.yml/badge.svg)](https://github.com/austinwells-dev/ferrum/actions/workflows/ci.yml)
+![Platform: Apple Silicon](https://img.shields.io/badge/platform-Apple%20Silicon-black)
+![Rust 1.96+](https://img.shields.io/badge/rust-1.96%2B-orange)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue)](#license)
 
-You point it at a model file (GGUF or a Hugging Face checkpoint) and either chat with it in the terminal or run an OpenAI- and Anthropic-compatible server that coding agents and other tools can talk to.
+**A from-scratch LLM inference engine for Apple Silicon, written in Rust with hand-written Metal kernels.**
 
-**Highlights**
+Ferrum runs 27B–35B language models on a 32 GB Mac, faster than llama.cpp on the same GGUF files. It has no runtime dependency on MLX, llama.cpp, PyTorch, Python or Apple's MPS. Every kernel, from the quantized matrix multiplies to Gated DeltaNet linear attention and speculative-decoding verification, is its own Metal Shading Language code, driven from safe Rust.
 
-- Runs 27B–35B models on a 32 GB Mac, faster than llama.cpp on the same GGUF files (see [Performance](#performance)).
-- Lossless speculative decoding: up to 2.5× faster generation with identical output.
-- Automatically picks the largest context that fits in memory, before loading any weights.
-- Drop-in server: OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`, tool calls, reasoning/thinking controls, and conversation caching between requests.
+You give it a model file and then either chat in the terminal, use the full-screen TUI (chat, a sandboxed coding agent, and a benchmarking tool), or run a local server that speaks the **OpenAI** and **Anthropic** APIs, so existing clients and coding agents work with it unchanged.
+
+## Highlights
+
+- **Faster than llama.cpp on the same files.** Measured on an M5: 15% faster prefill and 11% faster decode on a dense 27B model, 8–18% faster on a 35B mixture-of-experts. [Numbers below](#performance).
+- **Lossless speculative decoding, up to 2.5× faster.** Supports MTP heads, DFlash/DFlash2 and DSpark drafters. Greedy output is identical with and without speculation. On the dense 27B, Ferrum checks 8–16 drafted tokens for about 1.5× the cost of one token, where llama.cpp pays 2.4–3.8×.
+- **Plans memory before loading weights.** Every buffer is predicted from GGUF metadata, and Ferrum picks the largest context that fits: 101K tokens for the 27B model, the full 262K for the 35B MoE. Predictions match Metal's own accounting to within a few MiB.
+- **Matches llama.cpp's output.** Mean KL divergence against llama.cpp's own logits is 4×10⁻⁶ on the 27B model.
+- **Drop-in server.** OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`, tool calls, reasoning controls, image input, and conversation caching that only processes the new suffix of each request.
+- **Coding agent in a sandbox.** The TUI's agent can edit a project, run commands and fetch pages inside a macOS Seatbelt profile that can only write to that project.
+
+## Install
+
+**You need** an Apple Silicon Mac, the [Rust toolchain](https://rustup.rs) (1.96 or newer) and Apple's Command Line Tools (`xcode-select --install`). Xcode is not required, because shaders are compiled at runtime.
+
+```sh
+git clone https://github.com/austinwells-dev/ferrum.git
+cd ferrum
+cargo install --path .
+```
+
+This builds an optimized release and puts four binaries on your `PATH` (in `~/.cargo/bin`):
+
+| Binary | What it is |
+|---|---|
+| `ferrum-tui` | Full-screen launcher: chat, coding agent, server and benchmarks |
+| `ferrum-cli` | Plain terminal chat |
+| `ferrum-server` | OpenAI- and Anthropic-compatible HTTP server |
+| `ferrum` | Developer tool: device info, smoke tests, small-model runner |
+
+If you'd rather not install, `cargo build --release` puts the same binaries in `target/release/`.
+
+## Get a model
+
+Ferrum never downloads anything, so you provide the model files. The main engine (used by `ferrum-cli`, `ferrum-server` and the TUI) runs **Qwen3.5-family GGUF** models. These two are validated end to end on a 32 GB Mac:
+
+| Model | Hugging Face repo | File | Size |
+|---|---|---|---|
+| Swift 1.5 (Qwen3.8-27B, dense) | [`ukisai/Swift-1.5-Qwen3.8-27B-GGUF`](https://huggingface.co/ukisai/Swift-1.5-Qwen3.8-27B-GGUF) | `Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf` | 17.4 GB |
+| Tiel-Coder 35B-A3B (MoE, 3B active) | [`peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP`](https://huggingface.co/peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP) | `Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf` | 18.1 GB |
+
+```sh
+# Needs the Hugging Face CLI (pip install -U huggingface_hub)
+hf download peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP \
+  Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf --local-dir ~/models
+```
+
+The MoE model is the better place to start because it decodes at about 40 tok/s. The TUI finds models on its own in `~/models`, `~/Downloads`, the Hugging Face cache and LM Studio's folder, and greys out any file Ferrum can't run, with the reason.
 
 ## Quick start
 
-Requirements: an Apple Silicon Mac (tested on an M5 with macOS 27), Rust 1.96+, and Apple's Command Line Tools.
-
 ```sh
-cargo build --release
+# Full-screen launcher (try: alias ferrum=ferrum-tui)
+ferrum-tui
 
 # Chat in the terminal
-./target/release/ferrum-cli --model /path/to/model.gguf
+ferrum-cli --model ~/models/Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf
 
-# Run a server at http://127.0.0.1:8080/v1
-./target/release/ferrum-server --model /path/to/model.gguf --port 8080
+# Serve at http://127.0.0.1:8080/v1
+ferrum-server --model ~/models/Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf
 ```
 
-Or use the full-screen launcher:
+Once the server is running, any OpenAI or Anthropic client can talk to it:
 
 ```sh
-./target/release/ferrum-tui        # alias it: alias ferrum='/path/to/ferrum/target/release/ferrum-tui'
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"messages": [{"role": "user", "content": "Write a haiku about Rust."}]}'
 ```
 
-It opens with a short startup animation, then a home screen with **Chat**, **Serve** and **Settings**. Choosing Chat or Serve lists your saved favorite setups (model, settings and a DSpark/DFlash drafter), plus **New setup** (saved as a favorite when you launch) and **One-time run**. Chat runs inside the TUI with streaming, markdown and a reasoning view; Serve starts `ferrum-server` and shows its endpoint, health and live log. Models, quants and drafters ferrum can't run are greyed out with the reason.
+To make generation faster, add a drafter: `--draft mtp` uses the prediction head inside the GGUF and needs no extra download. See [speculative decoding](docs/server.md#speculative-decoding).
 
-**Agent tools and attachments (TUI chat).** Set *Tools* to `ask` or `auto` in a chat setup (or type `/tools ask`) and the model can read, write and edit files, run shell commands and fetch web pages. Commands and downloads run inside a macOS Seatbelt sandbox (`sandbox-exec`): the whole disk is read-only except the workspace folder (`~/ferrum-workspace` by default), keys and credentials such as `~/.ssh` are hidden, the network can be switched off, and the Mac's own localhost services are never reachable. In `ask` mode you approve each write, command or download. Attach files with `/attach PATH`, by dropping them on the terminal, or from the clipboard with Ctrl-V (files, screenshots or text); `/screenshot` grabs a screen region. Images are not seen by the model yet: the text in them is read with macOS Vision and sent instead.
+## The TUI
 
-**Agents tab (TUI).** A local coding agent for a real project folder. Pick a favorite (or a new/one-time setup), set the *Project folder* (default: where you started ferrum) and it works there inside the same Seatbelt sandbox: it can only change that folder, and runs commands and downloads under your approval mode (`edits`: file edits run freely, commands ask; `ask`; `auto`). Tools: `read_file`, `grep` (ripgrep), `glob`, `list_dir`, `edit_file`, `write_file`, `bash`, `check` (cargo/go/python/js errors), background processes (`process_start/output/stop`), `web_search`, `fetch_url`, a `todo` plan shown in a sidebar, and `ask_user`. `/plan on` makes it read-only until you turn it off.
+`ferrum-tui` opens on a home screen with five sections:
 
-*Ponytail* (`/ponytail lite|full|ultra|off`) adds minimal-code guidance every turn: read first, then climb the ladder (needed at all? already in the codebase? standard library? platform? installed dependency? one line? minimum) and mark deferred shortcuts `ponytail:`. `/review` checks your uncommitted diff for over-engineering, `/audit` the whole repo, `/debt` lists the marked shortcuts.
+- **Chat.** Streaming markdown, a separate reasoning view, file and image attachments, and optional agent tools.
+- **Agents.** A local coding agent that works in a project folder. It can read, grep, edit, run commands and checks, and keep a plan, all inside a Seatbelt sandbox and with an approval mode you choose.
+- **Serve.** Starts `ferrum-server` and shows its endpoint, health and live log.
+- **Benchmark.** Finds the fastest drafter and draft depth for a model on *your* Mac. It checks that every candidate's output matches plain decoding and saves the winner as a favorite.
+- **Settings.** Model folders, favorites and startup options.
 
-*Context optimisers* keep a small local context useful: long tool output is stored and searchable (BM25) and the model gets a short excerpt plus a handle (`ctx_search`, `ctx_read`; `bash` takes an `intent` to return just the relevant lines); re-reading an unchanged file returns a notice; old tool output is elided in one batch at 55% context (so the prompt cache is rebuilt once, not every turn) and the session is snapshotted at 80%; repeated identical tool calls are stopped; the system prompt carries a repo map, the commands available on the machine, and your `AGENTS.md`/`CLAUDE.md`. `/ctx` shows what was saved, `/compact` snapshots on demand.
-
-**Benchmark tab (TUI).** Finds the fastest speculative-decoding setup for a model on *this* Mac. Pick a model; it lists plain decoding, the MTP head (if the GGUF has a usable one) and every drafter that is compatible with the model (checked by hidden size, layers and vocabulary). Each drafter is loaded once and its draft depth swept (`quick` tries a few depths, `full` every depth), measuring greedy decode speed on three prompts (code, prose, structured data) and the mean tokens accepted per verify step. Every run is compared with the no-drafter output; rows whose text differs are shown with `≠` and are not recommended. An optional stage also sweeps the prefill chunk size. Results are ranked with the speedup over plain decoding, remembered per machine and model (`~/.config/ferrum/bench.json`), and `s` / `v` save the winner as a Chat/Agents favorite or a Serve favorite (including the chunk size).
-
-Ferrum never downloads anything. You supply the model files yourself.
-
-## Supported models
-
-**Large hybrid models** (dedicated engine in `src/hybrid`). Both use the Qwen3.5 hybrid architecture, which mixes Gated DeltaNet linear attention with gated full attention:
-
-| Model | Format | Type |
-|---|---|---|
-| Swift 1.5 Qwen3.8-27B | Q4_K_M GGUF | Dense, 27B |
-| Tiel-Coder 35B-A3B | UD-IQ4_XS GGUF | Mixture of experts: 256 experts, 3B active |
-
-**Smaller models** (shared transformer engine):
-
-| Family | Validated checkpoints |
-|---|---|
-| Qwen2.5 | 0.5B-Instruct (BF16, Q4_K_M GGUF) |
-| Qwen3 | 0.6B and 1.7B (BF16), 0.6B Q8_0 GGUF |
-| IBM Granite 4 | 4.0 350M (BF16) |
-| IBM Granite MoE | 3.1 1B-A400M (BF16) |
-| AllenAI OLMo 2 | 0425 1B (F32) |
-| LiquidAI LFM2.5 | 230M (BF16), 8B-A1B hybrid MoE (BF16, Q4_K_M GGUF) |
-
-Supported weight formats: safetensors in F32/F16/BF16, GGUF Q4/Q5/Q6/Q8 (including K-quants), and MLX affine Q4. Exact revisions and reference results are in the [Phase 6 journal](docs/phase6-architecture-journal.md); older Qwen2 quantized variants are covered in [Phase 5](docs/phase5-closeout.md).
-
-## Using the CLI and server
-
-Both `ferrum-cli` and `ferrum-server`:
-
-- use the chat template embedded in the GGUF,
-- stream the model's reasoning separately from its answer (as `reasoning_content`),
-- parse tool calls,
-- use the model's recommended sampling settings unless you override them.
-
-### Server features
-
-`ferrum-server` follows llama-server's conventions, so most clients that work with llama.cpp work with Ferrum.
-
-**Endpoints**
-
-- OpenAI: `/v1/chat/completions`, `/v1/completions`
-- Anthropic: `/v1/messages` and `count_tokens`
-- Utility: `/health`, `/props`, `/slots`, `/metrics` (Prometheus), `/tokenize`, `/detokenize`, `/apply-template`
-
-**Conversation caching.** The server remembers the previous conversation. If the next request extends it, only the new tokens are processed. `usage.prompt_tokens_details.cached_tokens` tells you how many were reused. An identical retry reuses everything except the last token.
-
-**Thinking controls.** Any of these request fields turn reasoning on or off, or set its effort:
-
-| Field | Effect |
-|---|---|
-| `chat_template_kwargs`, `enable_thinking`, `think` | Enable or disable thinking |
-| `reasoning_effort`, `reasoning: {effort}`, Anthropic `thinking: {type, budget_tokens}` | Set effort level |
-| `reasoning_budget`, `thinking_budget_tokens` | Force `</think>` after N tokens |
-| `reasoning_format: none` | Keep `<think>` inline in the content |
-
-Server-wide defaults: `--no-think`, `--reasoning-effort`, `--reasoning-budget`, `--chat-template-kwargs`.
-
-**Streaming.** Keep-alives prevent timeouts during long prompts. `return_progress` streams prompt-processing progress, and `stream_options.include_usage` adds a final usage chunk. If a client disconnects, generation stops right away and the work already done stays cached for a retry. If the model crashes mid-request, the session resets instead of the server going down.
-
-**Logging.** Each request logs one line on arrival, progress lines every few seconds, and a summary (cached/processed tokens, speeds, reasoning tokens, stop reason). Add `-v` to also log request bodies and outputs.
-
-## Vision (images)
-
-The Qwen3.5-family models can read images when you load the vision projector (the `mmproj*.gguf` published next to the model). Ferrum implements the Qwen3-VL projector (`qwen3vl_merger`): a ViT over 16x16 patches with 2-D rotary attention, a 2x2 merger and an MLP into the language model's width, all on Metal. Image tokens are positioned with the model's interleaved multi-axis RoPE, as in llama.cpp, and checked against it on the same prompts.
-
-A projector sitting in the same folder as the model, with a matching width, is loaded automatically (the `mmproj-BF16`/`F16` files from Hugging Face qualify). It takes about 1 GiB of the memory budget, and the auto-fitted context shrinks to make room.
-
-| Flag | Effect |
-|---|---|
-| `--mmproj FILE\|auto\|none` | Projector to load (default `auto`) |
-| `--image-tokens N` | Most context tokens one image may use (default 1024; larger images are scaled down) |
-| `--image-min-tokens N` | Scale small images up to at least N tokens (default 64; Qwen-VL reads fine print better at 1024) |
-
-Send images inline: OpenAI `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` parts, or Anthropic `{"type": "image", "source": {"type": "base64", ...}}` blocks. PNG, JPEG, GIF, WebP and BMP are decoded; remote URLs are rejected rather than fetched. `/props` reports `modalities.vision`, and a request with images to a model without a projector fails with a clear 400. Encoded images are cached, and the conversation cache is reused across turns as long as the same pictures sit in the same places. In `ferrum-cli`, `/image PATH` attaches a picture to your next message; in the TUI, attached images (paths, clipboard, screenshots) go to the model as pixels when a projector is present and fall back to OCR text otherwise. Design notes are in [docs/vision.md](docs/vision.md).
-
-## Speculative decoding
-
-Speculative decoding makes generation faster without changing the output. A small, fast "drafter" guesses the next few tokens, and the main model checks all the guesses in a single pass. With greedy decoding the output is exactly the same as without speculation; with sampling, the output distribution is unchanged.
-
-Three kinds of drafter are supported:
-
-- **MTP** — the prediction head built into the model's own GGUF. No extra download.
-- **DFlash / DFlash2** — separate drafters that propose a whole block of tokens at once.
-- **DSpark** — DFlash with extra tricks to predict which guesses will be accepted.
-
-Drafters are loaded from Hugging Face checkpoints and quantized to Q4_0 on load (with no measurable loss in accuracy). Memory for the drafter is planned up front, and the automatic context size shrinks to make room.
-
-```sh
-# Use the model's built-in MTP head
-./target/release/ferrum-server --model swift.gguf --draft mtp
-
-# Use a separate drafter from your Hugging Face cache
-./target/release/ferrum-server --model swift.gguf \
-  --draft ~/.cache/huggingface/hub/models--z-lab--Qwen3.8-27B-DFlash2
-
-./target/release/ferrum-cli --model tiel.gguf \
-  --draft ~/.cache/huggingface/hub/models--jzinno--Ornith-1.5-35B-A3B-DFlash2
-```
-
-Tuning flags:
-
-| Flag | Meaning |
-|---|---|
-| `--draft-max N` | Maximum tokens drafted per step (MoE models default to 2) |
-| `--draft-quant q4_0\|q8_0` | Drafter weight precision (default `q4_0`) |
-| `--draft-context N` | Context size for drafters without a sliding window |
-| `--draft-p-min P` | DSpark confidence cut-off |
-| `--draft-vocab N` | Drafter vocabulary size |
-
-Responses include `draft_n` and `draft_n_accepted` in `timings`, as llama-server does.
+Setups (model, sampling, drafter) are saved as favorites. The [TUI guide](docs/tui.md) covers the agent tools, the sandbox, context management and the benchmark in detail.
 
 ## Performance
 
-All numbers are from a 32 GB Apple M5, comparing Ferrum and llama.cpp on the same GGUF file. "pp" is prompt processing (prefill) and "tg" is text generation (decode), both in tokens per second; higher is better.
-
-### Large models
+These are measured on a 32 GB Apple M5, with Ferrum and llama.cpp running the same GGUF file. Units are tokens per second (higher is better): **pp** is prompt processing (prefill) and **tg** is text generation (decode).
 
 | Benchmark (tok/s) | Ferrum | llama.cpp |
 |---|---|---|
-| Swift pp512 / pp8192 | 171.9 / 162.1 | 149.8 / 134.4 |
-| Swift tg at empty / 32K context | 6.65 / 5.85 | 5.98 / 5.47 |
-| Tiel pp512 / pp16384 | 867 / 623 | 803 / 559 |
-| Tiel tg at empty / 32K context | 42.1 / 29.5 | 35.8 / 26.8 |
+| Swift 27B pp512 / pp8192 | **171.9 / 162.1** | 149.8 / 134.4 |
+| Swift 27B tg at empty / 32K context | **6.65 / 5.85** | 5.98 / 5.47 |
+| Tiel 35B-A3B pp512 / pp16384 | **867 / 623** | 803 / 559 |
+| Tiel 35B-A3B tg at empty / 32K context | **42.1 / 29.5** | 35.8 / 26.8 |
 
-Maximum context chosen automatically within a 24 GiB working set: 101K tokens for Swift, and the full 262K for Tiel. Predicted memory use matches Metal's own accounting to within a few MiB.
-
-### With speculative decoding
-
-8 chat prompts × 128 tokens, greedy, llama.cpp at commit 9710a32:
+**With speculative decoding** (8 chat prompts × 128 tokens, greedy, llama.cpp at commit 9710a32):
 
 | Setup (tok/s) | Ferrum | llama.cpp |
 |---|---|---|
@@ -178,118 +112,79 @@ Maximum context chosen automatically within a 24 GiB working set: 101K tokens fo
 | Swift + MTP (3 drafts) | 12.60 | 11.17 |
 | Swift + `z-lab/Qwen3.8-27B-DFlash2` | **17.78** | 9.87 |
 | Swift + `RedHatAI/Qwen3.8-27B-speculator.dspark` | 16.37 | 6.83 |
-| Swift + `RadixArk/Qwen3.8-27B-DSpark` | 12.53 | 6.93 |
 | Tiel, no speculation | 41.29 | 41.14 |
 | Tiel + `jzinno/Ornith-1.5-35B-A3B-DFlash2` (2 drafts) | **57.12** | 50.61 |
 
-Both engines accept the same share of drafts, so Ferrum's lead comes from cheaper verification: checking 8–16 tokens at once costs Ferrum about 1.5× a single-token step, versus 2.4–3.8× for llama.cpp. Gains on Tiel are smaller because each drafted token may route to different experts.
+Both engines accept the same share of drafts, so Ferrum's lead comes from cheaper verification. Accuracy is measured as KL divergence over llama-perplexity's text chunks: on Swift, Ferrum matches llama.cpp to a mean KLD of 4×10⁻⁶; on Tiel, both are equally close to a high-precision reference (0.0106 for Ferrum vs 0.0107 for llama.cpp). Small models (under 1B) still run at 0.6–1.0× llama.cpp's speed, because fixed per-kernel overhead dominates at that size. Full methodology and raw logs are in the [engineering journals](docs/README.md).
 
-### Accuracy
+## How it works
 
-Measured as KL divergence against reference outputs using llama-perplexity's own text chunks (lower is closer):
+```mermaid
+flowchart TD
+    subgraph Front ends
+        TUI[ferrum-tui] --> SRV[ferrum-server]
+        TUI --> RT
+        CLI[ferrum-cli] --> RT
+        SRV --> RT[hybrid::runtime<br/>chat template, tool calls, prefix cache]
+    end
+    RT --> SES[hybrid::session<br/>sampling, speculative loop, state snapshots]
+    SES --> ENG[hybrid::engine<br/>DeltaNet + attention forward pass]
+    SES --> DRF[hybrid::draft / mtp<br/>DFlash, DSpark, MTP drafters]
+    PLAN[hybrid::plan<br/>memory planner] -.sizes.-> ENG
+    ENG --> MTL
+    DRF --> MTL
+    VIS[vision<br/>Qwen3-VL encoder] --> MTL
+    MTL[metal backend<br/>command batching, residency, the only unsafe code] --> SH[(6.3K lines of MSL kernels)]
+```
 
-- **Swift:** Ferrum matches llama.cpp to a mean KLD of 4e-6.
-- **Tiel:** both engines are equally close to a high-precision reference (0.0106 for Ferrum vs 0.0107 for llama.cpp).
+Some of the engineering choices:
 
-### Small models
+- **Quantized weights stay in their GGML block format** and are read straight into Metal buffers. Decode uses GEMV kernels tuned per quant type; prefill dequantizes tiles to F16 and runs on the M5's TensorOps matrix units with F32 accumulation.
+- **Nothing allocates after load.** KV cache, recurrent DeltaNet state and all scratch are sized by the planner once. Prefill is chunked with flash-style attention, so no activation grows with the square of the sequence length.
+- **Conversation caching for hybrid models.** Linear-attention state can't be rewound like a KV cache, so the session keeps recurrent-state snapshots. A request that extends the previous conversation only processes the new tokens.
+- **Speculative verification is cheap.** Batched GEMV handles 2–3 rows and a narrow 16×64 TensorOps tile handles 4–32 rows. A 16-token verify on the 27B used to cost 3.5× a single-token step and now costs 1.4×.
+- **Safety boundary.** The library is `#![deny(unsafe_code)]` everywhere except the Metal backend, where six small, documented `unsafe` blocks do FFI and shared-memory mapping. Tensors are immutable once published, and command completion is checked before any result is readable.
 
-Speed relative to llama.cpp (1.0x = equal). These are mostly limited by fixed per-kernel overhead, so the tiny Qwen models still trail at short prompts:
+The design is covered in [docs/architecture.md](docs/architecture.md). How it was built, including the experiments that failed, is in the [phase journals](docs/README.md#engineering-journals).
 
-| Model | Decode | Prefill 512 / 1,024 | Prefill short / 128 |
-|---|---|---|---|
-| LFM2.5-8B-A1B Q4_K_M | 0.87–1.01x | 0.85–0.88x | 0.86x / 0.66–0.70x |
-| Qwen3-0.6B Q8_0 | 0.80–0.88x | 0.81x / 0.93x | 0.65x / 0.62x |
-| Qwen2.5-0.5B Q4_K_M | 0.75–0.86x | 0.80x / 0.90x | 0.67x / 0.65x |
+## Other supported models
 
-Some of these were measured while a background system process (`dasd`) was busy, so treat them as approximate until re-measured.
+The developer binary `ferrum run` has a second, general transformer engine that runs smaller checkpoints. Each was validated against reference logits:
 
-## Development commands
-
-The top-level binary has a few developer subcommands:
+| Family | Validated checkpoints |
+|---|---|
+| Qwen2.5 | 0.5B-Instruct (BF16, Q4_K_M GGUF) |
+| Qwen3 | 0.6B and 1.7B (BF16), 0.6B Q8_0 GGUF |
+| IBM Granite 4 / Granite MoE | 4.0 350M, 3.1 1B-A400M (BF16) |
+| AllenAI OLMo 2 | 0425 1B (F32) |
+| LiquidAI LFM2.5 | 230M (BF16), 8B-A1B hybrid MoE (BF16, Q4_K_M GGUF) |
 
 ```sh
-cargo run --release -- info                # Report Metal device and compiler capabilities
-cargo run --release -- smoke               # Quick GPU sanity check
-cargo run --release -- transformer-smoke
-
-# Generate text from a local checkpoint
-cargo run --release -- run --model /path/to/Qwen2.5-0.5B-Instruct \
-  --prompt 'Hello!' --max-new-tokens 32 --temperature 0 --warmup
-
-# Same, with per-operation timing output
-cargo run --release -- profile --model /path/to/Qwen2.5-0.5B-Instruct \
-  --prompt 'Hello!' --max-new-tokens 8 --temperature 0 --warmup
+ferrum run --model ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<rev> \
+  --prompt 'Hello!' --max-new-tokens 32 --temperature 0
 ```
 
-- Point `--model` at a checkpoint directory with its config, tokenizer and weights.
-- Use `--raw` for plain completion prompts (OLMo 2 has no official chat template).
-- `profile` also prints machine-readable `SUMMARY` and per-operation records.
-- `FERRUM_BATCH_LIMIT=1` gives cleaner per-kernel timings but changes execution; leave it unset when measuring throughput.
-- `FERRUM_NATIVE_MATMUL=0` switches to a slower diagnostic matrix-multiply fallback.
-- Native BF16 kernels need a capable Metal compiler and GPU; `info` reports whether yours qualifies. Devices older than the M5 have not been validated.
+Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants and IQ4_XS/IQ3_S, and MLX affine Q4.
 
-## Testing
+## Documentation
 
-```sh
-cargo fmt --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test
-
-# With Metal's validation layers
-MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --lib \
-  --test correctness --test transformer --test runtime_optimization -- --test-threads=1
-
-# Against a real local model
-FERRUM_QWEN_MODEL=/path/to/checkpoint MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 \
-  cargo test --release --test real_model -- --ignored --test-threads=1
-
-# Numerical probe and benchmarks
-cargo run --release --example qwen_probe -- /path/to/checkpoint --diagnostic-f32
-python3 tools/check_phase4_probe.py
-cargo bench --bench runtime -- --noplot
-```
-
-GPU tests fail if Metal is unavailable, and the real-model tests need a local checkpoint. Python is only used for optional measurement tools. The macOS 27 build profile keeps proc-macro dylibs around for a reason explained in [Phase 1 results](docs/phase1-results.md).
-
-## Using Ferrum as a library
-
-The `ferrum` crate exposes GPU tensors (F32/F16/BF16), tensor operations, safetensors and GGUF loading, quantized matrices, the transformer, and text generation.
-
-```rust
-use ferrum::{DType, MetalDevice, Result, Tensor};
-
-fn example() -> Result<()> {
-    let device = MetalDevice::new()?;
-    let x = Tensor::from_f32(&device, [2, 2], DType::F32, &[1., 2., 3., 4.])?;
-    let y = device.add(&x, &x)?;
-    assert_eq!(y.tensor.to_f32(), vec![2., 4., 6., 8.]);
-    Ok(())
-}
-```
-
-Tensor operations are synchronous from the caller's point of view. Model forward passes batch GPU work internally and only publish results once the GPU has finished.
-
-**Safety.** Only four `unsafe` blocks exist, all inside the Metal backend. Bounds checks, completion tracking and resource retention keep safe Rust callers safe; shader indexing and driver behavior are the remaining audited trust boundary. Tensor handles use `Rc` and are not `Send`/`Sync`. See [architecture](docs/architecture.md).
+| Guide | Contents |
+|---|---|
+| [Server](docs/server.md) | Endpoints, thinking controls, caching, streaming, vision, speculative decoding, flags |
+| [TUI](docs/tui.md) | Chat, the coding agent and its sandbox, context optimisers, the benchmark tab |
+| [Development](docs/development.md) | Building, testing (including Metal validation layers), profiling, using Ferrum as a library |
+| [Architecture](docs/architecture.md) | Tensor and storage model, Metal backend, safety argument, the hybrid engine |
+| [Vision](docs/vision.md) | How image input is encoded and positioned |
+| [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
 
 ## Limitations
 
-- Vision supports the Qwen3-VL projector only (no video, DeepStack variants, Gemma or LLaVA projectors).
-- One request at a time (batch size 1), single-threaded contexts.
-- Tensor views must be contiguous. No paged attention or graph scheduler.
-- GPU math accumulates in F32, but a different summation order can change BF16 rounding, and occasionally which token wins a near-tie in greedy decoding.
-- For the smaller models, long-context speed and accuracy beyond the recorded tests are not established. LFM2 has been tested only up to 32K context.
+- Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
+- One request at a time (batch size 1).
+- The server and TUI run Qwen3.5-family hybrids only. Other architectures go through the developer runner.
+- Vision supports the Qwen3-VL projector only (no video).
 - No training and no language bindings.
 
-## Project history
+## License
 
-Ferrum was built in phases, each with its own write-up:
-
-| Phase | Focus | Docs |
-|---|---|---|
-| 1–3 | Foundations and baselines | [1](docs/phase1-results.md), [2](docs/phase2-results.md), [3](docs/phase3-results.md) |
-| 4 | Command batching, KV cache, fast GEMV/GEMM | [Results](docs/phase4-results.md) |
-| 5 / 5.5 | Quantized GGUF and MLX weights | [Closeout](docs/phase5-closeout.md), [experiments](docs/phase5.5-experiments.md) |
-| 6 | Dense, MoE and hybrid architectures | [Journal](docs/phase6-architecture-journal.md) |
-| 7 | Closing the gap to llama.cpp on GGUF | [Journal](docs/phase7a-performance-journal.md) |
-| 8 | Large hybrid models, server | [Plan](docs/phase8-plan.md), [journal](docs/phase8-journal.md) |
-| 9 | Speculative decoding | [Plan](docs/phase9-plan.md), [journal](docs/phase9-journal.md) |
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Model weights are not included and keep their own licenses.

@@ -1,6 +1,51 @@
 # Ferrum architecture
 
-The Phase 4 section below describes the current runtime. Earlier sections are preserved as the historical Phase 1–3 design and are superseded where noted.
+This document starts with an overview of the system as it is today. After that come the runtime internals, written phase by phase as each piece was built: Phase 1–3 sections describe the original design and are superseded where noted, and "Phase 4 current execution and storage model" describes the batched runtime that both engines still use.
+
+## Overview
+
+Ferrum is a single Rust crate with two inference engines that share one Metal backend.
+
+| Layer | Modules | Role |
+|---|---|---|
+| Front ends | `src/bin/ferrum-tui`, `ferrum-cli`, `ferrum-server` | TUI, terminal chat, OpenAI/Anthropic HTTP server |
+| Chat runtime | `hybrid::runtime`, `hybrid::chat` | GGUF chat templates, streaming split into reasoning / content / tool calls |
+| Large-model engine | `hybrid::{plan, engine, session, weights, draft, mtp, speculative}` | Qwen3.5-family hybrids: memory planning, forward pass, sessions, speculative decoding |
+| General engine | `model`, `nn`, `generation` | Dense, MoE and short-conv transformers (Qwen2.5/3, Granite, OLMo 2, LFM2) |
+| Vision | `vision` | Qwen3-VL image encoder that feeds the hybrid engine |
+| Core | `tensor`, `ops`, `loader`, `quantization`, `tokenizer` | Tensors, operations, safetensors/GGUF parsing, GGML block formats |
+| Backend | `metal` (+ `metal/shaders/*.metal`) | Device, pipeline cache, command batching, residency, the only `unsafe` code |
+| Oracles | `reference` | CPU implementations used only by tests |
+
+### The hybrid engine
+
+Qwen3.5-family models interleave two kinds of layer. Three of every four layers are **Gated DeltaNet** linear attention, which keeps a fixed-size recurrent state per head. The fourth is **gated full attention** with a KV cache. The engine (`src/hybrid`) has its own kernel library (`hybrid.metal`) and an explicit-geometry dispatch path.
+
+- **Weights** (`weights`) keep their GGML block encoding (Q4_K, Q6_K, IQ4_XS, IQ3_S, ...) and are read directly into Metal storage. Decode uses per-type GEMV kernels (ports of llama.cpp's `mul_mv` that take F32 activations). Prefill dequantizes weight tiles to F16 and multiplies them on TensorOps with F32 accumulation.
+- **Memory planning** (`plan`) predicts every allocation from GGUF metadata before reading a weight: trunk tensors (page-rounded as Metal allocates them), chunk scratch, recurrent state and snapshots, F16 K/V per position, and drafter and vision budgets. With no requested context, it fits the largest one under the GPU working set minus a reserve. A request that can't fit fails before loading and reports the largest context that would. Everything is allocated once, so memory stays flat for the life of the process. Predictions match Metal's measured allocations to within 3 MiB.
+- **Forward pass** (`engine`) processes the prompt in fixed-size chunks (`--chunk`, default 512). Attention is flash-style and DeltaNet layers run a recurrent kernel over each chunk, so no activation grows with the square of the sequence length.
+- **Sessions** (`session`) hold the state and the tokens it represents. Recurrent state can't be truncated, so the session snapshots it at the end of every prompt (LRU slots, budgeted by the planner). A new request reuses the longest common prefix, restoring the deepest snapshot at or before the point where it diverges. K/V rows are append-only and stay valid.
+- **Sampling** applies penalties on the GPU, and a block kernel returns the top 32 logits of every 1,024-token block, so the global top 32 is exact. The host then applies temperature, top-k, min-p and top-p. Greedy decoding keeps an on-GPU argmax.
+
+### Speculative decoding
+
+`HybridModel::verify` runs `[anchor, d1..dk]` as one forward without advancing the state. Attention layers write K/V past the cached length, and rejected rows are simply overwritten later. DeltaNet layers read their state but don't write it, and instead record each row's pre-conv inputs on a small tape. `commit(n)` replays the first `n` tape rows into the live state. That costs one extra read and write of the state per step, compared with roughly 150 MB per row for per-position state copies on the 27B, and a failed verify leaves the session valid.
+
+Drafters (`draft`, `mtp`) read the target's residual stream at a few layers. MTP chains the model's own NextN block. DFlash, DFlash2 and DSpark are block-diffusion drafters loaded from Hugging Face checkpoints and quantized to Q4_0 at load. Verification of 4–32 rows uses a narrow 16×64 TensorOps tile, which brought a 16-row verify on the 27B from 3.5× to 1.4× the cost of a single-token step. The details are in the [Phase 9 journal](phase9-journal.md).
+
+### Front ends
+
+`ferrum-server` runs the model on one thread behind a FIFO queue and gives each connection its own thread, so status endpoints respond during generation. `hybrid::chat` renders the GGUF's Jinja template with minijinja configured like Hugging Face's `apply_chat_template`. Plain chat, multi-turn reasoning and tool calls render byte-identically to llama-server's `/apply-template`. The TUI drives the same `Runtime` in-process for chat, the agent and benchmarks, and starts `ferrum-server` as a child process for Serve. Agent commands run under `sandbox-exec` with the profile in `src/bin/ferrum-tui/sandbox.sb`.
+
+### Safety boundary
+
+`src/lib.rs` is `#![deny(unsafe_code)]`, with a single `#[allow]` on the `metal` module. That module has six `unsafe` blocks, each with a `SAFETY:` comment: mapping shared bytes for initialization and for reading completed results, zeroing fresh allocations, a residency-set capacity hint, threadgroup memory length, and encoder binding. Published tensors are immutable, outputs never alias inputs, and command-buffer completion is checked before any result can be mapped. Tensor and device handles use `Rc`, so they are `!Send` and `!Sync`. Outside the library, the server has one `unsafe` call: a non-blocking one-byte `recv` peek that notices when a client disconnects.
+
+The sections below give the full argument for the core runtime.
+
+---
+
+# Runtime internals (by phase)
 
 ## Modules and dependency direction
 

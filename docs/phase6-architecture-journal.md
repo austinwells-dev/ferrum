@@ -2,7 +2,6 @@
 
 ## Starting checkpoint (2026-09-23)
 
-- Repository root: `/Users/austinwells/Documents/ChatGPT/ferrum`.
 - Branch: `codex/phase6-modern-architectures`, created from clean Phase 5.5 checkpoint `e12964cf136262e35c4237415b111f13c93cce51`.
 - The retained Phase 5.5 changes are the two committed revisions `e875e68` and `e12964c`; the rejected Q5 row-sharing experiment was removed before the checkpoint. Phase 5.5 is explicitly performance-incomplete. See `docs/phase5.5-experiments.md`.
 - Host: Apple M5, macOS 27, 32 GiB unified memory; Rust 1.96.0. The Hugging Face cache contains the prior official Qwen2.5 checkpoint and an official LiquidAI LFM2.5-350M snapshot, among other unrelated artifacts. No model cache path is part of Ferrum's runtime contract.

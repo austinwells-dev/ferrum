@@ -3,7 +3,12 @@ name = "ferrum"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.96"
-description = "An independent Rust and Metal tensor runtime for Apple Silicon"
+description = "A from-scratch LLM inference engine for Apple Silicon, in Rust with hand-written Metal kernels"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/austinwells-dev/ferrum"
+readme = "README.md"
+keywords = ["llm", "metal", "inference", "apple-silicon", "gguf"]
+categories = ["science", "command-line-utilities"]
 
 [dependencies]
 crossterm = "0.29.0"
