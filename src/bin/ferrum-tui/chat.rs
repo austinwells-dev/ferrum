@@ -122,14 +122,6 @@ impl ChatOpts {
                     return Err(format!("{} is not a folder", project.display()));
                 }
                 let project = fs::canonicalize(&project).map_err(|e| e.to_string())?;
-                let home = fs::canonicalize(home()).unwrap_or_else(|_| home());
-                // The agent can change everything in its project: never a folder holding your home.
-                if home.starts_with(&project) {
-                    return Err(format!(
-                        "{} is too broad for an agent: set a Project folder first",
-                        tilde(&project)
-                    ));
-                }
                 Some(AgentOpts {
                     project,
                     ponytail: Ponytail::parse(app.value("ponytail")),
