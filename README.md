@@ -33,6 +33,8 @@ Or use the full-screen launcher:
 
 It opens with a short startup animation, then a home screen with **Chat**, **Serve** and **Settings**. Choosing Chat or Serve lists your saved favorite setups (model, settings and a DSpark/DFlash drafter), plus **New setup** (saved as a favorite when you launch) and **One-time run**. Chat runs inside the TUI with streaming, markdown and a reasoning view; Serve starts `ferrum-server` and shows its endpoint, health and live log. Models, quants and drafters ferrum can't run are greyed out with the reason.
 
+**Agent tools and attachments (TUI chat).** Set *Tools* to `ask` or `auto` in a chat setup (or type `/tools ask`) and the model can read, write and edit files, run shell commands and fetch web pages. Commands and downloads run inside a macOS Seatbelt sandbox (`sandbox-exec`): the whole disk is read-only except the workspace folder (`~/ferrum-workspace` by default), keys and credentials such as `~/.ssh` are hidden, the network can be switched off, and the Mac's own localhost services are never reachable. In `ask` mode you approve each write, command or download. Attach files with `/attach PATH`, by dropping them on the terminal, or from the clipboard with Ctrl-V (files, screenshots or text); `/screenshot` grabs a screen region. Images are not seen by the model yet: the text in them is read with macOS Vision and sent instead.
+
 Ferrum never downloads anything. You supply the model files yourself.
 
 ## Supported models

@@ -3,7 +3,9 @@
 //! ferrum-tui [MODEL.gguf]   (aliased to `ferrum`)
 #![allow(unused_imports)]
 
+mod agent;
 mod app;
+mod attach;
 mod catalog;
 mod chat;
 mod editor;
@@ -38,6 +40,7 @@ pub use std::{
     time::{Duration, Instant},
 };
 
+pub use agent::ToolMode;
 pub use catalog::*;
 pub use chat::Chat;
 pub use fields::*;
@@ -247,7 +250,12 @@ impl App {
             self.buffer.push_str(&clean.replace('\n', " "));
         } else if self.screen == Screen::Chat {
             if let Some(c) = self.chat.as_mut() {
-                c.insert_str(&clean);
+                let dropped = attach::parse_dropped(&clean);
+                if !dropped.is_empty() && c.accepts_input() {
+                    c.attach_paths(&dropped);
+                } else {
+                    c.insert_str(&clean);
+                }
             }
         }
     }

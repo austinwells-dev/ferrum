@@ -1,0 +1,45 @@
+;; Seatbelt profile for the chat agent's tools (sandbox-exec -p ... -D KEY=value).
+;; Parameters: WORKSPACE, HOME, NETWORK ("on" or "off").
+(version 1)
+(allow default)
+
+;; Files: writable only inside the workspace, plus the scratch devices.
+(deny file-write*)
+(allow file-write*
+    (subpath (param "WORKSPACE"))
+    (literal "/dev/null")
+    (literal "/dev/zero")
+    (literal "/dev/dtracehelper")
+    (regex #"^/dev/tty")
+    (regex #"^/dev/fd/"))
+
+;; Secrets: neither readable nor writable.
+(deny file-read* file-write*
+    (subpath (string-append (param "HOME") "/.ssh"))
+    (subpath (string-append (param "HOME") "/.aws"))
+    (subpath (string-append (param "HOME") "/.gnupg"))
+    (subpath (string-append (param "HOME") "/.azure"))
+    (subpath (string-append (param "HOME") "/.kube"))
+    (subpath (string-append (param "HOME") "/.docker"))
+    (subpath (string-append (param "HOME") "/.config/gcloud"))
+    (subpath (string-append (param "HOME") "/.config/gh"))
+    (subpath (string-append (param "HOME") "/.config/ferrum"))
+    (subpath (string-append (param "HOME") "/.claude"))
+    (subpath (string-append (param "HOME") "/.codex"))
+    (subpath (string-append (param "HOME") "/.grok"))
+    (subpath (string-append (param "HOME") "/Library/Keychains"))
+    (subpath (string-append (param "HOME") "/Library/Cookies"))
+    (subpath (string-append (param "HOME") "/Library/Messages"))
+    (subpath (string-append (param "HOME") "/Library/Mail"))
+    (subpath (string-append (param "HOME") "/Library/Safari"))
+    (subpath (string-append (param "HOME") "/Library/Application Support/Google/Chrome"))
+    (subpath (string-append (param "HOME") "/Library/Application Support/Firefox"))
+    (literal (string-append (param "HOME") "/.netrc"))
+    (literal (string-append (param "HOME") "/.npmrc"))
+    (literal (string-append (param "HOME") "/.pypirc"))
+    (literal (string-append (param "HOME") "/.git-credentials")))
+
+;; Network: off entirely, or on but never to this Mac's own services.
+(if (string=? (param "NETWORK") "off")
+    (deny network*)
+    (deny network-outbound (remote ip "localhost:*")))

@@ -1,12 +1,15 @@
 //! Chat inside the TUI. The model lives on its own thread (Metal objects stay
 //! where they were created); the UI talks to it over channels and streams
 //! tokens as they arrive.
+use crate::agent::{self, Sandbox, ToolMode};
+use crate::attach::{self, Attachment, Clip};
 use crate::*;
 use ferrum::hybrid::{
     plan::PlanOptions,
     runtime::{ChatHooks, ChatRequest, Delta, Runtime, SpecOptions},
 };
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -25,6 +28,9 @@ pub struct ChatOpts {
     pub budget: Option<usize>,
     pub overrides: Vec<(&'static str, f32)>,
     pub spec: Option<SpecOptions>,
+    pub tools: ToolMode,
+    pub workspace: String,
+    pub network: bool,
 }
 
 impl ChatOpts {
@@ -75,12 +81,19 @@ impl ChatOpts {
             budget: count("budget"),
             overrides,
             spec,
+            tools: ToolMode::parse(app.value("tools")),
+            workspace: app.value("workspace").to_string(),
+            network: app.value("network") != "off",
         })
     }
 }
 
 enum ToWorker {
-    Turn { messages: Vec<Json>, think: bool },
+    Turn {
+        messages: Vec<Json>,
+        think: bool,
+        tools: Vec<Json>,
+    },
     Reset,
 }
 
@@ -107,6 +120,7 @@ pub struct TurnDone {
     acceptance: Option<f64>,
     ctx_used: usize,
     ctx_cap: usize,
+    tool_calls: Vec<(String, Map<String, Json>)>,
 }
 
 enum FromWorker {
@@ -209,7 +223,11 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
     while let Ok(msg) = rx.recv() {
         match msg {
             ToWorker::Reset => rt.session.reset(),
-            ToWorker::Turn { messages, think } => {
+            ToWorker::Turn {
+                messages,
+                think,
+                tools,
+            } => {
                 cancel.store(false, Ordering::SeqCst);
                 let mut vars = Map::new();
                 vars.insert("enable_thinking".into(), Json::Bool(think));
@@ -218,7 +236,7 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                 }
                 let request = ChatRequest {
                     messages,
-                    tools: Vec::new(),
+                    tools,
                     max_tokens: opts.max_tokens,
                     sampling: sampling.clone(),
                     template_vars: vars,
@@ -234,7 +252,14 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                     Ok(result) => {
                         let c = &result.completion;
                         let spec = &rt.session.spec_stats;
+                        let tool_calls: Vec<_> = result
+                            .output
+                            .tool_calls
+                            .iter()
+                            .map(|c| (c.name.clone(), c.arguments.clone()))
+                            .collect();
                         send(FromWorker::Done(Box::new(TurnDone {
+                            tool_calls,
                             content: result.output.content,
                             reasoning: result.output.reasoning,
                             prompt_tokens: c.prompt_tokens,
@@ -260,7 +285,28 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
 pub enum Role {
     User,
     Assistant,
+    Tool,
     Note,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ToolState {
+    Queued,
+    Waiting,
+    Running,
+    Ok,
+    Failed,
+    Denied,
+}
+
+pub struct ToolView {
+    pub id: String,
+    pub name: String,
+    pub summary: String,
+    pub state: ToolState,
+    pub output: String,
+    pub secs: f32,
+    pub started: Option<Instant>,
 }
 
 pub struct Turn {
@@ -270,6 +316,9 @@ pub struct Turn {
     pub done: bool,
     pub stats: Option<String>,
     pub error: Option<String>,
+    pub tool: Option<ToolView>,
+    /// Chips for the files that came with a user message.
+    pub attachments: Vec<String>,
 }
 
 impl Turn {
@@ -281,6 +330,8 @@ impl Turn {
             done: role != Role::Assistant,
             stats: None,
             error: None,
+            tool: None,
+            attachments: Vec::new(),
         }
     }
 }
@@ -290,17 +341,27 @@ pub enum Phase {
     Loading(String),
     Ready,
     Generating,
+    /// Running (or waiting to run) the model's tool calls.
+    Tools,
     Failed(String),
 }
 
 /// Slash commands offered by the palette: (text to insert, description).
-pub const COMMANDS: [(&str, &str); 7] = [
+pub const COMMANDS: [(&str, &str); 15] = [
     ("/reset", "clear the conversation"),
     ("/think on", "turn reasoning on"),
     ("/think off", "turn reasoning off"),
     ("/thoughts", "show or hide the model's thinking"),
     ("/stats", "speed and context of the last turn"),
     ("/help", "list the commands"),
+    ("/tools off", "no tools"),
+    ("/tools ask", "approve writes, commands and downloads"),
+    ("/tools auto", "run tools without asking"),
+    ("/attach ", "attach a file by path"),
+    ("/paste", "attach the clipboard (image, files or text)"),
+    ("/screenshot", "drag out a screen region to attach"),
+    ("/detach", "remove the attachments"),
+    ("/workspace", "show the sandbox folder"),
     ("/exit", "leave the chat"),
 ];
 
@@ -332,7 +393,28 @@ pub struct Chat {
     last_stats: String,
     palette_sel: usize,
     palette_off: bool,
+    system: Option<String>,
+    pub tools: ToolMode,
+    workspace: String,
+    network: bool,
+    sandbox: Option<Sandbox>,
+    pub attachments: Vec<Attachment>,
+    /// Tool rounds since the last user message.
+    rounds: usize,
+    call_seq: usize,
+    /// Calls still to run: (turn index, call id, name, arguments).
+    queue: VecDeque<(usize, String, String, Map<String, Json>)>,
+    tool_msgs: Vec<Json>,
+    /// A call waiting for the user's yes or no.
+    pub approval: Option<(usize, String, String, Map<String, Json>)>,
+    exec_rx: Option<Receiver<(usize, bool, String, f32)>>,
+    tool_cancel: Arc<AtomicBool>,
+    aborted: bool,
+    flash: Option<(String, bool, Instant)>,
 }
+
+/// Most tool rounds the model may chain after one message.
+const MAX_ROUNDS: usize = 24;
 
 impl Chat {
     pub fn start(app: &App) -> Result<Chat, String> {
@@ -345,11 +427,14 @@ impl Chat {
             .file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_default();
-        let mut history = Vec::new();
-        if let Some(system) = &opts.system {
-            history.push(json!({"role": "system", "content": system}));
-        }
+        let history = Vec::new();
         let (think, show) = (opts.think, opts.show_thinking);
+        let (system, tools, workspace, network) = (
+            opts.system.clone(),
+            opts.tools,
+            opts.workspace.clone(),
+            opts.network,
+        );
         let flag = cancel.clone();
         let handle = std::thread::Builder::new()
             .name("ferrum-chat".into())
@@ -382,6 +467,21 @@ impl Chat {
             last_stats: String::new(),
             palette_sel: 0,
             palette_off: false,
+            system,
+            tools,
+            workspace,
+            network,
+            sandbox: None,
+            attachments: Vec::new(),
+            rounds: 0,
+            call_seq: 0,
+            queue: VecDeque::new(),
+            tool_msgs: Vec::new(),
+            approval: None,
+            exec_rx: None,
+            tool_cancel: Arc::new(AtomicBool::new(false)),
+            aborted: false,
+            flash: None,
         })
     }
 
@@ -422,11 +522,87 @@ impl Chat {
         self.cursor = self.input.chars().count();
     }
 
+    /// The model is writing or its tools are running.
     pub fn generating(&self) -> bool {
-        self.phase == Phase::Generating
+        matches!(self.phase, Phase::Generating | Phase::Tools)
+    }
+
+    pub fn accepts_input(&self) -> bool {
+        !matches!(self.phase, Phase::Loading(_) | Phase::Failed(_))
+    }
+
+    pub fn flash(&mut self, text: impl Into<String>, ok: bool) {
+        self.flash = Some((text.into(), ok, Instant::now()));
+    }
+
+    pub fn flash_text(&self) -> Option<(&str, bool)> {
+        self.flash
+            .as_ref()
+            .filter(|(_, _, t)| t.elapsed() < Duration::from_secs(5))
+            .map(|(s, ok, _)| (s.as_str(), *ok))
+    }
+
+    /// Messages for the model: the system prompt (plus the tool briefing) and the history.
+    fn messages_for_send(&mut self) -> Vec<Json> {
+        let mut system = self.system.clone().unwrap_or_default();
+        if self.tools != ToolMode::Off {
+            if let Ok(sb) = self.sandbox() {
+                if !system.is_empty() {
+                    system.push_str("\n\n");
+                }
+                system.push_str(&agent::system_prompt(&sb.workspace, self.network));
+            }
+        }
+        let mut messages = Vec::new();
+        if !system.is_empty() {
+            messages.push(json!({"role": "system", "content": system}));
+        }
+        messages.extend(self.history.iter().cloned());
+        messages
+    }
+
+    fn tool_defs(&self) -> Vec<Json> {
+        if self.tools == ToolMode::Off {
+            Vec::new()
+        } else {
+            agent::tool_defs(self.network)
+        }
+    }
+
+    /// Send the history to the model and show an empty reply being written.
+    fn start_turn(&mut self) {
+        let messages = self.messages_for_send();
+        let tools = self.tool_defs();
+        self.turns.push(Turn::new(Role::Assistant, String::new()));
+        self.phase = Phase::Generating;
+        self.gen_started = Some(Instant::now());
+        self.first_token = None;
+        self.gen_tokens = 0;
+        self.follow = true;
+        let _ = self.tx.send(ToWorker::Turn {
+            messages,
+            think: self.think,
+            tools,
+        });
+    }
+
+    pub fn sandbox(&mut self) -> Result<Sandbox, String> {
+        if self.sandbox.is_none() {
+            self.sandbox = Some(Sandbox::new(&self.workspace, self.network)?);
+        }
+        Ok(self.sandbox.clone().expect("just created"))
     }
 
     pub fn pump(&mut self) {
+        let mut results = Vec::new();
+        if let Some(rx) = &self.exec_rx {
+            while let Ok(r) = rx.try_recv() {
+                results.push(r);
+            }
+        }
+        for (idx, ok, out, secs) in results {
+            self.tool_done(idx, ok, out, secs);
+        }
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 FromWorker::Stage(s) => self.phase = Phase::Loading(s),
@@ -459,7 +635,10 @@ impl Chat {
                         t.done = true;
                         t.error = Some(e);
                     }
-                    self.history.pop();
+                    if self.rounds == 0 {
+                        self.history.pop();
+                    }
+                    self.rounds = 0;
                     self.end_generation();
                 }
             }
@@ -510,10 +689,165 @@ impl Chat {
         if let Some(r) = d.reasoning {
             reply["reasoning_content"] = Json::String(r);
         }
-        self.history.push(reply);
         self.ctx = Some((d.ctx_used, d.ctx_cap));
         self.last_stats = stats;
+        if !d.tool_calls.is_empty() && self.tools != ToolMode::Off && !cancelled {
+            if self.rounds >= MAX_ROUNDS {
+                self.history.push(reply);
+                self.note(format!("stopped after {MAX_ROUNDS} rounds of tool calls"));
+                self.rounds = 0;
+                self.end_generation();
+                return;
+            }
+            let mut calls = Vec::new();
+            for (name, args) in d.tool_calls {
+                self.call_seq += 1;
+                let id = format!("call_{}", self.call_seq);
+                calls.push(json!({
+                    "id": id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": Json::Object(args.clone()).to_string()}
+                }));
+                let mut turn = Turn::new(Role::Tool, String::new());
+                turn.tool = Some(ToolView {
+                    id: id.clone(),
+                    summary: agent::summary(&name, &args),
+                    name: name.clone(),
+                    state: ToolState::Queued,
+                    output: String::new(),
+                    secs: 0.0,
+                    started: None,
+                });
+                self.turns.push(turn);
+                self.queue.push_back((self.turns.len() - 1, id, name, args));
+            }
+            reply["tool_calls"] = Json::Array(calls);
+            self.history.push(reply);
+            self.rounds += 1;
+            self.aborted = false;
+            self.phase = Phase::Tools;
+            self.next_tool();
+            return;
+        }
+        self.history.push(reply);
+        self.rounds = 0;
         self.end_generation();
+    }
+
+    fn tool_message(&mut self, idx: usize, text: &str) {
+        let (id, name) = self
+            .turns
+            .get(idx)
+            .and_then(|t| t.tool.as_ref())
+            .map(|t| (t.id.clone(), t.name.clone()))
+            .unwrap_or_default();
+        self.tool_msgs.push(json!({
+            "role": "tool",
+            "tool_call_id": id,
+            "name": name,
+            "content": text,
+        }));
+    }
+
+    fn set_tool(&mut self, idx: usize, state: ToolState, output: &str) {
+        if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
+            t.state = state;
+            t.output = output.to_string();
+        }
+    }
+
+    /// Run, ask about, or skip the next queued call; start the next generation when none are left.
+    fn next_tool(&mut self) {
+        if self.aborted {
+            while let Some((idx, _, _, _)) = self.queue.pop_front() {
+                self.set_tool(idx, ToolState::Denied, "cancelled");
+                self.tool_message(idx, "cancelled by the user");
+            }
+            return self.finish_round();
+        }
+        let Some(call) = self.queue.pop_front() else {
+            return self.finish_round();
+        };
+        if self.tools == ToolMode::Ask && agent::needs_approval(&call.2) {
+            self.set_tool(call.0, ToolState::Waiting, "");
+            self.approval = Some(call);
+            return;
+        }
+        self.run_tool(call);
+    }
+
+    fn run_tool(&mut self, call: (usize, String, String, Map<String, Json>)) {
+        let (idx, _id, name, args) = call;
+        let sb = match self.sandbox() {
+            Ok(sb) => sb,
+            Err(e) => {
+                self.set_tool(idx, ToolState::Failed, &e);
+                self.tool_message(idx, &format!("error: {e}"));
+                return self.next_tool();
+            }
+        };
+        if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
+            t.state = ToolState::Running;
+            t.started = Some(Instant::now());
+        }
+        let (tx, rx) = channel();
+        self.exec_rx = Some(rx);
+        self.tool_cancel.store(false, Ordering::SeqCst);
+        let cancel = self.tool_cancel.clone();
+        std::thread::spawn(move || {
+            let started = Instant::now();
+            let (ok, out) = sb.execute(&name, &args, &cancel);
+            let _ = tx.send((idx, ok, out, started.elapsed().as_secs_f32()));
+        });
+    }
+
+    fn tool_done(&mut self, idx: usize, ok: bool, out: String, secs: f32) {
+        self.exec_rx = None;
+        if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
+            t.state = if ok { ToolState::Ok } else { ToolState::Failed };
+            t.output = out.clone();
+            t.secs = secs;
+        }
+        self.tool_message(idx, &out);
+        self.next_tool();
+    }
+
+    pub fn approve(&mut self, always: bool) {
+        if let Some(call) = self.approval.take() {
+            if always {
+                self.tools = ToolMode::Auto;
+            }
+            self.run_tool(call);
+        }
+    }
+
+    pub fn deny(&mut self) {
+        if let Some((idx, _, _, _)) = self.approval.take() {
+            self.set_tool(idx, ToolState::Denied, "denied");
+            self.tool_message(idx, "The user denied this tool call.");
+            self.next_tool();
+        }
+    }
+
+    fn finish_round(&mut self) {
+        self.history.append(&mut self.tool_msgs);
+        if self.aborted {
+            self.aborted = false;
+            self.rounds = 0;
+            self.end_generation();
+            self.note("stopped");
+            return;
+        }
+        self.start_turn();
+    }
+
+    /// Esc while tools run: kill the running command and skip the rest.
+    fn cancel_tools(&mut self) {
+        self.aborted = true;
+        self.tool_cancel.store(true, Ordering::SeqCst);
+        if self.approval.is_some() {
+            self.deny();
+        }
     }
 
     pub fn insert_str(&mut self, s: &str) {
@@ -539,22 +873,28 @@ impl Chat {
     }
 
     fn submit(&mut self, text: String) {
-        self.history.push(json!({"role": "user", "content": text}));
-        self.turns.push(Turn::new(Role::User, text));
-        self.turns.push(Turn::new(Role::Assistant, String::new()));
-        self.phase = Phase::Generating;
-        self.gen_started = Some(Instant::now());
-        self.first_token = None;
-        self.gen_tokens = 0;
-        self.follow = true;
-        let _ = self.tx.send(ToWorker::Turn {
-            messages: self.history.clone(),
-            think: self.think,
-        });
+        let attachments = std::mem::take(&mut self.attachments);
+        let mut content = String::new();
+        for a in &attachments {
+            content += &a.block();
+            content += "\n\n";
+        }
+        content += &text;
+        self.history
+            .push(json!({"role": "user", "content": content}));
+        let mut turn = Turn::new(Role::User, text);
+        turn.attachments = attachments.iter().map(|a| a.chip()).collect();
+        self.turns.push(turn);
+        self.rounds = 0;
+        self.start_turn();
     }
 
     fn reset(&mut self) {
-        self.history.retain(|m| m["role"] == "system");
+        self.history.clear();
+        self.tool_msgs.clear();
+        self.queue.clear();
+        self.attachments.clear();
+        self.rounds = 0;
         self.turns.clear();
         self.ctx = None;
         self.last_stats.clear();
@@ -608,13 +948,109 @@ impl Chat {
                 text += "alt+enter or a trailing \\ makes a new line";
                 self.note(text);
             }
+            "/tools off" | "/tools ask" | "/tools auto" => {
+                self.tools = ToolMode::parse(line.trim().trim_start_matches("/tools "));
+                self.note(match self.tools {
+                    ToolMode::Off => "tools are off".to_string(),
+                    ToolMode::Ask => {
+                        "tools on: I'll ask before writes, commands and downloads".to_string()
+                    }
+                    ToolMode::Auto => "tools on: they run without asking".to_string(),
+                });
+            }
+            "/workspace" => match self.sandbox() {
+                Ok(sb) => self.note(format!("workspace: {}", sb.workspace.display())),
+                Err(e) => self.note(e),
+            },
+            "/paste" => self.paste_clipboard(),
+            "/screenshot" => self.take_screenshot(),
+            "/detach" => {
+                let n = self.attachments.len();
+                self.attachments.clear();
+                self.flash(format!("removed {n} attachment(s)"), true);
+            }
+            l if l.starts_with("/attach") => {
+                let arg = l.trim_start_matches("/attach").trim();
+                if arg.is_empty() {
+                    self.flash("usage: /attach /path/to/file", false);
+                } else {
+                    let found = attach::parse_dropped(arg);
+                    let paths = if found.is_empty() {
+                        vec![expand(arg)]
+                    } else {
+                        found
+                    };
+                    self.attach_paths(&paths);
+                }
+            }
             other => self.note(format!("unknown command {other} (try /help)")),
         }
         false
     }
 
-    pub fn stop_generation(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+    pub fn stop_generation(&mut self) {
+        if self.phase == Phase::Tools {
+            self.cancel_tools();
+        } else {
+            self.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    // ---- attachments ----
+
+    pub fn attach_paths(&mut self, paths: &[PathBuf]) {
+        let sb = match self.sandbox() {
+            Ok(sb) => sb,
+            Err(e) => return self.flash(e, false),
+        };
+        for path in paths {
+            match attach::add_file(&sb, path) {
+                Ok(a) => {
+                    self.flash(format!("attached {}", a.name), true);
+                    self.attachments.push(a);
+                }
+                Err(e) => return self.flash(e, false),
+            }
+        }
+    }
+
+    /// Attach whatever is on the clipboard: files, an image, or (as text in the box) text.
+    pub fn paste_clipboard(&mut self) {
+        let sb = match self.sandbox() {
+            Ok(sb) => sb,
+            Err(e) => return self.flash(e, false),
+        };
+        match attach::clipboard(&sb) {
+            Ok(Clip::Files(paths)) => self.attach_paths(&paths),
+            Ok(Clip::Image(a)) => {
+                let note = match (&a.ocr, a.kind) {
+                    (Some(t), _) => {
+                        format!("attached {} · read {} characters of text", a.name, t.len())
+                    }
+                    _ => format!("attached {} · no text found in it", a.name),
+                };
+                self.flash(note, true);
+                self.attachments.push(a);
+            }
+            Ok(Clip::Text(text)) => self.insert_str(&text),
+            Ok(Clip::Empty) => self.flash("the clipboard is empty", false),
+            Err(e) => self.flash(e, false),
+        }
+    }
+
+    pub fn take_screenshot(&mut self) {
+        let sb = match self.sandbox() {
+            Ok(sb) => sb,
+            Err(e) => return self.flash(e, false),
+        };
+        match attach::screenshot(&sb) {
+            Ok(Some(a)) => {
+                self.flash(format!("attached {}", a.name), true);
+                self.attachments.push(a);
+            }
+            Ok(None) => self.flash("screenshot cancelled", false),
+            Err(e) => self.flash(e, false),
+        }
     }
 
     fn scroll(&mut self, up: bool, amount: usize) {
@@ -671,6 +1107,16 @@ impl App {
             }
             return;
         }
+        if chat.approval.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => chat.approve(false),
+                KeyCode::Char('a') => chat.approve(true),
+                KeyCode::Char('n') | KeyCode::Esc => chat.deny(),
+                KeyCode::Char('c') if ctrl => chat.stop_generation(),
+                _ => {}
+            }
+            return;
+        }
         let palette = chat.palette();
         if !palette.is_empty() && !alt && !shift {
             let n = palette.len();
@@ -692,7 +1138,13 @@ impl App {
                     chat.palette_off = true;
                     return;
                 }
-                KeyCode::Enter => chat.set_input(palette[sel].0),
+                KeyCode::Enter => {
+                    chat.set_input(palette[sel].0);
+                    // Commands that take an argument wait for it.
+                    if palette[sel].0.ends_with(' ') {
+                        return;
+                    }
+                }
                 _ => {}
             }
         }
@@ -737,11 +1189,14 @@ impl App {
                     chat.insert_str("\n");
                     return;
                 }
-                let text = chat.input.trim().to_string();
+                let mut text = chat.input.trim().to_string();
                 chat.input.clear();
                 chat.cursor = 0;
-                if text.is_empty() {
+                if text.is_empty() && chat.attachments.is_empty() {
                     return;
+                }
+                if text.is_empty() {
+                    text = "(see the attachment)".into();
                 }
                 if text.starts_with('/') {
                     if chat.command(&text) {
@@ -779,8 +1234,11 @@ impl App {
                 chat.input.drain(a..b);
                 chat.cursor = i;
             }
+            KeyCode::Char('v') if ctrl => chat.paste_clipboard(),
             KeyCode::Backspace => {
-                if chat.cursor > 0 {
+                if chat.input.is_empty() && !chat.attachments.is_empty() {
+                    chat.attachments.pop();
+                } else if chat.cursor > 0 {
                     let (a, b) = (chat.byte_at(chat.cursor - 1), chat.byte_at(chat.cursor));
                     chat.input.drain(a..b);
                     chat.cursor -= 1;
@@ -809,10 +1267,12 @@ impl App {
         let input_w = content_w.saturating_sub(6).max(8);
         let rows = wrap_rows(&chat.input, input_w);
         let input_rows = rows.len().clamp(1, 6) as u16;
-        let [head, mid, status, input, footer] = Layout::vertical([
+        let chips_h = u16::from(!chat.attachments.is_empty());
+        let [head, mid, status, chips, input, footer] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(4),
             Constraint::Length(1),
+            Constraint::Length(chips_h),
             Constraint::Length(input_rows + 2),
             Constraint::Length(1),
         ])
@@ -823,6 +1283,7 @@ impl App {
             Phase::Loading(_) => ("LOADING", GOLD),
             Phase::Ready => ("READY", GOOD),
             Phase::Generating => ("THINKING", EMBER),
+            Phase::Tools => ("WORKING", EMBER),
             Phase::Failed(_) => ("FAILED", BAD),
         };
         let mut sub = vec![chat.label.clone()];
@@ -859,6 +1320,20 @@ impl App {
         }
 
         self.draw_chat_status(f, col(status), chat, t);
+        if chips_h > 0 {
+            let mut spans = vec![Span::raw(" ")];
+            for a in &chat.attachments {
+                spans.push(Span::styled(
+                    format!(" ⊕ {} ", a.chip()),
+                    Style::new().fg(GOLD).bg(SELECTED),
+                ));
+                spans.push(Span::raw(" "));
+            }
+            if chat.input.is_empty() {
+                spans.push(Span::styled("⌫ removes the last", Style::new().fg(FAINT)));
+            }
+            f.render_widget(Paragraph::new(Line::from(spans)), col(chips));
+        }
 
         let ready = chat.phase == Phase::Ready;
         let input = col(input);
@@ -980,7 +1455,16 @@ impl App {
             f.render_widget(Paragraph::new(lines), inner);
         }
 
-        let keys: &[(&str, &str)] = if !items.is_empty() {
+        if chat.approval.is_some() {
+            self.draw_approval(f, input, chat);
+        }
+        let keys: &[(&str, &str)] = if chat.approval.is_some() {
+            &[
+                ("y", "allow once"),
+                ("a", "allow all this chat"),
+                ("n", "deny"),
+            ]
+        } else if !items.is_empty() {
             &[
                 ("↑↓", "choose"),
                 ("tab", "complete"),
@@ -994,10 +1478,12 @@ impl App {
                     ("pgup/pgdn", "scroll"),
                     ("ctrl-t", "thinking"),
                 ],
+                Phase::Tools => &[("esc", "cancel the tools"), ("pgup/pgdn", "scroll")],
                 Phase::Ready => &[
                     ("enter", "send"),
                     ("alt+enter", "new line"),
                     ("pgup/pgdn", "scroll"),
+                    ("ctrl-v", "attach clipboard"),
                     ("ctrl-t", "thinking"),
                     ("/help", "commands"),
                     ("esc", "leave"),
@@ -1006,6 +1492,72 @@ impl App {
             }
         };
         keys_footer(f, footer, keys, &self.status);
+    }
+
+    fn draw_approval(&self, f: &mut Frame, input: Rect, chat: &Chat) {
+        let Some((_, _, name, args)) = &chat.approval else {
+            return;
+        };
+        let s = |k: &str| args.get(k).and_then(Json::as_str).unwrap_or("");
+        let width = input.width.min(100);
+        let inner_w = width.saturating_sub(4) as usize;
+        let mut lines: Vec<Line> = vec![Line::from(vec![
+            Span::styled(" ⚙ ", Style::new().fg(EMBER)),
+            Span::styled(
+                name.clone(),
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                match name.as_str() {
+                    "bash" => "  wants to run a command in the sandbox",
+                    "write_file" => "  wants to write a file",
+                    "edit_file" => "  wants to edit a file",
+                    "fetch_url" => "  wants to download",
+                    _ => "  wants to run",
+                },
+                Style::new().fg(DIM),
+            ),
+        ])];
+        let mut add = |text: &str, style: Style, max: usize| {
+            let rows = wrap_rows(text, inner_w);
+            let chars: Vec<char> = text.chars().collect();
+            for (n, &(a, b)) in rows.iter().enumerate() {
+                if n == max {
+                    lines.push(Line::styled("   …", Style::new().fg(FAINT)));
+                    break;
+                }
+                lines.push(Line::styled(
+                    format!("   {}", chars[a..b].iter().collect::<String>()),
+                    style,
+                ));
+            }
+        };
+        match name.as_str() {
+            "bash" => add(s("command"), Style::new().fg(GOLD), 6),
+            "fetch_url" => add(s("url"), Style::new().fg(GOLD), 2),
+            "write_file" => {
+                add(
+                    &format!("{} ({} lines)", s("path"), s("content").lines().count()),
+                    Style::new().fg(GOLD),
+                    1,
+                );
+                let head: Vec<&str> = s("content").lines().take(5).collect();
+                add(&head.join("\n"), Style::new().fg(DIM), 5);
+            }
+            "edit_file" => {
+                add(s("path"), Style::new().fg(GOLD), 1);
+                add(&format!("- {}", s("old_text")), Style::new().fg(BAD), 3);
+                add(&format!("+ {}", s("new_text")), Style::new().fg(GOOD), 3);
+            }
+            _ => add(&agent::summary(name, args), Style::new().fg(GOLD), 2),
+        }
+        let h = (lines.len() as u16 + 2).min(input.y.saturating_sub(2));
+        let rect = Rect::new(input.x, input.y.saturating_sub(h), width, h);
+        f.render_widget(Clear, rect);
+        let block = panel("allow this tool call?", true);
+        let inner = block.inner(rect);
+        f.render_widget(block, rect);
+        f.render_widget(Paragraph::new(lines), inner);
     }
 
     fn draw_loading(&self, f: &mut Frame, area: Rect, chat: &Chat, stage: &str, t: f32) {
@@ -1071,11 +1623,39 @@ impl App {
                     ));
                 }
             }
+            Phase::Tools => {
+                left.push(Span::styled(
+                    format!(" {} ", spinner(t)),
+                    Style::new().fg(EMBER),
+                ));
+                left.push(Span::styled(
+                    if chat.approval.is_some() {
+                        "waiting for your approval".to_string()
+                    } else {
+                        "running tools".to_string()
+                    },
+                    Style::new().fg(TEXT),
+                ));
+            }
             _ => {}
+        }
+        if let Some((text, ok)) = chat.flash_text() {
+            left.push(Span::styled(
+                format!("  {text}"),
+                Style::new().fg(if ok { GOOD } else { BAD }),
+            ));
         }
         f.render_widget(Paragraph::new(Line::from(left)), area);
         let mut right = vec![Span::styled(
-            format!("think {} ", if chat.think { "on" } else { "off" }),
+            format!(
+                "{}think {} ",
+                if chat.tools == ToolMode::Off {
+                    String::new()
+                } else {
+                    format!("tools {} · ", chat.tools.label())
+                },
+                if chat.think { "on" } else { "off" }
+            ),
             Style::new().fg(DIM),
         )];
         if let Some((used, cap)) = chat.ctx {
@@ -1169,10 +1749,74 @@ impl App {
         let mut out: Vec<Line<'static>> = Vec::new();
         let indent = || Span::raw("  ");
         for (n, turn) in chat.turns.iter().enumerate() {
-            if n > 0 {
+            let prev = n.checked_sub(1).map(|p| chat.turns[p].role);
+            if n > 0 && !(turn.role == Role::Tool && prev == Some(Role::Tool)) {
                 out.push(Line::default());
             }
             match turn.role {
+                Role::Tool => {
+                    let Some(tool) = &turn.tool else { continue };
+                    let (icon, color) = match tool.state {
+                        ToolState::Queued => ("·".to_string(), DIM),
+                        ToolState::Waiting => ("?".to_string(), GOLD),
+                        ToolState::Running => (spinner(t).to_string(), EMBER),
+                        ToolState::Ok => ("✓".to_string(), GOOD),
+                        ToolState::Failed => ("✗".to_string(), BAD),
+                        ToolState::Denied => ("⊘".to_string(), DIM),
+                    };
+                    let tail = match tool.state {
+                        ToolState::Running => tool
+                            .started
+                            .map(|s| format!("{:.0}s", s.elapsed().as_secs_f32()))
+                            .unwrap_or_default(),
+                        ToolState::Ok | ToolState::Failed => format!("{:.1}s", tool.secs),
+                        ToolState::Waiting => "waiting for you".to_string(),
+                        ToolState::Denied => "denied".to_string(),
+                        ToolState::Queued => String::new(),
+                    };
+                    let room =
+                        width.saturating_sub(tool.name.chars().count() + tail.chars().count() + 8);
+                    out.push(Line::from(vec![
+                        indent(),
+                        Span::styled(format!("{icon} "), Style::new().fg(color)),
+                        Span::styled(
+                            tool.name.clone(),
+                            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(
+                            format!("  {}", clip(&tool.summary, room)),
+                            Style::new().fg(DIM),
+                        ),
+                        Span::styled(format!("  {tail}"), Style::new().fg(FAINT)),
+                    ]));
+                    if matches!(tool.state, ToolState::Ok | ToolState::Failed)
+                        && !tool.output.is_empty()
+                    {
+                        let style = Style::new().fg(if tool.state == ToolState::Failed {
+                            BAD
+                        } else {
+                            DIM
+                        });
+                        let lines: Vec<&str> = tool.output.lines().collect();
+                        for line in lines.iter().take(8) {
+                            let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
+                            let row = wrap_styled(&chars, width.saturating_sub(6), 0)
+                                .into_iter()
+                                .next()
+                                .unwrap_or_default();
+                            out.push(to_line(
+                                &row,
+                                vec![Span::styled("  │ ", Style::new().fg(FAINT))],
+                            ));
+                        }
+                        if lines.len() > 8 {
+                            out.push(Line::styled(
+                                format!("  │ … {} more lines", lines.len() - 8),
+                                Style::new().fg(FAINT),
+                            ));
+                        }
+                    }
+                }
                 Role::User => {
                     let style = Style::new().fg(Color::White);
                     for line in turn.content.split('\n') {
@@ -1183,6 +1827,12 @@ impl App {
                                 vec![Span::styled("▌ ", Style::new().fg(GOLD))],
                             ));
                         }
+                    }
+                    for chip in &turn.attachments {
+                        out.push(Line::from(vec![
+                            Span::styled("▌ ", Style::new().fg(GOLD)),
+                            Span::styled(format!("⊕ {chip}"), Style::new().fg(GOLD)),
+                        ]));
                     }
                 }
                 Role::Note => {
@@ -1195,13 +1845,15 @@ impl App {
                     }
                 }
                 Role::Assistant => {
-                    out.push(Line::from(vec![
-                        Span::styled("◆ ", Style::new().fg(EMBER)),
-                        Span::styled(
-                            chat.label.clone(),
-                            Style::new().fg(DIM).add_modifier(Modifier::BOLD),
-                        ),
-                    ]));
+                    if prev != Some(Role::Tool) {
+                        out.push(Line::from(vec![
+                            Span::styled("◆ ", Style::new().fg(EMBER)),
+                            Span::styled(
+                                chat.label.clone(),
+                                Style::new().fg(DIM).add_modifier(Modifier::BOLD),
+                            ),
+                        ]));
+                    }
                     let words = turn.reasoning.split_whitespace().count();
                     let thinking_now = !turn.done && turn.content.is_empty();
                     if !turn.reasoning.is_empty() {
