@@ -61,7 +61,7 @@ pub fn list(kind: &str, project: Option<&str>) -> Vec<Meta> {
         .filter(|e| e.path().extension().is_some_and(|x| x == "json"))
         .filter_map(|e| Some((e.metadata().ok()?.modified().ok()?, e.path())))
         .collect();
-    files.sort_by(|a, b| b.0.cmp(&a.0));
+    files.sort_by_key(|b| std::cmp::Reverse(b.0));
     let mut out = Vec::new();
     for (_, path) in files.into_iter().take(80) {
         let Ok(text) = fs::read_to_string(&path) else {
