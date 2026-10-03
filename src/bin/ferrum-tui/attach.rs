@@ -1,8 +1,8 @@
 //! Attachments for the chat: files, dropped paths, clipboard contents and
 //! screenshots. Everything is copied into the workspace (`.attachments/`) so
-//! the agent's tools can reach it. Images are not shown to the model yet; text
-//! found in them with macOS Vision is sent instead, and `Kind::Image` is the
-//! place to hand the pixels to a vision model later.
+//! the agent's tools can reach it. A model with a vision projector is shown
+//! the image itself; for any other model the text found in it with macOS
+//! Vision is sent instead.
 use crate::agent::Sandbox;
 use crate::*;
 
@@ -28,6 +28,8 @@ pub struct Attachment {
     /// Where the copy lives, relative to the workspace.
     pub rel: String,
     pub kind: Kind,
+    /// Absolute path of the stored copy.
+    pub full: PathBuf,
     pub bytes: u64,
     pub text: Option<String>,
     /// Text recognised in an image.
@@ -45,8 +47,10 @@ impl Attachment {
         format!("{} · {size}", self.name)
     }
 
-    /// What the model receives for this attachment.
-    pub fn block(&self) -> String {
+    /// What the model receives for this attachment. `sees_images`: the image
+    /// itself travels with the message, so only a pointer to the saved copy is
+    /// written into the text.
+    pub fn block(&self, sees_images: bool) -> String {
         match self.kind {
             Kind::Text => {
                 let text = self.text.as_deref().unwrap_or("");
@@ -66,7 +70,10 @@ impl Attachment {
                     self.name, self.rel
                 )
             }
-            // Vision hook: replace this with the image itself once the runtime can take one.
+            Kind::Image if sees_images => format!(
+                "<attachment name=\"{}\" path=\"{}\" type=\"image\">\n[The image is shown to you in this message; a copy is saved at this path.]\n</attachment>",
+                self.name, self.rel
+            ),
             Kind::Image => match self.ocr.as_deref().filter(|t| !t.trim().is_empty()) {
                 Some(text) => format!(
                     "<attachment name=\"{}\" path=\"{}\" type=\"image\">\n[You cannot see the image. Text recognised in it:]\n{}\n</attachment>",
@@ -135,6 +142,34 @@ pub fn is_image(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The image as bytes a vision model can decode: PNG, JPEG, GIF, WebP and BMP
+/// are sent as they are; anything else (HEIC, TIFF) is converted to PNG first.
+pub fn image_bytes(att: &Attachment) -> Result<Vec<u8>, String> {
+    let ext = att
+        .full
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp"
+    ) {
+        return fs::read(&att.full).map_err(|e| format!("{}: {e}", att.name));
+    }
+    let png = att.full.with_extension("converted.png");
+    let status = Command::new("/usr/bin/sips")
+        .args(["-s", "format", "png"])
+        .arg(&att.full)
+        .arg("--out")
+        .arg(&png)
+        .output()
+        .map_err(|e| format!("could not convert {}: {e}", att.name))?;
+    if !status.status.success() {
+        return Err(format!("could not convert {} to PNG", att.name));
+    }
+    fs::read(&png).map_err(|e| format!("{}: {e}", att.name))
+}
+
 /// Recognise text in an image with the macOS Vision framework.
 pub fn ocr(path: &Path) -> Option<String> {
     let out = Command::new("/usr/bin/osascript")
@@ -156,6 +191,7 @@ fn describe(sb: &Sandbox, stored: &Path, name: &str) -> Result<Attachment, Strin
     let mut att = Attachment {
         name: name.to_string(),
         rel,
+        full: stored.to_path_buf(),
         kind: Kind::Binary,
         bytes: meta.len(),
         text: None,
@@ -367,7 +403,7 @@ mod tests {
         fs::write(&src, "fn main() {}\n").unwrap();
         let a = add_file(&sb, &src).unwrap();
         assert_eq!(a.kind, Kind::Text);
-        assert!(a.block().contains("fn main"), "{}", a.block());
+        assert!(a.block(false).contains("fn main"), "{}", a.block(false));
         let b = add_file(&sb, &src).unwrap();
         assert_ne!(a.rel, b.rel, "second copy gets its own name");
         let bin = dir.join("data.bin");

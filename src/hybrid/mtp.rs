@@ -155,6 +155,7 @@ impl Mtp {
             &mix,
             m,
             pos,
+            &Default::default(),
         )?;
         t.add_rmsnorm(d, &x1, &mix, &w.post_norm, &x0, &xn, m)?;
         t.dense_ffn(d, &s, &w.ffn, &xn, &mix, m)?;

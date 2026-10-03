@@ -533,6 +533,13 @@ impl App {
                 if let Some(c) = i.train_ctx {
                     lines.push(row("trained", format!("{c} tokens")));
                 }
+                if let Some(v) = &m.vision {
+                    let file = v.file_name().map(|n| n.to_string_lossy().into_owned());
+                    lines.push(row(
+                        "vision",
+                        clip(&format!("👁 {}", file.unwrap_or_default()), w),
+                    ));
+                }
                 lines.push(row("sampling", clip(&i.sampling, w)));
             }
             None => lines.push(row("arch", "unreadable GGUF header".into())),

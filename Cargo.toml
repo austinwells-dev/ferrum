@@ -8,6 +8,7 @@ description = "An independent Rust and Metal tensor runtime for Apple Silicon"
 [dependencies]
 crossterm = "0.29.0"
 half = "2.7.1"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 minijinja = { version = "2", features = ["json", "loader", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 objc2 = "0.6.4"

@@ -1127,17 +1127,21 @@ struct AttnPrepArgs {
     float eps;
     uint cache_stride; // elements between cached positions (kv_heads*head_dim)
     float q_scale;     // softmax scale folded into the F16 query
+    int rope_delta;    // rotary position = cache position + rope_delta (text after images)
+    uint use_table;    // 1: rotary positions come from `pos3` instead
+    uint sections_h;   // interleaved M-RoPE sections of the height and width axes
+    uint sections_w;
 };
 
 // Query heads: rmsnorm + partial NEOX RoPE of q (first half of each [q|gate]
 // pair in qg) into q_out [tokens][heads][head_dim]. KV heads: rmsnorm + RoPE of
 // k and a copy of v into the F16 cache at `position + token`.
 // grid (heads + kv_heads, tokens); threads head_dim.
-kernel void h_attn_prep(constant AttnPrepArgs & p [[buffer(7)]],
+kernel void h_attn_prep(constant AttnPrepArgs & p [[buffer(8)]],
                         device const float * qg [[buffer(0)]], device const float * k [[buffer(1)]],
                         device const float * v [[buffer(2)]], device const float * q_norm [[buffer(3)]],
-                        device const float * k_norm [[buffer(4)]],
-                        device half * q_out [[buffer(5)]], device half * kv [[buffer(6)]],
+                        device const float * k_norm [[buffer(4)]], device const int * pos3 [[buffer(5)]],
+                        device half * q_out [[buffer(6)]], device half * kv [[buffer(7)]],
                         uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float scratch[8];
     threadgroup float normed[256];
@@ -1156,7 +1160,14 @@ kernel void h_attn_prep(constant AttnPrepArgs & p [[buffer(7)]],
     const uint half_rot = p.rope_dims / 2;
     if (tid < p.rope_dims) {
         const uint pair = tid % half_rot;
-        const float pos = float(p.position + t);
+        float pos = float(int(p.position + t) + p.rope_delta);
+        if (p.use_table != 0) {
+            // Interleaved M-RoPE (llama.cpp IMROPE): pairs cycle t, h, w; the
+            // height and width axes own the first 3*sections pairs of their phase.
+            const uint axis = (pair % 3 == 1 && pair < 3 * p.sections_h) ? 1
+                            : (pair % 3 == 2 && pair < 3 * p.sections_w) ? 2 : 0;
+            pos = float(pos3[t * 3 + axis]);
+        }
         const float freq = pow(p.theta, -2.f * float(pair) / float(p.rope_dims));
         const float angle = pos * freq;
         const float c = cos(angle), s = sin(angle);
@@ -2198,4 +2209,189 @@ kernel void d_confidence(constant ConfArgs & p [[buffer(4)]],
 kernel void h_accumulate(constant EltArgs & a [[buffer(2)]], device const float * r [[buffer(0)]],
                          device float * y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
     if (i < a.n) y[i] += r[i];
+}
+
+
+// ---------------------------------------------------------------- vision encoder
+// Qwen3-VL style ViT (GGUF `clip`/`qwen3vl_merger`). Activations are F32; the
+// weights are F16 (or F32 for attention operands). GEMMs stage 32x32 tiles in
+// half precision and accumulate in F32 like the language-model path.
+
+struct VGemmArgs {
+    uint M, N, K;
+    uint lda;                   // A row stride (elements)
+    uint ldb_n, ldb_k;          // B strides along n and k
+    uint ldc;
+    uint a_batch, b_batch, c_batch;   // per-threadgroup-z strides
+    uint a_off, b_off, c_off;   // element offsets of batch 0
+    uint epilogue;              // 0 none, 1 GELU (tanh), 2 GELU (erf)
+    uint has_bias;
+    float alpha;
+};
+
+inline float v_gelu_tanh(float x) {
+    const float u = 0.7978845608028654f * (x + 0.044715f * x * x * x);
+    return 0.5f * x * (1.f + precise::tanh(u));
+}
+// erf by Abramowitz & Stegun 7.1.26 (absolute error below 1.5e-7).
+inline float v_erf(float x) {
+    const float t = 1.f / (1.f + 0.3275911f * fabs(x));
+    const float y = 1.f - (((((1.061405429f * t - 1.453152027f) * t) + 1.421413741f) * t
+                            - 0.284496736f) * t + 0.254829592f) * t * exp(-x * x);
+    return copysign(y, x);
+}
+inline float v_gelu_erf(float x) { return 0.5f * x * (1.f + v_erf(x * 0.7071067811865476f)); }
+
+// C[m, n] = epilogue(alpha * sum_k A[m, k] * B[n, k] + bias[n]); grid (n/32, m/32, batch), 128 threads.
+template<typename BT>
+inline void v_gemm_impl(constant VGemmArgs & p, device const float * A, device const BT * B,
+                        device const float * bias, device float * C,
+                        uint tid, uint2 group, uint z,
+                        threadgroup half * As, threadgroup half * Bs, threadgroup float * Cs) {
+    const uint row0 = group.y * 32, col0 = group.x * 32;
+    const ulong a_base = (ulong)p.a_off + (ulong)z * p.a_batch;
+    const ulong b_base = (ulong)p.b_off + (ulong)z * p.b_batch;
+    const ulong c_base = (ulong)p.c_off + (ulong)z * p.c_batch;
+    const uint sg = tid / 32, sg_m = sg / 2, sg_n = sg % 2;
+    simdgroup_float8x8 acc[2][2];
+    FOR_UNROLL (uint i = 0; i < 2; i++) FOR_UNROLL (uint j = 0; j < 2; j++) acc[i][j] = simdgroup_float8x8(0.f);
+    const bool k_fast = p.ldb_k == 1;
+    for (uint k0 = 0; k0 < p.K; k0 += 32) {
+        for (uint t = tid; t < 1024; t += 128) {
+            const uint m = t / 32, k = t % 32;
+            const uint gm = row0 + m, gk = k0 + k;
+            As[t] = (gm < p.M && gk < p.K) ? half(A[a_base + (ulong)gm * p.lda + gk]) : half(0);
+            const uint nn = k_fast ? m : k, kk = k_fast ? k : m;
+            const uint gn = col0 + nn, gkb = k0 + kk;
+            Bs[nn * 32 + kk] = (gn < p.N && gkb < p.K)
+                ? half(B[b_base + (ulong)gn * p.ldb_n + (ulong)gkb * p.ldb_k]) : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        FOR_UNROLL (uint kk = 0; kk < 4; kk++) {
+            simdgroup_half8x8 a[2], b[2];
+            FOR_UNROLL (uint i = 0; i < 2; i++) {
+                simdgroup_load(a[i], As + (sg_m * 16 + i * 8) * 32 + kk * 8, 32);
+                simdgroup_load(b[i], Bs + (sg_n * 16 + i * 8) * 32 + kk * 8, 32, ulong2(0, 0), true);
+            }
+            FOR_UNROLL (uint i = 0; i < 2; i++) FOR_UNROLL (uint j = 0; j < 2; j++)
+                simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    FOR_UNROLL (uint i = 0; i < 2; i++) FOR_UNROLL (uint j = 0; j < 2; j++)
+        simdgroup_store(acc[i][j], Cs + (sg_m * 16 + i * 8) * 32 + sg_n * 16 + j * 8, 32);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint t = tid; t < 1024; t += 128) {
+        const uint m = t / 32, n = t % 32;
+        const uint gm = row0 + m, gn = col0 + n;
+        if (gm >= p.M || gn >= p.N) continue;
+        float v = Cs[t] * p.alpha;
+        if (p.has_bias != 0) v += bias[gn];
+        if (p.epilogue == 1) v = v_gelu_tanh(v);
+        else if (p.epilogue == 2) v = v_gelu_erf(v);
+        C[c_base + (ulong)gm * p.ldc + gn] = v;
+    }
+}
+
+kernel void v_gemm_h(constant VGemmArgs & p [[buffer(4)]], device const float * A [[buffer(0)]],
+                     device const half * B [[buffer(1)]], device const float * bias [[buffer(2)]],
+                     device float * C [[buffer(3)]],
+                     uint tid [[thread_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+    threadgroup half As[32 * 32];
+    threadgroup half Bs[32 * 32];
+    threadgroup float Cs[32 * 32];
+    v_gemm_impl<half>(p, A, B, bias, C, tid, group.xy, group.z, As, Bs, Cs);
+}
+kernel void v_gemm_f(constant VGemmArgs & p [[buffer(4)]], device const float * A [[buffer(0)]],
+                     device const float * B [[buffer(1)]], device const float * bias [[buffer(2)]],
+                     device float * C [[buffer(3)]],
+                     uint tid [[thread_index_in_threadgroup]], uint3 group [[threadgroup_position_in_grid]]) {
+    threadgroup half As[32 * 32];
+    threadgroup half Bs[32 * 32];
+    threadgroup float Cs[32 * 32];
+    v_gemm_impl<float>(p, A, B, bias, C, tid, group.xy, group.z, As, Bs, Cs);
+}
+
+struct VNormArgs { uint rows; uint width; float eps; };
+
+// LayerNorm with weight and bias; one threadgroup of 256 threads per row.
+kernel void v_layernorm(constant VNormArgs & p [[buffer(4)]], device const float * x [[buffer(0)]],
+                        device const float * w [[buffer(1)]], device const float * b [[buffer(2)]],
+                        device float * out [[buffer(3)]],
+                        uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float part[8];
+    device const float * xr = x + (ulong)row * p.width;
+    float s = 0.f;
+    for (uint i = tid; i < p.width; i += 256) s += xr[i];
+    s = simd_sum(s);
+    if (tid % 32 == 0) part[tid / 32] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float mean = 0.f;
+    for (uint i = 0; i < 8; i++) mean += part[i];
+    mean /= float(p.width);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v = 0.f;
+    for (uint i = tid; i < p.width; i += 256) { const float d = xr[i] - mean; v += d * d; }
+    v = simd_sum(v);
+    if (tid % 32 == 0) part[tid / 32] = v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float var = 0.f;
+    for (uint i = 0; i < 8; i++) var += part[i];
+    const float inv = rsqrt(var / float(p.width) + p.eps);
+    for (uint i = tid; i < p.width; i += 256)
+        out[(ulong)row * p.width + i] = (xr[i] - mean) * inv * w[i] + b[i];
+}
+
+struct VRopeArgs { uint tokens; uint heads; uint head_dim; uint stride; uint k_offset; };
+
+// Rotary embedding of the q and k thirds of a fused [tokens, 3*width] projection,
+// in place. cos/sin are [tokens, head_dim/2]; pair i rotates (i, i + head_dim/2).
+// grid: one thread per (token, q-or-k head, pair).
+kernel void v_rope(constant VRopeArgs & p [[buffer(3)]], device const float * cs [[buffer(0)]],
+                   device const float * sn [[buffer(1)]], device float * qkv [[buffer(2)]],
+                   uint i [[thread_position_in_grid]]) {
+    const uint half_dim = p.head_dim / 2;
+    const uint total = p.tokens * 2 * p.heads * half_dim;
+    if (i >= total) return;
+    const uint pair = i % half_dim;
+    const uint head = (i / half_dim) % (2 * p.heads);
+    const uint tok = i / (half_dim * 2 * p.heads);
+    const uint col = head < p.heads ? head * p.head_dim : p.k_offset + (head - p.heads) * p.head_dim;
+    device float * r = qkv + (ulong)tok * p.stride + col;
+    const float c = cs[tok * half_dim + pair], s = sn[tok * half_dim + pair];
+    const float x0 = r[pair], x1 = r[pair + half_dim];
+    r[pair] = x0 * c - x1 * s;
+    r[pair + half_dim] = x1 * c + x0 * s;
+}
+
+struct VRowsArgs { uint rows; uint cols; };
+
+// In-place row softmax; one 256-thread threadgroup per row.
+kernel void v_softmax(constant VRowsArgs & p [[buffer(1)]], device float * s [[buffer(0)]],
+                      uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float part[8];
+    device float * r = s + (ulong)row * p.cols;
+    float m = -INFINITY;
+    for (uint i = tid; i < p.cols; i += 256) m = max(m, r[i]);
+    m = simd_max(m);
+    if (tid % 32 == 0) part[tid / 32] = m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m = part[0];
+    for (uint i = 1; i < 8; i++) m = max(m, part[i]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.f;
+    for (uint i = tid; i < p.cols; i += 256) { const float e = exp(r[i] - m); r[i] = e; sum += e; }
+    sum = simd_sum(sum);
+    if (tid % 32 == 0) part[tid / 32] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float total = 0.f;
+    for (uint i = 0; i < 8; i++) total += part[i];
+    const float inv = 1.f / total;
+    for (uint i = tid; i < p.cols; i += 256) r[i] *= inv;
+}
+
+// acc += y (flat).
+kernel void v_add(constant VRowsArgs & p [[buffer(2)]], device const float * y [[buffer(0)]],
+                  device float * acc [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i < p.rows * p.cols) acc[i] += y[i];
 }

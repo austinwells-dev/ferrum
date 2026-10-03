@@ -56,6 +56,11 @@ speculative decoding (lossless; off by default):
   --draft-quant q4_0|q8_0   draft weight precision (default q4_0)
   --draft-context N         context slots for drafts without a sliding window (8192)
   --draft-p-min P           DSpark: stop drafting below this confidence (0)
+vision (images in chat requests as data: URLs / base64; Qwen3-VL style projectors):
+  --mmproj FILE|auto|none   vision projector GGUF (default auto: a sibling mmproj*.gguf)
+  --image-tokens N          most context tokens one image may take (default 1024)
+  --image-min-tokens N      scale small images up to at least N tokens (default 64;
+                            Qwen-VL reads fine print and grounds better with 1024)
 generation defaults (requests may override):
   --temp, --top-p, --top-k, --min-p, --presence-penalty, --frequency-penalty,
   --repeat-penalty X        sampling (default: the GGUF's recommended values)
@@ -154,6 +159,9 @@ struct Options {
     vars: Map<String, Json>,
     reasoning_budget: Option<usize>,
     raw_reasoning: bool,
+    mmproj: Option<String>,
+    image_tokens: usize,
+    image_min_tokens: usize,
 }
 
 fn parse() -> Result<Options, String> {
@@ -171,6 +179,9 @@ fn parse() -> Result<Options, String> {
         vars: Map::new(),
         reasoning_budget: None,
         raw_reasoning: false,
+        mmproj: None,
+        image_tokens: ferrum::vision::DEFAULT_MAX_TOKENS,
+        image_min_tokens: ferrum::vision::DEFAULT_MIN_TOKENS,
     };
     let mut args = std::env::args().skip(1);
     while let Some(key) = args.next() {
@@ -208,6 +219,9 @@ fn parse() -> Result<Options, String> {
                     Some(number()?)
                 }
             }
+            "--mmproj" => o.mmproj = Some(value.clone()),
+            "--image-tokens" => o.image_tokens = number()?,
+            "--image-min-tokens" => o.image_min_tokens = number()?,
             "--reserve-mib" => o.plan.reserve = number()? << 20,
             "--snapshots" => o.plan.snapshots = number()?,
             "--chunk" | "--ubatch-size" => o.plan.chunk = number()?.max(1),
@@ -320,11 +334,18 @@ fn run(o: Options) -> Result<(), String> {
         }),
         queued: AtomicUsize::new(0),
     });
+    let mmproj = ferrum::vision::resolve_projector(&o.model, o.mmproj.as_deref())
+        .map_err(|e| e.to_string())?;
     let jobs = worker::spawn(
         o.model.clone(),
         o.plan,
         o.spec.clone(),
         o.alias.clone(),
+        worker::Vision {
+            mmproj,
+            max_tokens: o.image_tokens,
+            min_tokens: o.image_min_tokens,
+        },
         shared.clone(),
     );
     if !o.vars.is_empty() {
@@ -616,7 +637,7 @@ fn handle(
                     "n_ctx": status.context,
                     "total_slots": 1,
                     "chat_template": server.template.source(),
-                    "modalities": {"vision": false, "audio": false},
+                    "modalities": {"vision": status.vision, "audio": false},
                     "build_info": format!("ferrum {}", env!("CARGO_PKG_VERSION")),
                     "default_generation_settings": {
                         "n_ctx": status.context,

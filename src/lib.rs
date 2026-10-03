@@ -21,3 +21,4 @@ pub mod nn;
 pub mod quantization;
 pub mod sampling;
 pub mod tokenizer;
+pub mod vision;

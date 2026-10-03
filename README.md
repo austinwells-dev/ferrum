@@ -95,6 +95,20 @@ Server-wide defaults: `--no-think`, `--reasoning-effort`, `--reasoning-budget`, 
 
 **Logging.** Each request logs one line on arrival, progress lines every few seconds, and a summary (cached/processed tokens, speeds, reasoning tokens, stop reason). Add `-v` to also log request bodies and outputs.
 
+## Vision (images)
+
+The Qwen3.5-family models can read images when you load the vision projector (the `mmproj*.gguf` published next to the model). Ferrum implements the Qwen3-VL projector (`qwen3vl_merger`): a ViT over 16x16 patches with 2-D rotary attention, a 2x2 merger and an MLP into the language model's width, all on Metal. Image tokens are positioned with the model's interleaved multi-axis RoPE, as in llama.cpp, and checked against it on the same prompts.
+
+A projector sitting in the same folder as the model, with a matching width, is loaded automatically (the `mmproj-BF16`/`F16` files from Hugging Face qualify). It takes about 1 GiB of the memory budget, and the auto-fitted context shrinks to make room.
+
+| Flag | Effect |
+|---|---|
+| `--mmproj FILE\|auto\|none` | Projector to load (default `auto`) |
+| `--image-tokens N` | Most context tokens one image may use (default 1024; larger images are scaled down) |
+| `--image-min-tokens N` | Scale small images up to at least N tokens (default 64; Qwen-VL reads fine print better at 1024) |
+
+Send images inline: OpenAI `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` parts, or Anthropic `{"type": "image", "source": {"type": "base64", ...}}` blocks. PNG, JPEG, GIF, WebP and BMP are decoded; remote URLs are rejected rather than fetched. `/props` reports `modalities.vision`, and a request with images to a model without a projector fails with a clear 400. Encoded images are cached, and the conversation cache is reused across turns as long as the same pictures sit in the same places. In `ferrum-cli`, `/image PATH` attaches a picture to your next message; in the TUI, attached images (paths, clipboard, screenshots) go to the model as pixels when a projector is present and fall back to OCR text otherwise. Design notes are in [docs/vision.md](docs/vision.md).
+
 ## Speculative decoding
 
 Speculative decoding makes generation faster without changing the output. A small, fast "drafter" guesses the next few tokens, and the main model checks all the guesses in a single pass. With greedy decoding the output is exactly the same as without speculation; with sampling, the output distribution is unchanged.
@@ -251,6 +265,7 @@ Tensor operations are synchronous from the caller's point of view. Model forward
 
 ## Limitations
 
+- Vision supports the Qwen3-VL projector only (no video, DeepStack variants, Gemma or LLaVA projectors).
 - One request at a time (batch size 1), single-threaded contexts.
 - Tensor views must be contiguous. No paged attention or graph scheduler.
 - GPU math accumulates in F32, but a different summation order can change BF16 rounding, and occasionally which token wins a near-tie in greedy decoding.

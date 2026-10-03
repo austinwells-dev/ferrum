@@ -105,6 +105,8 @@ pub struct LoadInfo {
     pub weights_gib: f64,
     pub load_secs: f64,
     pub drafter: Option<String>,
+    /// File name of the vision projector, when images can be shown to the model.
+    pub vision: Option<String>,
     pub sampling: String,
 }
 
@@ -169,13 +171,19 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
         let _ = tx.send(m);
     };
     send(FromWorker::Stage("loading weights".into()));
-    let mut rt = match Runtime::load_speculative(
+    // A projector next to the model lets attached images reach it as pixels.
+    let mmproj = ferrum::vision::resolve_projector(&opts.model, None)
+        .ok()
+        .flatten();
+    let mut rt = match Runtime::load_multimodal(
         &opts.model,
         PlanOptions {
             context: opts.context,
             ..Default::default()
         },
         opts.spec.as_ref(),
+        mmproj.as_deref(),
+        ferrum::vision::DEFAULT_MAX_TOKENS,
     ) {
         Ok(rt) => rt,
         Err(e) => return send(FromWorker::Failed(e.to_string())),
@@ -214,6 +222,11 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                 d.max_drafts(),
                 rt.draft_loaded_bytes as f64 / (1u64 << 30) as f64
             )
+        }),
+        vision: rt.vision.as_ref().map(|v| {
+            v.path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
         }),
         sampling: format!(
             "t {} · p {} · k {} · min-p {}",
@@ -872,16 +885,36 @@ impl Chat {
         self.follow = true;
     }
 
+    /// Images can be shown to the model (a vision projector is loaded).
+    fn sees_images(&self) -> bool {
+        self.info.as_ref().is_some_and(|i| i.vision.is_some())
+    }
+
     fn submit(&mut self, text: String) {
         let attachments = std::mem::take(&mut self.attachments);
+        let sees = self.sees_images();
         let mut content = String::new();
+        let mut pictures = Vec::new();
         for a in &attachments {
-            content += &a.block();
+            if sees && a.kind == attach::Kind::Image {
+                match attach::image_bytes(a) {
+                    Ok(bytes) => {
+                        pictures.push(ferrum::vision::media::image_part_from_bytes(&bytes))
+                    }
+                    Err(e) => self.note(e),
+                }
+            }
+            content += &a.block(sees);
             content += "\n\n";
         }
         content += &text;
-        self.history
-            .push(json!({"role": "user", "content": content}));
+        let message = if pictures.is_empty() {
+            json!({"role": "user", "content": content})
+        } else {
+            pictures.push(json!({"type": "text", "text": content}));
+            json!({"role": "user", "content": pictures})
+        };
+        self.history.push(message);
         let mut turn = Turn::new(Role::User, text);
         turn.attachments = attachments.iter().map(|a| a.chip()).collect();
         self.turns.push(turn);
@@ -1024,6 +1057,9 @@ impl Chat {
             Ok(Clip::Files(paths)) => self.attach_paths(&paths),
             Ok(Clip::Image(a)) => {
                 let note = match (&a.ocr, a.kind) {
+                    _ if self.sees_images() => {
+                        format!("attached {} · the model will see it", a.name)
+                    }
                     (Some(t), _) => {
                         format!("attached {} · read {} characters of text", a.name, t.len())
                     }
@@ -1291,6 +1327,9 @@ impl App {
             sub.push(format!("ctx {}", i.context));
             if let Some(d) = &i.drafter {
                 sub.push(format!("⚡ {}", d.split(" · ").next().unwrap_or("")));
+            }
+            if i.vision.is_some() {
+                sub.push("👁 vision".into());
             }
         }
         let crumb = sub.join(" · ");
@@ -1692,6 +1731,12 @@ impl App {
                 ));
                 if let Some(d) = &i.drafter {
                     lines.push(Line::styled(format!("⚡ {d}"), Style::new().fg(GOLD)));
+                }
+                if let Some(v) = &i.vision {
+                    lines.push(Line::styled(
+                        format!("👁 images are shown to the model · {v}"),
+                        Style::new().fg(GOLD),
+                    ));
                 }
                 lines.push(Line::styled(i.sampling.clone(), Style::new().fg(DIM)));
             }

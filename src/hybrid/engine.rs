@@ -25,10 +25,66 @@ impl Params {
         self.0.extend_from_slice(&v.to_le_bytes());
         self
     }
+    pub(crate) fn i(mut self, v: i32) -> Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
 }
 
 fn rows(t: &Tensor, start_row: usize, rows: usize, width: usize) -> Result<Tensor> {
     t.view(start_row * width, [rows, width])
+}
+
+/// An image occupying `grid.0 * grid.1` consecutive prompt positions whose
+/// input embeddings come from the vision encoder instead of the token table.
+#[derive(Clone)]
+pub struct ImageSpan {
+    /// Cache position of the first image token.
+    pub start: usize,
+    /// Token grid (rows, columns).
+    pub grid: (usize, usize),
+    /// `[grid.0 * grid.1, hidden]` F32 embeddings in raster order.
+    pub embedding: std::rc::Rc<Tensor>,
+    /// Identity of the image content, for prefix reuse.
+    pub hash: u64,
+}
+
+impl ImageSpan {
+    pub fn len(&self) -> usize {
+        self.grid.0 * self.grid.1
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    pub fn end(&self) -> usize {
+        self.start + self.len()
+    }
+    /// How many positions the image advances the rotary position less than it
+    /// advances the cache: its tokens share a 2-D grid of positions.
+    fn rope_saving(&self) -> usize {
+        self.len() - self.grid.0.max(self.grid.1)
+    }
+}
+
+/// Rotary position of the token at cache position `index` past images that
+/// end at or before it (text keeps counting from where the last image's
+/// position grid ended).
+pub fn rope_position(media: &[ImageSpan], index: usize) -> usize {
+    index
+        - media
+            .iter()
+            .filter(|s| s.end() <= index)
+            .map(ImageSpan::rope_saving)
+            .sum::<usize>()
+}
+
+/// How rotary positions differ from cache positions for one forward chunk.
+#[derive(Default)]
+pub(crate) struct RopePlan {
+    /// Added to the cache position (non-positive: images compress positions).
+    pub delta: i32,
+    /// Per-row (time, height, width) positions when the chunk holds image tokens.
+    pub table: Option<Tensor>,
 }
 
 /// Conversation state: F16 K/V for attention layers and F32 recurrent state
@@ -39,6 +95,8 @@ pub struct HybridState {
     valid: bool,
     /// Rows written by a speculative verify and not yet committed.
     verified: usize,
+    /// Images in the cached or incoming prompt, ordered by position.
+    media: Vec<ImageSpan>,
     k: Vec<Option<Tensor>>,
     v: Vec<Option<Tensor>>,
     conv: Vec<Option<Tensor>>,
@@ -58,6 +116,7 @@ impl HybridState {
             len: 0,
             valid: true,
             verified: 0,
+            media: Vec::new(),
             k: Vec::new(),
             v: Vec::new(),
             conv: Vec::new(),
@@ -115,6 +174,57 @@ impl HybridState {
         self.len = 0;
         self.valid = true;
         self.verified = 0;
+        self.media.clear();
+    }
+    /// The images of the sequence being processed. Spans past `len` are the
+    /// ones about to be prefilled; their embeddings replace the token rows.
+    pub fn set_media(&mut self, media: Vec<ImageSpan>) {
+        self.media = media;
+    }
+    pub fn media(&self) -> &[ImageSpan] {
+        &self.media
+    }
+    /// Rotary positions for `m` rows starting at cache position `pos`.
+    fn rope_plan(&self, d: &MetalDevice, pos: usize, m: usize) -> Result<RopePlan> {
+        let delta = rope_position(&self.media, pos) as i64 - pos as i64;
+        let delta = i32::try_from(delta)
+            .map_err(|_| Error::Cache("image rotary offset exceeds i32".into()))?;
+        if !self
+            .media
+            .iter()
+            .any(|s| s.start < pos + m && s.end() > pos)
+        {
+            return Ok(RopePlan { delta, table: None });
+        }
+        let mut table = Vec::with_capacity(m * 3 * 4);
+        for index in pos..pos + m {
+            let (t, h, w) = match self
+                .media
+                .iter()
+                .find(|s| s.start <= index && index < s.end())
+            {
+                Some(span) => {
+                    let base = rope_position(&self.media, span.start) as i32;
+                    let offset = index - span.start;
+                    (
+                        base,
+                        base + (offset / span.grid.1) as i32,
+                        base + (offset % span.grid.1) as i32,
+                    )
+                }
+                None => {
+                    let p = rope_position(&self.media, index) as i32;
+                    (p, p, p)
+                }
+            };
+            for v in [t, h, w] {
+                table.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        Ok(RopePlan {
+            delta: 0,
+            table: Some(Tensor::from_le_bytes(d, [m * 3], DType::F32, &table)?),
+        })
     }
     /// Recurrent tensors (conv windows then delta-rule matrices) in a fixed order.
     pub(crate) fn recurrent(&self) -> impl Iterator<Item = &Tensor> {
@@ -989,13 +1099,42 @@ impl HybridModel {
         let xn = rows(&s.xn, 0, m, h)?;
         let mix = rows(&s.mix, 0, m, h)?;
         self.get_rows(d, &self.weights.embedding, &ids, &x0)?;
+        // Image rows take the vision encoder's embeddings in place of the pad token's.
+        for span in state
+            .media
+            .iter()
+            .filter(|sp| sp.start < pos + m && sp.end() > pos)
+        {
+            if span.embedding.numel() != span.len() * h {
+                return Err(Error::Shape(format!(
+                    "image embedding has {} values, expected {} x {h}",
+                    span.embedding.numel(),
+                    span.len()
+                )));
+            }
+            let (from, to) = (span.start.max(pos), span.end().min(pos + m));
+            let src = rows(&span.embedding, from - span.start, to - from, h)?;
+            let dst = rows(&x0, from - pos, to - from, h)?;
+            d.dispatch_hybrid(
+                "h_copy_rows",
+                &[src.binding()],
+                &[dst.binding()],
+                &Params::default().u(to - from)?.u(h)?.u(h)?.u(h)?.u(0)?.0,
+                [((to - from) * h).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )?;
+        }
+        let rope = state.rope_plan(d, pos, m)?;
         self.rmsnorm(d, &x0, &self.weights.layers[0].attn_norm, &xn, m)?;
         let spec = self.spec.borrow();
         let spec = spec.as_ref();
         let (mut cur, mut next) = (&x0, &x1);
         for (i, layer) in self.weights.layers.iter().enumerate() {
             match &layer.mixer {
-                Mixer::Attention(a) => self.attention(d, &s, a, state, i, &xn, &mix, m, pos)?,
+                Mixer::Attention(a) => {
+                    self.attention(d, &s, a, state, i, &xn, &mix, m, pos, &rope)?
+                }
                 Mixer::Delta(w) => {
                     let tape = match (verify, spec) {
                         (true, Some(sp)) => {
@@ -1146,6 +1285,7 @@ impl HybridModel {
         out: &Tensor,
         m: usize,
         pos: usize,
+        rope: &RopePlan,
     ) -> Result<()> {
         let kc = state.k[layer]
             .as_ref()
@@ -1153,7 +1293,7 @@ impl HybridModel {
         let vc = state.v[layer]
             .as_ref()
             .expect("attention layer has V cache");
-        self.attention_with(d, s, a, kc, vc, layer, xn, out, m, pos)
+        self.attention_with(d, s, a, kc, vc, layer, xn, out, m, pos, rope)
     }
 
     /// Gated attention of `m` rows at `pos..` against explicit K/V caches.
@@ -1170,6 +1310,7 @@ impl HybridModel {
         out: &Tensor,
         m: usize,
         pos: usize,
+        rope: &RopePlan,
     ) -> Result<()> {
         let c = &self.config;
         let q_width = c.heads * c.head_dim;
@@ -1192,7 +1333,11 @@ impl HybridModel {
             .f(c.rope_theta)
             .f(c.eps)
             .u(kv_width)?
-            .f(1. / (c.head_dim as f32).sqrt());
+            .f(1. / (c.head_dim as f32).sqrt())
+            .i(rope.delta)
+            .u(usize::from(rope.table.is_some()))?
+            .u(c.rope_sections[1])?
+            .u(c.rope_sections[2])?;
         d.dispatch_hybrid(
             "h_attn_prep",
             &[
@@ -1201,6 +1346,8 @@ impl HybridModel {
                 v.binding(),
                 a.q_norm.binding(),
                 a.k_norm.binding(),
+                // Unread unless the plan carries a position table.
+                rope.table.as_ref().unwrap_or(&qg).binding(),
             ],
             &[q.binding(), kc.binding()],
             &prep.0,
@@ -2049,6 +2196,199 @@ mod tests {
                 ((x >> 40) as f32 / (1u64 << 24) as f32) * 2. - 1.
             })
             .collect()
+    }
+
+    #[test]
+    fn rope_positions_compress_around_images() {
+        let d = MetalDevice::new().unwrap();
+        let span = |start, grid: (usize, usize)| ImageSpan {
+            start,
+            grid,
+            embedding: std::rc::Rc::new(
+                Tensor::zeros(&d, [grid.0 * grid.1, 4], DType::F32).unwrap(),
+            ),
+            hash: 0,
+        };
+        // A 3x4 image at cache positions 5..17 advances rotary positions by 4.
+        let media = [span(5, (3, 4)), span(30, (2, 2))];
+        assert_eq!(rope_position(&media, 0), 0);
+        assert_eq!(rope_position(&media, 5), 5);
+        assert_eq!(rope_position(&media, 16), 16);
+        assert_eq!(rope_position(&media, 17), 9);
+        assert_eq!(rope_position(&media, 29), 21);
+        assert_eq!(rope_position(&media, 34), 24);
+        assert_eq!(rope_position(&media, 40), 30);
+        let mut state = HybridState {
+            capacity: 64,
+            len: 0,
+            valid: true,
+            verified: 0,
+            media: media.to_vec(),
+            k: Vec::new(),
+            v: Vec::new(),
+            conv: Vec::new(),
+            ssm: Vec::new(),
+        };
+        // Text only: a plain offset.
+        let plan = state.rope_plan(&d, 17, 4).unwrap();
+        assert_eq!((plan.delta, plan.table.is_none()), (-8, true));
+        // A chunk through the first image carries explicit (t, h, w) positions.
+        let plan = state.rope_plan(&d, 4, 15).unwrap();
+        let table = plan.table.expect("chunk touches an image").to_f32();
+        let ints: Vec<i32> = table.iter().map(|v| v.to_bits() as i32).collect();
+        assert_eq!(&ints[..3], &[4, 4, 4]);
+        // Row for cache position 5: image origin (t = 5, h = 5, w = 5).
+        assert_eq!(&ints[3..6], &[5, 5, 5]);
+        // Cache position 6 is image column 1; position 10 is row 1, column 1.
+        assert_eq!(&ints[6..9], &[5, 5, 6]);
+        assert_eq!(&ints[18..21], &[5, 6, 6]);
+        // The first text row after the image continues past the position grid.
+        assert_eq!(&ints[36..39], &[5, 7, 8]);
+        assert_eq!(&ints[39..42], &[9, 9, 9]);
+        state.media.clear();
+        assert_eq!(state.rope_plan(&d, 17, 4).unwrap().delta, 0);
+    }
+
+    /// The attention-prep kernel rotates image rows by their (t, h, w) table and
+    /// text rows by a scalar offset, exactly like llama.cpp's interleaved M-RoPE.
+    #[test]
+    fn attention_prep_follows_the_position_table() {
+        let d = MetalDevice::new().unwrap();
+        let (heads, kv_heads, head_dim, rope_dims, rows) =
+            (2usize, 1usize, 256usize, 64usize, 5usize);
+        let (theta, eps, scale) = (1.0e7f32, 1e-6f32, 0.0625f32);
+        let qg = random(rows * heads * 2 * head_dim, 1);
+        let kk = random(rows * kv_heads * head_dim, 2);
+        let vv = random(rows * kv_heads * head_dim, 3);
+        let norm = vec![1.; head_dim];
+        let positions: [[i32; 3]; 5] = [[3, 3, 3], [9, 9, 9], [9, 9, 10], [9, 10, 9], [9, 10, 10]];
+        let (sec_h, sec_w) = (11usize, 10usize);
+        let run = |table: Option<&[[i32; 3]]>, delta: i32| -> (Vec<f32>, Vec<f32>) {
+            let t = |data: &[f32], n: usize| Tensor::from_f32(&d, [n], DType::F32, data).unwrap();
+            let (qg_t, k_t, v_t) = (t(&qg, qg.len()), t(&kk, kk.len()), t(&vv, vv.len()));
+            let (qn, kn) = (t(&norm, head_dim), t(&norm, head_dim));
+            let pos3 = Tensor::from_le_bytes(
+                &d,
+                [rows * 3],
+                DType::F32,
+                &table
+                    .map(|tab| {
+                        tab.iter()
+                            .flatten()
+                            .flat_map(|v| v.to_le_bytes())
+                            .collect::<Vec<u8>>()
+                    })
+                    .unwrap_or_else(|| vec![0; rows * 12]),
+            )
+            .unwrap();
+            let q_out = Tensor::zeros(&d, [rows * heads * head_dim], DType::F16).unwrap();
+            let cache = Tensor::zeros(&d, [(rows + 2) * kv_heads * head_dim], DType::F16).unwrap();
+            let params = Params::default()
+                .u(rows)
+                .unwrap()
+                .u(heads)
+                .unwrap()
+                .u(kv_heads)
+                .unwrap()
+                .u(head_dim)
+                .unwrap()
+                .u(rope_dims)
+                .unwrap()
+                .u(2)
+                .unwrap()
+                .f(theta)
+                .f(eps)
+                .u(kv_heads * head_dim)
+                .unwrap()
+                .f(scale)
+                .i(delta)
+                .u(usize::from(table.is_some()))
+                .unwrap()
+                .u(sec_h)
+                .unwrap()
+                .u(sec_w)
+                .unwrap();
+            let e = d.execution_with_shared_encoder(true).unwrap();
+            d.dispatch_hybrid(
+                "h_attn_prep",
+                &[
+                    qg_t.binding(),
+                    k_t.binding(),
+                    v_t.binding(),
+                    qn.binding(),
+                    kn.binding(),
+                    pos3.binding(),
+                ],
+                &[q_out.binding(), cache.binding()],
+                &params.0,
+                [heads + kv_heads, rows, 1],
+                [head_dim, 1, 1],
+                0,
+            )
+            .unwrap();
+            e.finish().unwrap();
+            (
+                q_out.to_f32(),
+                cache.to_f32()[2 * kv_heads * head_dim..].to_vec(),
+            )
+        };
+        let reference = |pos_of: &dyn Fn(usize, usize) -> f32| -> Vec<f32> {
+            // Query heads of every row.
+            let mut out = Vec::new();
+            for r in 0..rows {
+                for h in 0..heads {
+                    let base = (r * heads + h) * 2 * head_dim;
+                    let x = &qg[base..base + head_dim];
+                    let rms = (x.iter().map(|v| v * v).sum::<f32>() / head_dim as f32 + eps)
+                        .sqrt()
+                        .recip();
+                    let n: Vec<f32> = x.iter().map(|v| v * rms).collect();
+                    let mut y = n.clone();
+                    for pair in 0..rope_dims / 2 {
+                        let angle =
+                            pos_of(r, pair) * theta.powf(-2. * pair as f32 / rope_dims as f32);
+                        let (c, s) = (angle.cos(), angle.sin());
+                        y[pair] = n[pair] * c - n[pair + rope_dims / 2] * s;
+                        y[pair + rope_dims / 2] = n[pair] * s + n[pair + rope_dims / 2] * c;
+                    }
+                    out.extend(y.iter().map(|v| v * scale));
+                }
+            }
+            out
+        };
+        let close = |got: &[f32], want: &[f32], what: &str| {
+            let worst = got
+                .iter()
+                .zip(want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0., f32::max);
+            assert!(worst < 2e-2, "{what}: worst error {worst}");
+        };
+        // Scalar path: rotary position = cache position (2 + row) + delta.
+        let (q, _) = run(None, -3);
+        close(&q, &reference(&|r, _| (2 + r) as f32 - 3.), "scalar offset");
+        // Table path: pairs cycle time, height, width.
+        let (q, _) = run(Some(&positions), 0);
+        let axis_of = |pair: usize| {
+            if pair % 3 == 1 && pair < 3 * sec_h {
+                1
+            } else if pair % 3 == 2 && pair < 3 * sec_w {
+                2
+            } else {
+                0
+            }
+        };
+        close(
+            &q,
+            &reference(&|r, pair| positions[r][axis_of(pair)] as f32),
+            "position table",
+        );
+        // A table of equal axes is the plain rotary embedding at that position.
+        let flat: Vec<[i32; 3]> = (0..rows as i32).map(|r| [r + 7; 3]).collect();
+        let (q_table, k_table) = run(Some(&flat), 0);
+        let (q_plain, k_plain) = run(None, 5);
+        close(&q_table, &q_plain, "equal axes, queries");
+        close(&k_table, &k_plain, "equal axes, keys");
     }
 
     /// Flash attention (both SIMD-group shapes, split and unsplit) against the

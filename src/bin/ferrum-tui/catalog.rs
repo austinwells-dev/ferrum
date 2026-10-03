@@ -11,13 +11,23 @@ pub struct Model {
     pub mtp: bool,
     /// Why `--draft mtp` is unavailable.
     pub mtp_why: String,
+    /// A vision projector sits next to the file, so images can be attached.
+    pub vision: Option<PathBuf>,
     /// Why ferrum cannot run this file; None means it can.
     pub problem: Option<String>,
 }
 
 pub fn make_model(path: PathBuf, name: String, size: u64) -> Model {
     let checked = check(&path);
+    let vision = if checked.problem.is_none() {
+        ferrum::vision::resolve_projector(&path, None)
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     Model {
+        vision,
         origin: origin_of(&path),
         path,
         name,
