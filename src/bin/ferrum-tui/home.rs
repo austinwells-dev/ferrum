@@ -3,7 +3,7 @@ use crate::*;
 
 const BUTTONS: [(&str, &str, &str); 5] = [
     ("◆", "Chat", "talk to a model right here"),
-    ("⌬", "Agents", "a local coding agent for your project"),
+    ("▣", "Agents", "a coding agent for your project"),
     ("◈", "Serve", "OpenAI & Anthropic compatible API"),
     ("⚙", "Settings", "folders, favorites, startup"),
     ("✕", "Quit", "see you soon"),
@@ -76,7 +76,7 @@ impl App {
         let tx = area.x + area.width.saturating_sub(tag.chars().count() as u16) / 2;
         put(f, tx, top + 6, tag, Style::new().fg(DIM));
 
-        let w = 54u16.min(area.width.saturating_sub(4));
+        let w = 62u16.min(area.width.saturating_sub(4));
         let bx = area.x + (area.width - w) / 2;
         let mut y = top + 9;
         for (i, (icon, title, desc)) in BUTTONS.iter().enumerate() {
@@ -150,8 +150,12 @@ fn button_line(
 ) -> Line<'static> {
     let bg = if on { SELECTED } else { Color::Reset };
     let left = format!(" {} {} {title}", if on { "▸" } else { " " }, icon);
-    let right = format!("{desc}  {badge} ");
-    let pad = width.saturating_sub(left.chars().count() + right.chars().count());
+    let tail = format!("  {badge} ");
+    // Whatever room the title leaves (keeping a gap of two) is the description's.
+    let room = width.saturating_sub(left.chars().count() + tail.chars().count() + 2);
+    let desc = clip(desc, room);
+    let pad =
+        width.saturating_sub(left.chars().count() + desc.chars().count() + tail.chars().count());
     Line::from(vec![
         Span::styled(
             left,
@@ -165,10 +169,7 @@ fn button_line(
                 }),
         ),
         Span::styled(" ".repeat(pad), Style::new().bg(bg)),
-        Span::styled(
-            desc.to_string(),
-            Style::new().fg(if on { GOLD } else { DIM }).bg(bg),
-        ),
-        Span::styled(format!("  {badge} "), Style::new().fg(FAINT).bg(bg)),
+        Span::styled(desc, Style::new().fg(if on { GOLD } else { DIM }).bg(bg)),
+        Span::styled(tail, Style::new().fg(FAINT).bg(bg)),
     ])
 }
