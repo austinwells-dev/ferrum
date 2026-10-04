@@ -78,3 +78,6 @@ pub fn shell_quote(s: &str) -> String {
 }
 
 pub const CODE_BG: Color = Color::Rgb(27, 27, 36);
+pub const BLUE: Color = Color::Rgb(122, 170, 255);
+pub const TEAL: Color = Color::Rgb(110, 200, 210);
+pub const COMMENT: Color = Color::Rgb(104, 106, 126);

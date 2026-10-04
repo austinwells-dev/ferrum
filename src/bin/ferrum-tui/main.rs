@@ -14,6 +14,7 @@ mod chat;
 mod coding;
 mod editor;
 mod fields;
+mod highlight;
 mod home;
 mod pick;
 mod search;

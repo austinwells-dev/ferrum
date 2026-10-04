@@ -13,7 +13,7 @@ Type `/help` in any chat for the full command list.
 
 ## Chat
 
-Chat runs the model inside the TUI with streaming markdown and a separate reasoning view (`/thoughts` shows or hides it, `/think on|off` turns reasoning on or off).
+Chat runs the model inside the TUI with streaming markdown (syntax-highlighted code blocks for common languages, tables that wrap to the window, links and horizontal rules) and a separate reasoning view (`/thoughts` shows or hides it, `/think on|off` turns reasoning on or off).
 
 **Attachments.** You can attach files in three ways: with `/attach PATH`, by dropping them onto the terminal, or from the clipboard with Ctrl-V or `/paste` (files, screenshots or text). `/screenshot` lets you drag out a screen region. If the model has a vision projector next to it, images go to the model as pixels. Otherwise, macOS Vision reads the text in the image and that text is sent instead.
 
