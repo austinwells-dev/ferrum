@@ -51,7 +51,7 @@ Write the key as `$NAME` to read it from an environment variable instead of savi
 
 ### Skills
 
-The agent loads `SKILL.md` files on demand. It looks for them anywhere in the project folder (up to four folders deep, skipping hidden folders, `node_modules`, `target` and similar) and in `~/.ferrum/skills`. A project skill wins over a global one with the same name.
+The agent loads `SKILL.md` files on demand. It checks `<project>/skills/*/SKILL.md`, `<project>/.ferrum/skills/*/SKILL.md`, `<project>/*/SKILL.md` and `~/.ferrum/skills/*/SKILL.md`: one folder level below each, never deeper. The first skill with a given name wins, in that order.
 
 Each file may start with frontmatter:
 
@@ -62,7 +62,7 @@ description: Ship the app to staging
 ---
 ```
 
-Without frontmatter, the folder name and the first line of text are used. Only the name and description go into the prompt; the agent calls `skill(name)` to read the whole file and see the files beside it, and uses its normal tools to read or run them (so scripts run in the sandbox). `/skills` rescans and lists what was found, and `/name [task]` loads a skill and starts on the task. Up to 40 skills are listed.
+Without frontmatter, the folder name and the first line of text are used. Only the name and description go into the prompt; the agent calls `skill(name)` to read the whole file and see the files beside it, and uses its normal tools to read or run them (so scripts run in the sandbox). Skills appear in the `/` menu. `/skills` rescans and lists what was found, and `/name [task]` loads a skill and starts on the task. Up to 40 skills are listed.
 
 ### Sandbox
 

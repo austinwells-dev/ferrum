@@ -477,6 +477,8 @@ pub struct Agent {
     map: String,
     notes: Option<String>,
     skills_text: String,
+    /// `/name ` entries for the palette.
+    skill_cmds: Vec<(String, String)>,
     pub branch: Option<String>,
     pub dirty: usize,
     /// The model asked the user something: stop after this round.
@@ -488,6 +490,21 @@ impl Agent {
     fn rescan_skills(&mut self) -> usize {
         let found = skills::discover(&self.project);
         self.skills_text = skills::prompt(&found);
+        self.skill_cmds = found
+            .iter()
+            .map(|s| {
+                (
+                    format!("/{} ", s.name),
+                    format!("skill · {}", skills::one_line(&s.description, 80)),
+                )
+            })
+            .filter(|(n, _)| {
+                !COMMANDS
+                    .iter()
+                    .chain(AGENT_COMMANDS)
+                    .any(|(c, _)| c.trim() == n.trim())
+            })
+            .collect();
         let n = found.len();
         self.shared.lock().unwrap_or_else(|e| e.into_inner()).skills = found;
         n
@@ -639,6 +656,7 @@ impl Chat {
                     map: format!("{}{}", brain::repo_map(&a.project), brain::env_notes()),
                     notes: brain::instructions(&a.project),
                     skills_text: String::new(),
+                    skill_cmds: Vec::new(),
                     branch: None,
                     dirty: 0,
                     asked: false,
@@ -724,7 +742,7 @@ impl Chat {
     }
 
     /// Commands matching what is typed after a leading `/`.
-    pub fn palette(&self) -> Vec<(&'static str, &'static str)> {
+    pub fn palette(&self) -> Vec<(String, String)> {
         if self.phase != Phase::Ready
             || self.palette_off
             || !self.input.starts_with('/')
@@ -739,17 +757,13 @@ impl Chat {
         } else {
             COMMANDS
         };
-        let mut out: Vec<_> = list
-            .iter()
-            .filter(|(n, _)| n.starts_with(&q))
-            .copied()
-            .collect();
-        out.extend(
-            list.iter()
-                .filter(|(n, _)| !n.starts_with(&q) && n.contains(word))
-                .copied(),
-        );
-        out
+        let own = |&(n, d): &(&str, &str)| (n.to_string(), d.to_string());
+        let skills: &[(String, String)] = self.agent.as_ref().map_or(&[], |a| &a.skill_cmds);
+        let mut out: Vec<_> = list.iter().map(own).chain(skills.iter().cloned()).collect();
+        let (mut hits, rest): (Vec<_>, Vec<_>) =
+            out.drain(..).partition(|(n, _)| n.starts_with(&q));
+        hits.extend(rest.into_iter().filter(|(n, _)| n.contains(word)));
+        hits
     }
 
     fn set_input(&mut self, text: &str) {
@@ -1885,7 +1899,7 @@ impl App {
                     return;
                 }
                 KeyCode::Tab => {
-                    chat.set_input(palette[sel].0);
+                    chat.set_input(&palette[sel].0);
                     return;
                 }
                 KeyCode::Esc => {
@@ -1893,7 +1907,7 @@ impl App {
                     return;
                 }
                 KeyCode::Enter => {
-                    chat.set_input(palette[sel].0);
+                    chat.set_input(&palette[sel].0);
                     // Commands that take an argument wait for it.
                     if palette[sel].0.ends_with(' ') {
                         return;

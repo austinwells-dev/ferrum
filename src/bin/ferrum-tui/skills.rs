@@ -4,9 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 const MAX_SKILLS: usize = 40;
-const MAX_DEPTH: usize = 4;
 const BODY_LIMIT: usize = 12_000;
-const SKIP: &[&str] = &["node_modules", "target", "vendor", "dist", "build", "venv"];
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Skill {
@@ -91,52 +89,45 @@ fn is_skill_file(name: &str) -> bool {
     name.eq_ignore_ascii_case("SKILL.md")
 }
 
-fn walk(dir: &Path, depth: usize, project: &Path, out: &mut Vec<Skill>) {
+/// Skills in `<dir>/*/SKILL.md`: one folder level, no recursion. Symlinked
+/// folders are skipped so a link cannot lead outside the project.
+fn scan(dir: &Path, project: &Path, out: &mut Vec<Skill>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return;
     };
     let mut entries: Vec<_> = entries.flatten().collect();
     entries.sort_by_key(|e| e.file_name());
-    for e in &entries {
-        let name = e.file_name().to_string_lossy().to_string();
-        if e.path().is_file() && is_skill_file(&name) && out.len() < MAX_SKILLS {
-            let folder = dir
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let folder = if dir == project {
-                project
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or(folder)
-            } else {
-                folder
-            };
-            out.extend(read_skill(&e.path(), &folder, project));
-        }
-    }
-    if depth >= MAX_DEPTH {
-        return;
-    }
     for e in entries {
-        let name = e.file_name().to_string_lossy().to_string();
-        let hidden = name.starts_with('.') && name != ".ferrum";
-        // symlinks are not followed: a link must not lead outside the project
-        let real = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-        if real && !hidden && !SKIP.contains(&name.as_str()) {
-            walk(&e.path(), depth + 1, project, out);
+        let folder = e.file_name().to_string_lossy().to_string();
+        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) || folder.starts_with('.') {
+            continue;
+        }
+        let Ok(inner) = fs::read_dir(e.path()) else {
+            continue;
+        };
+        let file = inner
+            .flatten()
+            .find(|f| is_skill_file(&f.file_name().to_string_lossy()) && f.path().is_file());
+        if let Some(f) = file {
+            out.extend(read_skill(&f.path(), &folder, project));
         }
     }
 }
 
-/// Skills found anywhere in the project (a few folders deep), then the ones in
-/// `~/.ferrum/skills`. A project skill wins over a global one of the same name.
+/// Skills in `<project>/*/`, `<project>/skills/*/` and `<project>/.ferrum/skills/*/`,
+/// then `~/.ferrum/skills/*/`. A project skill wins over a global one of the same name.
 pub fn discover(project: &Path) -> Vec<Skill> {
     let mut out = Vec::new();
-    walk(project, 0, project, &mut out);
+    for dir in [
+        project.join("skills"),
+        project.join(".ferrum").join("skills"),
+        project.to_path_buf(),
+    ] {
+        scan(&dir, project, &mut out);
+    }
     let home = expand_home();
     let mut global = Vec::new();
-    walk(&home.join(".ferrum").join("skills"), 1, &home, &mut global);
+    scan(&home.join(".ferrum").join("skills"), &home, &mut global);
     for mut s in global {
         s.global = true;
         s.dir = s
@@ -144,10 +135,11 @@ pub fn discover(project: &Path) -> Vec<Skill> {
             .parent()
             .map(|d| d.display().to_string())
             .unwrap_or_default();
-        if !out.iter().any(|p| p.name == s.name) && out.len() < MAX_SKILLS {
-            out.push(s);
-        }
+        out.push(s);
     }
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|s| seen.insert(s.name.to_lowercase()));
+    out.truncate(MAX_SKILLS);
     out
 }
 
@@ -155,6 +147,19 @@ fn expand_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
+}
+
+/// `text` on one line, cut with an ellipsis.
+pub fn one_line(text: &str, max: usize) -> String {
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        format!(
+            "{}…",
+            flat.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
+    }
 }
 
 /// The prompt section listing what is available.
@@ -166,7 +171,7 @@ pub fn prompt(skills: &[Skill]) -> String {
         "SKILLS\nInstructions for specific kinds of work are available. When a task matches one, call `skill` with its name and follow it. Do not load a skill that does not match.\n",
     );
     for k in skills {
-        let desc = crate::agent::clip_output(&k.description, 160);
+        let desc = one_line(&k.description, 160);
         let loc = if k.global { "~/.ferrum/skills" } else { &k.dir };
         s += &format!("- {} ({loc}): {desc}\n", k.name);
     }
@@ -257,34 +262,35 @@ mod tests {
     }
 
     #[test]
-    fn finds_project_skills_and_loads_them() {
+    fn finds_project_skills_one_level_down_and_loads_them() {
         let dir = std::env::temp_dir().join(format!("ferrum-skills-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("tools/lint/scripts")).unwrap();
-        fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        fs::create_dir_all(dir.join("skills/lint/scripts")).unwrap();
+        fs::create_dir_all(dir.join("tools/other")).unwrap();
+        fs::create_dir_all(dir.join("deep/er/lint")).unwrap();
+        fs::write(dir.join("SKILL.md"), "not scanned").unwrap();
         fs::write(
-            dir.join("SKILL.md"),
-            "---\ndescription: Root skill\n---\nhi",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("tools/lint/SKILL.md"),
+            dir.join("skills/lint/SKILL.md"),
             "---\nname: lint\ndescription: Run the linter\n---\nRun scripts/run.sh",
         )
         .unwrap();
-        fs::write(dir.join("tools/lint/scripts/run.sh"), "echo ok").unwrap();
-        fs::write(dir.join("node_modules/pkg/SKILL.md"), "ignored").unwrap();
+        fs::write(dir.join("skills/lint/scripts/run.sh"), "echo ok").unwrap();
+        fs::write(dir.join("tools/other/SKILL.md"), "x").unwrap();
+        fs::write(dir.join("deep/er/lint/SKILL.md"), "too deep").unwrap();
+        fs::create_dir_all(dir.join("mine")).unwrap();
+        fs::write(dir.join("mine/SKILL.md"), "My own skill").unwrap();
         let mut found = Vec::new();
-        walk(&dir, 0, &dir, &mut found);
+        for d in [dir.join("skills"), dir.clone()] {
+            scan(&d, &dir, &mut found);
+        }
         let names: Vec<_> = found.iter().map(|s| s.name.as_str()).collect();
-        assert_eq!(found.len(), 2, "{names:?}");
-        assert!(names.contains(&"lint"));
+        assert_eq!(names, ["lint", "mine"], "{names:?}");
         let text = load(&found, "LINT").unwrap();
         assert!(
-            text.contains("Run scripts/run.sh") && text.contains("- tools/lint/scripts/run.sh\n")
+            text.contains("Run scripts/run.sh") && text.contains("- skills/lint/scripts/run.sh\n")
         );
         assert!(load(&found, "nope").unwrap_err().contains("lint"));
-        assert!(prompt(&found).contains("lint (tools/lint): Run the linter"));
+        assert!(prompt(&found).contains("lint (skills/lint): Run the linter"));
         let _ = fs::remove_dir_all(&dir);
     }
 }
