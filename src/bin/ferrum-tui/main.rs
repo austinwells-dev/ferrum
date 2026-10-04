@@ -21,6 +21,7 @@ mod serve;
 mod sessions;
 mod settings;
 mod side;
+mod skills;
 mod splash;
 mod store;
 mod text;

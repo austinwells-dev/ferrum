@@ -476,6 +476,7 @@ pub struct Agent {
     pub compact: bool,
     map: String,
     notes: Option<String>,
+    skills_text: String,
     pub branch: Option<String>,
     pub dirty: usize,
     /// The model asked the user something: stop after this round.
@@ -483,6 +484,15 @@ pub struct Agent {
 }
 
 impl Agent {
+    /// Look for SKILL.md files again; returns how many there are.
+    fn rescan_skills(&mut self) -> usize {
+        let found = skills::discover(&self.project);
+        self.skills_text = skills::prompt(&found);
+        let n = found.len();
+        self.shared.lock().unwrap_or_else(|e| e.into_inner()).skills = found;
+        n
+    }
+
     fn refresh_git(&mut self) {
         self.branch = brain::git_branch(&self.project);
         self.dirty = brain::git_dirty(&self.project);
@@ -514,6 +524,7 @@ pub const AGENT_COMMANDS: &[(&str, &str)] = &[
     ("/ponytail off", "no minimal-code guidance"),
     ("/compact", "snapshot the session and clear old history now"),
     ("/ctx", "context use and what was saved"),
+    ("/skills", "list the SKILL.md skills (/name runs one)"),
     ("/todo", "show the agent's plan"),
     (
         "/tools edits",
@@ -627,11 +638,13 @@ impl Chat {
                     compact: a.compact,
                     map: format!("{}{}", brain::repo_map(&a.project), brain::env_notes()),
                     notes: brain::instructions(&a.project),
+                    skills_text: String::new(),
                     branch: None,
                     dirty: 0,
                     asked: false,
                 };
                 agent.refresh_git();
+                agent.rescan_skills();
                 (Some(agent), Some(sb))
             }
             None => (None, None),
@@ -783,6 +796,10 @@ impl Chat {
                 &a.map,
                 a.notes.as_deref(),
             ));
+            if !a.skills_text.is_empty() {
+                system.push_str("\n\n");
+                system.push_str(&a.skills_text);
+            }
         } else if self.tools != ToolMode::Off
             && let Ok(sb) = self.sandbox()
         {
@@ -803,7 +820,11 @@ impl Chat {
         if self.tools == ToolMode::Off {
             Vec::new()
         } else if let Some(a) = &self.agent {
-            coding::tool_defs(a.plan, self.network)
+            let mut defs = coding::tool_defs(a.plan, self.network);
+            if !a.skills_text.is_empty() {
+                defs.push(coding::skill_def());
+            }
+            defs
         } else {
             agent::tool_defs(self.network)
         }
@@ -1547,6 +1568,16 @@ impl Chat {
                 self.submit_with("/debt".into(), brain::DEBT_PROMPT.into())
             }
             "/compact" if self.agent.is_some() => self.compact_now("compacted on request"),
+            "/skills" if self.agent.is_some() => {
+                let text = match self.agent.as_mut() {
+                    Some(a) => match a.rescan_skills() {
+                        0 => "no SKILL.md files in this project or ~/.ferrum/skills".to_string(),
+                        _ => a.skills_text.clone(),
+                    },
+                    None => String::new(),
+                };
+                self.note(text);
+            }
             "/ctx" => {
                 let report = self.ctx_report();
                 self.note(report);
@@ -1629,6 +1660,7 @@ impl Chat {
                     self.attach_paths(&paths);
                 }
             }
+            other if self.agent.is_some() && self.run_skill(other) => {}
             other => self.note(format!("unknown command {other} (try /help)")),
         }
         false
@@ -1685,6 +1717,38 @@ impl Chat {
             Ok(Clip::Empty) => self.flash("the clipboard is empty", false),
             Err(e) => self.flash(e, false),
         }
+    }
+
+    /// `/skill-name task…` loads that skill and starts on the task.
+    fn run_skill(&mut self, line: &str) -> bool {
+        let line = line.trim();
+        let rest = line.trim_start_matches('/');
+        let (word, task) = rest.split_once(' ').unwrap_or((rest, ""));
+        let found = self
+            .agent
+            .as_ref()
+            .map(|a| {
+                a.shared
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .skills
+                    .clone()
+            })
+            .unwrap_or_default();
+        let Some(skill) = found.iter().find(|s| s.name.eq_ignore_ascii_case(word)) else {
+            return false;
+        };
+        let body = format!(
+            "Use the skill {:?}: call `skill` to load it, then follow it.{}",
+            skill.name,
+            if task.is_empty() {
+                String::new()
+            } else {
+                format!("\n\n{task}")
+            }
+        );
+        self.submit_with(line.to_string(), body);
+        true
     }
 
     pub fn take_screenshot(&mut self) {

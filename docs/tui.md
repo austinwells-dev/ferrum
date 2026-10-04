@@ -49,6 +49,21 @@ The Agents tab is a local coding agent that works on a real project folder. Pick
 
 Write the key as `$NAME` to read it from an environment variable instead of saving it in `tui.json`. The search request is made from your setting, never from model output, and runs outside the sandbox so that a SearXNG server on this Mac or LAN can be reached. The model only supplies the query. `ask` mode asks before each search.
 
+### Skills
+
+The agent loads `SKILL.md` files on demand. It looks for them anywhere in the project folder (up to four folders deep, skipping hidden folders, `node_modules`, `target` and similar) and in `~/.ferrum/skills`. A project skill wins over a global one with the same name.
+
+Each file may start with frontmatter:
+
+```
+---
+name: deploy
+description: Ship the app to staging
+---
+```
+
+Without frontmatter, the folder name and the first line of text are used. Only the name and description go into the prompt; the agent calls `skill(name)` to read the whole file and see the files beside it, and uses its normal tools to read or run them (so scripts run in the sandbox). `/skills` rescans and lists what was found, and `/name [task]` loads a skill and starts on the task. Up to 40 skills are listed.
+
 ### Sandbox
 
 Every command and download runs inside a macOS Seatbelt sandbox (`sandbox-exec`, profile in [`sandbox.sb`](../src/bin/ferrum-tui/sandbox.sb)):

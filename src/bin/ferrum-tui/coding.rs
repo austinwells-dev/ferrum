@@ -82,6 +82,7 @@ pub struct Shared {
     pub evicted: usize,
     pub evicted_bytes: usize,
     pub compactions: usize,
+    pub skills: Vec<crate::skills::Skill>,
 }
 
 impl Drop for Shared {
@@ -221,6 +222,7 @@ pub fn read_only(name: &str) -> bool {
             | "ctx_read"
             | "todo"
             | "ask_user"
+            | "skill"
             | "web_search"
             | "fetch_url"
             | "process_output"
@@ -244,6 +246,15 @@ pub fn needs_approval(name: &str, mode: ToolMode) -> bool {
         ),
         ToolMode::Edits => matches!(name, "bash" | "fetch_url" | "web_search" | "process_start"),
     }
+}
+
+pub fn skill_def() -> Json {
+    def(
+        "skill",
+        "Load a skill: step-by-step instructions for a kind of task, with its files. Use it when the task matches a skill in the SKILLS list.",
+        json!({"name": {"type": "string", "description": "The skill's name."}}),
+        &["name"],
+    )
 }
 
 pub fn tool_defs(plan: bool, network: bool) -> Vec<Json> {
@@ -837,6 +848,7 @@ fn run(
                 arg_int(args, "limit").unwrap_or(80).clamp(1, 400) as usize,
             )
         }
+        "skill" => crate::skills::load(&lock(shared).skills, arg_str(args, "name")?),
         "ask_user" => Ok(
             "the question was shown to the user; their reply comes in their next message".into(),
         ),
