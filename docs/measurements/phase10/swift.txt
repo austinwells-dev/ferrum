@@ -1,0 +1,94 @@
+positions 2040; Ferrum PPL 10.3298; llama.cpp PPL 10.3308; mean KLD 0.000156; median 0.000083; p99 0.001449; max 0.006546; same top-1 99.46%; 39.9 s
+positions 2040; Ferrum PPL 10.3298; llama.cpp PPL 10.3308; mean KLD 0.000156; median 0.000083; p99 0.001449; max 0.006546; same top-1 99.46%; 40.1 s
+positions 2040; Ferrum PPL 10.3253; llama.cpp PPL 10.3308; mean KLD 0.000190; median 0.000103; p99 0.001628; max 0.008201; same top-1 99.41%; 39.7 s
+14 verify steps, 3.43 tokens/step, 3 corrupted blocks
+speculative output == greedy reference (48 tokens)
+verify rows vs single-row decode over 4 positions: max |dlogit| 0.0006, max KL 1.15e-9
+replay after commit(2) vs plain forward: max |dlogit| 0.0000 (scale 22.3), argmax 369 vs 369
+7 verify steps, 6.86 tokens/step, 2 corrupted blocks
+speculative output == greedy reference (48 tokens)
+verify rows vs single-row decode over 9 positions: max |dlogit| 0.0110, max KL 2.54e-7
+replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 24.8), argmax 5759 vs 5759
+4 verify steps, 12.00 tokens/step, 1 corrupted blocks
+speculative output == greedy reference (48 tokens)
+verify rows vs single-row decode over 17 positions: max |dlogit| 0.0121, max KL 4.25e-6
+replay after commit(9) vs plain forward: max |dlogit| 0.0012 (scale 23.2), argmax 18509 vs 18509
+14 verify steps, 3.43 tokens/step, 3 corrupted blocks
+speculative output == greedy reference (48 tokens)
+verify rows vs single-row decode over 4 positions: max |dlogit| 0.0056, max KL 1.59e-8
+replay after commit(2) vs plain forward: max |dlogit| 0.0000 (scale 22.3), argmax 369 vs 369
+7 verify steps, 6.86 tokens/step, 2 corrupted blocks
+speculative output == greedy reference (48 tokens)
+verify rows vs single-row decode over 9 positions: max |dlogit| 0.0358, max KL 1.19e-6
+replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 24.8), argmax 5759 vs 5759
+4 verify steps, 12.00 tokens/step, 1 corrupted blocks
+speculative output == greedy reference (48 tokens)
+verify rows vs single-row decode over 17 positions: max |dlogit| 0.0287, max KL 5.46e-6
+replay after commit(9) vs plain forward: max |dlogit| 0.0049 (scale 23.2), argmax 18509 vs 18509
+4 verify steps, 12.00 tokens/step, 1 corrupted blocks
+speculative output == greedy reference (48 tokens)
+verify rows vs single-row decode over 17 positions: max |dlogit| 0.0121, max KL 4.25e-6
+replay after commit(9) vs plain forward: max |dlogit| 0.0011 (scale 23.2), argmax 18509 vs 18509
+### old bench (kv f16)
+| model | test | t/s |
+|---|---|---|
+| Miroslav 1.0 | pp512 @ d16384 | 138.69 |
+| Miroslav 1.0 | tg@0 | 6.87 (step 145.54 ms) |
+| Miroslav 1.0 | tg@16384 | 6.46 (step 154.79 ms) |
+| Miroslav 1.0 | pp512 | 183.02 ± 0.00 |
+### new bench (kv f16)
+| model | test | t/s |
+|---|---|---|
+| Miroslav 1.0 | pp512 @ d16384 | 138.76 |
+| Miroslav 1.0 | tg@0 | 7.00 (step 142.84 ms) |
+| Miroslav 1.0 | tg@16384 | 6.42 (step 155.78 ms) |
+| Miroslav 1.0 | pp512 | 183.29 ± 0.00 |
+### new-q8 bench (kv q8)
+| model | test | t/s |
+|---|---|---|
+| Miroslav 1.0 | pp512 @ d16384 | 142.45 |
+| Miroslav 1.0 | tg@0 | 7.02 (step 142.47 ms) |
+| Miroslav 1.0 | tg@16384 | 6.46 (step 154.71 ms) |
+| Miroslav 1.0 | pp512 | 183.52 ± 0.00 |
+### old spec depth 0 (kv f16)
+drafter dflash2 (50307d4c4cde6860d4eee73e2547cd786fe8e8a4) (max 7 drafts); memory predicted 1147.5 MiB, measured 1146.0 MiB
+prompt 0: 96 tokens, 21.2 tok/s, acceptance 5.00 (19 steps), baseline 6.9 tok/s, identical
+prompt 1: 96 tokens, 21.2 tok/s, acceptance 5.05 (19 steps), baseline 7.0 tok/s, identical
+speculative: 21.23 tok/s, acceptance length 5.026, draft 28.9 ms/step, verify 203.7 ms/step
+acceptance by position: 97% 87% 63% 50% 45% 34% 26%
+baseline: 6.96 tok/s; speedup 3.05x; greedy mismatches 0
+### new spec depth 0 (kv f16)
+drafter dflash2 (50307d4c4cde6860d4eee73e2547cd786fe8e8a4) (max 7 drafts); memory predicted 1147.5 MiB, measured 1146.0 MiB
+prompt 0: 96 tokens, 21.4 tok/s, acceptance 5.00 (19 steps), baseline 7.0 tok/s, identical
+prompt 1: 96 tokens, 21.5 tok/s, acceptance 5.05 (19 steps), baseline 6.9 tok/s, identical
+speculative: 21.44 tok/s, acceptance length 5.026, draft 28.5 ms/step, verify 201.8 ms/step
+acceptance by position: 97% 87% 63% 50% 45% 34% 26%
+baseline: 6.95 tok/s; speedup 3.09x; greedy mismatches 0
+### new-q8 spec depth 0 (kv q8)
+drafter dflash2 (50307d4c4cde6860d4eee73e2547cd786fe8e8a4) (max 7 drafts); memory predicted 1147.5 MiB, measured 1146.0 MiB
+prompt 0: 96 tokens, 21.3 tok/s, acceptance 5.00 (19 steps), baseline 6.9 tok/s, identical
+prompt 1: 96 tokens, 21.4 tok/s, acceptance 5.05 (19 steps), baseline 6.9 tok/s, identical
+speculative: 21.35 tok/s, acceptance length 5.026, draft 28.4 ms/step, verify 202.9 ms/step
+acceptance by position: 97% 87% 63% 50% 45% 34% 26%
+baseline: 6.89 tok/s; speedup 3.10x; greedy mismatches 0
+### old spec depth 16384 (kv f16)
+drafter dflash2 (50307d4c4cde6860d4eee73e2547cd786fe8e8a4) (max 7 drafts); memory predicted 1147.5 MiB, measured 1146.0 MiB
+prompt 0: 96 tokens, 8.9 tok/s, acceptance 4.36 (22 steps), baseline 6.4 tok/s, identical
+prompt 1: 96 tokens, 8.8 tok/s, acceptance 4.36 (22 steps), baseline 6.5 tok/s, identical
+speculative: 8.85 tok/s, acceptance length 4.364, draft 38.3 ms/step, verify 449.9 ms/step
+acceptance by position: 93% 80% 52% 36% 32% 23% 20%
+baseline: 6.45 tok/s; speedup 1.37x; greedy mismatches 0
+### new spec depth 16384 (kv f16)
+drafter dflash2 (50307d4c4cde6860d4eee73e2547cd786fe8e8a4) (max 7 drafts); memory predicted 1147.5 MiB, measured 1146.0 MiB
+prompt 0: 96 tokens, 15.9 tok/s, acceptance 4.17 (23 steps), baseline 6.5 tok/s, identical
+prompt 1: 96 tokens, 16.8 tok/s, acceptance 4.36 (22 steps), baseline 6.4 tok/s, identical
+speculative: 16.34 tok/s, acceptance length 4.267, draft 37.5 ms/step, verify 218.3 ms/step
+acceptance by position: 91% 78% 51% 33% 31% 22% 20%
+baseline: 6.42 tok/s; speedup 2.54x; greedy mismatches 0
+### new-q8 spec depth 16384 (kv q8)
+drafter dflash2 (50307d4c4cde6860d4eee73e2547cd786fe8e8a4) (max 7 drafts); memory predicted 1147.5 MiB, measured 1146.0 MiB
+prompt 0: 96 tokens, 17.5 tok/s, acceptance 4.57 (21 steps), baseline 6.4 tok/s, identical
+prompt 1: 96 tokens, 16.7 tok/s, acceptance 4.36 (22 steps), baseline 6.4 tok/s, identical
+speculative: 17.09 tok/s, acceptance length 4.465, draft 37.7 ms/step, verify 218.3 ms/step
+acceptance by position: 93% 81% 56% 37% 33% 26% 21%
+baseline: 6.45 tok/s; speedup 2.65x; greedy mismatches 0

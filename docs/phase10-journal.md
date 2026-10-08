@@ -150,6 +150,26 @@ mismatches: main 0/2 and 2/2, branch F16 0/2 and 1/2, all at top-2 margins
 0.04–0.11 (the existing single- vs multi-row rounding); Q8 1/2 and 2/2 at
 margins 0.08–0.11, as explained in Experiment 4.
 
+## Swift 27B (dense) check
+
+Same tools on Swift-1.5-Qwen3.8-27B Q4_K_M (log: `measurements/phase10/swift.txt`),
+DFlash2 drafter `z-lab/Qwen3.8-27B-DFlash2` (16 drafts, so verify is a 17-row
+prompt-attention chunk), 2 prompts × 96 tokens.
+
+| | main F16 | branch F16 | branch Q8 |
+|---|---|---|---|
+| KLD vs llama.cpp (512 ctx) | 0.000156, 99.46% | 0.000156, 99.46% | 0.000190, 99.41% |
+| tg @ 0 / @ 16K | 6.87 / 6.46 | 7.00 / 6.42 | 7.02 / 6.46 |
+| pp512 @ 16K | 138.7 | 138.8 | 142.5 |
+| spec, depth 0 | 21.2 tok/s (3.05×) | 21.4 (3.09×) | 21.4 (3.10×) |
+| spec, depth 16K | 8.85 (1.37×), verify 450 ms | **16.3 (2.54×)**, verify 218 ms | 17.1 (2.66×), verify 218 ms |
+
+All greedy speculative outputs were identical to plain greedy. Verify-vs-decode
+logit gaps (`hybrid_spec_check`, blocks 3/8/16): F16 0.0006/0.011/0.012 (main
+0.012 at 16), Q8 0.006/0.036/0.029. Plain decode on the dense model is weight
+bound, so attention changes barely show there; the gain is in the 17-row
+verify, now on the staged prompt kernel.
+
 ## Revert and A/B
 
 `FERRUM_HYBRID_LEGACY_ATTENTION=1` restores the Phase 9 routing (simdgroup
