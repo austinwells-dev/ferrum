@@ -1,0 +1,42 @@
+### main depth 32768 drafts 0 (kv f16)
+drafter dflash2 (9b4852c05fd00b672b7434b1bb105bc03c8682b0) (max 2 drafts); memory predicted 387.5 MiB, measured 386.2 MiB
+prompt 0: 192 tokens, 32.2 tok/s, acceptance 2.53 (76 steps), baseline 30.7 tok/s, identical
+prompt 1: 192 tokens, 32.2 tok/s, acceptance 2.53 (76 steps), baseline 30.8 tok/s, identical
+speculative: 32.21 tok/s, acceptance length 2.526, draft 16.9 ms/step, verify 59.5 ms/step
+acceptance by position: 84% 68%
+baseline: 30.76 tok/s; speedup 1.05x; greedy mismatches 0
+### branch depth 32768 drafts 0 (kv f16)
+drafter dflash2 (9b4852c05fd00b672b7434b1bb105bc03c8682b0) (max 2 drafts); memory predicted 387.5 MiB, measured 386.2 MiB
+prompt 0: 192 tokens, 44.8 tok/s, acceptance 2.53 (76 steps), baseline 30.7 tok/s, identical
+prompt 1: 192 tokens, 44.8 tok/s, acceptance 2.53 (76 steps), baseline 31.0 tok/s, identical
+speculative: 44.80 tok/s, acceptance length 2.526, draft 16.8 ms/step, verify 37.5 ms/step
+acceptance by position: 84% 68%
+baseline: 30.83 tok/s; speedup 1.45x; greedy mismatches 0
+### branch-q8 depth 32768 drafts 0 (kv q8)
+drafter dflash2 (9b4852c05fd00b672b7434b1bb105bc03c8682b0) (max 2 drafts); memory predicted 387.5 MiB, measured 386.2 MiB
+prompt 0: 192 tokens, 46.3 tok/s, acceptance 2.53 (76 steps), baseline 32.7 tok/s, identical
+prompt 1: 192 tokens, 44.7 tok/s, acceptance 2.46 (78 steps), baseline 32.9 tok/s, diverges at 137 (target top-2 margin 0.1093)
+speculative: 45.48 tok/s, acceptance length 2.494, draft 16.7 ms/step, verify 36.0 ms/step
+acceptance by position: 82% 67%
+baseline: 32.76 tok/s; speedup 1.39x; greedy mismatches 1
+### main depth 32768 drafts 8 (kv f16)
+drafter dflash2 (9b4852c05fd00b672b7434b1bb105bc03c8682b0) (max 8 drafts); memory predicted 399.2 MiB, measured 397.9 MiB
+prompt 0: 192 tokens, 8.3 tok/s, acceptance 3.43 (56 steps), baseline 30.7 tok/s, diverges at 54 (target top-2 margin 0.1020)
+prompt 1: 192 tokens, 10.7 tok/s, acceptance 4.47 (43 steps), baseline 31.1 tok/s, diverges at 137 (target top-2 margin 0.0375)
+speculative: 9.31 tok/s, acceptance length 3.879, draft 39.1 ms/step, verify 375.1 ms/step
+acceptance by position: 73% 58% 43% 36% 29% 22% 16% 10%
+baseline: 30.92 tok/s; speedup 0.30x; greedy mismatches 2
+### branch depth 32768 drafts 8 (kv f16)
+drafter dflash2 (9b4852c05fd00b672b7434b1bb105bc03c8682b0) (max 8 drafts); memory predicted 399.2 MiB, measured 397.9 MiB
+prompt 0: 192 tokens, 34.7 tok/s, acceptance 4.17 (46 steps), baseline 30.0 tok/s, diverges at 24 (target top-2 margin 0.0376)
+prompt 1: 192 tokens, 36.5 tok/s, acceptance 4.36 (44 steps), baseline 30.9 tok/s, identical
+speculative: 35.57 tok/s, acceptance length 4.267, draft 38.6 ms/step, verify 79.0 ms/step
+acceptance by position: 81% 62% 46% 42% 34% 28% 20% 13%
+baseline: 30.47 tok/s; speedup 1.17x; greedy mismatches 1
+### branch-q8 depth 32768 drafts 8 (kv q8)
+drafter dflash2 (9b4852c05fd00b672b7434b1bb105bc03c8682b0) (max 8 drafts); memory predicted 399.2 MiB, measured 397.9 MiB
+prompt 0: 192 tokens, 31.2 tok/s, acceptance 3.76 (51 steps), baseline 32.6 tok/s, diverges at 67 (target top-2 margin 0.0795)
+prompt 1: 192 tokens, 34.5 tok/s, acceptance 4.27 (45 steps), baseline 32.2 tok/s, diverges at 137 (target top-2 margin 0.1093)
+speculative: 32.77 tok/s, acceptance length 4.000, draft 38.9 ms/step, verify 80.9 ms/step
+acceptance by position: 76% 60% 46% 39% 30% 23% 16% 10%
+baseline: 32.36 tok/s; speedup 1.01x; greedy mismatches 2

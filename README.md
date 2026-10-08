@@ -17,7 +17,7 @@ You give it a model file and then either chat in the terminal, use the full-scre
 
 - **Faster than llama.cpp on the same files.** Measured on an M5: 15% faster prefill and 11% faster decode on a dense 27B model, 8–18% faster on a 35B mixture-of-experts. [Numbers below](#performance).
 - **Lossless speculative decoding, up to 2.5× faster.** Supports MTP heads, DFlash/DFlash2 and DSpark drafters. Greedy output is identical with and without speculation. On the dense 27B, Ferrum checks 8–16 drafted tokens for about 1.5× the cost of one token, where llama.cpp pays 2.4–3.8×.
-- **Plans memory before loading weights.** Every buffer is predicted from GGUF metadata, and Ferrum picks the largest context that fits: 101K tokens for the 27B model, the full 262K for the 35B MoE. Predictions match Metal's own accounting to within a few MiB.
+- **Plans memory before loading weights.** Every buffer is predicted from GGUF metadata, and Ferrum picks the largest context that fits: 101K tokens for the 27B model (190K with the optional 8-bit KV cache, `--kv-cache q8`), the full 262K for the 35B MoE. Predictions match Metal's own accounting to within a few MiB.
 - **Matches llama.cpp's output.** Mean KL divergence against llama.cpp's own logits is 4×10⁻⁶ on the 27B model.
 - **Drop-in server.** OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`, tool calls, reasoning controls, image input, and conversation caching that only processes the new suffix of each request.
 - **Coding agent in a sandbox.** The TUI's agent can edit a project, run commands and fetch pages inside a macOS Seatbelt profile that can only write to that project.
