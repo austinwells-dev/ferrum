@@ -2,6 +2,7 @@
 //! usage: hybrid_spec MODEL.gguf --drafter mtp|DRAFT_DIR [--drafts K]
 //!        [--tokens 256] [--context 8192] [--temp 0] [--baseline] [--prompts N]
 //!        [--pmin P]  (DSpark confidence cut-off)
+//!        [--depth N --filler FILE]  (generate after N tokens of FILE in the prompt)
 //!
 //! Each prompt is rendered with the model's chat template (thinking on) and
 //! generated with speculation. With --baseline the same prompt is first
@@ -48,6 +49,7 @@ fn main() -> Result<()> {
     let prompts: usize = get("--prompts", &PROMPTS.len().to_string())
         .parse()
         .expect("prompts");
+    let depth: usize = get("--depth", "0").parse().expect("depth");
     let drafter_arg = get("--drafter", "mtp");
     let drafts: usize = get("--drafts", "0").parse().expect("drafts");
     let spec = SpecOptions {
@@ -89,13 +91,28 @@ fn main() -> Result<()> {
         seed: 7,
         ..Default::default()
     };
+    // Long-context runs: the first `depth` tokens of the filler file precede
+    // every prompt, so drafting and verification run against a deep cache.
+    let filler = if depth > 0 {
+        let text = std::fs::read_to_string(get("--filler", "")).expect("--filler FILE");
+        let ids = rt.loaded.tokenizer.encode(&text)?;
+        assert!(ids.len() >= depth, "filler has only {} tokens", ids.len());
+        rt.loaded.tokenizer.decode(&ids[..depth])?
+    } else {
+        String::new()
+    };
     let (mut base_tokens, mut base_secs) = (0usize, 0f64);
     let (mut spec_tokens, mut spec_secs) = (0usize, 0f64);
     let mut total = SpecStats::default();
     let mut mismatches = 0;
     for (index, prompt) in PROMPTS.iter().take(prompts).enumerate() {
+        let content = if depth > 0 {
+            format!("Reference material:\n\n{filler}\n\n---\n\n{prompt}")
+        } else {
+            prompt.to_string()
+        };
         let request = ChatRequest::new(
-            vec![json!({"role": "user", "content": prompt})],
+            vec![json!({"role": "user", "content": content})],
             sampling.clone(),
         );
         let text = rt.render(&request)?;

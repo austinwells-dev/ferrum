@@ -25,6 +25,7 @@ Ferrum was built in phases, with each phase's experiments recorded as they happe
 | 7 | Closing the gap to llama.cpp on GGUF (73 experiments) | [Journal](phase7a-performance-journal.md) |
 | 8 | Large hybrid models (27B dense, 35B MoE), memory planner, server | [Plan](phase8-plan.md), [journal](phase8-journal.md) |
 | 9 | Lossless speculative decoding: MTP, DFlash, DSpark | [Plan](phase9-plan.md), [journal](phase9-journal.md) |
+| 10 | Long-context attention: Q8 K/V cache, TensorOps verify and staged prompt attention | [Journal](phase10-journal.md) |
 | — | Image input (Qwen3-VL projector) | [vision.md](vision.md) |
 
 The journals mention work branches such as `codex/phase2-transformer`. Those branches have been merged into `main` and archived as tags, for example `archive/codex/phase2-transformer`.

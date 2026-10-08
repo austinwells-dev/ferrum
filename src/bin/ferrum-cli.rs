@@ -1,6 +1,6 @@
 //! Interactive terminal chat with a Qwen3.5-family GGUF.
 //!
-//! ferrum-cli --model FILE.gguf [--context N|auto] [--system TEXT]
+//! ferrum-cli --model FILE.gguf [--context N|auto] [--kv-cache f16|q8] [--system TEXT]
 //!            [--temperature T] [--top-p P] [--top-k K] [--min-p P]
 //!            [--presence-penalty X] [--repetition-penalty X] [--seed N]
 //!            [--max-tokens N] [--no-think] [--reasoning-effort LEVEL]
@@ -14,6 +14,7 @@
 use ferrum::{
     Error, Result,
     hybrid::{
+        KvCache,
         plan::PlanOptions,
         runtime::{ChatRequest, Delta, Runtime, SpecOptions},
     },
@@ -24,6 +25,7 @@ use std::io::{BufRead, Write};
 struct Options {
     model: String,
     context: Option<usize>,
+    kv_cache: KvCache,
     system: Option<String>,
     max_tokens: usize,
     think: bool,
@@ -41,6 +43,7 @@ fn parse() -> Result<Options> {
     let mut o = Options {
         model: String::new(),
         context: None,
+        kv_cache: KvCache::from_env(),
         system: None,
         max_tokens: 32768,
         think: true,
@@ -91,6 +94,7 @@ fn parse() -> Result<Options> {
                             Some(number()?)
                         }
                     }
+                    "--kv-cache" => o.kv_cache = value.parse()?,
                     "--system" => o.system = Some(value.clone()),
                     "--mmproj" => o.mmproj = Some(value.clone()),
                     "--image-tokens" => o.image_tokens = number()?,
@@ -138,6 +142,7 @@ fn run() -> Result<()> {
         &o.model,
         PlanOptions {
             context: o.context,
+            kv_cache: o.kv_cache,
             ..Default::default()
         },
         o.spec.as_ref(),
@@ -183,10 +188,11 @@ fn run() -> Result<()> {
     sampling.validate()?;
     let plan = &rt.loaded.plan;
     eprintln!(
-        "{}: context {} tokens (max {}), {:.1} GiB weights, loaded in {:.1} s",
+        "{}: context {} tokens (max {}, {} K/V), {:.1} GiB weights, loaded in {:.1} s",
         rt.model_name,
         plan.context,
         plan.max_context,
+        rt.loaded.model.config.kv_cache,
         plan.weights as f64 / (1u64 << 30) as f64,
         rt.loaded.load_time.as_secs_f64()
     );

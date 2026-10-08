@@ -181,7 +181,7 @@ fn run(
     );
     info!(
         None,
-        "context {} tokens (largest that fits: {}, trained {}); memory {:.2} GiB of {:.2} GiB budget: weights {:.2}, KV {:.2} ({:.1} KiB/token), recurrent+snapshots {:.2}, scratch {:.2}",
+        "context {} tokens (largest that fits: {}, trained {}); memory {:.2} GiB of {:.2} GiB budget: weights {:.2}, KV {:.2} ({}, {:.1} KiB/token), recurrent+snapshots {:.2}, scratch {:.2}",
         n(plan.context),
         n(plan.max_context),
         n(plan.trained_context),
@@ -189,6 +189,7 @@ fn run(
         gib(plan.budget),
         gib(plan.weights),
         gib(plan.kv(plan.context)),
+        c.kv_cache,
         plan.kv_per_token / 1024.,
         gib(plan.recurrent + plan.snapshots),
         gib(plan.scratch)

@@ -1,7 +1,7 @@
 //! Forward pass for Qwen3.5-family hybrid models on fixed, preallocated storage.
 #![forbid(unsafe_code)]
 use super::{
-    config::HybridConfig,
+    config::{HybridConfig, KvCache},
     weights::{
         AttentionWeights, DeltaWeights, DenseFfn, Ffn, Format, Matrix, Mixer, MoeFfn, Weights,
     },
@@ -87,7 +87,7 @@ pub(crate) struct RopePlan {
     pub table: Option<Tensor>,
 }
 
-/// Conversation state: F16 K/V for attention layers and F32 recurrent state
+/// Conversation state: K/V (F16 or Q8) for attention layers and F32 recurrent state
 /// for delta-rule layers, all allocated once for `capacity` positions.
 pub struct HybridState {
     capacity: usize,
@@ -124,16 +124,8 @@ impl HybridState {
         };
         for layer in 0..c.layers {
             if c.is_attention(layer) {
-                state.k.push(Some(Tensor::zeros_resident(
-                    d,
-                    [kv_rows, kv_row],
-                    DType::F16,
-                )?));
-                state.v.push(Some(Tensor::zeros_resident(
-                    d,
-                    [kv_rows, kv_row],
-                    DType::F16,
-                )?));
+                state.k.push(Some(c.kv_cache.alloc(d, kv_rows, kv_row)?));
+                state.v.push(Some(c.kv_cache.alloc(d, kv_rows, kv_row)?));
                 state.conv.push(None);
                 state.ssm.push(None);
             } else {
@@ -277,6 +269,8 @@ pub(crate) struct Scratch {
     pub(crate) k: Tensor,
     pub(crate) v: Tensor,
     pub(crate) q: Tensor,
+    /// Verify-width queries regrouped by KV head (`h_q_by_kv_head`).
+    pub(crate) q_grouped: Tensor,
     pub(crate) att: Tensor,
     pub(crate) attn_partial: Tensor,
     pub(crate) attn_ml: Tensor,
@@ -455,6 +449,7 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
         total += f32s(n);
     }
     total += page(chunk * c.heads * c.head_dim * 2); // F16 queries
+    total += page(MPP_ATTENTION_MIN_TOKENS * c.heads * c.head_dim * 2); // regrouped verify queries
     if let Some(moe) = c.moe {
         let routes = chunk * moe.experts_used;
         for n in [
@@ -485,7 +480,8 @@ pub fn state_bytes(c: &HybridConfig, capacity: usize) -> usize {
 
 /// K and V caches of every attention layer for `capacity` positions.
 pub fn kv_bytes(c: &HybridConfig, capacity: usize) -> usize {
-    let per_tensor = page(capacity.next_multiple_of(32) * c.kv_heads * c.head_dim * 2);
+    let per_tensor =
+        page(capacity.next_multiple_of(32) * c.kv_cache.row_bytes(c.kv_heads * c.head_dim));
     c.attention_layer_count() * 2 * per_tensor
 }
 
@@ -517,6 +513,11 @@ impl Scratch {
             k: f(&[chunk, c.kv_heads * c.head_dim])?,
             v: f(&[chunk, c.kv_heads * c.head_dim])?,
             q: Tensor::zeros_resident(d, [chunk, c.heads * c.head_dim], DType::F16)?,
+            q_grouped: Tensor::zeros_resident(
+                d,
+                [MPP_ATTENTION_MIN_TOKENS, c.heads * c.head_dim],
+                DType::F16,
+            )?,
             att: f(&[chunk, c.heads * c.head_dim])?,
             attn_partial: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim])?,
             attn_ml: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * 2])?,
@@ -568,6 +569,7 @@ impl Scratch {
             &self.k,
             &self.v,
             &self.q,
+            &self.q_grouped,
             &self.att,
             &self.attn_partial,
             &self.attn_ml,
@@ -1337,9 +1339,11 @@ impl HybridModel {
             .i(rope.delta)
             .u(usize::from(rope.table.is_some()))?
             .u(c.rope_sections[1])?
-            .u(c.rope_sections[2])?;
+            .u(c.rope_sections[2])?
+            .u(kc.shape().dimensions()[0])?;
+        let q8 = c.kv_cache == KvCache::Q8;
         d.dispatch_hybrid(
-            "h_attn_prep",
+            if q8 { "h_attn_prep_q8" } else { "h_attn_prep" },
             &[
                 qg.binding(),
                 k.binding(),
@@ -1356,7 +1360,7 @@ impl HybridModel {
             0,
         )?;
         d.dispatch_hybrid(
-            "h_store_v",
+            if q8 { "h_store_v_q8" } else { "h_store_v" },
             &[v.binding()],
             &[vc.binding()],
             &prep.0,
@@ -1367,19 +1371,20 @@ impl HybridModel {
         self.dump(d, "Qcur_full", layer, &qg)?;
         self.dump(d, "Kcur", layer, &k)?;
         self.dump(d, "Vcur", layer, &v)?;
-        self.flash_attention(d, s, &q, kc, vc, &qg, &att, m, pos)?;
+        self.flash_attention(d, s, c.kv_cache, &q, kc, vc, &qg, &att, m, pos)?;
         self.dump(d, "attn_gated", layer, &att)?;
         self.project(d, &a.o, &att, m, out)?;
         self.dump(d, "attn_output", layer, out)
     }
 
-    /// Causal attention of `m` new queries against the cache, gated by
-    /// sigmoid(gate) from `qg`, written to `att`.
+    /// Causal attention of `m` new queries against the cache (format `kv`),
+    /// gated by sigmoid(gate) from `qg`, written to `att`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn flash_attention(
         &self,
         d: &MetalDevice,
         s: &Scratch,
+        kv: KvCache,
         q: &Tensor,
         kc: &Tensor,
         vc: &Tensor,
@@ -1392,6 +1397,14 @@ impl HybridModel {
         let group = c.heads / c.kv_heads;
         let rows = m * group;
         let keys = pos + m;
+        let kv_rows = kc.shape().dimensions()[0];
+        let q8 = kv == KvCache::Q8;
+        let legacy = flags().legacy_attention || flags().simd_attention;
+        if q8 && (flags().reference_attention || legacy) {
+            return Err(Error::Config(
+                "the reference and legacy attention kernels read only an F16 K/V cache".into(),
+            ));
+        }
         if flags().reference_attention {
             let args = Params::default()
                 .u(m)?
@@ -1411,19 +1424,29 @@ impl HybridModel {
                 0,
             );
         }
-        if m >= MPP_ATTENTION_MIN_TOKENS && !flags().simd_attention {
-            let args = Params::default()
+        let fa = |keys_per_split: usize, splits: usize| -> Result<Vec<u8>> {
+            Ok(Params::default()
                 .u(m)?
                 .u(c.heads)?
                 .u(c.kv_heads)?
                 .u(group)?
                 .u(pos)?
                 .u(c.kv_heads * c.head_dim)?
-                .u(0)?
-                .u(1)?
-                .0;
+                .u(keys_per_split)?
+                .u(splits)?
+                .u(kv_rows)?
+                .0)
+        };
+        if m >= MPP_ATTENTION_MIN_TOKENS && !flags().simd_attention {
+            let args = fa(0, 1)?;
             return d.dispatch_hybrid(
-                "h_flash_attn_mpp",
+                // K/V staged through threadgroup memory measured 15-20%
+                // faster than reading the cache as a device tensor.
+                match (q8, legacy) {
+                    (true, _) => "h_flash_attn_mpp_q8",
+                    (false, false) => "h_flash_attn_mpp_staged",
+                    (false, true) => "h_flash_attn_mpp",
+                },
                 &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
                 &[att.binding()],
                 &args,
@@ -1432,6 +1455,17 @@ impl HybridModel {
                 64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
             );
         }
+        let reduce = |args: &[u8]| {
+            d.dispatch_hybrid(
+                "h_flash_reduce",
+                &[s.attn_partial.binding(), s.attn_ml.binding(), qg.binding()],
+                &[att.binding()],
+                args,
+                [m * c.heads, 1, 1],
+                [c.head_dim, 1, 1],
+                0,
+            )
+        };
         if m == 1 && group <= 8 && !flags().simd_attention {
             let target = DECODE_SPLIT_TARGET;
             let min_keys = DECODE_SPLIT_MIN_KEYS;
@@ -1441,18 +1475,13 @@ impl HybridModel {
                 .clamp(1, MAX_SPLITS);
             let keys_per_split = keys.div_ceil(splits).next_multiple_of(32);
             let splits = keys.div_ceil(keys_per_split);
-            let args = Params::default()
-                .u(1)?
-                .u(c.heads)?
-                .u(c.kv_heads)?
-                .u(group)?
-                .u(pos)?
-                .u(c.kv_heads * c.head_dim)?
-                .u(keys_per_split)?
-                .u(splits)?
-                .0;
+            let args = fa(keys_per_split, splits)?;
             d.dispatch_hybrid(
-                "h_attn_decode",
+                if q8 {
+                    "h_attn_decode_q8"
+                } else {
+                    "h_attn_decode"
+                },
                 &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
                 &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
                 &args,
@@ -1461,15 +1490,58 @@ impl HybridModel {
                 8 * 256 * 2 + 4 * 8 * 2 * 4 + 2 * 8 * 256 * 4,
             )?;
             if splits > 1 {
-                d.dispatch_hybrid(
-                    "h_flash_reduce",
-                    &[s.attn_partial.binding(), s.attn_ml.binding(), qg.binding()],
-                    &[att.binding()],
-                    &args,
-                    [c.heads, 1, 1],
-                    [c.head_dim, 1, 1],
-                    0,
-                )?;
+                reduce(&args)?;
+            }
+            return Ok(());
+        }
+        if !legacy {
+            // Speculative verify widths on TensorOps: queries regrouped so each
+            // KV head's (token, head) rows form one matrix, taken 32 rows per
+            // threadgroup, with keys split across threadgroups to fill the GPU.
+            let qk = s.q_grouped.view(0, [m, c.heads * c.head_dim])?;
+            let args = fa(0, 1)?;
+            d.dispatch_hybrid(
+                "h_q_by_kv_head",
+                &[q.binding()],
+                &[qk.binding()],
+                &args,
+                [(m * c.heads * c.head_dim).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )?;
+            let br = 32;
+            let row_blocks = rows.div_ceil(br);
+            let capacity = (MAX_SPLITS * MAX_SPLIT_ROWS / (m * c.heads)).max(1);
+            let splits = (VERIFY_SPLIT_TARGET / (row_blocks * c.kv_heads))
+                .max(1)
+                .min(keys.div_ceil(SPLIT_MIN_KEYS))
+                .min(capacity)
+                .clamp(1, MAX_SPLITS);
+            let keys_per_split = keys.div_ceil(splits).next_multiple_of(64);
+            let splits = keys.div_ceil(keys_per_split);
+            let args = fa(keys_per_split, splits)?;
+            let shared = if q8 {
+                (64 * 128 * 2).max(br * 64 * 4) + br * 64 * 2 + 3 * br * 4
+            } else {
+                br * 64 * 4 + br * 64 * 2 + 3 * br * 4
+            };
+            d.dispatch_hybrid(
+                // F16 reads K/V directly: staging only pays off for prompt
+                // chunks. Q8 must stage to dequantize.
+                if q8 {
+                    "h_attn_verify_mpp_32_q8"
+                } else {
+                    "h_attn_verify_mpp_32"
+                },
+                &[qk.binding(), kc.binding(), vc.binding(), qg.binding()],
+                &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
+                &args,
+                [row_blocks, c.kv_heads, splits],
+                [128, 1, 1],
+                shared,
+            )?;
+            if splits > 1 {
+                reduce(&args)?;
             }
             return Ok(());
         }
@@ -1486,16 +1558,7 @@ impl HybridModel {
         };
         let keys_per_split = keys.div_ceil(splits).next_multiple_of(32);
         let splits = keys.div_ceil(keys_per_split);
-        let args = Params::default()
-            .u(m)?
-            .u(c.heads)?
-            .u(c.kv_heads)?
-            .u(group)?
-            .u(pos)?
-            .u(c.kv_heads * c.head_dim)?
-            .u(keys_per_split)?
-            .u(splits)?
-            .0;
+        let args = fa(keys_per_split, splits)?;
         d.dispatch_hybrid(
             if simds == 1 {
                 "h_flash_attn_1"
@@ -1510,15 +1573,7 @@ impl HybridModel {
             simds * 5888,
         )?;
         if splits > 1 {
-            d.dispatch_hybrid(
-                "h_flash_reduce",
-                &[s.attn_partial.binding(), s.attn_ml.binding(), qg.binding()],
-                &[att.binding()],
-                &args,
-                [m * c.heads, 1, 1],
-                [c.head_dim, 1, 1],
-                0,
-            )?;
+            reduce(&args)?;
         }
         Ok(())
     }
@@ -2099,6 +2154,7 @@ struct Flags {
     exact: bool,
     reference_attention: bool,
     simd_attention: bool,
+    legacy_attention: bool,
     dump: bool,
 }
 
@@ -2110,6 +2166,8 @@ fn flags() -> &'static Flags {
             exact: on("FERRUM_HYBRID_EXACT"),
             reference_attention: on("FERRUM_HYBRID_REFERENCE_ATTENTION"),
             simd_attention: on("FERRUM_HYBRID_SIMD_ATTENTION"),
+            // Pre-verify-kernel routing for 2..15 query tokens (F16 only).
+            legacy_attention: on("FERRUM_HYBRID_LEGACY_ATTENTION"),
             dump: on("FERRUM_HYBRID_DUMP"),
         }
     })
@@ -2132,6 +2190,10 @@ const SPLIT_MIN_KEYS: usize = 256;
 const DECODE_SPLIT_TARGET: usize = 128;
 const DECODE_SPLIT_MIN_KEYS: usize = 256;
 const MAX_SPLIT_ROWS: usize = 64;
+/// Speculative-verify attention: target threadgroups across row blocks,
+/// KV heads and key splits (swept 16..1024 on Tiel at 4K-128K keys; 16-64
+/// are within noise, larger loses up to 15%).
+const VERIFY_SPLIT_TARGET: usize = 32;
 /// Activation rows served by the small-batch GEMV, and by the narrow
 /// TensorOps tiles (speculative verify widths; see the Phase 9 journal).
 const MVB_MAX_ROWS: usize = 4;
@@ -2307,6 +2369,8 @@ mod tests {
                 .u(sec_h)
                 .unwrap()
                 .u(sec_w)
+                .unwrap()
+                .u(rows + 2)
                 .unwrap();
             let e = d.execution_with_shared_encoder(true).unwrap();
             d.dispatch_hybrid(
@@ -2486,6 +2550,8 @@ mod tests {
                         .u(kps)
                         .unwrap()
                         .u(splits)
+                        .unwrap()
+                        .u(cap)
                         .unwrap();
                     let e = d.execution_with_shared_encoder(true).unwrap();
                     d.dispatch_hybrid(
@@ -2551,6 +2617,8 @@ mod tests {
                         .u(kps)
                         .unwrap()
                         .u(splits)
+                        .unwrap()
+                        .u(cap)
                         .unwrap();
                     let e = d.execution_with_shared_encoder(true).unwrap();
                     d.dispatch_hybrid(
@@ -2606,6 +2674,8 @@ mod tests {
                 .u(0)
                 .unwrap()
                 .u(1)
+                .unwrap()
+                .u(cap)
                 .unwrap();
             let e = d.execution_with_shared_encoder(true).unwrap();
             d.dispatch_hybrid(
@@ -2629,6 +2699,303 @@ mod tests {
                 worst < 2e-3,
                 "TensorOps heads {heads}/{kv_heads} m {m} pos {pos}: max error {worst}"
             );
+        }
+    }
+
+    /// llama.cpp q8_0 rounding of `x` (rows of `width`) in the Q8 cache
+    /// layout: every value, then every block scale. Returns (bytes, dequantized).
+    fn quantize_q8(x: &[f32], width: usize) -> (Vec<u8>, Vec<f32>) {
+        let mut values = Vec::with_capacity(x.len());
+        let mut scales = Vec::with_capacity(x.len() / 16);
+        let mut deq = Vec::with_capacity(x.len());
+        assert_eq!(x.len() % width, 0);
+        for block in x.chunks(32) {
+            let amax = block.iter().fold(0f32, |a, v| a.max(v.abs()));
+            let d = half::f16::from_f32(amax / 127.);
+            let id = if d.to_f32() > 0. { 1. / d.to_f32() } else { 0. };
+            for v in block {
+                let q = (v * id).round_ties_even().clamp(-127., 127.) as i8;
+                values.push(q as u8);
+                deq.push(f32::from(q) * d.to_f32());
+            }
+            scales.extend_from_slice(&d.to_le_bytes());
+        }
+        values.extend_from_slice(&scales);
+        (values, deq)
+    }
+
+    #[test]
+    fn q8_cache_stores_match_cpu_quantization() {
+        let d = MetalDevice::new().unwrap();
+        let (kv_heads, head_dim, rows, pos) = (2usize, 256usize, 3usize, 5usize);
+        let stride = kv_heads * head_dim;
+        let cap = 32usize;
+        let v: Vec<f32> = random(rows * stride, 9).iter().map(|x| x * 3.).collect();
+        let v_t = Tensor::from_f32(&d, [rows * stride], DType::F32, &v).unwrap();
+        let cache = KvCache::Q8.alloc(&d, cap, stride).unwrap();
+        let mut params = Params::default();
+        for x in [rows, 1, kv_heads, head_dim, 64, pos] {
+            params = params.u(x).unwrap();
+        }
+        let params = params
+            .f(1e7)
+            .f(1e-6)
+            .u(stride)
+            .unwrap()
+            .f(1.)
+            .i(0)
+            .u(0)
+            .unwrap()
+            .u(0)
+            .unwrap()
+            .u(0)
+            .unwrap()
+            .u(cap)
+            .unwrap();
+        let e = d.execution_with_shared_encoder(true).unwrap();
+        d.dispatch_hybrid(
+            "h_store_v_q8",
+            &[v_t.binding()],
+            &[cache.binding()],
+            &params.0,
+            [(rows * stride).div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+        )
+        .unwrap();
+        e.finish().unwrap();
+        let (buffer, offset, len) = cache.binding();
+        let bytes = buffer.with_bytes(offset, len, <[u8]>::to_vec);
+        let (want, _) = quantize_q8(&v, stride);
+        let n = rows * stride;
+        let got_values = &bytes[pos * stride..pos * stride + n];
+        assert_eq!(got_values, &want[..n]);
+        let scale_base = cap * stride + pos * stride / 16;
+        assert_eq!(&bytes[scale_base..scale_base + n / 16], &want[n..]);
+    }
+
+    #[test]
+    fn verify_and_q8_attention_match_reference() {
+        let d = MetalDevice::new().unwrap();
+        // (heads, kv_heads, m, pos): verify widths over both GQA shapes, plus
+        // decode and prompt chunks for the Q8 kernels.
+        let cases: [(usize, usize, usize, usize); 9] = [
+            (16, 2, 1, 700),
+            (24, 4, 1, 90),
+            (16, 2, 2, 300),
+            (16, 2, 3, 0),
+            (24, 4, 3, 517),
+            (16, 2, 9, 1000),
+            (16, 2, 15, 64),
+            (24, 4, 37, 90),
+            (16, 2, 64, 128),
+        ];
+        let dim = 256;
+        for (heads, kv_heads, m, pos) in cases {
+            let stride = kv_heads * dim;
+            let keys = pos + m;
+            let cap = keys.next_multiple_of(32);
+            let group = heads / kv_heads;
+            let q = Tensor::from_f32(
+                &d,
+                [m, heads * dim],
+                DType::F16,
+                &random(m * heads * dim, 1)
+                    .iter()
+                    .map(|v| v / 16.)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let qg = Tensor::from_f32(
+                &d,
+                [m, 2 * heads * dim],
+                DType::F32,
+                &random(m * 2 * heads * dim, 4),
+            )
+            .unwrap();
+            let (k_raw, v_raw) = (random(cap * stride, 2), random(cap * stride, 3));
+            for kv in [KvCache::F16, KvCache::Q8] {
+                // The reference reads an F16 cache holding exactly the values
+                // the kernel under test sees.
+                let (kc, vc, k_ref, v_ref) = match kv {
+                    KvCache::F16 => {
+                        let t = |x: &[f32]| Tensor::from_f32(&d, [cap, stride], DType::F16, x);
+                        (
+                            t(&k_raw).unwrap(),
+                            t(&v_raw).unwrap(),
+                            k_raw.clone(),
+                            v_raw.clone(),
+                        )
+                    }
+                    KvCache::Q8 => {
+                        let (kb, kd) = quantize_q8(&k_raw, stride);
+                        let (vb, vd) = quantize_q8(&v_raw, stride);
+                        let t = |b: &[u8]| {
+                            Tensor::from_le_bytes(
+                                &d,
+                                [cap, kv.row_bytes(stride) / 2],
+                                DType::F16,
+                                b,
+                            )
+                        };
+                        (t(&kb).unwrap(), t(&vb).unwrap(), kd, vd)
+                    }
+                };
+                let kr = Tensor::from_f32(&d, [cap, stride], DType::F16, &k_ref).unwrap();
+                let vr = Tensor::from_f32(&d, [cap, stride], DType::F16, &v_ref).unwrap();
+                let reference = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
+                let mut args = Params::default();
+                for x in [m, heads, kv_heads, dim, pos, stride] {
+                    args = args.u(x).unwrap();
+                }
+                let args = args.f(1.);
+                let e = d.execution_with_shared_encoder(true).unwrap();
+                d.dispatch_hybrid(
+                    "h_attention",
+                    &[q.binding(), kr.binding(), vr.binding(), qg.binding()],
+                    &[reference.binding()],
+                    &args.0,
+                    [heads, m, 1],
+                    [dim, 1, 1],
+                    0,
+                )
+                .unwrap();
+                e.finish().unwrap();
+                let expected = reference.to_f32();
+                let q8 = kv == KvCache::Q8;
+                let check = |name: &'static str,
+                             groups: [usize; 3],
+                             threads: usize,
+                             shared: usize,
+                             kps: usize,
+                             splits: usize| {
+                    let out = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
+                    let partial =
+                        Tensor::zeros(&d, [splits * m * heads * dim], DType::F32).unwrap();
+                    let ml = Tensor::zeros(&d, [splits * m * heads * 2], DType::F32).unwrap();
+                    let mut fa = Params::default();
+                    for x in [m, heads, kv_heads, group, pos, stride, kps, splits, cap] {
+                        fa = fa.u(x).unwrap();
+                    }
+                    let mpp = name.starts_with("h_flash_attn_mpp");
+                    let verify = name.starts_with("h_attn_verify_mpp");
+                    let qk = Tensor::zeros(&d, [m, heads * dim], DType::F16).unwrap();
+                    let e = d.execution_with_shared_encoder(true).unwrap();
+                    if verify {
+                        d.dispatch_hybrid(
+                            "h_q_by_kv_head",
+                            &[q.binding()],
+                            &[qk.binding()],
+                            &fa.0,
+                            [(m * heads * dim).div_ceil(256), 1, 1],
+                            [256, 1, 1],
+                            0,
+                        )
+                        .unwrap();
+                    }
+                    let outputs = if mpp {
+                        vec![out.binding()]
+                    } else {
+                        vec![out.binding(), partial.binding(), ml.binding()]
+                    };
+                    d.dispatch_hybrid(
+                        name,
+                        &[
+                            if verify { qk.binding() } else { q.binding() },
+                            kc.binding(),
+                            vc.binding(),
+                            qg.binding(),
+                        ],
+                        &outputs,
+                        &fa.0,
+                        groups,
+                        [threads, 1, 1],
+                        shared,
+                    )
+                    .unwrap();
+                    if splits > 1 {
+                        d.dispatch_hybrid(
+                            "h_flash_reduce",
+                            &[partial.binding(), ml.binding(), qg.binding()],
+                            &[out.binding()],
+                            &fa.0,
+                            [m * heads, 1, 1],
+                            [dim, 1, 1],
+                            0,
+                        )
+                        .unwrap();
+                    }
+                    e.finish().unwrap();
+                    let worst = out
+                        .to_f32()
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        worst < 2e-3,
+                        "{name} heads {heads}/{kv_heads} m {m} pos {pos} splits {splits}: max error {worst}"
+                    );
+                };
+                for splits_wanted in [1usize, 5] {
+                    let kps = keys.div_ceil(splits_wanted).next_multiple_of(32);
+                    let splits = keys.div_ceil(kps);
+                    if m == 1 {
+                        let name = if q8 {
+                            "h_attn_decode_q8"
+                        } else {
+                            "h_attn_decode"
+                        };
+                        check(
+                            name,
+                            [kv_heads, splits, 1],
+                            128,
+                            8 * 256 * 2 + 4 * 8 * 2 * 4 + 2 * 8 * 256 * 4,
+                            kps,
+                            splits,
+                        );
+                    }
+                    if m > 1 && m < 16 {
+                        let name = if q8 {
+                            "h_attn_verify_mpp_32_q8"
+                        } else {
+                            "h_attn_verify_mpp_32"
+                        };
+                        let shared = if q8 {
+                            64 * 128 * 2 + 32 * 64 * 2 + 3 * 32 * 4
+                        } else {
+                            32 * 64 * 4 + 32 * 64 * 2 + 3 * 32 * 4
+                        };
+                        let kps = keys.div_ceil(splits_wanted).next_multiple_of(64);
+                        let splits = keys.div_ceil(kps);
+                        check(
+                            name,
+                            [(m * group).div_ceil(32), kv_heads, splits],
+                            128,
+                            shared,
+                            kps,
+                            splits,
+                        );
+                    }
+                }
+                if m >= 16 {
+                    let names: &[&'static str] = if q8 {
+                        &["h_flash_attn_mpp_q8"]
+                    } else {
+                        &["h_flash_attn_mpp", "h_flash_attn_mpp_staged"]
+                    };
+                    for &name in names {
+                        check(
+                            name,
+                            [m.div_ceil(64), heads, 1],
+                            128,
+                            64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
+                            0,
+                            1,
+                        );
+                    }
+                }
+            }
         }
     }
 }

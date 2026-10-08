@@ -150,6 +150,15 @@ pub fn fields() -> Vec<Field> {
             "Tokens of context. auto picks the largest that fits in memory.",
         ),
         field(
+            "kv_cache",
+            "KV cache",
+            m,
+            Both,
+            Kind::Cycle(&["f16", "q8"]),
+            "f16",
+            "K/V cache precision. q8 needs about half the memory (auto context grows) and is faster at long context; f16 is exact.",
+        ),
+        field(
             "max_tokens",
             "Max tokens",
             m,

@@ -1,0 +1,39 @@
+== base512 f16
+
+thread 'main' (454989) panicked at examples/hybrid_kld.rs:29:43:
+chunk count: ParseIntError { kind: InvalidDigit }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+== base512 q8 vs llama.cpp
+chunk 3: ppl 13.9670 (llama.cpp 13.9468) mean KLD 0.008686 same top 95.00%
+chunk 4: ppl 14.5369 (llama.cpp 14.5087) mean KLD 0.008160 same top 95.37%
+chunk 5: ppl 15.6251 (llama.cpp 15.5525) mean KLD 0.008838 same top 95.56%
+chunk 6: ppl 16.1410 (llama.cpp 16.0739) mean KLD 0.009429 same top 95.41%
+chunk 7: ppl 17.3682 (llama.cpp 17.3225) mean KLD 0.009368 same top 95.20%
+positions 2040; Ferrum PPL 17.3682; llama.cpp PPL 17.3225; mean KLD 0.009368; median 0.004633; p99 0.078614; max 0.240712; same top-1 95.20%; 14.0 s
+== base512 q8 vs ferrum f16
+
+thread 'main' (455267) panicked at examples/hybrid_kld.rs:34:47:
+open base file: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+== base8k f16
+
+thread 'main' (455272) panicked at examples/hybrid_kld.rs:29:43:
+chunk count: ParseIntError { kind: InvalidDigit }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+== base8k q8 vs llama.cpp
+chunk 0: ppl 18.2452 (llama.cpp 18.2585) mean KLD 0.009462 same top 95.12%
+positions 4095; Ferrum PPL 18.2452; llama.cpp PPL 18.2585; mean KLD 0.009462; median 0.005638; p99 0.060945; max 0.279027; same top-1 95.12%; 30.4 s
+== base8k q8 vs ferrum f16
+
+thread 'main' (455724) panicked at examples/hybrid_kld.rs:34:47:
+open base file: Os { code: 2, kind: NotFound, message: "No such file or directory" }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+== base512 f16 vs llama.cpp
+positions 2040; Ferrum PPL 17.3622; llama.cpp PPL 17.3225; mean KLD 0.008293; median 0.003922; p99 0.074628; max 0.402878; same top-1 95.78%; 14.0 s
+== base512 q8 vs ferrum f16
+positions 2040; Ferrum PPL 17.3682; llama.cpp PPL 17.3622; mean KLD 0.008572; median 0.004219; p99 0.065009; max 0.217989; same top-1 95.49%; 13.6 s
+== base8k f16 vs llama.cpp
+positions 4095; Ferrum PPL 18.2841; llama.cpp PPL 18.2585; mean KLD 0.008946; median 0.005046; p99 0.060075; max 0.283863; same top-1 94.97%; 34.4 s
+== base8k q8 vs ferrum f16
+positions 4095; Ferrum PPL 18.2452; llama.cpp PPL 18.2607; mean KLD 0.009494; median 0.005382; p99 0.065461; max 0.434007; same top-1 94.92%; 30.7 s
+positions 2040; Ferrum PPL 17.3622; llama.cpp PPL 17.3622; mean KLD 0.000000; median 0.000000; p99 0.000034; max 0.000059; same top-1 100.00%; 13.0 s

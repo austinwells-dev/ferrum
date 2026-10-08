@@ -1,0 +1,54 @@
+### main rep1 (kv f16)
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 @ d32768 | 385.24 |
+| Ornith-1.5-35B | tg@0 | 39.36 (step 25.40 ms) |
+| Ornith-1.5-35B | tg@8192 | 35.92 (step 27.84 ms) |
+| Ornith-1.5-35B | tg@32768 | 30.91 (step 32.35 ms) |
+| Ornith-1.5-35B | tg@65536 | 26.68 (step 37.48 ms) |
+| Ornith-1.5-35B | pp512 | 920.91 ± 0.00 |
+### branch rep1 (kv f16)
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 @ d32768 | 407.58 |
+| Ornith-1.5-35B | tg@0 | 39.69 (step 25.20 ms) |
+| Ornith-1.5-35B | tg@8192 | 33.47 (step 29.87 ms) |
+| Ornith-1.5-35B | tg@32768 | 30.76 (step 32.51 ms) |
+| Ornith-1.5-35B | tg@65536 | 25.75 (step 38.83 ms) |
+| Ornith-1.5-35B | pp512 | 903.57 ± 0.00 |
+### branch-q8 rep1 (kv q8)
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 @ d32768 | 431.72 |
+| Ornith-1.5-35B | tg@0 | 39.47 (step 25.33 ms) |
+| Ornith-1.5-35B | tg@8192 | 38.23 (step 26.16 ms) |
+| Ornith-1.5-35B | tg@32768 | 32.86 (step 30.43 ms) |
+| Ornith-1.5-35B | tg@65536 | 29.10 (step 34.37 ms) |
+| Ornith-1.5-35B | pp512 | 912.97 ± 0.00 |
+### main rep2 (kv f16)
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 @ d32768 | 393.13 |
+| Ornith-1.5-35B | tg@0 | 40.90 (step 24.45 ms) |
+| Ornith-1.5-35B | tg@8192 | 38.64 (step 25.88 ms) |
+| Ornith-1.5-35B | tg@32768 | 31.52 (step 31.72 ms) |
+| Ornith-1.5-35B | tg@65536 | 27.18 (step 36.79 ms) |
+| Ornith-1.5-35B | pp512 | 924.46 ± 0.00 |
+### branch rep2 (kv f16)
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 @ d32768 | 404.93 |
+| Ornith-1.5-35B | tg@0 | 40.53 (step 24.68 ms) |
+| Ornith-1.5-35B | tg@8192 | 37.71 (step 26.52 ms) |
+| Ornith-1.5-35B | tg@32768 | 31.77 (step 31.48 ms) |
+| Ornith-1.5-35B | tg@65536 | 26.06 (step 38.38 ms) |
+| Ornith-1.5-35B | pp512 | 924.50 ± 0.00 |
+### branch-q8 rep2 (kv q8)
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 @ d32768 | 437.36 |
+| Ornith-1.5-35B | tg@0 | 40.60 (step 24.63 ms) |
+| Ornith-1.5-35B | tg@8192 | 38.31 (step 26.10 ms) |
+| Ornith-1.5-35B | tg@32768 | 33.63 (step 29.73 ms) |
+| Ornith-1.5-35B | tg@65536 | 28.66 (step 34.90 ms) |
+| Ornith-1.5-35B | pp512 | 941.48 ± 0.00 |

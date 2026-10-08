@@ -14,6 +14,69 @@ pub enum Variant {
     Moe,
 }
 
+/// Storage format of the attention K/V cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KvCache {
+    /// Half precision: 2 bytes per element.
+    #[default]
+    F16,
+    /// 8-bit values with one F16 scale per 32 elements (llama.cpp's q8_0
+    /// scheme): 1.0625 bytes per element. A cache tensor holds every row's
+    /// values first, then every row's scales.
+    Q8,
+}
+
+impl KvCache {
+    /// Bytes of one cached row of `width` elements.
+    pub fn row_bytes(self, width: usize) -> usize {
+        match self {
+            Self::F16 => width * 2,
+            Self::Q8 => width + width / 32 * 2,
+        }
+    }
+    /// A zeroed, resident cache of `rows` rows. Q8 storage is an F16-typed
+    /// byte blob of `[rows, row_bytes / 2]`, so `shape()[0]` is still the row count.
+    pub fn alloc(self, d: &crate::MetalDevice, rows: usize, width: usize) -> Result<crate::Tensor> {
+        crate::Tensor::zeros_resident(d, [rows, self.row_bytes(width) / 2], crate::DType::F16)
+    }
+    /// `FERRUM_KV_CACHE` (f16 or q8), else F16. An unparsable value is
+    /// ignored with a warning.
+    pub fn from_env() -> Self {
+        match std::env::var("FERRUM_KV_CACHE") {
+            Ok(v) => v.parse().unwrap_or_else(|e| {
+                eprintln!("ignoring FERRUM_KV_CACHE: {e}");
+                Self::F16
+            }),
+            Err(_) => Self::F16,
+        }
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Q8 => "q8",
+        }
+    }
+}
+
+impl std::fmt::Display for KvCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+impl std::str::FromStr for KvCache {
+    type Err = Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "f16" => Ok(Self::F16),
+            "q8" | "q8_0" => Ok(Self::Q8),
+            other => Err(Error::Config(format!(
+                "unknown KV cache format {other:?} (expected f16 or q8)"
+            ))),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeConfig {
     pub experts: usize,
@@ -50,6 +113,8 @@ pub struct HybridConfig {
     pub ssm_v_heads: usize,
     pub moe: Option<MoeConfig>,
     pub trained_context: usize,
+    /// K/V cache format (a load option, not GGUF metadata).
+    pub kv_cache: KvCache,
 }
 
 impl HybridConfig {
@@ -147,6 +212,7 @@ impl HybridConfig {
             ssm_v_heads,
             moe,
             trained_context: uint(md, &key("context_length"))?,
+            kv_cache: KvCache::F16,
         };
         config.validate()?;
         Ok(config)
@@ -211,9 +277,9 @@ impl HybridConfig {
     pub fn conv_channels(&self) -> usize {
         2 * self.ssm_key_dim() + self.ssm_value_dim()
     }
-    /// Bytes of K plus V for one cached position across all attention layers (F16).
+    /// Bytes of K plus V for one cached position across all attention layers.
     pub fn kv_bytes_per_token(&self) -> usize {
-        self.attention_layer_count() * 2 * self.kv_heads * self.head_dim * 2
+        self.attention_layer_count() * 2 * self.kv_cache.row_bytes(self.kv_heads * self.head_dim)
     }
     /// Fixed recurrent state bytes (conv window + delta-rule matrices, F32).
     pub fn recurrent_state_bytes(&self) -> usize {

@@ -1,0 +1,15 @@
+kv f16  m  1  keys    8192:    212.0 us/layer    79.1 GB/s
+kv f16  m  1  keys   32768:    745.4 us/layer    90.0 GB/s
+kv f16  m  1  keys  131072:   2582.1 us/layer   104.0 GB/s
+kv f16  m  2  keys    8192:    737.8 us/layer    22.7 GB/s
+kv f16  m  2  keys   32768:   2686.5 us/layer    25.0 GB/s
+kv f16  m  2  keys  131072:  10576.1 us/layer    25.4 GB/s
+kv f16  m  3  keys    8192:    770.2 us/layer    21.8 GB/s
+kv f16  m  3  keys   32768:   2717.1 us/layer    24.7 GB/s
+kv f16  m  3  keys  131072:  10611.5 us/layer    25.3 GB/s
+kv f16  m  5  keys    8192:   7443.6 us/layer     2.3 GB/s
+kv f16  m  5  keys   32768:  29706.4 us/layer     2.3 GB/s
+kv f16  m  5  keys  131072: 118900.5 us/layer     2.3 GB/s
+kv f16  m  9  keys    8192:   7436.4 us/layer     2.3 GB/s
+kv f16  m  9  keys   32768:  29683.4 us/layer     2.3 GB/s
+kv f16  m  9  keys  131072: 118932.1 us/layer     2.3 GB/s
