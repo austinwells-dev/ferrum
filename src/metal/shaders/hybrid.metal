@@ -1131,20 +1131,61 @@ struct AttnPrepArgs {
     uint use_table;    // 1: rotary positions come from `pos3` instead
     uint sections_h;   // interleaved M-RoPE sections of the height and width axes
     uint sections_w;
+    uint kv_rows;      // rows the cache buffer holds (locates Q8 scales)
 };
+
+// Q8 K/V cache: the buffer holds kv_rows * stride int8 values, then one half
+// scale per 32 values (same element order). F16 caches have no scales.
+inline device half * kv_scales(device half * cache, uint kv_rows, uint stride) {
+    return (device half *)((device char *)cache + (ulong)kv_rows * stride);
+}
+inline device const half * kv_scales(device const half * cache, uint kv_rows, uint stride) {
+    return (device const half *)((device const char *)cache + (ulong)kv_rows * stride);
+}
+
+// Store one element per thread; with Q8 the 32 lanes of a SIMD group hold one
+// 32-element block (callers align blocks to SIMD groups).
+template <bool Q8>
+inline void kv_store(device half * cache, uint kv_rows, uint stride, ulong e, float x) {
+    if (Q8) {
+        const float amax = simd_max(abs(x));
+        const half d = half(amax / 127.f);
+        const float id = float(d) > 0.f ? 1.f / float(d) : 0.f;
+        ((device char *)cache)[e] = char(clamp(rint(x * id), -127.f, 127.f));
+        if (e % 32 == 0) kv_scales(cache, kv_rows, stride)[e / 32] = d;
+    } else {
+        cache[e] = half(x);
+    }
+}
+
+// Eight consecutive cached elements from e (e % 8 == 0), unscaled, and the
+// scale of their block (1 for F16).
+template <bool Q8>
+inline void kv_load8(device const half * cache, ulong e, thread float4 & a, thread float4 & b) {
+    if (Q8) {
+        const uint2 raw = *(device const uint2 *)((device const char *)cache + e);
+        a = float4(as_type<char4>(raw.x));
+        b = float4(as_type<char4>(raw.y));
+    } else {
+        device const half4 * h = (device const half4 *)(cache + e);
+        a = float4(h[0]);
+        b = float4(h[1]);
+    }
+}
+template <bool Q8>
+inline float kv_scale(device const half * scales, ulong e) {
+    return Q8 ? float(scales[e / 32]) : 1.f;
+}
 
 // Query heads: rmsnorm + partial NEOX RoPE of q (first half of each [q|gate]
 // pair in qg) into q_out [tokens][heads][head_dim]. KV heads: rmsnorm + RoPE of
 // k and a copy of v into the F16 cache at `position + token`.
 // grid (heads + kv_heads, tokens); threads head_dim.
-kernel void h_attn_prep(constant AttnPrepArgs & p [[buffer(8)]],
-                        device const float * qg [[buffer(0)]], device const float * k [[buffer(1)]],
-                        device const float * v [[buffer(2)]], device const float * q_norm [[buffer(3)]],
-                        device const float * k_norm [[buffer(4)]], device const int * pos3 [[buffer(5)]],
-                        device half * q_out [[buffer(6)]], device half * kv [[buffer(7)]],
-                        uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
-    threadgroup float scratch[8];
-    threadgroup float normed[256];
+template <bool Q8>
+void attn_prep_impl(constant AttnPrepArgs & p, device const float * qg, device const float * k,
+                    device const float * q_norm, device const float * k_norm, device const int * pos3,
+                    device half * q_out, device half * kv, uint2 group, ushort tid,
+                    threadgroup float * scratch, threadgroup float * normed) {
     const uint head = group.x;
     const uint t = group.y;
     const bool is_q = head < p.heads;
@@ -1177,18 +1218,42 @@ kernel void h_attn_prep(constant AttnPrepArgs & p [[buffer(8)]],
     if (is_q) {
         q_out[((ulong)t * p.heads + head) * p.head_dim + tid] = half(outv * p.q_scale);
     } else {
-        device half * kc = kv + (ulong)(p.position + t) * p.cache_stride + kvh * p.head_dim;
-        kc[tid] = half(outv);
+        const ulong e = (ulong)(p.position + t) * p.cache_stride + kvh * p.head_dim + tid;
+        kv_store<Q8>(kv, p.kv_rows, p.cache_stride, e, outv);
     }
 }
 
-// V is stored in its own cache buffer with the same geometry.
-kernel void h_store_v(constant AttnPrepArgs & p [[buffer(2)]], device const float * v [[buffer(0)]],
-                      device half * vc [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+#define ATTN_PREP(name, q8)                                                                          \
+kernel void name(constant AttnPrepArgs & p [[buffer(8)]],                                           \
+                 device const float * qg [[buffer(0)]], device const float * k [[buffer(1)]],       \
+                 device const float * v [[buffer(2)]], device const float * q_norm [[buffer(3)]],   \
+                 device const float * k_norm [[buffer(4)]], device const int * pos3 [[buffer(5)]],  \
+                 device half * q_out [[buffer(6)]], device half * kv [[buffer(7)]],                 \
+                 uint2 group [[threadgroup_position_in_grid]],                                      \
+                 ushort tid [[thread_index_in_threadgroup]]) {                                      \
+    threadgroup float scratch[8];                                                                   \
+    threadgroup float normed[256];                                                                  \
+    attn_prep_impl<q8>(p, qg, k, q_norm, k_norm, pos3, q_out, kv, group, tid, scratch, normed);     \
+}
+ATTN_PREP(h_attn_prep, false)
+ATTN_PREP(h_attn_prep_q8, true)
+
+// V is stored in its own cache buffer with the same geometry. Threadgroups of
+// 256 keep every 32-element Q8 block inside one SIMD group.
+template <bool Q8>
+void store_v_impl(constant AttnPrepArgs & p, device const float * v, device half * vc, uint i) {
     const uint row = p.kv_heads * p.head_dim;
     if (i >= p.tokens * row) return;
     const uint t = i / row, r = i % row;
-    vc[(ulong)(p.position + t) * p.cache_stride + r] = half(v[i]);
+    kv_store<Q8>(vc, p.kv_rows, p.cache_stride, (ulong)(p.position + t) * p.cache_stride + r, v[i]);
+}
+kernel void h_store_v(constant AttnPrepArgs & p [[buffer(2)]], device const float * v [[buffer(0)]],
+                      device half * vc [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    store_v_impl<false>(p, v, vc, i);
+}
+kernel void h_store_v_q8(constant AttnPrepArgs & p [[buffer(2)]], device const float * v [[buffer(0)]],
+                         device half * vc [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    store_v_impl<true>(p, v, vc, i);
 }
 
 struct AttnArgs {
@@ -1511,6 +1576,7 @@ struct FaArgs {
     uint cache_stride;   // halfs between cached positions
     uint keys_per_split;
     uint splits;
+    uint kv_rows;        // rows the cache buffers hold (locates Q8 scales)
 };
 
 // Causal attention over the F16 cache for query rows r = t*group + g of one
@@ -1830,6 +1896,439 @@ kernel void h_flash_attn_mpp(constant FaArgs & p [[buffer(5)]],
     }
 }
 
+// Stage `BC` keys x 128 dims (dims d0 .. d0+128) of one KV head from an F16
+// or Q8 cache into Hs [BC][128] as F16, zeros at and past `total`.
+template <bool Q8, int BC, int NT>
+inline void stage_kv_half(threadgroup half * Hs, device const half * cache, device const half * scales,
+                          uint j0, uint total, uint stride, ulong head_off, uint d0, uint tid) {
+    constexpr int W = 128, E = Q8 ? 16 : 8;   // one 16-byte load per thread step
+    for (uint i = tid; i < BC * W / E; i += NT) {
+        const uint kr = i / (W / E), dd = (i % (W / E)) * E;
+        const uint key = j0 + kr;
+        threadgroup half4 * dst = (threadgroup half4 *)(Hs + kr * W + dd);
+        if (key >= total) {
+            for (int j = 0; j < E / 4; j++) dst[j] = 0.h;
+            continue;
+        }
+        const ulong e = (ulong)key * stride + head_off + d0 + dd;
+        if (Q8) {
+            const uint4 raw = *(device const uint4 *)((device const char *)cache + e);
+            const half sc = scales[e / 32];
+            dst[0] = half4(as_type<char4>(raw.x)) * sc;
+            dst[1] = half4(as_type<char4>(raw.y)) * sc;
+            dst[2] = half4(as_type<char4>(raw.z)) * sc;
+            dst[3] = half4(as_type<char4>(raw.w)) * sc;
+        } else {
+            device const half4 * src = (device const half4 *)(cache + e);
+            dst[0] = src[0];
+            dst[1] = src[1];
+        }
+    }
+}
+
+// h_flash_attn_mpp with K and V blocks staged (from F16, or dequantized from
+// Q8) into threadgroup memory 128 dims at a time (S = Q Kᵀ accumulates over the two
+// halves; O is two 64x128 cooperative tensors). The staging buffer aliases
+// the score tile, which is only live between the K and V phases.
+// grid (ceil(tokens/64), heads); threads 128; 64*64*4 + 64*64*2 + 3*64*4 bytes.
+template <bool Q8>
+void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device half * kc,
+                                device half * vc, device const float * qg, device float * out,
+                                threadgroup char * shared, threadgroup uint & rescale,
+                                uint2 tgpig, ushort tid) {
+    constexpr int D = 256, W = 128, BR = 64, BC = 64;
+    threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
+    threadgroup half  * Hs = (threadgroup half *)shared;                  // [BC][W], aliases Ss
+    threadgroup half  * Ps = (threadgroup half *)(Ss + BR * BC);          // [BR][BC]
+    threadgroup float * corr = (threadgroup float *)(Ps + BR * BC);       // [BR]
+    threadgroup float * mrow = corr + BR;                                 // [BR]
+    threadgroup float * lrow = mrow + BR;                                 // [BR]
+    const uint h = tgpig.y;
+    const uint kvh = h / p.group;
+    const int t0 = int(tgpig.x) * BR;
+    const int rows = min(BR, int(p.tokens) - t0);
+    const uint total_keys = p.position + p.tokens;
+    const uint last_key = p.position + uint(t0 + rows - 1);
+    const int q_stride = int(p.heads) * D;
+    const ulong head_off = (ulong)kvh * D;
+    device const half * ks = kv_scales(kc, p.kv_rows, p.cache_stride);
+    device const half * vs = kv_scales(vc, p.kv_rows, p.cache_stride);
+
+    auto tQ0 = tensor(q + (ulong)t0 * q_stride + h * D, dextents<int32_t, 2>(W, rows), array<int, 2>({1, q_stride}));
+    auto tQ1 = tensor(q + (ulong)t0 * q_stride + h * D + W, dextents<int32_t, 2>(W, rows), array<int, 2>({1, q_stride}));
+    auto tH = tensor(Hs, dextents<int32_t, 2>(W, BC));
+    auto tS = tensor(Ss, dextents<int32_t, 2>(BC, BR));
+    auto tP = tensor(Ps, dextents<int32_t, 2>(BC, BR));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(BR, BC, W, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm_s;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(BR, W, BC, false, false, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm_o;
+    auto cS = mm_s.get_destination_cooperative_tensor<decltype(tQ0), decltype(tH), float>();
+    auto cO0 = mm_o.get_destination_cooperative_tensor<decltype(tP), decltype(tH), float>();
+    auto cO1 = mm_o.get_destination_cooperative_tensor<decltype(tP), decltype(tH), float>();
+    for (uint i = 0; i < cO0.get_capacity(); i++) { cO0[i] = 0.f; cO1[i] = 0.f; }
+    if (tid < BR) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int my_row = tid / 2;
+    const int c0 = (tid % 2) * 32;
+    const uint row_last_key = p.position + uint(t0 + my_row);
+    for (uint j0 = 0; j0 < total_keys && j0 <= last_key; j0 += BC) {
+        for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
+        stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, total_keys, p.cache_stride, head_off, 0, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mm_s.run(tQ0, tH, cS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, total_keys, p.cache_stride, head_off, W, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mm_s.run(tQ1, tH, cS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cS.store(tS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float s[32];
+        float mx = -INFINITY;
+        for (int c = 0; c < 32; c++) {
+            const uint key = j0 + uint(c0 + c);
+            const bool ok = my_row < rows && key < total_keys && key <= row_last_key;
+            s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
+            mx = max(mx, s[c]);
+        }
+        mx = max(mx, simd_shuffle_xor(mx, 1));
+        const float m_old = mrow[my_row];
+        const float m_new = max(m_old, mx);
+        const float cr = m_new == -INFINITY ? 1.f : exp(m_old - m_new);
+        float sum = 0.f;
+        for (int c = 0; c < 32; c++) {
+            const float e = m_new == -INFINITY ? 0.f : exp(s[c] - m_new);
+            sum += e;
+            Ps[my_row * BC + c0 + c] = half(e);
+        }
+        sum += simd_shuffle_xor(sum, 1);
+        if (tid == 0) rescale = 0;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid % 2 == 0) {
+            mrow[my_row] = m_new;
+            lrow[my_row] = lrow[my_row] * cr + sum;
+            corr[my_row] = cr;
+            if (cr != 1.f) rescale = 1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (rescale) {
+            for (uint i = 0; i < cO0.get_capacity(); i++) {
+                if (cO0.is_valid_element(i)) {
+                    auto idx = cO0.get_multidimensional_index(i);
+                    cO0[i] *= corr[idx[1]];
+                    cO1[i] *= corr[idx[1]];
+                }
+            }
+        }
+        stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, total_keys, p.cache_stride, head_off, 0, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mm_o.run(tP, tH, cO0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, total_keys, p.cache_stride, head_off, W, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mm_o.run(tP, tH, cO1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < cO0.get_capacity(); i++) {
+        if (!cO0.is_valid_element(i)) continue;
+        auto idx = cO0.get_multidimensional_index(i);
+        const int r = idx[1], dcol = idx[0];
+        if (r >= rows) continue;
+        const uint t = uint(t0 + r);
+        const float l = lrow[r];
+        const ulong o = ((ulong)t * p.heads + h) * D;
+        const float g0 = qg[((ulong)t * p.heads + h) * 2 * D + D + dcol];
+        const float g1 = qg[((ulong)t * p.heads + h) * 2 * D + D + W + dcol];
+        out[o + dcol] = (l > 0.f ? cO0[i] / l : 0.f) / (1.f + exp(-g0));
+        out[o + W + dcol] = (l > 0.f ? cO1[i] / l : 0.f) / (1.f + exp(-g1));
+    }
+}
+
+#define FLASH_MPP_STAGED(name, q8)                                                              \
+kernel void name(constant FaArgs & p [[buffer(5)]],                                             \
+                 device half * q [[buffer(0)]], device half * kc [[buffer(1)]],                 \
+                 device half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],         \
+                 device float * out [[buffer(4)]],                                              \
+                 threadgroup char * shared [[threadgroup(0)]],                                  \
+                 uint2 tgpig [[threadgroup_position_in_grid]],                                  \
+                 ushort tid [[thread_index_in_threadgroup]]) {                                  \
+    threadgroup uint rescale;                                                                   \
+    flash_attn_mpp_staged_impl<q8>(p, q, kc, vc, qg, out, shared, rescale, tgpig, tid);         \
+}
+FLASH_MPP_STAGED(h_flash_attn_mpp_staged, false)
+FLASH_MPP_STAGED(h_flash_attn_mpp_q8, true)
+
+// Copy F16 queries [tokens][heads][256] to KV-head-major rows
+// [kv_heads][tokens * group][256] (row t*group + g), so each KV head's query
+// rows form one strided matrix for the TensorOps verify kernels.
+kernel void h_q_by_kv_head(constant FaArgs & p [[buffer(2)]], device const half * q [[buffer(0)]],
+                           device half * qk [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    constexpr uint D = 256;
+    if (i >= p.tokens * p.heads * D) return;
+    const uint t = i / (p.heads * D), h = (i / D) % p.heads, d = i % D;
+    const uint kvh = h / p.group, g = h % p.group;
+    qk[((ulong)(kvh * p.tokens + t) * p.group + g) * D + d] = q[i];
+}
+
+// Online-softmax step shared by the TensorOps verify kernels: thread tid owns
+// row tid / TPR and CPT columns of the [BR][BC] score tile; scores of keys
+// outside [.., key_end) or past the row's causal limit are masked. Writes P
+// (F16) and updates the running max / sum / correction rows.
+template <int BR, int BC>
+inline void verify_softmax(threadgroup const float * Ss, threadgroup half * Ps,
+                           threadgroup float * corr, threadgroup float * mrow,
+                           threadgroup float * lrow, threadgroup uint & rescale,
+                           int rows, uint j0, uint key_end, uint row_last_key, ushort tid) {
+    constexpr int TPR = 128 / BR, CPT = BC / TPR;
+    const int my_row = tid / TPR;
+    const int c0 = (tid % TPR) * CPT;
+    float s[CPT];
+    float mx = -INFINITY;
+    for (int c = 0; c < CPT; c++) {
+        const uint key = j0 + uint(c0 + c);
+        const bool ok = my_row < rows && key < key_end && key <= row_last_key;
+        s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
+        mx = max(mx, s[c]);
+    }
+    for (ushort o = 1; o < TPR; o *= 2) mx = max(mx, simd_shuffle_xor(mx, o));
+    const float m_old = mrow[my_row];
+    const float m_new = max(m_old, mx);
+    const float cr = m_new == -INFINITY ? 1.f : exp(m_old - m_new);
+    float sum = 0.f;
+    for (int c = 0; c < CPT; c++) {
+        const float e = m_new == -INFINITY ? 0.f : exp(s[c] - m_new);
+        sum += e;
+        Ps[my_row * BC + c0 + c] = half(e);
+    }
+    for (ushort o = 1; o < TPR; o *= 2) sum += simd_shuffle_xor(sum, o);
+    if (tid == 0) rescale = 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid % TPR == 0) {
+        mrow[my_row] = m_new;
+        lrow[my_row] = lrow[my_row] * cr + sum;
+        corr[my_row] = cr;
+        if (cr != 1.f) rescale = 1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+// Write one finished element of row r (0-based within the tile at r0) and
+// column dcol: gated output with one split, else the unnormalized partial.
+inline void verify_store(constant FaArgs & p, device const float * qg, device float * out,
+                         device float * po, uint kvh, uint split, uint rr, uint dcol,
+                         float acc, float l) {
+    constexpr uint D = 256;
+    const uint t = rr / p.group, g = rr % p.group, h = kvh * p.group + g;
+    if (p.splits == 1) {
+        const float gate = qg[((ulong)t * p.heads + h) * 2 * D + D + dcol];
+        out[((ulong)t * p.heads + h) * D + dcol] = (l > 0.f ? acc / l : 0.f) / (1.f + exp(-gate));
+    } else {
+        const ulong grow = (ulong)split * p.tokens * p.heads + (ulong)t * p.heads + h;
+        po[grow * D + dcol] = acc;
+    }
+}
+inline void verify_store_ml(constant FaArgs & p, device float * pml, uint kvh, uint split,
+                            uint rr, float m, float l) {
+    const uint t = rr / p.group, g = rr % p.group, h = kvh * p.group + g;
+    const ulong grow = (ulong)split * p.tokens * p.heads + (ulong)t * p.heads + h;
+    pml[grow * 2] = m;
+    pml[grow * 2 + 1] = l;
+}
+
+// Speculative-verify attention on TensorOps. One threadgroup takes BR query
+// rows (t, g) of one KV head (32-row tiles measured faster than 64-row ones
+// even when a second tile re-reads the keys) from the KV-head-major copy (h_q_by_kv_head) and
+// one key split; S = Q Kᵀ and O += P V run as matmul2d on 64-key blocks read
+// straight from the F16 cache, with the online softmax in threadgroup memory.
+// grid (row_blocks, kv_heads, splits); threads 128; BR*64*4 + BR*64*2 + 3*BR*4 bytes.
+template <int BR>
+void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * kc,
+                          device half * vc, device const float * qg, device float * out,
+                          device float * po, device float * pml, threadgroup char * shared,
+                          threadgroup uint & rescale, uint3 tgpig, ushort tid) {
+    constexpr int D = 256, BC = 64;
+    threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
+    threadgroup half  * Ps = (threadgroup half *)(Ss + BR * BC);          // [BR][BC]
+    threadgroup float * corr = (threadgroup float *)(Ps + BR * BC);       // [BR]
+    threadgroup float * mrow = corr + BR;
+    threadgroup float * lrow = mrow + BR;
+    const uint kvh = tgpig.y, split = tgpig.z;
+    const uint rows_total = p.tokens * p.group;
+    const int r0 = int(tgpig.x) * BR;
+    const int rows = min(BR, int(rows_total) - r0);
+    const uint total_keys = p.position + p.tokens;
+    const uint key_begin = split * p.keys_per_split;
+    const uint key_end = min(key_begin + p.keys_per_split, total_keys);
+    const uint last_key = p.position + uint(r0 + rows - 1) / p.group;
+    const int kv_stride = int(p.cache_stride);
+
+    auto tQ = tensor(qk + ((ulong)kvh * rows_total + r0) * D, dextents<int32_t, 2>(D, rows), array<int, 2>({1, D}));
+    auto tK = tensor(kc + kvh * D, dextents<int32_t, 2>(D, int(total_keys)), array<int, 2>({1, kv_stride}));
+    auto tV = tensor(vc + kvh * D, dextents<int32_t, 2>(D, int(total_keys)), array<int, 2>({1, kv_stride}));
+    auto tS = tensor(Ss, dextents<int32_t, 2>(BC, BR));
+    auto tP = tensor(Ps, dextents<int32_t, 2>(BC, BR));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(BR, BC, D, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<4>> mm_s;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(BR, D, BC, false, false, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm_o;
+    auto cS = mm_s.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK), float>();
+    auto cO = mm_o.template get_destination_cooperative_tensor<decltype(tP), decltype(tV), float>();
+    for (uint i = 0; i < cO.get_capacity(); i++) cO[i] = 0.f;
+    if (tid < BR) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row_last_key = p.position + uint(r0 + int(tid / (128 / BR))) / p.group;
+    for (uint j0 = key_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
+        auto mK = tK.slice(0, int(j0));
+        mm_s.run(tQ, mK, cS);
+        cS.store(tS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        verify_softmax<BR, BC>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, row_last_key, tid);
+        if (rescale) {
+            for (uint i = 0; i < cO.get_capacity(); i++) {
+                if (cO.is_valid_element(i)) {
+                    auto idx = cO.get_multidimensional_index(i);
+                    cO[i] *= corr[idx[1]];
+                }
+            }
+        }
+        auto mV = tV.slice(0, int(j0));
+        mm_o.run(tP, mV, cO);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < cO.get_capacity(); i++) {
+        if (!cO.is_valid_element(i)) continue;
+        auto idx = cO.get_multidimensional_index(i);
+        const int r = idx[1];
+        if (r >= rows) continue;
+        verify_store(p, qg, out, po, kvh, split, uint(r0 + r), uint(idx[0]), cO[i], lrow[r]);
+    }
+    if (p.splits > 1 && int(tid) < rows) {
+        verify_store_ml(p, pml, kvh, split, uint(r0 + int(tid)), mrow[tid], lrow[tid]);
+    }
+}
+
+// Staged variant (required for Q8): K and V blocks are copied or dequantized
+// into threadgroup memory 128 dims at a time (as h_flash_attn_mpp_staged);
+// the staging buffer aliases S.
+// shared bytes max(64*128*2, BR*64*4) + BR*64*2 + 3*BR*4.
+template <int BR, bool Q8>
+void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device half * kc,
+                             device half * vc, device const float * qg, device float * out,
+                             device float * po, device float * pml, threadgroup char * shared,
+                             threadgroup uint & rescale, uint3 tgpig, ushort tid) {
+    constexpr int D = 256, W = 128, BC = 64;
+    constexpr int SBYTES = (BC * W * 2 > BR * BC * 4) ? BC * W * 2 : BR * BC * 4;
+    threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
+    threadgroup half  * Hs = (threadgroup half *)shared;                  // [BC][W], aliases Ss
+    threadgroup half  * Ps = (threadgroup half *)(shared + SBYTES);       // [BR][BC]
+    threadgroup float * corr = (threadgroup float *)(Ps + BR * BC);       // [BR]
+    threadgroup float * mrow = corr + BR;
+    threadgroup float * lrow = mrow + BR;
+    const uint kvh = tgpig.y, split = tgpig.z;
+    const uint rows_total = p.tokens * p.group;
+    const int r0 = int(tgpig.x) * BR;
+    const int rows = min(BR, int(rows_total) - r0);
+    const uint total_keys = p.position + p.tokens;
+    const uint key_begin = split * p.keys_per_split;
+    const uint key_end = min(key_begin + p.keys_per_split, total_keys);
+    const uint last_key = p.position + uint(r0 + rows - 1) / p.group;
+    const ulong head_off = (ulong)kvh * D;
+    device const half * ks = kv_scales(kc, p.kv_rows, p.cache_stride);
+    device const half * vs = kv_scales(vc, p.kv_rows, p.cache_stride);
+
+    device half * qrow = qk + ((ulong)kvh * rows_total + r0) * D;
+    auto tQ0 = tensor(qrow, dextents<int32_t, 2>(W, rows), array<int, 2>({1, D}));
+    auto tQ1 = tensor(qrow + W, dextents<int32_t, 2>(W, rows), array<int, 2>({1, D}));
+    auto tH = tensor(Hs, dextents<int32_t, 2>(W, BC));
+    auto tS = tensor(Ss, dextents<int32_t, 2>(BC, BR));
+    auto tP = tensor(Ps, dextents<int32_t, 2>(BC, BR));
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(BR, BC, W, false, true, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm_s;
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(BR, W, BC, false, false, true,
+            mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<4>> mm_o;
+    auto cS = mm_s.template get_destination_cooperative_tensor<decltype(tQ0), decltype(tH), float>();
+    auto cO0 = mm_o.template get_destination_cooperative_tensor<decltype(tP), decltype(tH), float>();
+    auto cO1 = mm_o.template get_destination_cooperative_tensor<decltype(tP), decltype(tH), float>();
+    for (uint i = 0; i < cO0.get_capacity(); i++) { cO0[i] = 0.f; cO1[i] = 0.f; }
+    if (tid < BR) { mrow[tid] = -INFINITY; lrow[tid] = 0.f; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row_last_key = p.position + uint(r0 + int(tid / (128 / BR))) / p.group;
+    for (uint j0 = key_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
+        for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
+        stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, key_end, p.cache_stride, head_off, 0, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mm_s.run(tQ0, tH, cS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, key_end, p.cache_stride, head_off, W, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mm_s.run(tQ1, tH, cS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        cS.store(tS);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        verify_softmax<BR, BC>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, row_last_key, tid);
+        if (rescale) {
+            for (uint i = 0; i < cO0.get_capacity(); i++) {
+                if (cO0.is_valid_element(i)) {
+                    auto idx = cO0.get_multidimensional_index(i);
+                    cO0[i] *= corr[idx[1]];
+                    cO1[i] *= corr[idx[1]];
+                }
+            }
+        }
+        stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, key_end, p.cache_stride, head_off, 0, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mm_o.run(tP, tH, cO0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, key_end, p.cache_stride, head_off, W, tid);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        mm_o.run(tP, tH, cO1);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i = 0; i < cO0.get_capacity(); i++) {
+        if (!cO0.is_valid_element(i)) continue;
+        auto idx = cO0.get_multidimensional_index(i);
+        const int r = idx[1];
+        if (r >= rows) continue;
+        const uint rr = uint(r0 + r), dcol = uint(idx[0]);
+        verify_store(p, qg, out, po, kvh, split, rr, dcol, cO0[i], lrow[r]);
+        verify_store(p, qg, out, po, kvh, split, rr, dcol + W, cO1[i], lrow[r]);
+    }
+    if (p.splits > 1 && int(tid) < rows) {
+        verify_store_ml(p, pml, kvh, split, uint(r0 + int(tid)), mrow[tid], lrow[tid]);
+    }
+}
+
+#define ATTN_VERIFY_MPP(name, impl)                                                              \
+kernel void name(constant FaArgs & p [[buffer(7)]],                                             \
+                 device half * qk [[buffer(0)]], device half * kc [[buffer(1)]],                \
+                 device half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],         \
+                 device float * out [[buffer(4)]], device float * po [[buffer(5)]],             \
+                 device float * pml [[buffer(6)]], threadgroup char * shared [[threadgroup(0)]],\
+                 uint3 tgpig [[threadgroup_position_in_grid]],                                  \
+                 ushort tid [[thread_index_in_threadgroup]]) {                                  \
+    threadgroup uint rescale;                                                                   \
+    impl(p, qk, kc, vc, qg, out, po, pml, shared, rescale, tgpig, tid);                         \
+}
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32, (attn_verify_mpp_impl<32>))
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32_q8, (attn_verify_mpp_staged_impl<32, true>))
+
 // Single-token decode attention for one KV head and all `group` (<= 8) query
 // heads sharing it. QKᵀ is key-parallel (lane = key, full 256-wide dot
 // products against Q staged in threadgroup memory); PV is dimension-parallel
@@ -1837,15 +2336,14 @@ kernel void h_flash_attn_mpp(constant FaArgs & p [[buffer(5)]],
 // interleaved 32-key blocks of this split's range and merge before writing a
 // partial (or, with one split, the gated output).
 // grid (kv_heads, splits); threads 128; 8*256*2 + 4*8*2*4 + 2*8*256*4 bytes.
-kernel void h_attn_decode(constant FaArgs & p [[buffer(7)]],
-                          device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],
-                          device const half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],
-                          device float * out [[buffer(4)]], device float * po [[buffer(5)]],
-                          device float * pml [[buffer(6)]],
-                          threadgroup char * shared [[threadgroup(0)]],
-                          uint2 tgpig [[threadgroup_position_in_grid]],
-                          ushort sg [[simdgroup_index_in_threadgroup]], ushort lane [[thread_index_in_simdgroup]]) {
+template <bool Q8>
+void attn_decode_impl(constant FaArgs & p, device const half * q, device const half * kc,
+                      device const half * vc, device const float * qg, device float * out,
+                      device float * po, device float * pml, threadgroup char * shared,
+                      uint2 tgpig, ushort sg, ushort lane) {
     constexpr int D = 256, G = 8, NSG = 4;
+    device const half * ks = kv_scales(kc, p.kv_rows, p.cache_stride);
+    device const half * vs = kv_scales(vc, p.kv_rows, p.cache_stride);
     threadgroup half * Qs = (threadgroup half *)shared;                     // [G][D]
     threadgroup float * Ms = (threadgroup float *)(Qs + G * D);             // [NSG][G] max
     threadgroup float * Ls = Ms + NSG * G;                                  // [NSG][G] sum
@@ -1873,7 +2371,7 @@ kernel void h_attn_decode(constant FaArgs & p [[buffer(7)]],
         const bool ok = key < end;
         float s[G];
         for (int g = 0; g < G; g++) s[g] = 0.f;
-        if (ok) {
+        if (ok && !Q8) {
             device const half4 * kr = (device const half4 *)(kc + (ulong)key * p.cache_stride + head);
             for (int d4 = 0; d4 < D / 4; d4++) {
                 const float4 kv = float4(kr[d4]);
@@ -1881,6 +2379,24 @@ kernel void h_attn_decode(constant FaArgs & p [[buffer(7)]],
                     const float4 qv = float4(((threadgroup const half4 *)(Qs + g * D))[d4]);
                     s[g] += dot(qv, kv);
                 }
+            }
+        } else if (ok) {
+            // Q8: dot each 32-element block unscaled, then apply its scale.
+            const ulong kr = (ulong)key * p.cache_stride + head;
+            for (int b = 0; b < D / 32; b++) {
+                float sb[G];
+                for (int g = 0; g < G; g++) sb[g] = 0.f;
+                for (int j = 0; j < 4; j++) {
+                    const int d8 = b * 32 + j * 8;
+                    float4 k0, k1;
+                    kv_load8<Q8>(kc, kr + d8, k0, k1);
+                    for (int g = 0; g < G; g++) {
+                        threadgroup const half4 * qr = (threadgroup const half4 *)(Qs + g * D + d8);
+                        sb[g] += dot(float4(qr[0]), k0) + dot(float4(qr[1]), k1);
+                    }
+                }
+                const float sc = kv_scale<Q8>(ks, kr + b * 32);
+                for (int g = 0; g < G; g++) s[g] += sb[g] * sc;
             }
         }
         float pr[G];
@@ -1896,9 +2412,14 @@ kernel void h_attn_decode(constant FaArgs & p [[buffer(7)]],
         }
         const uint count = min(32u, end - j0);
         for (uint k = 0; k < count; k++) {
-            device const half * vr = vc + (ulong)(j0 + k) * p.cache_stride + head + lane * 8;
-            const float4 v0 = float4(*(device const half4 *)vr);
-            const float4 v1 = float4(*(device const half4 *)(vr + 4));
+            const ulong ve = (ulong)(j0 + k) * p.cache_stride + head + lane * 8;
+            float4 v0, v1;
+            kv_load8<Q8>(vc, ve, v0, v1);
+            if (Q8) {
+                const float vsc = kv_scale<Q8>(vs, ve);
+                v0 *= vsc;
+                v1 *= vsc;
+            }
             for (int g = 0; g < G; g++) {
                 const float pk = simd_shuffle(pr[g], ushort(k));
                 acc[g][0] += pk * v0.x; acc[g][1] += pk * v0.y; acc[g][2] += pk * v0.z; acc[g][3] += pk * v0.w;
@@ -1949,6 +2470,21 @@ kernel void h_attn_decode(constant FaArgs & p [[buffer(7)]],
         }
     }
 }
+
+#define ATTN_DECODE(name, q8)                                                                   \
+kernel void name(constant FaArgs & p [[buffer(7)]],                                            \
+                 device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],    \
+                 device const half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],  \
+                 device float * out [[buffer(4)]], device float * po [[buffer(5)]],            \
+                 device float * pml [[buffer(6)]],                                             \
+                 threadgroup char * shared [[threadgroup(0)]],                                 \
+                 uint2 tgpig [[threadgroup_position_in_grid]],                                 \
+                 ushort sg [[simdgroup_index_in_threadgroup]],                                 \
+                 ushort lane [[thread_index_in_simdgroup]]) {                                  \
+    attn_decode_impl<q8>(p, q, kc, vc, qg, out, po, pml, shared, tgpig, sg, lane);             \
+}
+ATTN_DECODE(h_attn_decode, false)
+ATTN_DECODE(h_attn_decode_q8, true)
 
 // ---------------------------------------------------------------- sampling support
 

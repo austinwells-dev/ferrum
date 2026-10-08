@@ -31,7 +31,7 @@ mod ui;
 
 pub use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 pub use ferrum::{
-    hybrid::{config::HybridConfig, draft::DraftConfig},
+    hybrid::{KvCache, config::HybridConfig, draft::DraftConfig},
     loader::gguf::{GgufReader, MetadataValue},
 };
 pub use ratatui::{

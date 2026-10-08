@@ -130,6 +130,7 @@ pub struct Plan {
     /// Also sweep the prefill chunk for the winner.
     pub chunks: bool,
     pub context: usize,
+    pub kv_cache: KvCache,
 }
 
 impl Plan {
@@ -253,6 +254,7 @@ fn load(
 ) -> Result<Runtime, String> {
     let mut options = PlanOptions {
         context: Some(plan.context),
+        kv_cache: plan.kv_cache,
         ..Default::default()
     };
     if let Some(c) = chunk {
@@ -711,6 +713,7 @@ mod tests {
             tokens: 192,
             chunks: false,
             context: 8192,
+            kv_cache: KvCache::F16,
         };
         let quick = plan.estimate_secs();
         plan.quick = false;

@@ -142,7 +142,8 @@ impl SpecOptions {
                     aux_layers: Vec::new(),
                     final_hidden: true,
                 };
-                let per_token = (2 * target.kv_heads * target.head_dim * 2) as f64;
+                let per_token =
+                    (2 * target.kv_cache.row_bytes(target.kv_heads * target.head_dim)) as f64;
                 Ok(DraftMemory {
                     weights: mtp_weight_bytes(file, target),
                     fixed: mtp_state_bytes(target, 0, chunk, k)
@@ -349,7 +350,8 @@ impl Runtime {
         let file = GgufFile::open(path)?;
         let default_sampling = recommended_sampling(&file);
         if let Some(spec) = spec {
-            let config = HybridConfig::from_gguf(&file)?;
+            let mut config = HybridConfig::from_gguf(&file)?;
+            config.kv_cache = options.kv_cache;
             options.draft = spec.memory(&file, &config, options.chunk.max(1))?;
         }
         drop(file);

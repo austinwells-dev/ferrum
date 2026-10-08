@@ -67,15 +67,25 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 | `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY` |
 | `--alias NAME` | file name | Model name reported to clients |
 | `-c`, `--context N\|auto` | `auto` | Context length |
+| `--kv-cache f16\|q8` | `f16` | K/V cache format (also `-ctk`/`-ctv`). `q8` nearly halves K/V memory, so `auto` fits about twice the context, and decodes faster at long context. See [K/V cache format](#kv-cache-format) |
 | `--reserve-mib N` | `1024` | GPU memory left free for the system |
 | `--chunk N` | `512` | Prompt tokens per forward pass |
 | `--max-tokens N` | context | Per-request cap when the client sends none |
 | `--temp`, `--top-p`, `--top-k`, `--min-p`, ... | from the GGUF | Sampling defaults |
 
+### K/V cache format
+
+`--kv-cache q8` stores attention keys and values as 8-bit values with one F16 scale per 32 (llama.cpp's `q8_0` layout), 1.06 bytes per element instead of 2. `FERRUM_KV_CACHE=q8` sets the same default for every front end and tool.
+
+- **Memory.** The cache is the only thing that grows with context, so on a 32 GB Mac `auto` context roughly doubles for the dense 27B. The 35B MoE already fits its full 262K in F16; Q8 leaves about 2.3 GiB of that free (5.0 → 2.7 GiB). The dense 27B goes from 101K to 190K tokens of auto context.
+- **Speed.** Decode attention reads about half the bytes, which matters from roughly 16K tokens of context. Prompt attention also gets faster (the kernels stage K/V through threadgroup memory either way).
+- **Accuracy.** On Tiel the mean KL divergence against F16 is about 0.009, the same size as the difference between Ferrum and llama.cpp on that model, and perplexity is unchanged. F16 stays the default because it is exact.
+- **Speculative decoding** stays correct, but greedy output with a drafter can differ from greedy output without one where the top two tokens are within a few tenths of a logit: a verify of 5 or more rows computes K/V through different matrix kernels than single-token decode, and 8-bit rounding amplifies that last-bit difference.
+
 ## CLI
 
 ```sh
-ferrum-cli --model model.gguf
+ferrum-cli --model model.gguf     # --kv-cache q8 as for the server
 ```
 
 Commands: `/reset`, `/think on|off`, `/image PATH`, `/stats`, `/exit`. To continue a message on the next line, end the line with `\`.

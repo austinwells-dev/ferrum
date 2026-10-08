@@ -45,6 +45,9 @@ server:
   -v, --verbose             debug logging (request bodies, outputs, first-token times)
 memory:
   -c, --context N|auto      context length (default auto: largest that fits)
+  --kv-cache f16|q8         K/V cache format; q8 nearly halves its memory, so auto
+                            context grows, and decodes faster at long context
+                            (default f16, or FERRUM_KV_CACHE). Also -ctk/-ctv.
   --reserve-mib N           GPU memory left free for the system (default 1024)
   --snapshots N             recurrent snapshots kept for prefix reuse (default 2)
   --chunk N                 prompt tokens per forward pass (default 512)
@@ -218,6 +221,9 @@ fn parse() -> Result<Options, String> {
                 } else {
                     Some(number()?)
                 }
+            }
+            "--kv-cache" | "-ctk" | "--cache-type-k" | "-ctv" | "--cache-type-v" => {
+                o.plan.kv_cache = value.parse().map_err(|e: ferrum::Error| e.to_string())?
             }
             "--mmproj" => o.mmproj = Some(value.clone()),
             "--image-tokens" => o.image_tokens = number()?,

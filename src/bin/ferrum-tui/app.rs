@@ -160,6 +160,14 @@ impl App {
         }
     }
 
+    /// The K/V cache format setting (FERRUM_KV_CACHE or f16 when unset).
+    pub fn kv_cache(&self) -> Result<KvCache, String> {
+        match self.value("kv_cache") {
+            "" => Ok(KvCache::from_env()),
+            v => v.parse().map_err(|e: ferrum::Error| e.to_string()),
+        }
+    }
+
     pub fn value(&self, key: &str) -> &str {
         self.fields
             .iter()
@@ -201,6 +209,7 @@ impl App {
             }
             let flag = match f.key {
                 "context" => "--context",
+                "kv_cache" => "--kv-cache",
                 "max_tokens" => "--max-tokens",
                 "effort" => "--reasoning-effort",
                 "budget" => "--reasoning-budget",

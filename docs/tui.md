@@ -11,6 +11,8 @@ Ferrum looks for models in the current folder, `./models`, `~/models`, `~/Downlo
 
 Type `/help` in any chat for the full command list.
 
+Each setup's **Model** group has *Context* and *KV cache*. *KV cache* `q8` stores the attention cache in 8 bits, which nearly halves its memory (so `auto` context grows) and speeds up long conversations; `f16` (the default) is exact. It applies to Chat, Agents, Serve and the Benchmark tab, and is saved with favorites. See [K/V cache format](server.md#kv-cache-format).
+
 ## Chat
 
 Chat runs the model inside the TUI with streaming markdown (syntax-highlighted code blocks for common languages, tables that wrap to the window, links and horizontal rules) and a separate reasoning view (`/thoughts` shows or hides it, `/think on|off` turns reasoning on or off).

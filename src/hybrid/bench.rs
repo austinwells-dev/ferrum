@@ -1,6 +1,7 @@
 //! Kernel and bandwidth probes on real weights (development tooling).
 #![forbid(unsafe_code)]
 use super::{
+    config::KvCache,
     engine::{HybridModel, Params},
     weights::{Ffn, Matrix, Mixer},
 };
@@ -165,28 +166,31 @@ pub fn bench_read_bandwidth(
 }
 
 impl HybridModel {
-    /// Decode attention alone: one query token against `keys` cached
-    /// positions. Returns (microseconds per call, GB/s of K+V read).
-    pub fn bench_decode_attention(
+    /// Few-row attention alone: `m` query tokens (1 = decode, more =
+    /// speculative verify) at positions `keys - m .. keys`, against a cache
+    /// in format `kv`. Returns (microseconds per call, GB/s of K+V read).
+    pub fn bench_attention(
         &self,
         d: &MetalDevice,
+        kv: KvCache,
+        m: usize,
         keys: usize,
         iters: usize,
     ) -> Result<(f64, f64)> {
         let c = &self.config;
         let stride = c.kv_heads * c.head_dim;
         let cap = keys.next_multiple_of(32);
-        let q = Tensor::zeros(d, [1, c.heads * c.head_dim], DType::F16)?;
-        let kc = Tensor::zeros(d, [cap, stride], DType::F16)?;
-        let vc = Tensor::zeros(d, [cap, stride], DType::F16)?;
-        let qg = Tensor::zeros(d, [1, 2 * c.heads * c.head_dim], DType::F32)?;
-        let att = Tensor::zeros(d, [1, c.heads * c.head_dim], DType::F32)?;
+        let q = Tensor::zeros(d, [m, c.heads * c.head_dim], DType::F16)?;
+        let kc = kv.alloc(d, cap, stride)?;
+        let vc = kv.alloc(d, cap, stride)?;
+        let qg = Tensor::zeros(d, [m, 2 * c.heads * c.head_dim], DType::F32)?;
+        let att = Tensor::zeros(d, [m, c.heads * c.head_dim], DType::F32)?;
         let s = self.scratch.borrow();
         let run = |n: usize| -> Result<f64> {
             let e = d.execution_with_shared_encoder(true)?;
             let start = std::time::Instant::now();
             for _ in 0..n {
-                self.flash_attention(d, &s, &q, &kc, &vc, &qg, &att, 1, keys - 1)?;
+                self.flash_attention(d, &s, kv, &q, &kc, &vc, &qg, &att, m, keys - m)?;
             }
             e.finish()?;
             Ok(start.elapsed().as_secs_f64())
@@ -197,7 +201,10 @@ impl HybridModel {
             run(iters)?;
         }
         let per = run(iters)? / iters as f64;
-        Ok((per * 1e6, 2. * (keys * stride * 2) as f64 / per / 1e9))
+        Ok((
+            per * 1e6,
+            2. * (keys * kv.row_bytes(stride)) as f64 / per / 1e9,
+        ))
     }
 }
 
@@ -207,6 +214,7 @@ impl HybridModel {
     pub fn bench_prefill_attention(
         &self,
         d: &MetalDevice,
+        kv: KvCache,
         m: usize,
         keys: usize,
         iters: usize,
@@ -215,8 +223,8 @@ impl HybridModel {
         let stride = c.kv_heads * c.head_dim;
         let cap = keys.next_multiple_of(32);
         let q = Tensor::zeros(d, [m, c.heads * c.head_dim], DType::F16)?;
-        let kc = Tensor::zeros(d, [cap, stride], DType::F16)?;
-        let vc = Tensor::zeros(d, [cap, stride], DType::F16)?;
+        let kc = kv.alloc(d, cap, stride)?;
+        let vc = kv.alloc(d, cap, stride)?;
         let qg = Tensor::zeros(d, [m, 2 * c.heads * c.head_dim], DType::F32)?;
         let att = Tensor::zeros(d, [m, c.heads * c.head_dim], DType::F32)?;
         let s = self.scratch.borrow();
@@ -224,7 +232,7 @@ impl HybridModel {
             let e = d.execution_with_shared_encoder(true)?;
             let start = std::time::Instant::now();
             for _ in 0..n {
-                self.flash_attention(d, &s, &q, &kc, &vc, &qg, &att, m, keys - m)?;
+                self.flash_attention(d, &s, kv, &q, &kc, &vc, &qg, &att, m, keys - m)?;
             }
             e.finish()?;
             Ok(start.elapsed().as_secs_f64())

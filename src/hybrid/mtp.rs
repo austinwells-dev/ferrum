@@ -47,7 +47,10 @@ pub fn mtp_state_bytes(
     max_drafts: usize,
 ) -> usize {
     let rows = chunk + 1;
-    let kv = page((capacity + max_drafts + 1).next_multiple_of(32) * c.kv_heads * c.head_dim * 2);
+    let kv = page(
+        (capacity + max_drafts + 1).next_multiple_of(32)
+            * c.kv_cache.row_bytes(c.kv_heads * c.head_dim),
+    );
     2 * kv
         + page(rows * c.hidden * 4)
         + page(rows * 2 * c.hidden * 4)
@@ -92,8 +95,8 @@ impl Mtp {
         let f = |dims: &[usize]| Tensor::zeros_resident(d, dims, DType::F32);
         Ok(Self {
             weights,
-            k: Tensor::zeros_resident(d, [kv_rows, kv_width], DType::F16)?,
-            v: Tensor::zeros_resident(d, [kv_rows, kv_width], DType::F16)?,
+            k: c.kv_cache.alloc(d, kv_rows, kv_width)?,
+            v: c.kv_cache.alloc(d, kv_rows, kv_width)?,
             capacity: capacity + max_drafts + 1,
             max_drafts,
             len: 0,

@@ -196,6 +196,7 @@ impl App {
             tokens: TOKENS[b.tokens],
             chunks: b.chunks,
             context: 8192,
+            kv_cache: self.kv_cache().unwrap_or_default(),
         })
     }
 

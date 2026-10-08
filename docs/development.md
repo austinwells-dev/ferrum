@@ -48,6 +48,8 @@ cargo run --release -- hybrid --model /path/to/model.gguf --prompt 'The capital 
 - `profile` also prints machine-readable `SUMMARY` and per-operation records.
 - `FERRUM_BATCH_LIMIT=1` gives cleaner per-kernel timings but changes how work is executed, so leave it unset when you measure throughput.
 - `FERRUM_NATIVE_MATMUL=0` switches to a slower diagnostic matrix-multiply fallback.
+- `FERRUM_KV_CACHE=q8` makes every tool and front end default to the 8-bit K/V cache (an explicit `--kv-cache` or TUI setting wins).
+- `FERRUM_HYBRID_LEGACY_ATTENTION=1` restores the Phase 9 attention routing (simdgroup kernels for 2–15 query rows, unstaged TensorOps prompt attention) for A/B runs. It reads only an F16 cache.
 - Native BF16 kernels need a capable Metal compiler and GPU, and `info` reports whether yours qualifies. Devices older than the M5 have not been validated.
 
 ## Testing
@@ -78,7 +80,7 @@ python3 tools/check_phase4_probe.py
 cargo bench --bench runtime -- --noplot
 ```
 
-The `examples/hybrid_*` programs measure the hybrid engine: `hybrid_bench` (prefill and decode), `hybrid_kld` (KL divergence against llama.cpp logits), `hybrid_spec` (speculative decoding), `hybrid_verify_cost` (verify cost against block width) and `hybrid_needle` (long-context retrieval).
+The `examples/hybrid_*` programs measure the hybrid engine: `hybrid_bench` (prefill and decode), `hybrid_kld` (KL divergence against llama.cpp logits), `hybrid_spec` (speculative decoding, `--depth N --filler FILE` for long context), `hybrid_verify_cost` (verify cost against block width), `hybrid_attention` and `hybrid_prefill_attention` (attention kernels alone, per query width and K/V format), `hybrid_plan` (memory plan per K/V format) and `hybrid_needle` (long-context retrieval).
 
 Python is only used by the optional comparison tools. To set up the reference environment:
 

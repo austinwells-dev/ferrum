@@ -22,6 +22,7 @@ use std::thread::JoinHandle;
 pub struct ChatOpts {
     pub model: PathBuf,
     pub context: Option<usize>,
+    pub kv_cache: KvCache,
     pub system: Option<String>,
     pub max_tokens: usize,
     pub think: bool,
@@ -134,6 +135,7 @@ impl ChatOpts {
         Ok(Self {
             model,
             context: count("context"),
+            kv_cache: app.kv_cache()?,
             system: Some(app.value("system").to_string()).filter(|s| !s.is_empty()),
             max_tokens: count("max_tokens").unwrap_or(32768),
             think: app.value("think") != "off",
@@ -266,6 +268,7 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
         &opts.model,
         PlanOptions {
             context: opts.context,
+            kv_cache: opts.kv_cache,
             ..Default::default()
         },
         opts.spec.as_ref(),

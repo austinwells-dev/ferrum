@@ -27,6 +27,9 @@ pub struct PlanOptions {
     pub draft: DraftMemory,
     /// Vision projector weights and encoder buffers (`vision::projector_bytes`).
     pub vision: usize,
+    /// K/V cache format; Q8 roughly halves the per-token cost. Defaults to
+    /// `FERRUM_KV_CACHE` (f16 or q8) when set, else F16.
+    pub kv_cache: super::KvCache,
 }
 
 /// Memory a speculative drafter adds: weights, verify and draft buffers,
@@ -49,6 +52,7 @@ impl Default for PlanOptions {
             snapshots: 2,
             draft: DraftMemory::default(),
             vision: 0,
+            kv_cache: super::KvCache::from_env(),
         }
     }
 }

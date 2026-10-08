@@ -1,0 +1,20 @@
+== kv f16 block 3
+28 verify steps, 3.43 tokens/step, 7 corrupted blocks
+speculative output == greedy reference (96 tokens)
+verify rows vs single-row decode over 4 positions: max |dlogit| 0.0012, max KL 1.42e-8
+replay after commit(2) vs plain forward: max |dlogit| 0.0000 (scale 20.1), argmax 271 vs 271
+== kv f16 block 8
+44 verify steps, 2.18 tokens/step, 14 corrupted blocks
+first divergence at token 59: reference margin 0.0012 (near-tie if small)
+verify rows vs single-row decode over 9 positions: max |dlogit| 0.0101, max KL 1.55e-6
+replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 21.1), argmax 2336 vs 2336
+== kv q8 block 3
+28 verify steps, 3.43 tokens/step, 7 corrupted blocks
+speculative output == greedy reference (96 tokens)
+verify rows vs single-row decode over 4 positions: max |dlogit| 0.0087, max KL 9.24e-7
+replay after commit(2) vs plain forward: max |dlogit| 0.0000 (scale 20.1), argmax 271 vs 271
+== kv q8 block 8
+70 verify steps, 1.36 tokens/step, 22 corrupted blocks
+first divergence at token 30: reference margin 0.1558 (near-tie if small)
+verify rows vs single-row decode over 9 positions: max |dlogit| 0.4678, max KL 2.15e-4
+replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 21.0), argmax 2336 vs 2336

@@ -1,0 +1,6 @@
+| model | K/V | KiB/token | auto context | K/V at auto context |
+|---|---|---|---|---|
+| Miroslav 1.0 | f16 | 64.0 | 101120 | 6.17 GiB |
+| Miroslav 1.0 | q8 | 34.0 | 190208 | 6.17 GiB |
+| Ornith-1.5-35B | f16 | 20.0 | 262144 | 5.00 GiB |
+| Ornith-1.5-35B | q8 | 10.6 | 262144 | 2.66 GiB |

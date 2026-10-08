@@ -14,7 +14,7 @@ pub mod session;
 pub mod speculative;
 pub mod weights;
 
-pub use config::{HybridConfig, Variant};
+pub use config::{HybridConfig, KvCache, Variant};
 pub use engine::{
     HybridModel, HybridState, Output, Penalties, Produced, RowOutput, RowsProduced, SpecGeometry,
 };
@@ -72,7 +72,8 @@ pub fn load_with(
 ) -> Result<LoadedHybrid> {
     let start = std::time::Instant::now();
     let mut file = GgufFile::open(path)?;
-    let config = HybridConfig::from_gguf(&file)?;
+    let mut config = HybridConfig::from_gguf(&file)?;
+    config.kv_cache = options.kv_cache;
     let plan = plan::plan(
         &file,
         &config,
