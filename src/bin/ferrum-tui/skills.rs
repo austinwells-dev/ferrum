@@ -68,7 +68,7 @@ pub fn parse(text: &str, fallback: &str) -> (String, String) {
 }
 
 fn read_skill(file: &Path, fallback: &str, project: &Path) -> Option<Skill> {
-    let text = fs::read_to_string(file).ok()?;
+    let text = crate::agent::read_no_follow(file).ok()?;
     let (name, description) = parse(&text, fallback);
     let folder = file.parent()?;
     let (dir, global) = match folder.strip_prefix(project) {
@@ -105,9 +105,12 @@ fn scan(dir: &Path, project: &Path, out: &mut Vec<Skill>) {
         let Ok(inner) = fs::read_dir(e.path()) else {
             continue;
         };
-        let file = inner
-            .flatten()
-            .find(|f| is_skill_file(&f.file_name().to_string_lossy()) && f.path().is_file());
+        // file_type does not follow links: a SKILL.md symlinked to a secret
+        // would otherwise be read here, outside the sandbox.
+        let file = inner.flatten().find(|f| {
+            is_skill_file(&f.file_name().to_string_lossy())
+                && f.file_type().is_ok_and(|t| t.is_file())
+        });
         if let Some(f) = file {
             out.extend(read_skill(&f.path(), &folder, project));
         }
@@ -194,7 +197,7 @@ pub fn load(skills: &[Skill], name: &str) -> Result<String, String> {
                     .join(", ")
             )
         })?;
-    let text = fs::read_to_string(&skill.file).map_err(|e| e.to_string())?;
+    let text = crate::agent::read_no_follow(&skill.file).map_err(|e| e.to_string())?;
     let dir = skill.file.parent().unwrap_or(Path::new("."));
     let mut files = Vec::new();
     collect(dir, dir, 0, &mut files);
@@ -291,6 +294,18 @@ mod tests {
         );
         assert!(load(&found, "nope").unwrap_err().contains("lint"));
         assert!(prompt(&found).contains("lint (skills/lint): Run the linter"));
+        // A SKILL.md that is a symlink (say, to a key) is never read.
+        let secret = dir.with_extension("secret");
+        fs::write(&secret, "TOP SECRET").unwrap();
+        fs::create_dir_all(dir.join("skills/leak")).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("skills/leak/SKILL.md")).unwrap();
+        let mut again = Vec::new();
+        scan(&dir.join("skills"), &dir, &mut again);
+        assert!(again.iter().all(|s| s.name != "leak"), "{again:?}");
+        fs::remove_file(dir.join("skills/lint/SKILL.md")).unwrap();
+        std::os::unix::fs::symlink(&secret, dir.join("skills/lint/SKILL.md")).unwrap();
+        assert!(load(&found, "lint").is_err());
+        let _ = fs::remove_file(secret);
         let _ = fs::remove_dir_all(&dir);
     }
 }

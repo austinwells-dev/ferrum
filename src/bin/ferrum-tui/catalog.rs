@@ -302,7 +302,7 @@ pub fn scan(extra: &[String]) -> Vec<Model> {
             walk(&root, depth, &mut seen, &mut out);
         }
     }
-    // Reading a header means parsing the whole tokenizer vocabulary, so check files in parallel.
+    // Headers are read in parallel; each still walks past the tokenizer arrays.
     let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
     let chunk = out.len().div_ceil(threads).max(1);
     let mut models: Vec<Model> = std::thread::scope(|scope| {
@@ -407,7 +407,13 @@ pub fn check(path: &Path) -> Checked {
     };
     let opened = fs::File::open(path)
         .map_err(|e| ferrum::Error::Gguf(format!("{}: {e}", path.display())))
-        .and_then(|f| GgufReader::from_reader(std::io::BufReader::with_capacity(1 << 20, f)));
+        .and_then(|f| {
+            // The tokenizer's big arrays are never looked at here.
+            GgufReader::from_reader_skipping_arrays(
+                std::io::BufReader::with_capacity(1 << 20, f),
+                4096,
+            )
+        });
     let file = match opened {
         Ok(f) => f,
         Err(e) => {

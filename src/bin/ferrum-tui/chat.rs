@@ -10,8 +10,9 @@ use ferrum::hybrid::{
     plan::PlanOptions,
     runtime::{ChatHooks, ChatRequest, Delta, Runtime, SpecOptions},
 };
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::rc::Rc;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -423,6 +424,8 @@ pub struct Turn {
     pub tool: Option<ToolView>,
     /// Chips for the files that came with a user message.
     pub attachments: Vec<String>,
+    /// Where those files are stored (for previews).
+    pub files: Vec<String>,
 }
 
 impl Turn {
@@ -436,6 +439,7 @@ impl Turn {
             error: None,
             tool: None,
             attachments: Vec::new(),
+            files: Vec::new(),
         }
     }
 }
@@ -466,6 +470,9 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/paste", "attach the clipboard (image, files or text)"),
     ("/screenshot", "drag out a screen region to attach"),
     ("/detach", "remove the attachments"),
+    ("/preview", "view attached images and videos (ctrl-o)"),
+    ("/previews off", "hide images and videos in the transcript"),
+    ("/previews on", "show images and videos in the transcript"),
     ("/workspace", "show this chat's sandbox folder"),
     ("/exit", "leave the chat"),
 ];
@@ -560,6 +567,7 @@ pub const AGENT_COMMANDS: &[(&str, &str)] = &[
     ("/attach ", "attach a file by path"),
     ("/paste", "attach the clipboard (image, files or text)"),
     ("/screenshot", "drag out a screen region to attach"),
+    ("/preview", "view attached images and videos (ctrl-o)"),
     ("/help", "list the commands"),
     ("/exit", "leave the agent"),
 ];
@@ -622,6 +630,74 @@ pub struct Chat {
     created: u64,
     title: Option<String>,
     pub resume: Option<ResumeList>,
+    pub preview: Option<preview::Preview>,
+    pub thumbs: preview::Thumbs,
+    /// Kitty image placements the last draw asked for.
+    pub wants: RefCell<Vec<preview::Want>>,
+    /// Show images and videos inline (`/previews on|off`).
+    pub inline: bool,
+    /// Display rows of finished turns, by turn index (see `turn_key`).
+    rendered: RefCell<Vec<Option<Rendered>>>,
+}
+
+/// Most rows an inline picture takes in the transcript, and in the strip of
+/// attachments waiting to be sent.
+const INLINE_ROWS: u16 = 14;
+const STRIP_ROWS: u16 = 8;
+
+/// A picture laid out in the transcript.
+#[derive(Clone)]
+struct InlinePic {
+    line: usize,
+    thumb: std::rc::Rc<preview::Thumb>,
+    cols: u16,
+    rows: u16,
+}
+
+/// A turn's display rows (pictures placed relative to its first row).
+struct Rendered {
+    key: u64,
+    lines: Rc<[Line<'static>]>,
+    pics: Vec<InlinePic>,
+}
+
+/// Everything a turn's rows depend on, or None while they can still change
+/// without its text changing (streaming, running tools, loading previews).
+fn turn_key(chat: &Chat, turn: &Turn, prev: Option<Role>, width: usize) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let stable = match turn.role {
+        Role::Assistant => turn.done,
+        Role::Tool => turn.tool.as_ref().is_some_and(|t| {
+            matches!(
+                t.state,
+                ToolState::Ok | ToolState::Failed | ToolState::Denied
+            )
+        }),
+        Role::Note => true,
+        Role::User => {
+            !chat.inline
+                || !turn
+                    .files
+                    .iter()
+                    .any(|f| preview::previewable(Path::new(f)))
+        }
+    };
+    if !stable {
+        return None;
+    }
+    let mut h = std::hash::DefaultHasher::new();
+    let role = |r: Role| r as u8;
+    (role(turn.role), prev.map(role), width, chat.show_thinking).hash(&mut h);
+    (&turn.content, &turn.reasoning, &turn.stats, &turn.error).hash(&mut h);
+    (&turn.attachments, &chat.label).hash(&mut h);
+    if let Some(tool) = &turn.tool {
+        (&tool.name, &tool.summary, &tool.output).hash(&mut h);
+        (tool.state as u8, tool.secs.to_bits()).hash(&mut h);
+        for k in ["old_text", "new_text", "content"] {
+            tool.args.get(k).and_then(Json::as_str).hash(&mut h);
+        }
+    }
+    Some(h.finish())
 }
 
 /// Most tool rounds the model may chain after one message.
@@ -709,6 +785,7 @@ impl Chat {
             follow: true,
             top: Cell::new(0),
             max_top: Cell::new(0),
+            rendered: RefCell::new(Vec::new()),
             page: Cell::new(10),
             last_stats: String::new(),
             palette_sel: 0,
@@ -734,6 +811,10 @@ impl Chat {
             created: bench::now(),
             title: None,
             resume: None,
+            preview: None,
+            thumbs: Default::default(),
+            wants: RefCell::new(Vec::new()),
+            inline: true,
         })
     }
 
@@ -875,6 +956,10 @@ impl Chat {
     }
 
     pub fn pump(&mut self) {
+        if let Some(p) = self.preview.as_mut() {
+            p.pump();
+        }
+        self.thumbs.pump();
         let mut results = Vec::new();
         if let Some(rx) = &self.exec_rx {
             while let Ok(r) = rx.try_recv() {
@@ -1244,6 +1329,10 @@ impl Chat {
         }
         let mut turn = Turn::new(Role::User, display);
         turn.attachments = attachments.iter().map(|a| a.chip()).collect();
+        turn.files = attachments
+            .iter()
+            .map(|a| a.full.display().to_string())
+            .collect();
         self.turns.push(turn);
         self.rounds = 0;
         if let Some(a) = &self.agent
@@ -1362,7 +1451,7 @@ impl Chat {
                 json!({
                     "role": match t.role { Role::User => "user", Role::Assistant => "assistant", Role::Tool => "tool", Role::Note => "note" },
                     "reasoning": t.reasoning, "content": t.content, "stats": t.stats,
-                    "error": t.error, "attachments": t.attachments,
+                    "error": t.error, "attachments": t.attachments, "files": t.files,
                     "tool": t.tool.as_ref().map(|v| json!({
                         "id": v.id, "name": v.name, "args": v.args, "summary": v.summary,
                         "state": state(v.state), "output": v.output, "secs": v.secs,
@@ -1405,6 +1494,14 @@ impl Chat {
                 turn.stats = t["stats"].as_str().map(str::to_string);
                 turn.error = t["error"].as_str().map(str::to_string);
                 turn.attachments = t["attachments"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str().map(str::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                turn.files = t["files"]
                     .as_array()
                     .map(|a| {
                         a.iter()
@@ -1657,6 +1754,16 @@ impl Chat {
                 Err(e) => self.note(e),
             },
             "/paste" => self.paste_clipboard(),
+            "/previews on" | "/previews off" => {
+                self.inline = line.trim().ends_with("on");
+                self.note(format!(
+                    "inline previews {}",
+                    if self.inline { "on" } else { "off" }
+                ));
+            }
+            l if l == "/preview" || l.starts_with("/preview ") => {
+                self.open_preview(l.trim_start_matches("/preview").trim())
+            }
             "/screenshot" => self.take_screenshot(),
             "/detach" => {
                 let n = self.attachments.len();
@@ -1693,6 +1800,61 @@ impl Chat {
 
     // ---- attachments ----
 
+    /// Images and videos in this conversation, oldest first: sent ones, then
+    /// the pending attachments.
+    fn media(&self) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = Vec::new();
+        let sent = self
+            .turns
+            .iter()
+            .flat_map(|t| t.files.iter().map(PathBuf::from));
+        let pending = self.attachments.iter().map(|a| a.full.clone());
+        for p in sent.chain(pending) {
+            if preview::previewable(&p) && p.is_file() && !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// `/preview` (newest), `/preview N` (Nth in the conversation) or `/preview PATH`.
+    pub fn open_preview(&mut self, arg: &str) {
+        let mut items = self.media();
+        let idx = if arg.is_empty() {
+            items.len().checked_sub(1)
+        } else if let Ok(n) = arg.parse::<usize>() {
+            (1..=items.len()).contains(&n).then(|| n - 1)
+        } else {
+            let found = attach::parse_dropped(arg);
+            let path = found.into_iter().next().unwrap_or_else(|| expand(arg));
+            if !path.is_file() {
+                return self.flash(format!("{} not found", path.display()), false);
+            }
+            if !preview::previewable(&path) {
+                return self.flash(
+                    format!("{} is not an image or video", path.display()),
+                    false,
+                );
+            }
+            let at = items.iter().position(|p| *p == path);
+            Some(at.unwrap_or_else(|| {
+                items.push(path);
+                items.len() - 1
+            }))
+        };
+        match idx {
+            Some(i) => self.preview = Some(preview::Preview::open(items, i)),
+            None if items.is_empty() => self.flash(
+                "nothing to preview: attach an image or video, or /preview PATH",
+                false,
+            ),
+            None => self.flash(
+                format!("there are {} images and videos", items.len()),
+                false,
+            ),
+        }
+    }
+
     pub fn attach_paths(&mut self, paths: &[PathBuf]) {
         let sb = match self.sandbox() {
             Ok(sb) => sb,
@@ -1701,7 +1863,12 @@ impl Chat {
         for path in paths {
             match attach::add_file(&sb, path) {
                 Ok(a) => {
-                    self.flash(format!("attached {}", a.name), true);
+                    let hint = if preview::previewable(&a.full) {
+                        " · ctrl-o to preview"
+                    } else {
+                        ""
+                    };
+                    self.flash(format!("attached {}{hint}", a.name), true);
                     self.attachments.push(a);
                 }
                 Err(e) => return self.flash(e, false),
@@ -1838,6 +2005,25 @@ impl App {
             }
             return;
         }
+        if let Some(p) = chat.preview.as_mut() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => chat.preview = None,
+                KeyCode::Char('o') if ctrl => chat.preview = None,
+                KeyCode::Char('c') if ctrl => chat.preview = None,
+                KeyCode::Right | KeyCode::Char('l') | KeyCode::Down | KeyCode::Char('j') => {
+                    p.step(true)
+                }
+                KeyCode::Left | KeyCode::Char('h') | KeyCode::Up | KeyCode::Char('k') => {
+                    p.step(false)
+                }
+                KeyCode::Char(' ') => p.paused = !p.paused,
+                KeyCode::Char('o') => {
+                    let _ = Command::new("/usr/bin/open").arg(p.path()).spawn();
+                }
+                _ => {}
+            }
+            return;
+        }
         if let Some(list) = chat.resume.as_mut() {
             let last = list.items.len() - 1;
             match key.code {
@@ -1939,6 +2125,7 @@ impl App {
             }
             KeyCode::Char('d') if ctrl && chat.input.is_empty() => self.leave_chat(),
             KeyCode::Char('t') if ctrl => chat.show_thinking = !chat.show_thinking,
+            KeyCode::Char('o') if ctrl => chat.open_preview(""),
             KeyCode::PageUp => {
                 let page = chat.page.get().max(2) - 1;
                 chat.scroll(true, page)
@@ -2047,11 +2234,26 @@ impl App {
         let input_w = content_w.saturating_sub(6).max(8);
         let rows = wrap_rows(&chat.input, input_w);
         let input_rows = rows.len().clamp(1, 6) as u16;
+        chat.wants.borrow_mut().clear();
         let chips_h = u16::from(!chat.attachments.is_empty());
-        let [head, mid, status, chips, input, footer] = Layout::vertical([
+        let pending: Vec<std::rc::Rc<preview::Thumb>> = if chat.inline {
+            chat.attachments
+                .iter()
+                .filter(|a| preview::previewable(&a.full))
+                .filter_map(|a| match chat.thumbs.get(&a.full) {
+                    preview::Slot::Ready(t) => Some(t),
+                    _ => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let strip_h = if pending.is_empty() { 0 } else { STRIP_ROWS };
+        let [head, mid, status, strip, chips, input, footer] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(4),
             Constraint::Length(1),
+            Constraint::Length(strip_h),
             Constraint::Length(chips_h),
             Constraint::Length(input_rows + 2),
             Constraint::Length(1),
@@ -2111,6 +2313,29 @@ impl App {
         }
 
         self.draw_chat_status(f, col(status), chat, t);
+        if strip_h > 0 {
+            // Attachments waiting to be sent, side by side.
+            let strip = col(strip);
+            let mut x = strip.x + 1;
+            for thumb in &pending {
+                let room = (strip.x + strip.width).saturating_sub(x);
+                if room < 4 {
+                    break;
+                }
+                let (cols, rows) = thumb.size(chat.thumbs.mode, room, strip_h);
+                preview::render(
+                    f,
+                    chat.thumbs.mode,
+                    &chat.wants,
+                    thumb.id,
+                    &thumb.pic,
+                    (x, (strip.y + strip_h - rows) as i32),
+                    (cols, rows),
+                    strip,
+                );
+                x += cols + 2;
+            }
+        }
         if chips_h > 0 {
             let mut spans = vec![Span::raw(" ")];
             for a in &chat.attachments {
@@ -2122,6 +2347,13 @@ impl App {
             }
             if chat.input.is_empty() {
                 spans.push(Span::styled("⌫ removes the last", Style::new().fg(FAINT)));
+                if chat
+                    .attachments
+                    .iter()
+                    .any(|a| preview::previewable(&a.full))
+                {
+                    spans.push(Span::styled(" · ctrl-o previews", Style::new().fg(FAINT)));
+                }
             }
             f.render_widget(Paragraph::new(Line::from(spans)), col(chips));
         }
@@ -2183,7 +2415,7 @@ impl App {
             }
         }
         f.render_widget(Paragraph::new(lines), inner);
-        if ready || chat.generating() {
+        if (ready || chat.generating()) && chat.preview.is_none() {
             let (s, _) = rows[cursor_row];
             let before: String = chars[s..chat.cursor.min(chars.len())].iter().collect();
             let x = inner.x + 3 + text_width(&before) as u16;
@@ -2293,6 +2525,17 @@ impl App {
             }
         };
         keys_footer(f, footer, keys, &self.status);
+        // Kitty images sit above the text, so popups hide them.
+        if chat.preview.is_some()
+            || chat.resume.is_some()
+            || chat.approval.is_some()
+            || !items.is_empty()
+        {
+            chat.wants.borrow_mut().clear();
+        }
+        if let Some(p) = &chat.preview {
+            p.draw(f, full, &chat.wants);
+        }
     }
 
     fn draw_resume(&self, f: &mut Frame, area: Rect, list: &ResumeList) {
@@ -2579,9 +2822,10 @@ impl App {
             return;
         }
         let width = area.width.saturating_sub(3) as usize;
-        let lines = self.transcript_lines(chat, width, t);
+        let (chunks, pics) = self.transcript_lines(chat, width, t);
         let h = area.height as usize;
-        let max_top = lines.len().saturating_sub(h);
+        let total: usize = chunks.iter().map(|c| c.len()).sum();
+        let max_top = total.saturating_sub(h);
         chat.max_top.set(max_top);
         chat.page.set(h);
         let top = if chat.follow {
@@ -2590,9 +2834,29 @@ impl App {
             chat.top.get().min(max_top)
         };
         chat.top.set(top);
-        let visible: Vec<Line> = lines.into_iter().skip(top).take(h).collect();
+        let visible: Vec<Line> = chunks
+            .iter()
+            .flat_map(|c| c.iter())
+            .skip(top)
+            .take(h)
+            .cloned()
+            .collect();
         let text_area = Rect::new(area.x, area.y, area.width.saturating_sub(1), area.height);
         f.render_widget(Paragraph::new(visible), text_area);
+        for p in &pics {
+            // Past the "▌ " bar.
+            let y = text_area.y as i32 + p.line as i32 - top as i32;
+            preview::render(
+                f,
+                chat.thumbs.mode,
+                &chat.wants,
+                p.thumb.id,
+                &p.thumb.pic,
+                (text_area.x + 2, y),
+                (p.cols, p.rows),
+                text_area,
+            );
+        }
         if max_top > 0 {
             let mut state = ratatui::widgets::ScrollbarState::new(max_top + 1)
                 .position(top)
@@ -2613,228 +2877,306 @@ impl App {
         }
     }
 
-    fn transcript_lines(&self, chat: &Chat, width: usize, t: f32) -> Vec<Line<'static>> {
-        let mut out: Vec<Line<'static>> = Vec::new();
-        let indent = || Span::raw("  ");
+    /// The transcript's display rows, one shared chunk per turn. Finished
+    /// turns are rendered once and reused while `turn_key` is unchanged, so
+    /// idle frames skip markdown, highlighting and wrapping of the history.
+    fn transcript_lines(
+        &self,
+        chat: &Chat,
+        width: usize,
+        t: f32,
+    ) -> (Vec<Rc<[Line<'static>]>>, Vec<InlinePic>) {
+        let mut cache = chat.rendered.borrow_mut();
+        cache.resize_with(chat.turns.len(), || None);
+        let mut chunks = Vec::with_capacity(chat.turns.len());
+        let mut pics = Vec::new();
+        let mut row = 0;
         for (n, turn) in chat.turns.iter().enumerate() {
             let prev = n.checked_sub(1).map(|p| chat.turns[p].role);
-            if n > 0 && !(turn.role == Role::Tool && prev == Some(Role::Tool)) {
-                out.push(Line::default());
+            let key = turn_key(chat, turn, prev, width);
+            let fresh = |r: &Option<Rendered>| r.as_ref().is_some_and(|r| Some(r.key) == key);
+            if key.is_none() || !fresh(&cache[n]) {
+                let (lines, pics) = self.turn_lines(chat, turn, n, prev, width, t);
+                cache[n] = Some(Rendered {
+                    key: key.unwrap_or_default(),
+                    lines: lines.into(),
+                    pics,
+                });
             }
-            match turn.role {
-                Role::Tool => {
-                    let Some(tool) = &turn.tool else { continue };
-                    let (icon, color) = match tool.state {
-                        ToolState::Queued => ("·".to_string(), DIM),
-                        ToolState::Waiting => ("?".to_string(), GOLD),
-                        ToolState::Running => (spinner(t).to_string(), EMBER),
-                        ToolState::Ok => ("✓".to_string(), GOOD),
-                        ToolState::Failed => ("✗".to_string(), BAD),
-                        ToolState::Denied => ("⊘".to_string(), DIM),
+            let Some(r) = &cache[n] else { continue };
+            pics.extend(r.pics.iter().map(|p| InlinePic {
+                line: row + p.line,
+                ..p.clone()
+            }));
+            row += r.lines.len();
+            chunks.push(r.lines.clone());
+            if key.is_none() {
+                cache[n] = None;
+            }
+        }
+        (chunks, pics)
+    }
+
+    /// One turn's rows, including the blank line that separates it.
+    fn turn_lines(
+        &self,
+        chat: &Chat,
+        turn: &Turn,
+        n: usize,
+        prev: Option<Role>,
+        width: usize,
+        t: f32,
+    ) -> (Vec<Line<'static>>, Vec<InlinePic>) {
+        let mut out: Vec<Line<'static>> = Vec::new();
+        let mut pics = Vec::new();
+        let indent = || Span::raw("  ");
+        if n > 0 && !(turn.role == Role::Tool && prev == Some(Role::Tool)) {
+            out.push(Line::default());
+        }
+        match turn.role {
+            Role::Tool => {
+                let Some(tool) = &turn.tool else {
+                    return (out, pics);
+                };
+                let (icon, color) = match tool.state {
+                    ToolState::Queued => ("·".to_string(), DIM),
+                    ToolState::Waiting => ("?".to_string(), GOLD),
+                    ToolState::Running => (spinner(t).to_string(), EMBER),
+                    ToolState::Ok => ("✓".to_string(), GOOD),
+                    ToolState::Failed => ("✗".to_string(), BAD),
+                    ToolState::Denied => ("⊘".to_string(), DIM),
+                };
+                let tail = match tool.state {
+                    ToolState::Running => tool
+                        .started
+                        .map(|s| format!("{:.0}s", s.elapsed().as_secs_f32()))
+                        .unwrap_or_default(),
+                    ToolState::Ok | ToolState::Failed => format!("{:.1}s", tool.secs),
+                    ToolState::Waiting => "waiting for you".to_string(),
+                    ToolState::Denied => "denied".to_string(),
+                    ToolState::Queued => String::new(),
+                };
+                let room =
+                    width.saturating_sub(tool.name.chars().count() + tail.chars().count() + 8);
+                out.push(Line::from(vec![
+                    indent(),
+                    Span::styled(format!("{icon} "), Style::new().fg(color)),
+                    Span::styled(
+                        tool.name.clone(),
+                        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("  {}", clip(&tool.summary, room)),
+                        Style::new().fg(DIM),
+                    ),
+                    Span::styled(format!("  {tail}"), Style::new().fg(FAINT)),
+                ]));
+                let diff_card = tool.state == ToolState::Ok
+                    && matches!(tool.name.as_str(), "edit_file" | "write_file");
+                if diff_card {
+                    let s = |k: &str| tool.args.get(k).and_then(Json::as_str).unwrap_or("");
+                    let (minus, plus) = if tool.name == "edit_file" {
+                        (s("old_text"), s("new_text"))
+                    } else {
+                        ("", s("content"))
                     };
-                    let tail = match tool.state {
-                        ToolState::Running => tool
-                            .started
-                            .map(|s| format!("{:.0}s", s.elapsed().as_secs_f32()))
-                            .unwrap_or_default(),
-                        ToolState::Ok | ToolState::Failed => format!("{:.1}s", tool.secs),
-                        ToolState::Waiting => "waiting for you".to_string(),
-                        ToolState::Denied => "denied".to_string(),
-                        ToolState::Queued => String::new(),
+                    let bar = |text: &str, sign: char, color: Color| {
+                        let style = Style::new().fg(color);
+                        let chars: Vec<Sc> = format!("{sign} {text}")
+                            .chars()
+                            .map(|c| (c, style))
+                            .collect();
+                        let row = wrap_styled(&chars, width.saturating_sub(6), 0)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default();
+                        to_line(&row, vec![Span::styled("  │ ", Style::new().fg(FAINT))])
                     };
-                    let room =
-                        width.saturating_sub(tool.name.chars().count() + tail.chars().count() + 8);
+                    for (text, sign, color) in [(minus, '-', BAD), (plus, '+', GOOD)] {
+                        let all: Vec<&str> = text.lines().collect();
+                        for line in all.iter().take(6) {
+                            out.push(bar(line, sign, color));
+                        }
+                        if all.len() > 6 {
+                            out.push(Line::styled(
+                                format!("  │ {sign} … {} more lines", all.len() - 6),
+                                Style::new().fg(FAINT),
+                            ));
+                        }
+                    }
+                } else if matches!(tool.state, ToolState::Ok | ToolState::Failed)
+                    && !tool.output.is_empty()
+                {
+                    let style = Style::new().fg(if tool.state == ToolState::Failed {
+                        BAD
+                    } else {
+                        DIM
+                    });
+                    let lines: Vec<&str> = tool.output.lines().collect();
+                    for line in lines.iter().take(8) {
+                        let line = line.replace('\t', "  ");
+                        let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
+                        let row = wrap_styled(&chars, width.saturating_sub(6), 0)
+                            .into_iter()
+                            .next()
+                            .unwrap_or_default();
+                        out.push(to_line(
+                            &row,
+                            vec![Span::styled("  │ ", Style::new().fg(FAINT))],
+                        ));
+                    }
+                    if lines.len() > 8 {
+                        out.push(Line::styled(
+                            format!("  │ … {} more lines", lines.len() - 8),
+                            Style::new().fg(FAINT),
+                        ));
+                    }
+                }
+            }
+            Role::User => {
+                let style = Style::new().fg(Color::White);
+                for line in turn.content.split('\n') {
+                    let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
+                    for row in wrap_styled(&chars, width.saturating_sub(2), 0) {
+                        out.push(to_line(
+                            &row,
+                            vec![Span::styled("▌ ", Style::new().fg(GOLD))],
+                        ));
+                    }
+                }
+                for chip in &turn.attachments {
                     out.push(Line::from(vec![
-                        indent(),
-                        Span::styled(format!("{icon} "), Style::new().fg(color)),
-                        Span::styled(
-                            tool.name.clone(),
-                            Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-                        ),
-                        Span::styled(
-                            format!("  {}", clip(&tool.summary, room)),
-                            Style::new().fg(DIM),
-                        ),
-                        Span::styled(format!("  {tail}"), Style::new().fg(FAINT)),
+                        Span::styled("▌ ", Style::new().fg(GOLD)),
+                        Span::styled(format!("⊕ {chip}"), Style::new().fg(GOLD)),
                     ]));
-                    let diff_card = tool.state == ToolState::Ok
-                        && matches!(tool.name.as_str(), "edit_file" | "write_file");
-                    if diff_card {
-                        let s = |k: &str| tool.args.get(k).and_then(Json::as_str).unwrap_or("");
-                        let (minus, plus) = if tool.name == "edit_file" {
-                            (s("old_text"), s("new_text"))
-                        } else {
-                            ("", s("content"))
-                        };
-                        let bar = |text: &str, sign: char, color: Color| {
-                            let style = Style::new().fg(color);
-                            let chars: Vec<Sc> = format!("{sign} {text}")
-                                .chars()
-                                .map(|c| (c, style))
-                                .collect();
-                            let row = wrap_styled(&chars, width.saturating_sub(6), 0)
-                                .into_iter()
-                                .next()
-                                .unwrap_or_default();
-                            to_line(&row, vec![Span::styled("  │ ", Style::new().fg(FAINT))])
-                        };
-                        for (text, sign, color) in [(minus, '-', BAD), (plus, '+', GOOD)] {
-                            let all: Vec<&str> = text.lines().collect();
-                            for line in all.iter().take(6) {
-                                out.push(bar(line, sign, color));
+                }
+                let bar = || Span::styled("▌ ", Style::new().fg(GOLD));
+                let media = turn.files.iter().map(Path::new);
+                for path in media.filter(|p| chat.inline && preview::previewable(p)) {
+                    match chat.thumbs.get(path) {
+                        preview::Slot::Ready(thumb) => {
+                            let room = width.saturating_sub(3).min(u16::MAX as usize) as u16;
+                            let (cols, rows) = thumb.size(chat.thumbs.mode, room, INLINE_ROWS);
+                            pics.push(InlinePic {
+                                line: out.len(),
+                                thumb: thumb.clone(),
+                                cols,
+                                rows,
+                            });
+                            for _ in 0..rows {
+                                out.push(Line::from(bar()));
                             }
-                            if all.len() > 6 {
-                                out.push(Line::styled(
-                                    format!("  │ {sign} … {} more lines", all.len() - 6),
-                                    Style::new().fg(FAINT),
+                            if thumb.video {
+                                out.push(Line::from(vec![
+                                    bar(),
+                                    Span::styled("▶ ctrl-o to play", Style::new().fg(DIM)),
+                                ]));
+                            }
+                        }
+                        preview::Slot::Loading => out.push(Line::from(vec![
+                            bar(),
+                            Span::styled(
+                                format!("{} loading preview", spinner(t)),
+                                Style::new().fg(DIM),
+                            ),
+                        ])),
+                        preview::Slot::Failed => {}
+                    }
+                }
+            }
+            Role::Note => {
+                let style = Style::new().fg(DIM).add_modifier(Modifier::ITALIC);
+                for line in turn.content.split('\n') {
+                    let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
+                    for row in wrap_styled(&chars, width.saturating_sub(2), 2) {
+                        out.push(to_line(&row, vec![indent()]));
+                    }
+                }
+            }
+            Role::Assistant => {
+                if prev != Some(Role::Tool) {
+                    out.push(Line::from(vec![
+                        Span::styled("◆ ", Style::new().fg(EMBER)),
+                        Span::styled(
+                            chat.label.clone(),
+                            Style::new().fg(DIM).add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+                let words = turn.reasoning.split_whitespace().count();
+                let thinking_now = !turn.done && turn.content.is_empty();
+                if !turn.reasoning.is_empty() {
+                    if chat.show_thinking {
+                        let style = Style::new().fg(DIM).add_modifier(Modifier::ITALIC);
+                        out.push(Line::styled(
+                            format!("{}┊ thinking{}", "  ", if thinking_now { " …" } else { "" }),
+                            Style::new().fg(FAINT),
+                        ));
+                        for line in turn.reasoning.trim_end().split('\n') {
+                            let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
+                            for row in wrap_styled(&chars, width.saturating_sub(4), 0) {
+                                out.push(to_line(
+                                    &row,
+                                    vec![Span::styled("  ┊ ", Style::new().fg(FAINT))],
                                 ));
                             }
                         }
-                    } else if matches!(tool.state, ToolState::Ok | ToolState::Failed)
-                        && !tool.output.is_empty()
-                    {
-                        let style = Style::new().fg(if tool.state == ToolState::Failed {
-                            BAD
-                        } else {
-                            DIM
-                        });
-                        let lines: Vec<&str> = tool.output.lines().collect();
-                        for line in lines.iter().take(8) {
-                            let line = line.replace('\t', "  ");
-                            let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
-                            let row = wrap_styled(&chars, width.saturating_sub(6), 0)
-                                .into_iter()
-                                .next()
-                                .unwrap_or_default();
-                            out.push(to_line(
-                                &row,
-                                vec![Span::styled("  │ ", Style::new().fg(FAINT))],
-                            ));
-                        }
-                        if lines.len() > 8 {
-                            out.push(Line::styled(
-                                format!("  │ … {} more lines", lines.len() - 8),
-                                Style::new().fg(FAINT),
-                            ));
-                        }
-                    }
-                }
-                Role::User => {
-                    let style = Style::new().fg(Color::White);
-                    for line in turn.content.split('\n') {
-                        let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
-                        for row in wrap_styled(&chars, width.saturating_sub(2), 0) {
-                            out.push(to_line(
-                                &row,
-                                vec![Span::styled("▌ ", Style::new().fg(GOLD))],
-                            ));
-                        }
-                    }
-                    for chip in &turn.attachments {
-                        out.push(Line::from(vec![
-                            Span::styled("▌ ", Style::new().fg(GOLD)),
-                            Span::styled(format!("⊕ {chip}"), Style::new().fg(GOLD)),
-                        ]));
-                    }
-                }
-                Role::Note => {
-                    let style = Style::new().fg(DIM).add_modifier(Modifier::ITALIC);
-                    for line in turn.content.split('\n') {
-                        let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
-                        for row in wrap_styled(&chars, width.saturating_sub(2), 2) {
-                            out.push(to_line(&row, vec![indent()]));
-                        }
-                    }
-                }
-                Role::Assistant => {
-                    if prev != Some(Role::Tool) {
-                        out.push(Line::from(vec![
-                            Span::styled("◆ ", Style::new().fg(EMBER)),
-                            Span::styled(
-                                chat.label.clone(),
-                                Style::new().fg(DIM).add_modifier(Modifier::BOLD),
-                            ),
-                        ]));
-                    }
-                    let words = turn.reasoning.split_whitespace().count();
-                    let thinking_now = !turn.done && turn.content.is_empty();
-                    if !turn.reasoning.is_empty() {
-                        if chat.show_thinking {
-                            let style = Style::new().fg(DIM).add_modifier(Modifier::ITALIC);
-                            out.push(Line::styled(
-                                format!(
-                                    "{}┊ thinking{}",
-                                    "  ",
-                                    if thinking_now { " …" } else { "" }
-                                ),
-                                Style::new().fg(FAINT),
-                            ));
-                            for line in turn.reasoning.trim_end().split('\n') {
-                                let chars: Vec<Sc> = line.chars().map(|c| (c, style)).collect();
-                                for row in wrap_styled(&chars, width.saturating_sub(4), 0) {
-                                    out.push(to_line(
-                                        &row,
-                                        vec![Span::styled("  ┊ ", Style::new().fg(FAINT))],
-                                    ));
-                                }
-                            }
-                        } else if thinking_now {
-                            out.push(Line::from(vec![
-                                indent(),
-                                Span::styled(spinner(t).to_string(), Style::new().fg(EMBER)),
-                                Span::styled(
-                                    format!(" thinking · {words} words"),
-                                    Style::new().fg(DIM).add_modifier(Modifier::ITALIC),
-                                ),
-                            ]));
-                        } else {
-                            out.push(Line::from(vec![
-                                indent(),
-                                Span::styled(
-                                    format!("▸ thought for {words} words · ctrl-t to show"),
-                                    Style::new().fg(FAINT),
-                                ),
-                            ]));
-                        }
-                        if !turn.content.is_empty() {
-                            out.push(Line::default());
-                        }
-                    }
-                    if !turn.content.is_empty() {
-                        let mut text = turn.content.clone();
-                        if !turn.done {
-                            text.push('▍');
-                        }
-                        for row in markdown(&text, width.saturating_sub(2), Style::new().fg(TEXT)) {
-                            out.push(to_line(&row, vec![indent()]));
-                        }
-                    } else if turn.reasoning.is_empty() && !turn.done {
-                        let msg = match chat.prefill {
-                            Some((d, tot)) => format!("reading prompt {d} / {tot}"),
-                            None => "starting".to_string(),
-                        };
+                    } else if thinking_now {
                         out.push(Line::from(vec![
                             indent(),
                             Span::styled(spinner(t).to_string(), Style::new().fg(EMBER)),
-                            Span::styled(format!(" {msg}"), Style::new().fg(DIM)),
+                            Span::styled(
+                                format!(" thinking · {words} words"),
+                                Style::new().fg(DIM).add_modifier(Modifier::ITALIC),
+                            ),
                         ]));
-                    }
-                    if let Some(e) = &turn.error {
+                    } else {
                         out.push(Line::from(vec![
                             indent(),
-                            Span::styled(format!("✗ {e}"), Style::new().fg(BAD)),
+                            Span::styled(
+                                format!("▸ thought for {words} words · ctrl-t to show"),
+                                Style::new().fg(FAINT),
+                            ),
                         ]));
                     }
-                    if let Some(s) = &turn.stats {
-                        out.push(Line::from(vec![
-                            indent(),
-                            Span::styled(s.clone(), Style::new().fg(FAINT)),
-                        ]));
+                    if !turn.content.is_empty() {
+                        out.push(Line::default());
                     }
+                }
+                if !turn.content.is_empty() {
+                    let mut text = turn.content.clone();
+                    if !turn.done {
+                        text.push('▍');
+                    }
+                    for row in markdown(&text, width.saturating_sub(2), Style::new().fg(TEXT)) {
+                        out.push(to_line(&row, vec![indent()]));
+                    }
+                } else if turn.reasoning.is_empty() && !turn.done {
+                    let msg = match chat.prefill {
+                        Some((d, tot)) => format!("reading prompt {d} / {tot}"),
+                        None => "starting".to_string(),
+                    };
+                    out.push(Line::from(vec![
+                        indent(),
+                        Span::styled(spinner(t).to_string(), Style::new().fg(EMBER)),
+                        Span::styled(format!(" {msg}"), Style::new().fg(DIM)),
+                    ]));
+                }
+                if let Some(e) = &turn.error {
+                    out.push(Line::from(vec![
+                        indent(),
+                        Span::styled(format!("✗ {e}"), Style::new().fg(BAD)),
+                    ]));
+                }
+                if let Some(s) = &turn.stats {
+                    out.push(Line::from(vec![
+                        indent(),
+                        Span::styled(s.clone(), Style::new().fg(FAINT)),
+                    ]));
                 }
             }
         }
-        out
+        (out, pics)
     }
 }
 

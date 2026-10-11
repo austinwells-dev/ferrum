@@ -38,7 +38,46 @@
     (literal (string-append (param "HOME") "/.netrc"))
     (literal (string-append (param "HOME") "/.npmrc"))
     (literal (string-append (param "HOME") "/.pypirc"))
-    (literal (string-append (param "HOME") "/.git-credentials")))
+    (literal (string-append (param "HOME") "/.git-credentials"))
+    (literal (string-append (param "HOME") "/.zsh_history"))
+    (literal (string-append (param "HOME") "/.bash_history"))
+    (literal (string-append (param "HOME") "/.cargo/credentials.toml"))
+    (literal (string-append (param "HOME") "/.cargo/credentials"))
+    (literal (string-append (param "HOME") "/.cache/huggingface/token"))
+    (subpath (string-append (param "HOME") "/.config/op"))
+    (subpath (string-append (param "HOME") "/Library/Group Containers/2BUA8C4S2C.com.1password"))
+    (subpath (string-append (param "HOME") "/Library/Application Support/BraveSoftware"))
+    (subpath (string-append (param "HOME") "/Library/Application Support/Arc"))
+    (subpath (string-append (param "HOME") "/Library/Application Support/Microsoft Edge")))
+
+;; Git settings and hooks run programs later, outside the sandbox (a git-aware
+;; shell prompt runs `git status` at every command): they stay read-only.
+(deny file-write*
+    (literal (string-append (param "WORKSPACE") "/.git"))
+    (literal (string-append (param "WORKSPACE") "/.git/config"))
+    (literal (string-append (param "WORKSPACE") "/.git/config.worktree"))
+    (subpath (string-append (param "WORKSPACE") "/.git/hooks")))
+
+;; Ways out through other processes: LaunchServices (`open` starts apps
+;; outside this sandbox), Apple events, the clipboard and the keychain.
+;; LaunchServices falls back across several coreservices names: deny them all.
+(deny mach-lookup
+    (global-name-prefix "com.apple.coreservices.")
+    (global-name-prefix "com.apple.lsd.")
+    (global-name "com.apple.pasteboard.1")
+    (global-name "com.apple.SecurityServer")
+    (global-name "com.apple.securityd")
+    (global-name "com.apple.securityd.xpc")
+    (global-name "com.apple.securityd.systemkeychain"))
+
+;; Unix sockets (tmux, Docker, ssh-agent, …) only inside the sandbox's own
+;; folders, plus the system's DNS and log sockets.
+(deny network-outbound (remote unix-socket))
+(allow network-outbound
+    (literal "/private/var/run/mDNSResponder")
+    (literal "/private/var/run/syslog")
+    (subpath (param "WORKSPACE"))
+    (subpath (param "STATE")))
 
 ;; Network: off entirely, or on but never to this Mac's own services.
 (if (string=? (param "NETWORK") "off")

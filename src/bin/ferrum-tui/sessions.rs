@@ -32,14 +32,10 @@ pub struct Meta {
 }
 
 pub fn save(id: &str, data: &Json) {
-    let d = dir();
-    if fs::create_dir_all(&d).is_err() {
-        return;
-    }
-    let tmp = d.join(format!("{id}.json.tmp"));
-    if fs::write(&tmp, serde_json::to_string(data).unwrap_or_default()).is_ok() {
-        let _ = fs::rename(&tmp, d.join(format!("{id}.json")));
-    }
+    let _ = crate::write_private(
+        &dir().join(format!("{id}.json")),
+        &serde_json::to_string(data).unwrap_or_default(),
+    );
 }
 
 pub fn load(id: &str) -> Option<Json> {

@@ -2,7 +2,8 @@
 //! the user's settings, never from the model, so the request runs outside the
 //! sandbox. That lets a SearXNG server on this Mac or LAN work.
 use serde_json::Value as Json;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 pub const PROVIDERS: &[&str] = &["duckduckgo", "instant", "searxng", "brave", "custom"];
 
@@ -91,12 +92,28 @@ pub fn search(cfg: &Config, query: &str) -> Result<String, String> {
         "Mozilla/5.0 (Macintosh) ferrum",
     ]);
     cmd.args(["-H", "Accept: application/json, text/html;q=0.8"]);
+    // The URL and headers can hold the API key, and any process (the agent's
+    // sandbox too) can read another's arguments: send them as a config on stdin.
+    let quote = |s: &str| {
+        let clean: String = s.chars().filter(|c| !c.is_control()).collect();
+        format!("\"{}\"", clean.replace('\\', "\\\\").replace('"', "\\\""))
+    };
+    let mut config = format!("url = {}\n", quote(&url));
     for h in &headers {
-        cmd.args(["-H", h]);
+        config += &format!("header = {}\n", quote(h));
     }
-    cmd.args(["-w", "\n%{http_code}", "--", &url]);
-    let out = cmd
-        .output()
+    cmd.args(["-w", "\n%{http_code}", "-K", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("could not run curl: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(config.as_bytes());
+    }
+    let out = child
+        .wait_with_output()
         .map_err(|e| format!("could not run curl: {e}"))?;
     if !out.status.success() {
         return Err(format!(

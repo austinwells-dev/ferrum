@@ -30,16 +30,36 @@ impl Request {
 }
 
 pub const MAX_BODY: usize = 512 << 20;
+/// Longest request, header or chunk-size line, and most headers, accepted.
+const MAX_LINE: u64 = 64 << 10;
+const MAX_HEADERS: usize = 128;
+
+/// `read_line` that refuses a line longer than `MAX_LINE`.
+fn read_line(reader: &mut BufReader<TcpStream>, line: &mut String) -> io::Result<usize> {
+    let n = reader.by_ref().take(MAX_LINE).read_line(line)?;
+    if n as u64 == MAX_LINE && !line.ends_with('\n') {
+        return Err(io::Error::other("header line too long"));
+    }
+    Ok(n)
+}
 
 /// Read one request. `Ok(None)` means the client closed the connection.
 pub fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Request>> {
     let mut line = String::new();
-    if reader.read_line(&mut line)? == 0 {
-        return Ok(None);
+    // Blank lines between pipelined requests are skipped (not recursed on:
+    // a stream of them would overflow the stack).
+    for _ in 0..MAX_HEADERS {
+        line.clear();
+        if read_line(reader, &mut line)? == 0 {
+            return Ok(None);
+        }
+        if !line.trim_end().is_empty() {
+            break;
+        }
     }
     let line = line.trim_end();
     if line.is_empty() {
-        return read_request(reader);
+        return Err(io::Error::other("no request line"));
     }
     let mut parts = line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_owned();
@@ -49,8 +69,11 @@ pub fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option
     let mut headers = Vec::new();
     loop {
         let mut h = String::new();
-        if reader.read_line(&mut h)? == 0 || h.trim().is_empty() {
+        if read_line(reader, &mut h)? == 0 || h.trim().is_empty() {
             break;
+        }
+        if headers.len() == MAX_HEADERS {
+            return Err(io::Error::other("too many headers"));
         }
         if let Some((k, v)) = h.split_once(':') {
             headers.push((k.trim().to_ascii_lowercase(), v.trim().to_owned()));
@@ -73,12 +96,15 @@ pub fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option
         let mut body = Vec::new();
         loop {
             let mut size = String::new();
-            reader.read_line(&mut size)?;
+            read_line(reader, &mut size)?;
             let size = usize::from_str_radix(size.trim().split(';').next().unwrap_or("0"), 16)
                 .map_err(|_| std::io::Error::other("bad chunk size"))?;
             if size == 0 {
                 let mut trailer = String::new();
-                while reader.read_line(&mut trailer)? > 0 && !trailer.trim().is_empty() {
+                for _ in 0..MAX_HEADERS {
+                    if read_line(reader, &mut trailer)? == 0 || trailer.trim().is_empty() {
+                        break;
+                    }
                     trailer.clear();
                 }
                 break;
@@ -125,6 +151,7 @@ pub fn reason(status: u16) -> &'static str {
         204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
@@ -281,5 +308,46 @@ fn peer_closed(stream: &TcpStream) -> bool {
             io::Error::last_os_error().kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+
+    /// Parse what a client sends, as the server would.
+    fn parse(bytes: Vec<u8>) -> io::Result<Option<Request>> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let client = thread::spawn(move || {
+            if let Ok(mut s) = TcpStream::connect(addr) {
+                let _ = s.write_all(&bytes);
+            }
+        });
+        let (stream, _) = listener.accept()?;
+        let parsed = read_request(&mut BufReader::new(stream));
+        // The reader is dropped, so a client still writing a flood fails fast.
+        let _ = client.join();
+        parsed
+    }
+
+    #[test]
+    fn hostile_headers_are_refused_without_crashing() {
+        // A flood of blank lines used to recurse once per line.
+        let mut flood = b"\r\n".repeat(500_000);
+        flood.extend_from_slice(b"GET /health HTTP/1.1\r\n\r\n");
+        assert!(parse(flood).is_err());
+        let long = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(100_000));
+        assert!(parse(long.into_bytes()).is_err());
+        let many = format!("GET / HTTP/1.1\r\n{}\r\n", "X: 1\r\n".repeat(200));
+        assert!(parse(many.into_bytes()).is_err());
+        let ok = parse(b"\r\nGET /health?x=1 HTTP/1.1\r\nHost: localhost\r\n\r\n".to_vec())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (ok.path.as_str(), ok.header("host")),
+            ("/health", Some("localhost"))
+        );
     }
 }

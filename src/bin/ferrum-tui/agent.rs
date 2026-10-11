@@ -3,7 +3,8 @@
 //! read-only except for the workspace folder, secrets are hidden, and the
 //! network can be switched off. File tools never leave the workspace.
 use crate::*;
-use std::io::Read;
+use std::io::{Read, Write};
+use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,6 +12,40 @@ use std::sync::mpsc::channel;
 
 const PROFILE: &str = include_str!("sandbox.sb");
 const MAX_OUTPUT: usize = 12_000;
+/// macOS `open(2)` flag: fail if any component of the path is a symlink.
+const O_NOFOLLOW_ANY: i32 = 0x2000_0000;
+/// `ELOOP`, what `O_NOFOLLOW_ANY` reports on meeting a symlink.
+const ELOOP: i32 = 62;
+
+/// Read a file the agent may have planted, refusing a symlink in its place
+/// (the TUI reads outside the sandbox, so a link could reach a secret).
+pub fn read_no_follow(path: &Path) -> std::io::Result<String> {
+    const O_NOFOLLOW: i32 = 0x100;
+    let mut text = String::new();
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(O_NOFOLLOW)
+        .open(path)?
+        .read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// `program args…` in a sandbox that can write nothing and reach no network.
+/// For commands the TUI runs itself in the agent's project (git): the agent
+/// can rewrite `.git/config`, and settings like `core.fsmonitor` run programs.
+pub fn confined(argv: &[&str]) -> Command {
+    let mut c = Command::new("/usr/bin/sandbox-exec");
+    c.arg("-p")
+        .arg(PROFILE)
+        .args(["-D", "WORKSPACE=/private/var/empty"])
+        .args(["-D", "STATE=/private/var/empty"])
+        .arg("-D")
+        .arg(format!("HOME={}", home().display()))
+        .args(["-D", "NETWORK=off"])
+        .args(argv)
+        .stdin(Stdio::null());
+    c
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ToolMode {
@@ -254,12 +289,14 @@ impl Sandbox {
             }
         }
         let mut probe = norm.clone();
-        while !probe.exists() {
+        // A dangling symlink exists here, so it is canonicalized (and fails)
+        // rather than skipped: writing through it would land outside.
+        while fs::symlink_metadata(&probe).is_err() {
             if !probe.pop() {
                 break;
             }
         }
-        let real = fs::canonicalize(&probe).map_err(|e| e.to_string())?;
+        let real = fs::canonicalize(&probe).map_err(|e| format!("{p}: {e}"))?;
         if !real.starts_with(&self.workspace) && !real.starts_with(self.attachments()) {
             return Err(format!(
                 "{p} is outside the workspace ({})",
@@ -267,6 +304,60 @@ impl Sandbox {
             ));
         }
         Ok(norm)
+    }
+
+    /// Open a resolved path without following symlinks: the real location is
+    /// checked again, then opened with `O_NOFOLLOW_ANY`, so a link swapped in
+    /// after `resolve` (by a background process) is refused, not followed.
+    fn open(&self, path: &Path, write: bool) -> Result<fs::File, String> {
+        let rel = self.rel(path);
+        let real = match fs::canonicalize(path) {
+            Ok(real) => real,
+            Err(_) => {
+                let name = path
+                    .file_name()
+                    .ok_or_else(|| format!("{rel} is not a file"))?;
+                let parent = path.parent().unwrap_or(&self.workspace);
+                fs::canonicalize(parent)
+                    .map_err(|e| format!("{rel}: {e}"))?
+                    .join(name)
+            }
+        };
+        if !real.starts_with(&self.workspace) && !real.starts_with(self.attachments()) {
+            return Err(format!("{rel} is outside the workspace"));
+        }
+        let mut options = fs::OpenOptions::new();
+        if write {
+            options.write(true).create(true).truncate(true);
+        } else {
+            options.read(true);
+        }
+        options
+            .custom_flags(O_NOFOLLOW_ANY)
+            .open(&real)
+            .map_err(|e| match e.raw_os_error() {
+                Some(ELOOP) => format!("{rel}: refusing to follow a symbolic link"),
+                _ => format!("{rel}: {e}"),
+            })
+    }
+
+    pub fn read_bytes(&self, path: &Path) -> Result<Vec<u8>, String> {
+        let mut bytes = Vec::new();
+        self.open(path, false)?
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("{}: {e}", self.rel(path)))?;
+        Ok(bytes)
+    }
+
+    pub fn read_text(&self, path: &Path) -> Result<String, String> {
+        String::from_utf8(self.read_bytes(path)?)
+            .map_err(|_| format!("{} is not UTF-8 text", self.rel(path)))
+    }
+
+    pub fn write_text(&self, path: &Path, text: &str) -> Result<(), String> {
+        self.open(path, true)?
+            .write_all(text.as_bytes())
+            .map_err(|e| format!("{}: {e}", self.rel(path)))
     }
 
     pub fn rel(&self, path: &Path) -> String {
@@ -366,12 +457,21 @@ impl Sandbox {
             }
             std::thread::sleep(Duration::from_millis(25));
         }
-        let _ = reader.join();
-        while let Ok(chunk) = rx.try_recv() {
+        // Jobs the command left in the background (`server &`) would hold the
+        // output pipe open and hang this call: end the whole group.
+        if !killed {
+            let _ = Command::new("/bin/kill")
+                .args(["-KILL", &format!("-{}", child.id())])
+                .status();
+        }
+        // Whatever escaped the group may still hold the pipe; stop waiting soon.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while let Ok(chunk) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
             if out.len() < 400_000 {
                 out.extend_from_slice(&chunk);
             }
         }
+        drop(reader);
         Ok((code, String::from_utf8_lossy(&out).into_owned(), killed))
     }
 
@@ -430,7 +530,7 @@ impl Sandbox {
 
     pub fn read_file(&self, args: &Map<String, Json>) -> Result<String, String> {
         let path = self.resolve(arg_str(args, "path")?)?;
-        let bytes = fs::read(&path).map_err(|e| format!("{}: {e}", self.rel(&path)))?;
+        let bytes = self.read_bytes(&path)?;
         if bytes.contains(&0) {
             return Err(format!("{} is a binary file", self.rel(&path)));
         }
@@ -462,7 +562,7 @@ impl Sandbox {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir).map_err(|e| e.to_string())?;
         }
-        fs::write(&path, content).map_err(|e| format!("{}: {e}", self.rel(&path)))?;
+        self.write_text(&path, content)?;
         Ok(format!(
             "wrote {} bytes ({} lines) to {}",
             content.len(),
@@ -477,12 +577,11 @@ impl Sandbox {
         if old.is_empty() {
             return Err("old_text is empty".into());
         }
-        let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", self.rel(&path)))?;
+        let text = self.read_text(&path)?;
         match text.matches(old).count() {
             0 => Err("old_text was not found; read the file again and copy it exactly".into()),
             1 => {
-                fs::write(&path, text.replacen(old, new, 1))
-                    .map_err(|e| format!("{}: {e}", self.rel(&path)))?;
+                self.write_text(&path, &text.replacen(old, new, 1))?;
                 Ok(format!(
                     "edited {}: replaced {} lines with {}",
                     self.rel(&path),
@@ -595,6 +694,37 @@ impl Sandbox {
     }
 }
 
+/// `&#39;` and `&#x27;` style character references.
+fn decode_numeric_entities(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("&#") {
+        out += &rest[..at];
+        let tail = &rest[at + 2..];
+        let decoded = tail.find(';').filter(|&end| end <= 8).and_then(|end| {
+            let digits = &tail[..end];
+            let code = match digits.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok(),
+                None => digits.parse().ok(),
+            };
+            code.and_then(char::from_u32)
+                .filter(|c| !c.is_control() || c.is_whitespace())
+                .map(|c| (c, end))
+        });
+        match decoded {
+            Some((c, end)) => {
+                out.push(c);
+                rest = &tail[end + 1..];
+            }
+            None => {
+                out += "&#";
+                rest = tail;
+            }
+        }
+    }
+    out + rest
+}
+
 /// Reduce HTML to readable text: drop scripts and styles, keep block breaks.
 pub fn html_to_text(html: &str) -> String {
     let lower = html.to_ascii_lowercase();
@@ -674,6 +804,7 @@ pub fn html_to_text(html: &str) -> String {
         .replace("&#39;", "'")
         .replace("&rsquo;", "'")
         .replace("&mdash;", "—");
+    let decoded = decode_numeric_entities(&decoded);
     let mut result = String::new();
     let mut blank = 0;
     for line in decoded.lines() {
@@ -748,6 +879,11 @@ mod tests {
             json!({"command": "curl -sS -m 5 -o /dev/null https://example.com", "timeout_secs": 10}),
         );
         assert!(!ok, "network should be off: {out}");
+        // The clipboard and keychain are system services outside the sandbox.
+        let (ok, out) = call(&sb, "bash", json!({"command": "pbpaste"}));
+        assert!(!ok, "clipboard should be unreachable: {out}");
+        let (_, out) = call(&sb, "bash", json!({"command": "security list-keychains"}));
+        assert!(!out.contains("login.keychain"), "keychain: {out}");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -799,6 +935,49 @@ mod tests {
     }
 
     #[test]
+    fn git_settings_and_hooks_stay_read_only() {
+        let (sb, dir) = sandbox("git", false);
+        let init = Command::new("git")
+            .args(["init", "-q"])
+            .arg(&sb.workspace)
+            .status();
+        if init.is_ok_and(|s| s.success()) {
+            for command in [
+                "git config core.fsmonitor 'touch pwned'",
+                "echo x > .git/hooks/post-checkout",
+                "mv .git .git-old",
+            ] {
+                let (ok, out) = call(&sb, "bash", json!({ "command": command }));
+                assert!(!ok, "{command}: {out}");
+            }
+            let (ok, out) = call(&sb, "bash", json!({"command": "echo x > f && git add f"}));
+            assert!(ok, "{out}");
+        }
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn file_tools_refuse_dangling_symlinks() {
+        let (sb, dir) = sandbox("dangling", false);
+        let outside = dir.with_extension("outside");
+        let _ = fs::remove_file(&outside);
+        std::os::unix::fs::symlink(&outside, sb.workspace.join("out")).unwrap();
+        let (ok, out) = call(&sb, "write_file", json!({"path": "out", "content": "x"}));
+        assert!(!ok && !outside.exists(), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn background_jobs_do_not_hold_a_command_open() {
+        let (sb, dir) = sandbox("background", false);
+        let started = Instant::now();
+        let (ok, out) = call(&sb, "bash", json!({"command": "sleep 30 & echo started"}));
+        assert!(ok && out.contains("started"), "{out}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn bash_reports_exit_codes_and_timeouts() {
         let (sb, dir) = sandbox("bash", false);
         let (ok, out) = call(
@@ -827,6 +1006,10 @@ mod tests {
         assert!(
             text.contains("Hi & bye") && text.contains("one two"),
             "{text}"
+        );
+        assert_eq!(
+            html_to_text("<p>it&#39;s &#x27;ok&#x27; &#xZZ; &#1;</p>"),
+            "it's 'ok' &#xZZ; &#1;\n"
         );
         assert!(!text.contains("var a") && !text.contains("p{}"), "{text}");
     }

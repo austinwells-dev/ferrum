@@ -17,6 +17,7 @@ mod fields;
 mod highlight;
 mod home;
 mod pick;
+mod preview;
 mod search;
 mod serve;
 mod sessions;
@@ -62,6 +63,26 @@ pub use ui::*;
 
 pub fn config_path() -> PathBuf {
     home().join(".config/ferrum/tui.json")
+}
+
+/// Replace `path` atomically (a crash leaves the old file, not half a new
+/// one), readable only by you: settings hold API keys, sessions your chats.
+pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let tmp = path.with_extension("tmp");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(text.as_bytes())?;
+    file.sync_all()?;
+    fs::rename(&tmp, path)
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -167,6 +188,8 @@ pub struct App {
     pub bench: Option<BenchState>,
     /// Chat workers that were told to stop and may still be unloading.
     pub closing: Vec<std::thread::JoinHandle<()>>,
+    /// The kitty-protocol image currently on screen.
+    pub gfx: preview::Kitty,
 }
 
 impl App {
@@ -342,11 +365,18 @@ fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.quit {
         app.tick();
         terminal.draw(|f| app.draw(f))?;
+        let wants = match (app.screen, app.chat.as_ref()) {
+            (Screen::Chat, Some(c)) => c.wants.take(),
+            _ => Vec::new(),
+        };
+        app.gfx.sync(terminal.backend_mut(), &wants)?;
         if event::poll(app.poll_interval())? {
             loop {
                 match event::read()? {
                     Event::Key(k) if k.kind != KeyEventKind::Release => app.on_key(k),
                     Event::Paste(s) => app.on_paste(&s),
+                    // The resize clears the screen, images included.
+                    Event::Resize(..) => app.gfx.reset(),
                     _ => {}
                 }
                 if app.quit || !event::poll(Duration::ZERO)? {

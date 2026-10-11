@@ -11,6 +11,8 @@ const OCR_JS: &str = include_str!("ocr.js");
 /// Largest file read into a message, and how much of it is pasted inline.
 const MAX_BYTES: u64 = 8 << 20;
 const INLINE_CHARS: usize = 24_000;
+/// Videos are only copied (for previews and tools), so they may be larger.
+const MAX_VIDEO_BYTES: u64 = 512 << 20;
 const IMAGE_EXTS: [&str; 9] = [
     "png", "jpg", "jpeg", "gif", "webp", "heic", "tiff", "tif", "bmp",
 ];
@@ -19,6 +21,7 @@ const IMAGE_EXTS: [&str; 9] = [
 pub enum Kind {
     Text,
     Image,
+    Video,
     Binary,
 }
 
@@ -86,6 +89,10 @@ impl Attachment {
                     self.name, self.rel
                 ),
             },
+            Kind::Video => format!(
+                "<attachment name=\"{}\" path=\"{}\" type=\"video\">\n[A video file of {} bytes saved in the workspace; you cannot watch it.]\n</attachment>",
+                self.name, self.rel, self.bytes
+            ),
             Kind::Binary => format!(
                 "<attachment name=\"{}\" path=\"{}\" type=\"binary\">\n[A binary file of {} bytes saved in the workspace.]\n</attachment>",
                 self.name, self.rel, self.bytes
@@ -202,6 +209,10 @@ fn describe(sb: &Sandbox, stored: &Path, name: &str) -> Result<Attachment, Strin
         att.ocr = ocr(stored);
         return Ok(att);
     }
+    if crate::preview::is_video(stored) {
+        att.kind = Kind::Video;
+        return Ok(att);
+    }
     let bytes = fs::read(stored).map_err(|e| e.to_string())?;
     if !bytes.contains(&0) {
         att.kind = Kind::Text;
@@ -216,11 +227,16 @@ pub fn add_file(sb: &Sandbox, src: &Path) -> Result<Attachment, String> {
     if meta.is_dir() {
         return Err(format!("{} is a folder; attach files", src.display()));
     }
-    if meta.len() > MAX_BYTES {
+    let limit = if crate::preview::is_video(src) {
+        MAX_VIDEO_BYTES
+    } else {
+        MAX_BYTES
+    };
+    if meta.len() > limit {
         return Err(format!(
             "{} is larger than {} MB",
             src.display(),
-            MAX_BYTES >> 20
+            limit >> 20
         ));
     }
     let name = src

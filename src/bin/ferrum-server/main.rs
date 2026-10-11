@@ -41,6 +41,9 @@ server:
   --host ADDR               bind address (default 127.0.0.1)
   --port N                  port (default 8080)
   --api-key KEY             require `Authorization: Bearer KEY` or `x-api-key: KEY`
+                            (or set FERRUM_API_KEY, which other processes can't read)
+  --cors ORIGIN             let web pages from ORIGIN call the server (repeatable;
+                            `*` for any). Default: only localhost pages
   --alias NAME              model name reported to clients (default: file name)
   -v, --verbose             debug logging (request bodies, outputs, first-token times)
 memory:
@@ -97,6 +100,10 @@ pub struct Server {
     name: String,
     model_path: PathBuf,
     api_key: Option<String>,
+    /// Extra origins web pages may call from (`--cors`).
+    cors: Vec<String>,
+    /// Bound to a loopback address: only local `Host` names are served.
+    loopback: bool,
     next_id: AtomicU64,
     started: Instant,
 }
@@ -141,6 +148,7 @@ pub fn error_json(message: &str, kind: &str) -> Json {
     let code = match kind {
         "invalid_request_error" => 400,
         "authentication_error" => 401,
+        "permission_error" => 403,
         "not_found_error" => 404,
         "unavailable_error" => 503,
         _ => 500,
@@ -155,6 +163,7 @@ struct Options {
     plan: PlanOptions,
     spec: Option<SpecOptions>,
     api_key: Option<String>,
+    cors: Vec<String>,
     alias: Option<String>,
     verbose: bool,
     sampling: Vec<(String, f32)>,
@@ -175,6 +184,7 @@ fn parse() -> Result<Options, String> {
         plan: PlanOptions::default(),
         spec: None,
         api_key: None,
+        cors: Vec::new(),
         alias: None,
         verbose: false,
         sampling: Vec::new(),
@@ -214,6 +224,7 @@ fn parse() -> Result<Options, String> {
             "--host" => o.host = value.clone(),
             "--port" => o.port = value.parse().map_err(|_| bad())?,
             "--api-key" => o.api_key = Some(value.clone()),
+            "--cors" => o.cors.push(value.trim_end_matches('/').to_owned()),
             "--alias" => o.alias = Some(value.clone()),
             "-c" | "--context" | "--ctx-size" => {
                 o.plan.context = if value == "auto" || value == "0" {
@@ -278,6 +289,11 @@ fn parse() -> Result<Options, String> {
     }
     if o.model.as_os_str().is_empty() {
         return Err("--model is required (see --help)".into());
+    }
+    if o.api_key.is_none() {
+        o.api_key = std::env::var("FERRUM_API_KEY")
+            .ok()
+            .filter(|k| !k.is_empty());
     }
     Ok(o)
 }
@@ -379,6 +395,12 @@ fn run(o: Options) -> Result<(), String> {
         name,
         model_path: o.model,
         api_key: o.api_key,
+        loopback: o.host == "localhost"
+            || o.host
+                .trim_matches(|c| c == '[' || c == ']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback()),
+        cors: o.cors,
         next_id: AtomicU64::new(1),
         started: Instant::now(),
     });
@@ -396,6 +418,45 @@ fn run(o: Options) -> Result<(), String> {
             .spawn(move || connection(&server, stream));
     }
     Ok(())
+}
+
+/// Why a request from a web page is refused, if it is. Browsers send
+/// `Origin` (command-line clients and SDKs do not): without `--cors`, only
+/// pages on this machine may call the server, so a site you visit cannot
+/// drive it. On a loopback address the `Host` must also be a local name,
+/// which stops DNS rebinding (a site's own name pointed at 127.0.0.1).
+fn cross_site(server: &Server, r: &http::Request) -> Option<String> {
+    if server.loopback
+        && let Some(host) = r.header("host")
+        && !is_local(host)
+    {
+        return Some(format!("requests for host {host} are refused"));
+    }
+    let origin = r.header("origin")?.trim_end_matches('/');
+    let allowed = server
+        .cors
+        .iter()
+        .any(|o| o == "*" || o.eq_ignore_ascii_case(origin));
+    if allowed
+        || origin
+            .split_once("://")
+            .is_some_and(|(_, host)| is_local(host))
+    {
+        return None;
+    }
+    Some(format!(
+        "web page at {origin} refused; start the server with --cors {origin} to allow it"
+    ))
+}
+
+/// `localhost`, `127.0.0.1` or `[::1]`, with or without a port.
+fn is_local(host: &str) -> bool {
+    let name = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    }
+    .to_ascii_lowercase();
+    name == "localhost" || name.ends_with(".localhost") || name == "127.0.0.1" || name == "::1"
 }
 
 fn connection(server: &Server, mut stream: TcpStream) {
@@ -440,6 +501,10 @@ fn handle(
     peer: &str,
 ) -> std::io::Result<()> {
     let ka = r.keep_alive;
+    if let Some(why) = cross_site(server, r) {
+        warn!(None, "{} {} from {peer}: {why}", r.method, r.path);
+        return http::json(stream, 403, &error_json(&why, "permission_error"), ka);
+    }
     if r.method == "OPTIONS" {
         return http::respond(stream, 204, "text/plain", b"", ka);
     }
@@ -737,6 +802,34 @@ fn handle(
         _ => {
             warn!(Some(id), "no route for {} {}", r.method, r.path);
             http::json(stream, 404, &error_json("not found", "not_found_error"), ka)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_local;
+
+    #[test]
+    fn local_hosts() {
+        for h in [
+            "localhost",
+            "localhost:8080",
+            "127.0.0.1:8080",
+            "[::1]:80",
+            "app.localhost:3000",
+        ] {
+            assert!(is_local(h), "{h}");
+        }
+        for h in [
+            "evil.com",
+            "127.0.0.1.evil.com",
+            "localhost.evil.com:80",
+            "[::2]",
+            "0.0.0.0",
+            "null",
+        ] {
+            assert!(!is_local(h), "{h}");
         }
     }
 }

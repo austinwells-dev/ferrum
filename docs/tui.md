@@ -19,6 +19,8 @@ Chat runs the model inside the TUI with streaming markdown (syntax-highlighted c
 
 **Attachments.** You can attach files in three ways: with `/attach PATH`, by dropping them onto the terminal, or from the clipboard with Ctrl-V or `/paste` (files, screenshots or text). `/screenshot` lets you drag out a screen region. If the model has a vision projector next to it, images go to the model as pixels. Otherwise, macOS Vision reads the text in the image and that text is sent instead.
 
+**Previews.** Images and videos are shown inline: attachments waiting to be sent appear in a strip above the message box, and sent ones appear under your message (videos show their first frame). `/previews off` hides them. Ctrl-O or `/preview` opens the newest one full screen. `/preview N` opens the Nth one and `/preview PATH` opens any file. In the preview, ←/→ moves between them, space pauses, `o` opens the file in its default app and esc closes it. Terminals that support the kitty graphics protocol (kitty, Ghostty, WezTerm) show the real pixels; other terminals get a 24-bit colour half-block rendering. To choose the mode yourself, set `FERRUM_GRAPHICS=kitty` or `FERRUM_GRAPHICS=blocks`. Inside tmux the half-block mode is used. GIFs animate. Videos (`mp4`, `mov`, `m4v`, `webm`, `mkv`, `avi`, up to 512 MB) play through `ffmpeg` if it is installed. Without ffmpeg you get the Quick Look poster frame. Models can't see videos, so the model is only told that the file is in the workspace.
+
 **Tools.** Set *Tools* to `ask` or `auto` in a setup (or type `/tools ask`) and the model can read, write and edit files, run shell commands and fetch web pages. In `ask` mode you approve every write, command and download.
 
 ## Agents
@@ -31,7 +33,7 @@ The Agents tab is a local coding agent that works on a real project folder. Pick
 
 | Mode | Behaviour |
 |---|---|
-| `edits` | File edits run freely; commands and downloads ask first |
+| `edits` | File edits run freely; commands, `check` (it builds the project) and downloads ask first |
 | `ask` | Every change asks first |
 | `auto` | Never asks |
 
@@ -73,7 +75,11 @@ Every command and download runs inside a macOS Seatbelt sandbox (`sandbox-exec`,
 - the whole disk is read-only except the workspace: the project folder in Agents, and in Chat a folder of its own for every session (a new `<date>-<time>-<model>` subfolder of `~/ferrum-workspace`, set by *Sandboxes folder*),
 - keys and credentials such as `~/.ssh` are hidden,
 - the network can be switched off entirely,
-- localhost services on your Mac can never be reached.
+- localhost services on your Mac can never be reached, and neither can Unix sockets outside the workspace (tmux, Docker, ssh-agent),
+- it cannot start programs outside the sandbox through `open` or Apple events, or use the clipboard or keychain,
+- commands left running in the background end with the command (use `process_start` for servers).
+
+The project's `.git/config`, `.git/hooks` and `.git` itself are read-only to the agent (it can still commit and branch), because git settings and hooks run programs later, outside the sandbox, for example when a git-aware shell prompt runs `git status`. The TUI's own `git` calls (branch, status, `/review`) run sandboxed as well, and the file tools, which run in the TUI itself, refuse symlinks out of the workspace rather than follow them. Shell history, Cargo and Hugging Face tokens, and the 1Password, Brave, Arc and Edge data folders are hidden too.
 
 ### Context optimisers
 

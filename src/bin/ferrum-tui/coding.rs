@@ -244,7 +244,11 @@ pub fn needs_approval(name: &str, mode: ToolMode) -> bool {
                 | "process_start"
                 | "check"
         ),
-        ToolMode::Edits => matches!(name, "bash" | "fetch_url" | "web_search" | "process_start"),
+        // `check` builds the project, which runs its code (build.rs, plugins).
+        ToolMode::Edits => matches!(
+            name,
+            "bash" | "fetch_url" | "web_search" | "process_start" | "check"
+        ),
     }
 }
 
@@ -467,37 +471,48 @@ fn hash(text: &str) -> u64 {
     h
 }
 
+/// Longest glob pattern accepted (the matcher recurses once per character).
+pub const MAX_GLOB: usize = 512;
+
 /// `*` matches within a name, `**` across folders, `?` one character.
+/// Memoized on (pattern, text) positions, so stacked stars stay polynomial.
 pub fn glob_match(pattern: &str, text: &str) -> bool {
-    fn go(p: &[char], t: &[char]) -> bool {
-        match p.first() {
-            None => t.is_empty(),
-            Some('*') if p.get(1) == Some(&'*') => {
-                let rest = if p.get(2) == Some(&'/') {
-                    &p[3..]
+    fn go(p: &[char], t: &[char], i: usize, j: usize, memo: &mut [Option<bool>]) -> bool {
+        let key = i * (t.len() + 1) + j;
+        if let Some(hit) = memo[key] {
+            return hit;
+        }
+        let matched = match p.get(i) {
+            None => j == t.len(),
+            Some('*') if p.get(i + 1) == Some(&'*') => {
+                let rest = if p.get(i + 2) == Some(&'/') {
+                    i + 3
                 } else {
-                    &p[2..]
+                    i + 2
                 };
-                (0..=t.len()).any(|i| go(rest, &t[i..]))
+                (j..=t.len()).any(|k| go(p, t, rest, k, memo))
             }
             Some('*') => {
-                let mut i = 0;
+                let mut k = j;
                 loop {
-                    if go(&p[1..], &t[i..]) {
-                        return true;
+                    if go(p, t, i + 1, k, memo) {
+                        break true;
                     }
-                    if i >= t.len() || t[i] == '/' {
-                        return false;
+                    if k >= t.len() || t[k] == '/' {
+                        break false;
                     }
-                    i += 1;
+                    k += 1;
                 }
             }
-            Some('?') => !t.is_empty() && t[0] != '/' && go(&p[1..], &t[1..]),
-            Some(c) => t.first() == Some(c) && go(&p[1..], &t[1..]),
-        }
+            Some('?') => j < t.len() && t[j] != '/' && go(p, t, i + 1, j + 1, memo),
+            Some(c) => t.get(j) == Some(c) && go(p, t, i + 1, j + 1, memo),
+        };
+        memo[key] = Some(matched);
+        matched
     }
     let (p, t): (Vec<char>, Vec<char>) = (pattern.chars().collect(), text.chars().collect());
-    go(&p, &t)
+    let mut memo = vec![None; (p.len() + 1) * (t.len() + 1)];
+    go(&p, &t, 0, 0, &mut memo)
 }
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>, cap: usize) {
@@ -716,8 +731,7 @@ fn run(
             let path = sb.resolve(&rel)?;
             let offset = arg_int(args, "offset").unwrap_or(1).max(1) as usize;
             let limit = arg_int(args, "limit").unwrap_or(400).clamp(1, 2000) as usize;
-            let content =
-                fs::read_to_string(&path).map_err(|e| format!("{}: {e}", sb.rel(&path)))?;
+            let content = String::from_utf8_lossy(&sb.read_bytes(&path)?).into_owned();
             let key = (sb.rel(&path), offset, limit);
             let h = hash(&content);
             let mut g = lock(shared);
@@ -757,6 +771,9 @@ fn run(
         }
         "glob" => {
             let pattern = arg_str(args, "pattern")?;
+            if pattern.chars().count() > MAX_GLOB {
+                return Err(format!("the pattern is longer than {MAX_GLOB} characters"));
+            }
             let root = sb.resolve(args.get("path").and_then(Json::as_str).unwrap_or(""))?;
             let mut files = Vec::new();
             walk(&root, &mut files, 20_000);
@@ -957,7 +974,7 @@ fn edit(shared: &SharedRef, sb: &Sandbox, args: &Map<String, Json>) -> Result<St
     if old.is_empty() {
         return Err("old_text is empty".into());
     }
-    let text = fs::read_to_string(&path).map_err(|e| format!("{}: {e}", sb.rel(&path)))?;
+    let text = sb.read_text(&path)?;
     let all = arg_bool(args, "replace_all");
     let mut n = text.matches(old).count();
     let mut base = text.clone();
@@ -993,7 +1010,7 @@ fn edit(shared: &SharedRef, sb: &Sandbox, args: &Map<String, Json>) -> Result<St
             ));
         }
     };
-    fs::write(&path, &updated).map_err(|e| format!("{}: {e}", sb.rel(&path)))?;
+    sb.write_text(&path, &updated)?;
     let mut g = lock(shared);
     g.touch(&sb.rel(&path), Touch::Edited);
     g.reads.clear();
@@ -1097,6 +1114,11 @@ mod tests {
         assert!(glob_match("**/*.py", "src/deep/main.py"));
         assert!(glob_match("src/**/test_*.rs", "src/a/b/test_x.rs"));
         assert!(glob_match("a?c", "abc") && !glob_match("a?c", "a/c"));
+        // Stacked stars used to take exponential time.
+        let started = Instant::now();
+        assert!(!glob_match(&("**/".repeat(12) + "x"), &"a/".repeat(80)));
+        assert!(!glob_match(&"*a".repeat(30), &("a".repeat(100) + "b")));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[test]

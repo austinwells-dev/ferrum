@@ -90,6 +90,7 @@ impl App {
             serve: None,
             bench: None,
             closing: Vec::new(),
+            gfx: Default::default(),
         };
         app.load_info();
         app
@@ -117,15 +118,10 @@ impl App {
                 "values": f.values,
             })).collect::<Vec<_>>(),
         });
-        let path = config_path();
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir).ok();
-        }
-        fs::write(
-            path,
-            serde_json::to_string_pretty(&config).unwrap_or_default(),
-        )
-        .ok();
+        let _ = write_private(
+            &config_path(),
+            &serde_json::to_string_pretty(&config).unwrap_or_default(),
+        );
     }
 
     /// The model under the cursor, if ferrum can run it.
@@ -224,7 +220,9 @@ impl App {
                 "system" => "--system",
                 "host" => "--host",
                 "port" => "--port",
-                "api_key" => "--api-key",
+                // Passed in the environment (Serve::start): any process,
+                // the agent's sandbox included, can read another's arguments.
+                "api_key" => continue,
                 "alias" => "--alias",
                 "reserve" => "--reserve-mib",
                 "snapshots" => "--snapshots",

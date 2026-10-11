@@ -174,7 +174,22 @@ impl GgufFile {
 }
 
 impl<R: Read + Seek> GgufReader<R> {
-    pub fn from_reader(mut reader: R) -> Result<Self> {
+    pub fn from_reader(reader: R) -> Result<Self> {
+        Self::read(reader, u64::MAX)
+    }
+
+    /// Like `from_reader`, but metadata arrays longer than `max_items` (the
+    /// tokenizer's vocabulary and merges) are skipped and read back empty.
+    /// For callers that need only the settings and the tensor list: it avoids
+    /// hundreds of thousands of string allocations per file.
+    pub fn from_reader_skipping_arrays(reader: R, max_items: u64) -> Result<Self> {
+        Self::read(reader, max_items)
+    }
+
+    fn read(mut file: R, max_items: u64) -> Result<Self> {
+        // The header is millions of small values (a tokenizer string is two
+        // reads): parse it through a buffer, not one syscall per value.
+        let mut reader = std::io::BufReader::with_capacity(1 << 20, &mut file);
         let file_len = reader
             .seek(SeekFrom::End(0))
             .map_err(|e| io_error("seek to end", e))?;
@@ -203,7 +218,7 @@ impl<R: Read + Seek> GgufReader<R> {
             let key = read_string(&mut reader, file_len, "metadata key")?;
             let type_id = read_u32(&mut reader, "metadata value type")?;
             let value_type = MetadataType::try_from(type_id)?;
-            let value = read_metadata_value(&mut reader, value_type, file_len)?;
+            let value = read_metadata_value(&mut reader, value_type, file_len, max_items)?;
             if metadata.insert(key.clone(), value).is_some() {
                 return Err(Error::Gguf(format!("duplicate metadata key {key}")));
             }
@@ -338,8 +353,9 @@ impl<R: Read + Seek> GgufReader<R> {
             ));
         }
 
+        drop(reader);
         Ok(Self {
-            reader,
+            reader: file,
             file_len,
             tensor_data_offset,
             version,
@@ -493,6 +509,7 @@ fn read_metadata_value<R: Read>(
     reader: &mut R,
     ty: MetadataType,
     file_len: u64,
+    max_items: u64,
 ) -> Result<MetadataValue> {
     let value = match ty {
         MetadataType::Uint8 => MetadataValue::Uint8(read_u8(reader, "uint8 metadata")?),
@@ -525,9 +542,21 @@ fn read_metadata_value<R: Read>(
                     "unreasonable metadata array length {count}"
                 )));
             }
+            if count > max_items {
+                skip_values(reader, element_type, count, file_len)?;
+                return Ok(MetadataValue::Array {
+                    element_type,
+                    values: Vec::new(),
+                });
+            }
             let mut values = Vec::with_capacity(count as usize);
             for _ in 0..count {
-                values.push(read_metadata_value(reader, element_type, file_len)?);
+                values.push(read_metadata_value(
+                    reader,
+                    element_type,
+                    file_len,
+                    u64::MAX,
+                )?);
             }
             MetadataValue::Array {
                 element_type,
@@ -539,6 +568,36 @@ fn read_metadata_value<R: Read>(
         MetadataType::Float64 => MetadataValue::Float64(read_f64(reader, "float64 metadata")?),
     };
     Ok(value)
+}
+
+/// Read past `count` array elements of type `ty` without keeping them.
+fn skip_values<R: Read>(reader: &mut R, ty: MetadataType, count: u64, file_len: u64) -> Result<()> {
+    let width = match ty {
+        MetadataType::Uint8 | MetadataType::Int8 | MetadataType::Bool => 1,
+        MetadataType::Uint16 | MetadataType::Int16 => 2,
+        MetadataType::Uint32 | MetadataType::Int32 | MetadataType::Float32 => 4,
+        MetadataType::Uint64 | MetadataType::Int64 | MetadataType::Float64 => 8,
+        MetadataType::String | MetadataType::Array => 0,
+    };
+    let skip = |reader: &mut R, bytes: u64| -> Result<()> {
+        let skipped = std::io::copy(&mut reader.by_ref().take(bytes), &mut std::io::sink())
+            .map_err(|e| io_error("skip metadata array", e))?;
+        if skipped != bytes {
+            return Err(Error::Gguf("metadata array is truncated".into()));
+        }
+        Ok(())
+    };
+    if width > 0 {
+        return skip(reader, count * width);
+    }
+    for _ in 0..count {
+        let length = read_u64(reader, "string length")?;
+        if length > MAX_STRING_BYTES || length > file_len {
+            return Err(Error::Gguf(format!("unreasonable string length {length}")));
+        }
+        skip(reader, length)?;
+    }
+    Ok(())
 }
 
 fn read_string<R: Read>(reader: &mut R, file_len: u64, what: &str) -> Result<String> {
@@ -662,6 +721,68 @@ mod tests {
             assert!(!name.is_empty());
         }
         bytes
+    }
+
+    #[test]
+    fn skipping_arrays_keeps_everything_else() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        push_u32(&mut bytes, 3);
+        push_u64(&mut bytes, 1);
+        push_u64(&mut bytes, 4);
+        push_string(&mut bytes, "general.architecture");
+        push_u32(&mut bytes, MetadataType::String as u32);
+        push_string(&mut bytes, "qwen2");
+        push_string(&mut bytes, "tokenizer.ggml.tokens");
+        push_u32(&mut bytes, MetadataType::Array as u32);
+        push_u32(&mut bytes, MetadataType::String as u32);
+        push_u64(&mut bytes, 3);
+        for token in ["a", "bc", "def"] {
+            push_string(&mut bytes, token);
+        }
+        push_string(&mut bytes, "tokenizer.ggml.token_type");
+        push_u32(&mut bytes, MetadataType::Array as u32);
+        push_u32(&mut bytes, MetadataType::Int32 as u32);
+        push_u64(&mut bytes, 5);
+        for t in 0..5u32 {
+            push_u32(&mut bytes, t);
+        }
+        push_string(&mut bytes, "qwen2.rope.dimension_sections");
+        push_u32(&mut bytes, MetadataType::Array as u32);
+        push_u32(&mut bytes, MetadataType::Uint32 as u32);
+        push_u64(&mut bytes, 2);
+        push_u32(&mut bytes, 11);
+        push_u32(&mut bytes, 12);
+        push_string(&mut bytes, "w");
+        push_u32(&mut bytes, 1);
+        push_u64(&mut bytes, 4);
+        push_u32(&mut bytes, 0);
+        push_u64(&mut bytes, 0);
+        while !bytes.len().is_multiple_of(32) {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&[7; 16]);
+        let full = GgufReader::from_reader(Cursor::new(bytes.clone())).unwrap();
+        let mut skim = GgufReader::from_reader_skipping_arrays(Cursor::new(bytes), 2).unwrap();
+        let values = |f: &GgufReader<Cursor<Vec<u8>>>, key: &str| match f.metadata_value(key) {
+            Some(MetadataValue::Array { values, .. }) => values.len(),
+            _ => usize::MAX,
+        };
+        assert_eq!(values(&full, "tokenizer.ggml.tokens"), 3);
+        assert_eq!(values(&skim, "tokenizer.ggml.tokens"), 0);
+        assert_eq!(values(&skim, "tokenizer.ggml.token_type"), 0);
+        assert_eq!(
+            skim.metadata_value("qwen2.rope.dimension_sections"),
+            full.metadata_value("qwen2.rope.dimension_sections")
+        );
+        let shape = |f: &GgufReader<Cursor<Vec<u8>>>| {
+            let t = &f.tensors()["w"];
+            (t.dimensions.clone(), t.type_id, t.offset, t.byte_len)
+        };
+        assert_eq!(shape(&skim), shape(&full));
+        let mut out = vec![0; 16];
+        skim.read_tensor_into("w", &mut out).unwrap();
+        assert_eq!(out, [7; 16]);
     }
 
     #[test]

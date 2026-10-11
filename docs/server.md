@@ -64,7 +64,8 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 | Flag | Default | Meaning |
 |---|---|---|
 | `--host`, `--port` | `127.0.0.1`, `8080` | Bind address |
-| `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY` |
+| `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY`. `FERRUM_API_KEY=KEY` does the same without putting the key in the process list |
+| `--cors ORIGIN` | localhost pages only | Let web pages from `ORIGIN` (e.g. `https://chat.example.com`) call the server; repeatable, `*` for any. Requests from other sites' pages get 403, so a site you visit can't use your model. Clients that aren't browsers (curl, SDKs, agents) send no `Origin` and are unaffected |
 | `--alias NAME` | file name | Model name reported to clients |
 | `-c`, `--context N\|auto` | `auto` | Context length |
 | `--kv-cache f16\|q8` | `f16` | K/V cache format (also `-ctk`/`-ctv`). `q8` nearly halves K/V memory, so `auto` fits about twice the context, and decodes faster at long context. See [K/V cache format](#kv-cache-format) |

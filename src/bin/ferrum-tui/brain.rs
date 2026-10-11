@@ -73,7 +73,7 @@ comment starting `ponytail:`."
 /// The text of the project's own instructions, if it has any.
 pub fn instructions(root: &Path) -> Option<String> {
     for name in ["AGENTS.md", "CLAUDE.md", ".ferrum/AGENTS.md"] {
-        if let Ok(text) = fs::read_to_string(root.join(name)) {
+        if let Ok(text) = crate::agent::read_no_follow(&root.join(name)) {
             let text = text.trim();
             if !text.is_empty() {
                 return Some(format!(
@@ -86,13 +86,22 @@ pub fn instructions(root: &Path) -> Option<String> {
     None
 }
 
+/// Git in the agent's project, sandboxed (no writes, no network) and with
+/// the repository's hooks and fsmonitor off: the agent can edit `.git/config`.
 fn git(root: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .output()
-        .ok()?;
+    let root = root.to_str()?;
+    let mut argv = vec![
+        "git",
+        "--no-optional-locks",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        "-C",
+        root,
+    ];
+    argv.extend_from_slice(args);
+    let out = crate::agent::confined(&argv).output().ok()?;
     out.status
         .success()
         .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -100,7 +109,16 @@ fn git(root: &Path, args: &[&str]) -> Option<String> {
 
 /// Uncommitted changes (staged and not).
 pub fn git_diff(root: &Path) -> Option<String> {
-    git(root, &["diff", "HEAD", "--no-color"])
+    git(
+        root,
+        &[
+            "diff",
+            "HEAD",
+            "--no-color",
+            "--no-ext-diff",
+            "--no-textconv",
+        ],
+    )
 }
 
 pub fn git_branch(root: &Path) -> Option<String> {

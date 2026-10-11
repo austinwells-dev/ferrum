@@ -56,7 +56,12 @@ impl Serve {
             .and_then(|p| p.parent().map(|d| d.join(bin)))
             .filter(|p| p.exists())
             .unwrap_or_else(|| PathBuf::from(bin));
-        let mut child = Command::new(&program)
+        let mut command = Command::new(&program);
+        match app.value("api_key") {
+            "" => command.env_remove("FERRUM_API_KEY"),
+            key => command.env("FERRUM_API_KEY", key),
+        };
+        let mut child = command
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
