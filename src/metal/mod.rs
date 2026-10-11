@@ -234,6 +234,9 @@ pub struct ProfileEntry {
 pub type Profile = std::collections::BTreeMap<String, ProfileEntry>;
 /// An encoding epoch owns every referenced Metal resource through completion.
 /// No tensor carrying this epoch may be mapped until successful completion.
+/// Default for `MetalDevice::early_commit`: enough work to cover encoding the
+/// rest of a decode step, small enough that the GPU starts almost at once.
+const EARLY_COMMIT: usize = 32;
 struct Submission {
     command: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     // With a shared encoder, one compute encoder spans the epoch (serial, or
@@ -416,7 +419,12 @@ pub struct MetalDevice {
     reference_math: Cell<bool>,
     batching: Cell<bool>,
     batch_limit: Cell<usize>,
+    /// Dispatches after which an epoch's first command buffer is committed
+    /// without waiting, so the GPU starts while the rest is encoded. 0 is off.
+    early_commit: Cell<usize>,
     pending: RefCell<Option<Submission>>,
+    /// Committed, not yet awaited parts of the current epoch (in queue order).
+    in_flight: RefCell<Vec<Submission>>,
     profiling: Cell<bool>,
     profile: RefCell<Profile>,
     counters: Cell<Counters>,
@@ -528,7 +536,14 @@ impl MetalDevice {
             reference_math: Cell::new(false),
             batching: Cell::new(false),
             batch_limit: Cell::new(1024),
+            early_commit: Cell::new(
+                std::env::var("FERRUM_EARLY_COMMIT")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(EARLY_COMMIT),
+            ),
             pending: RefCell::new(None),
+            in_flight: RefCell::new(Vec::new()),
             counters: Cell::new(Counters::default()),
             profiling: Cell::new(false),
             profile: RefCell::new(Profile::new()),
@@ -1371,11 +1386,9 @@ impl MetalDevice {
         self.execution_shared_encoder.set(shared_encoder);
         Ok(Execution { device: self })
     }
-    fn flush(&self) -> Result<()> {
-        let Some(submission) = self.pending.borrow_mut().take() else {
-            return Ok(());
-        };
-        let start = Instant::now();
+    /// End the open submission's encoder and commit it without waiting.
+    fn commit_pending(&self) -> Option<Submission> {
+        let submission = self.pending.borrow_mut().take()?;
         if let Some(encoder) = &submission.encoder {
             encoder.endEncoding();
         }
@@ -1383,33 +1396,52 @@ impl MetalDevice {
             keep_alive.touch();
         }
         submission.command.commit();
-        submission.command.waitUntilCompleted();
+        Some(submission)
+    }
+    fn flush(&self) -> Result<()> {
+        let mut parts = std::mem::take(&mut *self.in_flight.borrow_mut());
+        let start = Instant::now();
+        parts.extend(self.commit_pending());
+        let Some(last) = parts.last() else {
+            return Ok(());
+        };
+        // One queue runs the parts in order; they share one completion cell.
+        last.command.waitUntilCompleted();
         let mut counters = self.counters.get();
-        counters.command_buffers += 1;
+        counters.command_buffers += parts.len();
         counters.completion_waits += 1;
         counters.wait += start.elapsed();
-        let seconds = submission.command.GPUEndTime() - submission.command.GPUStartTime();
-        if seconds.is_finite() && seconds > 0. {
-            counters.gpu += Duration::from_secs_f64(seconds);
+        let mut failure = None;
+        for submission in &parts {
+            submission.command.waitUntilCompleted();
+            let seconds = submission.command.GPUEndTime() - submission.command.GPUStartTime();
+            if seconds.is_finite() && seconds > 0. {
+                counters.gpu += Duration::from_secs_f64(seconds);
+            }
+            if failure.is_none() && submission.command.status() != MTLCommandBufferStatus::Completed
+            {
+                failure = Some(
+                    submission
+                        .command
+                        .error()
+                        .map(|e| e.to_string())
+                        .unwrap_or_else(|| format!("status {:?}", submission.command.status())),
+                );
+            }
         }
         self.counters.set(counters);
-        let succeeded = submission.command.status() == MTLCommandBufferStatus::Completed;
         #[cfg(test)]
-        let succeeded = succeeded && !self.fail_completion.replace(false);
-        if !succeeded {
-            submission.ready.set(Completion::Failed);
-            self.arena.borrow_mut().complete();
-            return Err(Error::Synchronization(
-                submission
-                    .command
-                    .error()
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| format!("status {:?}", submission.command.status())),
-            ));
+        if failure.is_none() && self.fail_completion.replace(false) {
+            failure = Some("injected completion failure".into());
         }
-        submission.ready.set(Completion::Completed);
+        if let Some(error) = failure {
+            last.ready.set(Completion::Failed);
+            self.arena.borrow_mut().complete();
+            return Err(Error::Synchronization(error));
+        }
+        last.ready.set(Completion::Completed);
         self.arena.borrow_mut().complete();
-        // submission.resources drops only after the wait and status check.
+        // The parts' resources drop only after the wait and status check.
         Ok(())
     }
     /// Complete the current encoding epoch before safe host readback. Model
@@ -2514,13 +2546,18 @@ impl MetalDevice {
                     .queue
                     .commandBuffer()
                     .ok_or_else(|| Error::Dispatch("command buffer creation failed".into()))?;
+                // A continuation of a partly committed epoch shares its state.
+                let ready = self.in_flight.borrow().last().map_or_else(
+                    || Rc::new(Cell::new(Completion::Encoding)),
+                    |s| s.ready.clone(),
+                );
                 *self.pending.borrow_mut() = Some(Submission {
                     command,
                     encoder: None,
                     reads: Vec::new(),
                     writes: Vec::new(),
                     resources: Vec::new(),
-                    ready: Rc::new(Cell::new(Completion::Encoding)),
+                    ready,
                     dispatches: 0,
                 });
             }
@@ -2614,6 +2651,9 @@ impl MetalDevice {
             }
             submission.dispatches += 1;
             let flush = !self.batching.get() || submission.dispatches >= self.batch_limit.get();
+            let early = !flush
+                && submission.dispatches == self.early_commit.get()
+                && self.in_flight.borrow().is_empty();
             let mut counters = self.counters.get();
             counters.dispatches += 1;
             let submission_time = start.elapsed();
@@ -2623,6 +2663,8 @@ impl MetalDevice {
             let before_gpu = counters.gpu;
             if flush {
                 self.flush()?;
+            } else if early && let Some(part) = self.commit_pending() {
+                self.in_flight.borrow_mut().push(part);
             }
             let synchronized = start.elapsed();
             let gpu = flush.then(|| self.counters.get().gpu - before_gpu);
@@ -2838,8 +2880,11 @@ mod failed_completion_tests {
         // Small enough that the whole chain stays in one epoch.
         let n = 1 << 16;
         let a = Tensor::from_f32(&d, [n], DType::F32, &vec![1.0; n]).unwrap();
-        for concurrent in [false, true] {
+        // Early commit 0 keeps one command buffer; 32 splits the chain so
+        // recycled storage is rewritten across buffers.
+        for (concurrent, early) in [(false, 0), (true, 0), (false, 32), (true, 32)] {
             d.set_concurrent_dispatch(concurrent).unwrap();
+            d.early_commit.set(early);
             let before = d.counters();
             let execution = d.execution().unwrap();
             // Each step drops the previous tensor right after its last read is
@@ -2857,7 +2902,10 @@ mod failed_completion_tests {
                 after.reused_bytes > before.reused_bytes,
                 "concurrent={concurrent}"
             );
-            assert_eq!(after.command_buffers - before.command_buffers, 1);
+            assert_eq!(
+                after.command_buffers - before.command_buffers,
+                if early == 0 { 1 } else { 2 }
+            );
             assert!(x.to_f32().iter().all(|&v| v == 66.0));
             for (i, s) in sums.iter().enumerate() {
                 let expected = 2.0 * (3.0 + i as f32);
@@ -2865,6 +2913,7 @@ mod failed_completion_tests {
             }
         }
         d.set_concurrent_dispatch(true).unwrap();
+        d.early_commit.set(EARLY_COMMIT);
     }
 }
 

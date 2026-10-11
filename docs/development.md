@@ -49,6 +49,7 @@ cargo run --release -- hybrid --model /path/to/model.gguf --prompt 'The capital 
 - `FERRUM_BATCH_LIMIT=1` gives cleaner per-kernel timings but changes how work is executed, so leave it unset when you measure throughput.
 - `FERRUM_NATIVE_MATMUL=0` switches to a slower diagnostic matrix-multiply fallback.
 - `FERRUM_KV_CACHE=q8` makes every tool and front end default to the 8-bit K/V cache (an explicit `--kv-cache` or TUI setting wins).
+- `FERRUM_EARLY_COMMIT=N` commits each execution's first command buffer after N kernels (default 32) without waiting, so the GPU starts while the CPU encodes the rest of the step. `0` restores one command buffer per step. Worth about 2–3% decode on the 35B MoE; neutral on the dense 27B.
 - `FERRUM_HYBRID_LEGACY_ATTENTION=1` restores the Phase 9 attention routing (simdgroup kernels for 2–15 query rows, unstaged TensorOps prompt attention) for A/B runs. It reads only an F16 cache.
 - Native BF16 kernels need a capable Metal compiler and GPU, and `info` reports whether yours qualifies. Devices older than the M5 have not been validated.
 
