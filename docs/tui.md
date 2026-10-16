@@ -125,9 +125,20 @@ Results are ranked by speedup over plain decoding and remembered per machine and
 
 ### Measuring intelligence
 
-Set *Measure* to `intelligence` to score a model on four question sets instead of timing it: math (GSM8K), knowledge (MMLU), following instructions (IFEval) and reading code (CRUXEval, predicting what a function returns). Every answer is checked by a program, not by another model. Generation is greedy, so a result can be reproduced exactly.
+Set *Measure* to `intelligence` to score a model on four question sets instead of timing it: math, knowledge, following instructions and reading code (predicting what a Python function returns). Every answer is checked by a program, not by another model. Generation is greedy, so a result can be reproduced exactly.
 
-The question sets are not part of the binary. Select *Question sets* and press Enter to install them: the tab downloads a fixed sample of 100 questions per set from Hugging Face (with the system `curl`) into `~/.config/ferrum/eval`, or `$FERRUM_EVAL_DIR`. The same questions are picked every time. Requests are spaced out, and if Hugging Face rate-limits the download (HTTP 429), the tab waits and retries. Each finished set is kept, so if the install fails or you leave the tab (which cancels it), installing again picks up where it stopped. The question files are only replaced once all four sets are in. Setting `HF_TOKEN` raises the rate limit. To remove the sets, press Enter on the line twice. Saved results stay. Results from different question files are never mixed, and older ones are marked as such.
+*Difficulty* picks the sets:
+
+| | `hard` (the default) | `standard` |
+|---|---|---|
+| Math | MATH-500, levels 3-5, problems with a plain-number answer | GSM8K |
+| Knowledge | MMLU-Pro (10 options) | MMLU (4 options) |
+| Instructions | IFEval, the prompts with the most rules | IFEval |
+| Code reading | CRUXEval, the longest functions | CRUXEval |
+
+The standard sets are easy for current mid-size models, which mostly score in the 80s and 90s. Use them for small models. Each difficulty is installed and scored separately, and its results are never mixed with the other's.
+
+The question sets are not part of the binary. Select *Question sets* and press Enter to install them: the tab downloads a fixed sample of 100 questions per set from Hugging Face (with the system `curl`) into `~/.config/ferrum/eval` (the hard sets into its `hard` folder), or `$FERRUM_EVAL_DIR`. The same questions are picked every time. Requests are spaced out, and if Hugging Face rate-limits the download (HTTP 429), the tab waits and retries. Each finished set is kept, so if the install fails or you leave the tab (which cancels it), installing again picks up where it stopped. The question files are only replaced once all four sets are in. Setting `HF_TOKEN` raises the rate limit. To remove the sets, press Enter on the line twice. Saved results stay. Results from different question files are never mixed, and older ones are marked as such.
 
 - *Questions*: `quick` asks the first 15 questions of each set and **predicts** the full score with a 95% range (shown as `~62% ±9`). `full` asks all of them and gives the **actual** score.
 - *Thinking*: `off` (the default), or on with a reasoning budget per question. Thinking usually raises the score a lot and makes the run several times longer, so results with and without it are kept apart.
@@ -135,6 +146,6 @@ The question sets are not part of the binary. Select *Question sets* and press E
 
 The score is the mean of the four category scores. Complete runs are saved in `~/.config/ferrum/eval.json`, the newest per model, question files and setup. Previous results for the model are listed under the options. A stopped run is shown but not saved.
 
-Press `c` in the intelligence setup or results to open **Compare**: every saved result from every model, best first, one bar each. Each row is labeled with the model, the run size, thinking, and whether a drafter was used, plus this Mac's best speedup for the model from the speed benchmark. A predicted score's 95% range is shaded (`▒`). `t` cycles thinking (all, off, on), `f` shows only full runs, and Enter opens a result's four category bars.
+Press `c` in the intelligence setup or results to open **Compare**: every saved result from every model, best first, one bar each. Each row is labeled with the model, the difficulty, the run size, thinking, and whether a drafter was used, plus this Mac's best speedup for the model from the speed benchmark. A predicted score's 95% range is shaded (`▒`). It opens on the setup's difficulty. `d` cycles difficulty (hard, standard, both), `t` cycles thinking (all, off, on), `f` shows only full runs, and Enter opens a result's four category bars. Pressing `x` twice deletes every saved result.
 
 These are public benchmarks that models may have seen in training. Use the scores to compare models and settings on this Mac, not as leaderboard numbers.

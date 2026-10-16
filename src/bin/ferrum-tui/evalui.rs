@@ -3,7 +3,9 @@
 //! and keep the results per model and setup.
 use crate::bench::{self, Candidate, Source};
 use crate::benchui::{BenchPhase, ago};
-use crate::eval::{self, CATEGORIES, EvalEvent, EvalPlan, EvalResult, EvalRunning, Suite, Tally};
+use crate::eval::{
+    self, CATEGORIES, Difficulty, EvalEvent, EvalPlan, EvalResult, EvalRunning, Suite, Tally,
+};
 use crate::evalcompare::Compare;
 use crate::evalsets::{self, InstallEvent, Installing};
 use crate::*;
@@ -20,6 +22,7 @@ pub enum Measure {
 }
 
 pub struct IqState {
+    pub difficulty: Difficulty,
     pub suite: Result<Suite, String>,
     pub quick: bool,
     /// Index into `THINKING`.
@@ -55,7 +58,8 @@ pub struct IqState {
 impl IqState {
     pub fn new() -> Self {
         Self {
-            suite: Suite::load(&eval::suite_dir()),
+            difficulty: Difficulty::default(),
+            suite: Suite::load(&eval::suite_dir(Difficulty::default())),
             quick: true,
             thinking: 0,
             tuned: false,
@@ -121,7 +125,21 @@ impl IqState {
             Ok(n) => (format!("installed {n} questions"), true),
             Err(e) => (format!("install failed: {e}"), false),
         });
-        self.suite = Suite::load(&eval::suite_dir());
+        self.reload();
+    }
+
+    fn reload(&mut self) {
+        self.suite = Suite::load(&eval::suite_dir(self.difficulty));
+    }
+
+    /// Switch between the standard and hard sets (not while installing).
+    fn toggle_difficulty(&mut self) {
+        if self.installing() {
+            return;
+        }
+        self.difficulty = self.difficulty.other();
+        self.install_note = None;
+        self.reload();
     }
 
     /// Enter on the question-sets line: install, or remove after a confirm.
@@ -133,17 +151,17 @@ impl IqState {
             self.confirm_remove = false;
             self.install_note = None;
             self.install_stage = "starting".into();
-            match evalsets::spawn_install(eval::suite_dir()) {
+            match evalsets::spawn_install(eval::suite_dir(self.difficulty), self.difficulty) {
                 Ok(i) => self.install = Some(i),
                 Err(e) => self.install_note = Some((e, false)),
             }
         } else if self.confirm_remove {
             self.confirm_remove = false;
-            self.install_note = Some(match evalsets::remove(&eval::suite_dir()) {
+            self.install_note = Some(match evalsets::remove(&eval::suite_dir(self.difficulty)) {
                 Ok(()) => ("removed the question sets".into(), true),
                 Err(e) => (format!("could not remove them: {e}"), false),
             });
-            self.suite = Suite::load(&eval::suite_dir());
+            self.reload();
         } else {
             self.confirm_remove = true;
         }
@@ -154,6 +172,7 @@ impl IqState {
 enum IqLine {
     Model,
     Measure,
+    Difficulty,
     Sets,
     Size,
     Thinking,
@@ -161,9 +180,10 @@ enum IqLine {
     Run,
 }
 
-const LINES: [IqLine; 7] = [
+const LINES: [IqLine; 8] = [
     IqLine::Model,
     IqLine::Measure,
+    IqLine::Difficulty,
     IqLine::Sets,
     IqLine::Size,
     IqLine::Thinking,
@@ -271,6 +291,7 @@ impl App {
         let model = self.models.get(b.model)?;
         Some(EvalPlan {
             model: model.path.clone(),
+            difficulty: b.iq.difficulty,
             quick: b.iq.quick,
             thinking: THINKING[b.iq.thinking],
             draft: if b.iq.tuned { self.tuned_draft() } else { None },
@@ -363,6 +384,7 @@ impl App {
         if let (true, Some(plan), Ok(suite)) = (complete, &iq.plan, &iq.suite) {
             let result = EvalResult {
                 model: plan.model.display().to_string(),
+                difficulty: plan.difficulty,
                 when: bench::now(),
                 quick: plan.quick,
                 thinking: plan.thinking,
@@ -412,7 +434,7 @@ impl App {
                 iq.sel = (iq.sel + 1).min(LINES.len() - 1)
             }
             KeyCode::Char('r') => start = true,
-            KeyCode::Char('c') => iq.compare = Some(Compare::default()),
+            KeyCode::Char('c') => iq.compare = Some(Compare::new(iq.difficulty)),
             KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
                 let step: i32 = if key.code == KeyCode::Left { -1 } else { 1 };
                 match LINES[iq.sel] {
@@ -427,6 +449,7 @@ impl App {
                         b.measure = Measure::Speed;
                         b.sel = 1;
                     }
+                    IqLine::Difficulty => iq.toggle_difficulty(),
                     IqLine::Sets => {
                         iq.confirm_remove = removing;
                         if key.code != KeyCode::Left {
@@ -459,7 +482,7 @@ impl App {
         match key.code {
             KeyCode::Char('c') => {
                 if let Some(b) = self.bench.as_mut() {
-                    b.iq.compare = Some(Compare::default());
+                    b.iq.compare = Some(Compare::new(b.iq.difficulty));
                 }
             }
             KeyCode::Char('r') | KeyCode::Enter => {
@@ -484,7 +507,7 @@ impl App {
         let mut lines = Vec::new();
         for r in b.iq.results.iter().filter(|r| r.model == path).take(8) {
             let Some(s) = r.score() else { continue };
-            let stale = current.is_some_and(|f| f != r.suite);
+            let stale = r.difficulty == b.iq.difficulty && current.is_some_and(|f| f != r.suite);
             lines.push(Line::from(vec![
                 Span::styled(
                     format!("   {:>10}  ", s.label()),
@@ -519,14 +542,19 @@ impl App {
     }
 
     /// One row per category: name, right of asked, bar, share.
-    fn iq_table(tallies: &[Tally], width: usize) -> Vec<Line<'static>> {
-        let bar_w = width.saturating_sub(58).clamp(10, 30);
+    pub fn iq_table(tallies: &[Tally], difficulty: Difficulty, width: usize) -> Vec<Line<'static>> {
+        let bar_w = width.saturating_sub(66).clamp(10, 30);
         tallies
             .iter()
-            .zip(CATEGORIES)
-            .map(|(t, (_, name))| {
+            .enumerate()
+            .map(|(i, t)| {
                 let mut spans = vec![Span::styled(
-                    format!("   {name:<26} {:>3}/{:<3}  ", t.right, t.n),
+                    format!(
+                        "   {:<34} {:>3}/{:<3}  ",
+                        difficulty.cat_name(i),
+                        t.right,
+                        t.n
+                    ),
                     Style::new().fg(TEXT),
                 )];
                 if t.n == 0 {
@@ -575,7 +603,11 @@ impl App {
                     .collect();
                 sets_info.push(Line::styled(
                     clip(
-                        &format!("   {} · {}", sizes.join(" · "), eval::suite_dir().display()),
+                        &format!(
+                            "   {} · {}",
+                            sizes.join(" · "),
+                            eval::suite_dir(iq.difficulty).display()
+                        ),
                         width,
                     ),
                     Style::new().fg(FAINT),
@@ -584,8 +616,9 @@ impl App {
             Err(_) => sets_info.push(Line::styled(
                 clip(
                     &format!(
-                        "   {} questions each from GSM8K, MMLU, IFEval and CRUXEval, from Hugging Face",
-                        evalsets::PER_SET
+                        "   {} questions each from {}, from Hugging Face",
+                        evalsets::PER_SET,
+                        iq.difficulty.datasets().join(", ")
                     ),
                     width,
                 ),
@@ -609,7 +642,7 @@ impl App {
         let questions = iq.suite.as_ref().map_or(0, |s| s.questions(iq.quick).len());
         let mut sel_line = 0;
         for (n, &def) in LINES.iter().enumerate() {
-            if def == IqLine::Sets {
+            if def == IqLine::Difficulty {
                 out.push(Line::default());
                 out.push(title("QUESTION SETS"));
             }
@@ -636,6 +669,13 @@ impl App {
                     ),
                 ),
                 IqLine::Measure => ("Measure", "‹ intelligence ›".into()),
+                IqLine::Difficulty => (
+                    "Difficulty",
+                    match iq.difficulty {
+                        Difficulty::Hard => "‹ hard ›".into(),
+                        Difficulty::Standard => "‹ standard (easy for current models) ›".into(),
+                    },
+                ),
                 IqLine::Sets => (
                     "Question sets",
                     match &iq.suite {
@@ -804,7 +844,11 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        lines.extend(Self::iq_table(&iq.tallies, width));
+        lines.extend(Self::iq_table(
+            &iq.tallies,
+            iq.plan.as_ref().map_or(iq.difficulty, |p| p.difficulty),
+            width,
+        ));
         lines.push(Line::default());
         for (cat, id, correct, answer) in iq.answers.iter().rev().take(8) {
             lines.push(Line::styled(
@@ -900,7 +944,11 @@ impl App {
             }
         }
         lines.push(Line::default());
-        lines.extend(Self::iq_table(&iq.tallies, width));
+        lines.extend(Self::iq_table(
+            &iq.tallies,
+            iq.plan.as_ref().map_or(iq.difficulty, |p| p.difficulty),
+            width,
+        ));
         lines.push(Line::default());
         lines.extend(self.iq_history(b, width));
         f.render_widget(Paragraph::new(lines), inner);

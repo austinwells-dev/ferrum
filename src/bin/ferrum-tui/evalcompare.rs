@@ -1,7 +1,7 @@
 //! The Compare view of the intelligence benchmark: every saved result, from
 //! every model, as one bar each, with its setup and this Mac's speedup.
 use crate::benchui::ago;
-use crate::eval::{CATEGORIES, EvalResult};
+use crate::eval::{self, Difficulty, EvalResult};
 use crate::evalui::{bar_ranged, score_color};
 use crate::*;
 
@@ -43,10 +43,32 @@ impl ThinkingFilter {
 #[derive(Clone, Default)]
 pub struct Compare {
     pub sel: usize,
+    /// Only results of this difficulty (None: both).
+    pub difficulty: Option<Difficulty>,
     pub thinking: ThinkingFilter,
     pub full_only: bool,
     /// Show the selected result's categories.
     pub detail: bool,
+    /// `x` was pressed once: the next `x` deletes every saved result.
+    pub confirm_clear: bool,
+}
+
+impl Compare {
+    /// Opens on the difficulty the setup shows.
+    pub fn new(difficulty: Difficulty) -> Self {
+        Self {
+            difficulty: Some(difficulty),
+            ..Self::default()
+        }
+    }
+
+    fn next_difficulty(&mut self) {
+        self.difficulty = match self.difficulty {
+            Some(Difficulty::Hard) => Some(Difficulty::Standard),
+            Some(Difficulty::Standard) => None,
+            None => Some(Difficulty::Hard),
+        };
+    }
 }
 
 /// The model's file name without `.gguf`.
@@ -64,7 +86,12 @@ fn model_name(path: &str) -> String {
 pub fn compare_rows<'a>(results: &'a [EvalResult], c: &Compare) -> Vec<&'a EvalResult> {
     let mut rows: Vec<&EvalResult> = results
         .iter()
-        .filter(|r| c.thinking.keeps(r) && (!c.full_only || !r.quick) && r.score().is_some())
+        .filter(|r| {
+            c.difficulty.is_none_or(|d| d == r.difficulty)
+                && c.thinking.keeps(r)
+                && (!c.full_only || !r.quick)
+                && r.score().is_some()
+        })
         .collect();
     rows.sort_by(|a, b| {
         let s = |r: &EvalResult| r.score().map_or(0.0, |s| s.share);
@@ -83,7 +110,21 @@ impl App {
         let Some(c) = b.iq.compare.as_mut() else {
             return;
         };
+        let clearing = c.confirm_clear;
+        c.confirm_clear = false;
         match key.code {
+            KeyCode::Char('x') if clearing => {
+                b.iq.results.clear();
+                eval::write_results(&eval::results_path(), &b.iq.results);
+                c.sel = 0;
+                c.detail = false;
+                self.status = Some(("cleared every intelligence result".into(), true));
+            }
+            KeyCode::Char('x') => c.confirm_clear = true,
+            KeyCode::Char('d') => {
+                c.next_difficulty();
+                c.sel = 0;
+            }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => b.iq.compare = None,
             KeyCode::Up | KeyCode::Char('k') => c.sel = c.sel.saturating_sub(1),
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
@@ -112,7 +153,8 @@ impl App {
         let current = b.iq.suite.as_ref().ok().map(|s| s.fingerprint.as_str());
         let mut head = vec![Line::styled(
             format!(
-                " {} · {} · {} result{}",
+                " {} · {} · {} · {} result{}",
+                c.difficulty.map_or("hard and standard", |d| d.key()),
                 c.thinking.label(),
                 if c.full_only {
                     "full runs only"
@@ -125,39 +167,54 @@ impl App {
             Style::new().fg(DIM),
         )];
         head.push(Line::styled(
-            " ▒ is the 95% range of a predicted (quick) score · speed is this Mac's best speedup over plain decoding",
+            clip(
+                " ▒ 95% range of a quick (predicted) score · × this Mac's best speedup for the model",
+                width,
+            ),
             Style::new().fg(FAINT),
         ));
+        if c.confirm_clear {
+            head.push(Line::styled(
+                format!(
+                    " press x again to delete all {} saved results (every model and difficulty) · any other key keeps them",
+                    b.iq.results.len()
+                ),
+                Style::new().fg(BAD).add_modifier(Modifier::BOLD),
+            ));
+        }
         head.push(Line::default());
         if rows.is_empty() {
             head.push(Line::styled(
                 if b.iq.results.is_empty() {
                     "   no results yet: run an intelligence test first"
                 } else {
-                    "   nothing matches these filters (t: thinking, f: full runs)"
+                    "   nothing matches these filters (d: difficulty, t: thinking, f: full runs)"
                 },
                 Style::new().fg(GOLD),
             ));
             f.render_widget(Paragraph::new(head), inner);
             return;
         }
-        let name_w = width.saturating_sub(70).clamp(16, 34);
-        let setup_w = 26;
-        let bar_w = width.saturating_sub(name_w + setup_w + 26).clamp(10, 24);
+        // Room left of the marker (3), score (11) and speed (7) columns and
+        // the gaps, shared so the model name gets what the bar does not need.
+        let setup_w = 28;
+        let bar_w = width.saturating_sub(setup_w + 24 + 40).clamp(10, 20);
+        let name_w = width.saturating_sub(setup_w + bar_w + 24).clamp(16, 48);
         let sel = c.sel.min(rows.len() - 1);
         let mut list: Vec<Line> = Vec::new();
         for (i, r) in rows.iter().enumerate() {
             let Some(s) = r.score() else { continue };
             let on = i == sel;
             let bg = if on { SELECTED } else { Color::Reset };
-            let stale = current.is_some_and(|f| f != r.suite);
+            let stale = r.difficulty == b.iq.difficulty && current.is_some_and(|f| f != r.suite);
             let speed = b
                 .saved
                 .iter()
                 .find(|x| x.machine == b.machine.label() && x.model == r.model)
                 .map_or("–".to_string(), |x| format!("{:.2}×", x.speedup));
             let setup = format!(
-                "{} · {}{}",
+                "{} · {} · {}{}",
+                r.difficulty.key(),
                 if r.quick { "quick" } else { "full" },
                 r.thinking
                     .map_or("no think".to_string(), |t| format!("think ≤{t}")),
@@ -222,9 +279,14 @@ impl App {
                     ),
                     Style::new().fg(FAINT),
                 ));
-                for (t, (_, name)) in r.tallies.iter().zip(CATEGORIES) {
+                for (i, t) in r.tallies.iter().enumerate() {
                     let mut spans = vec![Span::styled(
-                        format!("     {name:<26} {:>3}/{:<3} ", t.right, t.n),
+                        format!(
+                            "     {:<34} {:>3}/{:<3} ",
+                            r.difficulty.cat_name(i),
+                            t.right,
+                            t.n
+                        ),
                         Style::new().fg(TEXT),
                     )];
                     if t.n > 0 {
@@ -260,6 +322,7 @@ mod tests {
         EvalResult {
             model: model.into(),
             when: 1,
+            difficulty: crate::eval::Difficulty::Hard,
             quick,
             thinking,
             draft: "plain decoding".into(),
@@ -284,7 +347,7 @@ mod tests {
             result("/a/two.gguf", false, Some(1024), 9),
             result("/a/three.gguf", false, None, 7),
         ];
-        let mut c = Compare::default();
+        let mut c = Compare::new(crate::eval::Difficulty::Hard);
         let rows: Vec<&str> = compare_rows(&results, &c)
             .iter()
             .map(|r| r.model.as_str())
@@ -297,5 +360,15 @@ mod tests {
         c.thinking = c.thinking.next();
         assert_eq!(compare_rows(&results, &c)[0].model, "/a/two.gguf");
         assert_eq!(model_name("/m/Tiel-Coder-35B.gguf"), "Tiel-Coder-35B");
+        // Standard results only show once the filter allows them.
+        let mut easy = result("/a/four.gguf", false, None, 10);
+        easy.difficulty = crate::eval::Difficulty::Standard;
+        let both = vec![easy, result("/a/five.gguf", false, None, 6)];
+        let mut c = Compare::new(crate::eval::Difficulty::Hard);
+        assert_eq!(compare_rows(&both, &c).len(), 1);
+        c.next_difficulty();
+        assert_eq!(compare_rows(&both, &c)[0].model, "/a/four.gguf");
+        c.next_difficulty();
+        assert_eq!(compare_rows(&both, &c).len(), 2);
     }
 }

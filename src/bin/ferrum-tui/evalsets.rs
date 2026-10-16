@@ -1,8 +1,11 @@
-//! Installing and removing the intelligence question sets: a fixed, seeded
-//! sample of GSM8K (MIT), MMLU (MIT), IFEval (Apache-2.0) and CRUXEval (MIT),
-//! fetched with the system `curl` from the Hugging Face datasets-server API
-//! and written as the JSON lines [`eval`] reads.
-use crate::eval::{self, CATEGORIES};
+//! Installing and removing the intelligence question sets, fetched with the
+//! system `curl` from the Hugging Face datasets-server API and written as the
+//! JSON lines [`eval`] reads. Each is a fixed, seeded sample:
+//! - standard: GSM8K (MIT), MMLU (MIT), IFEval (Apache-2.0), CRUXEval (MIT)
+//! - hard: MATH-500 levels 3-5 with plain-number answers (MIT), MMLU-Pro (MIT,
+//!   ten options), the IFEval prompts with the most rules and the longest
+//!   CRUXEval functions
+use crate::eval::{self, CATEGORIES, Difficulty};
 use crate::*;
 use rand::SeedableRng;
 use rand::seq::SliceRandom;
@@ -35,15 +38,19 @@ struct Dataset {
     split: &'static str,
     /// One datasets-server row (with `row_idx`) as an item, or None to skip it.
     convert: fn(&Json) -> Option<Json>,
+    /// How hard a row is: when set, the hardest rows are kept. Only for
+    /// splits fetched whole.
+    rank: Option<fn(&Json) -> usize>,
 }
 
-const DATASETS: [Dataset; 4] = [
+const STANDARD: [Dataset; 4] = [
     Dataset {
         cat: "math",
         name: "openai/gsm8k",
         config: "main",
         split: "test",
         convert: gsm8k,
+        rank: None,
     },
     Dataset {
         cat: "knowledge",
@@ -51,6 +58,7 @@ const DATASETS: [Dataset; 4] = [
         config: "all",
         split: "test",
         convert: mmlu,
+        rank: None,
     },
     Dataset {
         cat: "instructions",
@@ -58,6 +66,7 @@ const DATASETS: [Dataset; 4] = [
         config: "default",
         split: "train",
         convert: ifeval,
+        rank: None,
     },
     Dataset {
         cat: "code",
@@ -65,8 +74,115 @@ const DATASETS: [Dataset; 4] = [
         config: "default",
         split: "test",
         convert: cruxeval,
+        rank: None,
     },
 ];
+
+const HARD: [Dataset; 4] = [
+    Dataset {
+        cat: "math",
+        name: "HuggingFaceH4/MATH-500",
+        config: "default",
+        split: "test",
+        convert: math500,
+        rank: Some(math_level),
+    },
+    Dataset {
+        cat: "knowledge",
+        name: "TIGER-Lab/MMLU-Pro",
+        config: "default",
+        split: "test",
+        convert: mmlu_pro,
+        rank: None,
+    },
+    Dataset {
+        cat: "instructions",
+        name: "google/IFEval",
+        config: "default",
+        split: "train",
+        convert: ifeval,
+        rank: Some(rule_count),
+    },
+    Dataset {
+        cat: "code",
+        name: "cruxeval-org/cruxeval",
+        config: "default",
+        split: "test",
+        convert: cruxeval,
+        rank: Some(code_length),
+    },
+];
+
+fn datasets(difficulty: Difficulty) -> &'static [Dataset; 4] {
+    match difficulty {
+        Difficulty::Standard => &STANDARD,
+        Difficulty::Hard => &HARD,
+    }
+}
+
+/// MATH problems of level 3-5 whose answer is a plain number (no LaTeX), so
+/// the number check can grade them.
+fn math500(r: &Json) -> Option<Json> {
+    let row = &r["row"];
+    if math_level(r) < 3 {
+        return None;
+    }
+    let answer = row["answer"].as_str()?.trim().replace(',', "");
+    let plain = !answer.is_empty()
+        && answer
+            .chars()
+            .all(|c| c.is_ascii_digit() || c == '.' || c == '-')
+        && answer.parse::<f64>().is_ok();
+    plain.then(|| {
+        json!({
+            "id": format!("math500-{}", r["row_idx"]), "cat": "math", "check": "number",
+            "answer": answer, "prompt": row["problem"].as_str().unwrap_or("").trim(),
+            "max_tokens": 1024,
+        })
+    })
+}
+
+/// MATH levels come as strings ("4"); accept numbers too.
+fn math_level(r: &Json) -> usize {
+    let level = &r["row"]["level"];
+    level
+        .as_u64()
+        .map(|n| n as usize)
+        .or_else(|| level.as_str().and_then(|s| s.trim().parse().ok()))
+        .unwrap_or(0)
+}
+
+fn mmlu_pro(r: &Json) -> Option<Json> {
+    let row = &r["row"];
+    let letters = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J'];
+    let options: Vec<String> = row["options"]
+        .as_array()?
+        .iter()
+        .zip(letters)
+        .map(|(c, l)| format!("{l}. {}", c.as_str().unwrap_or("")))
+        .collect();
+    Some(json!({
+        "id": format!("mmlupro-{}", row["question_id"]), "cat": "knowledge", "check": "choice",
+        "answer": row["answer"].as_str()?,
+        "prompt": format!(
+            "A question about {}.\n\n{}\n\n{}",
+            row["category"].as_str()?,
+            row["question"].as_str()?.trim(),
+            options.join("\n")
+        ),
+        "max_tokens": 384,
+    }))
+}
+
+fn rule_count(r: &Json) -> usize {
+    r["row"]["instruction_id_list"]
+        .as_array()
+        .map_or(0, Vec::len)
+}
+
+fn code_length(r: &Json) -> usize {
+    r["row"]["code"].as_str().map_or(0, str::len)
+}
 
 fn gsm8k(r: &Json) -> Option<Json> {
     let row = &r["row"];
@@ -257,11 +373,25 @@ fn sample(d: &Dataset, progress: &impl Fn(String), stop: &AtomicBool) -> Result<
             rows.extend(batch);
         }
         rows.shuffle(&mut rng);
-        lines.extend(
-            rows.iter()
-                .filter_map(|r| (d.convert)(r).and_then(checked_line))
-                .take(PER_SET),
-        );
+        if let Some(rank) = d.rank {
+            // The hardest usable rows (stable, so ties keep the shuffle)...
+            let mut usable: Vec<(usize, String)> = rows
+                .iter()
+                .filter_map(|r| Some((rank(r), (d.convert)(r).and_then(checked_line)?)))
+                .collect();
+            usable.sort_by_key(|(k, _)| std::cmp::Reverse(*k));
+            usable.truncate(PER_SET);
+            // ...shuffled again, so a quick run's first questions are a fair
+            // sample of them rather than the very hardest.
+            usable.shuffle(&mut rng);
+            lines.extend(usable.into_iter().map(|(_, l)| l));
+        } else {
+            lines.extend(
+                rows.iter()
+                    .filter_map(|r| (d.convert)(r).and_then(checked_line))
+                    .take(PER_SET),
+            );
+        }
     } else {
         // Too big to fetch whole, and sorted by subject: a few rows from each
         // of many random places.
@@ -302,9 +432,14 @@ fn part_path(dir: &Path, cat: &str) -> PathBuf {
 
 /// Downloads every set into `dir`. Each finished set is kept as a `.part`
 /// file, and the question files are only replaced once all of them are in.
-pub fn install(dir: &Path, progress: impl Fn(String), stop: &AtomicBool) -> Result<usize, String> {
+pub fn install(
+    dir: &Path,
+    difficulty: Difficulty,
+    progress: impl Fn(String),
+    stop: &AtomicBool,
+) -> Result<usize, String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    for d in &DATASETS {
+    for d in datasets(difficulty) {
         let part = part_path(dir, d.cat);
         if part.exists() {
             continue;
@@ -348,7 +483,7 @@ pub struct Installing {
     pub handle: Option<JoinHandle<()>>,
 }
 
-pub fn spawn_install(dir: PathBuf) -> Result<Installing, String> {
+pub fn spawn_install(dir: PathBuf, difficulty: Difficulty) -> Result<Installing, String> {
     let (tx, rx) = channel();
     let stop = Arc::new(AtomicBool::new(false));
     let flag = stop.clone();
@@ -358,7 +493,7 @@ pub fn spawn_install(dir: PathBuf) -> Result<Installing, String> {
             let progress = |s| {
                 let _ = tx.send(InstallEvent::Progress(s));
             };
-            let result = install(&dir, progress, &flag);
+            let result = install(&dir, difficulty, progress, &flag);
             let _ = tx.send(InstallEvent::Done(result));
         })
         .map_err(|e| e.to_string())?;
@@ -411,6 +546,41 @@ mod tests {
         .and_then(checked_line)
         .unwrap();
         assert!(c.contains("crux-sample_3") && c.contains("f(4)"));
+    }
+
+    #[test]
+    fn converts_the_hard_sets() {
+        let m = |level: u64, answer: &str| {
+            math500(&row(
+                3,
+                json!({"problem": "Find x.", "answer": answer, "level": level.to_string()}),
+            ))
+            .and_then(checked_line)
+        };
+        let line = m(5, "1,024").unwrap();
+        let item = &eval::parse_items(&line).unwrap()[0];
+        assert_eq!(item.check, eval::Check::Number(1024.0));
+        assert_eq!(item.max_tokens, 1024);
+        assert_eq!(m(5, "\\frac{1}{2}"), None, "LaTeX answers are skipped");
+        assert_eq!(m(2, "7"), None, "easy levels are skipped");
+        assert_eq!(math_level(&row(0, json!({"level": 4}))), 4);
+        assert_eq!(math_level(&row(0, json!({"level": "5"}))), 5);
+
+        let p = mmlu_pro(&row(
+            0,
+            json!({"question_id": 70, "question": "Q?", "category": "law",
+                   "options": ["a","b","c","d","e","f","g","h","i","j"], "answer": "J"}),
+        ))
+        .and_then(checked_line)
+        .unwrap();
+        let item = &eval::parse_items(&p).unwrap()[0];
+        assert_eq!(item.check, eval::Check::Choice('J'));
+        assert!(item.prompt.ends_with("J. j"));
+        assert_eq!(code_length(&row(0, json!({"code": "abcd"}))), 4);
+        assert_eq!(
+            rule_count(&row(0, json!({"instruction_id_list": ["a", "b", "c"]}))),
+            3
+        );
     }
 
     #[test]

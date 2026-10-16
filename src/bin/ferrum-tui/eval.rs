@@ -604,21 +604,75 @@ pub fn store_baseline(path: &Path, key: &CheckKey, answers: &[Graded]) {
 
 /// Question sets, one `<name>.jsonl` each in the suite folder.
 pub const CATEGORIES: [(&str, &str); 4] = [
-    ("math", "Math · GSM8K"),
-    ("knowledge", "Knowledge · MMLU"),
-    ("instructions", "Instructions · IFEval"),
-    ("code", "Code reading · CRUXEval"),
+    ("math", "Math"),
+    ("knowledge", "Knowledge"),
+    ("instructions", "Instructions"),
+    ("code", "Code reading"),
 ];
+
+/// Which question sets a run uses. Each difficulty has its own folder and
+/// its results are never compared with the other's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Difficulty {
+    /// GSM8K, MMLU, IFEval and CRUXEval: easy for current mid-size models.
+    Standard,
+    /// MATH-500, MMLU-Pro, the IFEval prompts with the most rules and the
+    /// longest CRUXEval functions.
+    #[default]
+    Hard,
+}
+
+impl Difficulty {
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Hard => "hard",
+        }
+    }
+
+    pub fn parse(s: &str) -> Self {
+        if s == "hard" {
+            Self::Hard
+        } else {
+            Self::Standard
+        }
+    }
+
+    pub fn other(self) -> Self {
+        match self {
+            Self::Standard => Self::Hard,
+            Self::Hard => Self::Standard,
+        }
+    }
+
+    /// The dataset behind each category, in `CATEGORIES` order.
+    pub fn datasets(self) -> [&'static str; 4] {
+        match self {
+            Self::Standard => ["GSM8K", "MMLU", "IFEval", "CRUXEval"],
+            Self::Hard => ["MATH-500", "MMLU-Pro", "IFEval multi-rule", "CRUXEval long"],
+        }
+    }
+
+    /// "Math · MATH-500"
+    pub fn cat_name(self, cat: usize) -> String {
+        format!("{} · {}", CATEGORIES[cat].1, self.datasets()[cat])
+    }
+}
 
 /// Questions per category in a quick run: the first ones of each file, which
 /// the installer shuffled with a fixed seed.
 pub const QUICK_PER_CAT: usize = 15;
 
-/// `$FERRUM_EVAL_DIR`, else `~/.config/ferrum/eval`.
-pub fn suite_dir() -> PathBuf {
-    std::env::var_os("FERRUM_EVAL_DIR")
+/// `$FERRUM_EVAL_DIR`, else `~/.config/ferrum/eval`; the hard sets live in
+/// its `hard` subfolder.
+pub fn suite_dir(difficulty: Difficulty) -> PathBuf {
+    let root = std::env::var_os("FERRUM_EVAL_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| home().join(".config/ferrum/eval"))
+        .unwrap_or_else(|| home().join(".config/ferrum/eval"));
+    match difficulty {
+        Difficulty::Standard => root,
+        Difficulty::Hard => root.join("hard"),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -759,6 +813,7 @@ pub fn score(tallies: &[Tally]) -> Option<Score> {
 #[derive(Clone)]
 pub struct EvalPlan {
     pub model: PathBuf,
+    pub difficulty: Difficulty,
     pub quick: bool,
     /// Reasoning budget per question (None: thinking off).
     pub thinking: Option<usize>,
@@ -871,7 +926,7 @@ fn run(plan: EvalPlan, suite: Suite, tx: Sender<EvalEvent>, stop: Arc<AtomicBool
         }
         send(EvalEvent::Stage(format!(
             "{} · question {}/{}",
-            CATEGORIES[*cat].1,
+            plan.difficulty.cat_name(*cat),
             n + 1,
             questions.len()
         )));
@@ -908,6 +963,7 @@ fn run(plan: EvalPlan, suite: Suite, tx: Sender<EvalEvent>, stop: Arc<AtomicBool
 pub struct EvalResult {
     pub model: String,
     pub when: u64,
+    pub difficulty: Difficulty,
     pub quick: bool,
     pub thinking: Option<usize>,
     /// `EvalPlan::draft_label`.
@@ -929,6 +985,7 @@ impl EvalResult {
     fn same_setup(&self, o: &Self) -> bool {
         (
             &self.model,
+            self.difficulty,
             self.quick,
             self.thinking,
             &self.draft,
@@ -936,6 +993,7 @@ impl EvalResult {
             &self.suite,
         ) == (
             &o.model,
+            o.difficulty,
             o.quick,
             o.thinking,
             &o.draft,
@@ -944,10 +1002,11 @@ impl EvalResult {
         )
     }
 
-    /// "quick · thinking off · plain decoding"
+    /// "hard · quick · thinking off · plain decoding"
     pub fn setup_label(&self) -> String {
         format!(
-            "{} · thinking {} · {}",
+            "{} · {} · thinking {} · {}",
+            self.difficulty.key(),
             if self.quick { "quick" } else { "full" },
             self.thinking.map_or("off".to_string(), |b| format!("≤{b}")),
             self.draft
@@ -966,7 +1025,8 @@ impl EvalResult {
             })
             .collect();
         json!({
-            "model": self.model, "when": self.when, "quick": self.quick,
+            "model": self.model, "when": self.when, "difficulty": self.difficulty.key(),
+            "quick": self.quick,
             "thinking": self.thinking, "draft": self.draft, "kv_cache": self.kv_cache,
             "suite": self.suite, "tallies": tallies, "wrong": self.wrong,
         })
@@ -977,6 +1037,7 @@ impl EvalResult {
         Self {
             model: r["model"].as_str().unwrap_or("").into(),
             when: r["when"].as_u64().unwrap_or(0),
+            difficulty: Difficulty::parse(r["difficulty"].as_str().unwrap_or("")),
             quick: r["quick"].as_bool().unwrap_or(true),
             thinking: r["thinking"].as_u64().map(|b| b as usize),
             draft: r["draft"].as_str().unwrap_or("").into(),
@@ -1326,6 +1387,7 @@ mod tests {
         let run = |quick, right| EvalResult {
             model: "/m.gguf".into(),
             when: 5,
+            difficulty: Difficulty::Hard,
             quick,
             thinking: Some(1024),
             draft: "plain decoding".into(),
@@ -1351,7 +1413,7 @@ mod tests {
         assert_eq!(load_results(&path), results);
         assert_eq!(
             results[1].setup_label(),
-            "full · thinking ≤1024 · plain decoding"
+            "hard · full · thinking ≤1024 · plain decoding"
         );
         fs::remove_dir_all(dir).ok();
     }

@@ -511,8 +511,10 @@ impl App {
             _ if comparing => &[
                 ("↑↓", "move"),
                 ("enter", "details"),
+                ("d", "difficulty"),
                 ("t", "thinking"),
-                ("f", "full runs only"),
+                ("f", "full only"),
+                ("x", "clear"),
                 ("esc", "back"),
             ],
             BenchPhase::Setup if iq => &[
