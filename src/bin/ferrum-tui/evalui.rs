@@ -4,6 +4,7 @@
 use crate::bench::{self, Candidate, Source};
 use crate::benchui::{BenchPhase, ago};
 use crate::eval::{self, CATEGORIES, EvalEvent, EvalPlan, EvalResult, EvalRunning, Suite, Tally};
+use crate::evalcompare::Compare;
 use crate::evalsets::{self, InstallEvent, Installing};
 use crate::*;
 use std::sync::atomic::Ordering;
@@ -47,6 +48,8 @@ pub struct IqState {
     pub install_note: Option<(String, bool)>,
     /// Enter was pressed once on installed sets: the next press removes them.
     pub confirm_remove: bool,
+    /// The Compare view, when open.
+    pub compare: Option<Compare>,
 }
 
 impl IqState {
@@ -73,6 +76,7 @@ impl IqState {
             install_stage: String::new(),
             install_note: None,
             confirm_remove: false,
+            compare: None,
         }
     }
 
@@ -167,7 +171,7 @@ const LINES: [IqLine; 7] = [
     IqLine::Run,
 ];
 
-fn score_color(share: f64) -> Color {
+pub fn score_color(share: f64) -> Color {
     if share >= 0.75 {
         GOOD
     } else if share >= 0.5 {
@@ -179,11 +183,36 @@ fn score_color(share: f64) -> Color {
 
 /// `width`-cell bar filled to `share`.
 fn bar(share: f64, width: usize, color: Color) -> Vec<Span<'static>> {
-    let filled = ((share.clamp(0.0, 1.0)) * width as f64).round() as usize;
+    bar_ranged(share, 0.0, width, color)
+}
+
+/// A bar solid up to `share - margin`, shaded (`▒`) across the range
+/// `share ± margin`, empty after.
+pub fn bar_ranged(share: f64, margin: f64, width: usize, color: Color) -> Vec<Span<'static>> {
+    let cells = |x: f64| ((x.clamp(0.0, 1.0)) * width as f64).round() as usize;
+    let (solid, upper) = if margin > 0.0 {
+        (cells(share - margin), cells(share + margin))
+    } else {
+        let s = cells(share);
+        (s, s)
+    };
     vec![
-        Span::styled("█".repeat(filled), Style::new().fg(color)),
-        Span::styled("░".repeat(width - filled), Style::new().fg(FAINT)),
+        Span::styled("█".repeat(solid), Style::new().fg(color)),
+        Span::styled("▒".repeat(upper - solid), Style::new().fg(color)),
+        Span::styled("░".repeat(width - upper), Style::new().fg(FAINT)),
     ]
+}
+
+/// An answer as shown: IFEval answers are which rules held ("101").
+fn shown_answer(cat: usize, answer: Option<&str>) -> String {
+    match answer {
+        None => "no answer found".into(),
+        Some(a) if CATEGORIES[cat].0 == "instructions" => {
+            let held = a.chars().filter(|&c| c == '1').count();
+            format!("{held}/{} rules held", a.len())
+        }
+        Some(a) => a.to_string(),
+    }
 }
 
 impl App {
@@ -383,6 +412,7 @@ impl App {
                 iq.sel = (iq.sel + 1).min(LINES.len() - 1)
             }
             KeyCode::Char('r') => start = true,
+            KeyCode::Char('c') => iq.compare = Some(Compare::default()),
             KeyCode::Left | KeyCode::Right | KeyCode::Enter | KeyCode::Char(' ') => {
                 let step: i32 = if key.code == KeyCode::Left { -1 } else { 1 };
                 match LINES[iq.sel] {
@@ -427,6 +457,11 @@ impl App {
 
     pub fn iq_results_key(&mut self, key: KeyEvent) {
         match key.code {
+            KeyCode::Char('c') => {
+                if let Some(b) = self.bench.as_mut() {
+                    b.iq.compare = Some(Compare::default());
+                }
+            }
             KeyCode::Char('r') | KeyCode::Enter => {
                 if let Some(b) = self.bench.as_mut() {
                     b.phase = BenchPhase::Setup;
@@ -539,28 +574,34 @@ impl App {
                     .map(|(set, (cat, _))| format!("{cat} {}", set.len()))
                     .collect();
                 sets_info.push(Line::styled(
-                    format!("   {} · {}", sizes.join(" · "), eval::suite_dir().display()),
+                    clip(
+                        &format!("   {} · {}", sizes.join(" · "), eval::suite_dir().display()),
+                        width,
+                    ),
                     Style::new().fg(FAINT),
                 ));
             }
             Err(_) => sets_info.push(Line::styled(
-                format!(
-                    "   samples of GSM8K, MMLU, IFEval and CRUXEval ({} each), fetched from Hugging Face into {}",
-                    evalsets::PER_SET,
-                    eval::suite_dir().display()
+                clip(
+                    &format!(
+                        "   {} questions each from GSM8K, MMLU, IFEval and CRUXEval, from Hugging Face",
+                        evalsets::PER_SET
+                    ),
+                    width,
                 ),
                 Style::new().fg(FAINT),
             )),
         }
         if let Some((note, ok)) = &iq.install_note {
-            sets_info.push(Line::styled(
-                format!(
-                    "   {} {}",
-                    if *ok { "✓" } else { "✗" },
-                    clip(note, width.saturating_sub(6))
-                ),
-                Style::new().fg(if *ok { GOOD } else { BAD }),
-            ));
+            // Errors carry advice: wrap them instead of cutting them off.
+            let text = format!("{} {note}", if *ok { "✓" } else { "✗" });
+            let chars: Vec<char> = text.chars().collect();
+            for (a, z) in wrap_rows(&text, width.saturating_sub(5)) {
+                sets_info.push(Line::styled(
+                    format!("   {}", chars[a..z].iter().collect::<String>()),
+                    Style::new().fg(if *ok { GOOD } else { BAD }),
+                ));
+            }
         }
         let mut out: Vec<Line> = Vec::new();
         let tuned = self.tuned_draft();
@@ -609,7 +650,9 @@ impl App {
                 ),
                 IqLine::Size => (
                     "Questions",
-                    if iq.quick {
+                    if iq.suite.is_err() {
+                        "install the question sets first".into()
+                    } else if iq.quick {
                         format!("‹ quick: {questions}, predicts the full score ›")
                     } else {
                         format!("‹ full: all {questions} ›")
@@ -770,7 +813,7 @@ impl App {
                     if *correct { "✓" } else { "✗" },
                     clip(id, 22),
                     CATEGORIES[*cat].0,
-                    clip(answer.as_deref().unwrap_or("no answer found"), 30)
+                    clip(&shown_answer(*cat, answer.as_deref()), 30)
                 ),
                 Style::new().fg(if *correct { DIM } else { BAD }),
             ));
@@ -880,6 +923,15 @@ mod tests {
         assert_eq!(text(1.2), "██████████");
         assert_eq!(text(-1.0), "░░░░░░░░░░");
         assert_eq!(score_color(0.8), GOOD);
+        let ranged = bar_ranged(0.5, 0.2, 10, GOOD)
+            .iter()
+            .map(|s| s.content.to_string())
+            .collect::<String>();
+        assert_eq!(ranged, "███▒▒▒▒░░░");
+        assert_eq!(shown_answer(2, Some("101")), "2/3 rules held");
+        assert_eq!(shown_answer(2, Some("1")), "1/1 rules held");
+        assert_eq!(shown_answer(0, Some("42")), "42");
+        assert_eq!(shown_answer(1, None), "no answer found");
         assert_eq!(score_color(0.2), BAD);
     }
 }

@@ -19,8 +19,14 @@ pub const PER_SET: usize = 100;
 /// The same seed always picks the same questions.
 const SEED: u64 = 7;
 const API: &str = "https://datasets-server.huggingface.co/rows";
-/// Splits up to this size are fetched whole; larger ones row by row.
+/// Splits up to this size are fetched whole; larger ones in random windows.
 const FETCH_ALL: usize = 2000;
+/// Rows per random window of a large split: few requests, many subjects.
+const WINDOW: usize = 4;
+/// Pause between requests, so the anonymous API does not rate-limit us.
+const PACE: Duration = Duration::from_millis(500);
+/// Attempts per request; rate limits (HTTP 429) wait longer each time.
+const ATTEMPTS: u64 = 6;
 
 struct Dataset {
     cat: &'static str,
@@ -147,36 +153,93 @@ fn checked_line(item: Json) -> Option<String> {
     eval::parse_items(&line).ok().map(|_| line)
 }
 
-fn fetch(d: &Dataset, offset: usize, length: usize, stop: &AtomicBool) -> Result<Json, String> {
+/// Sleeps `secs`, a second at a time so a stop is noticed.
+fn wait(secs: u64, stop: &AtomicBool) -> Result<(), String> {
+    for _ in 0..secs {
+        if stop.load(Ordering::SeqCst) {
+            return Err("stopped".into());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    Ok(())
+}
+
+fn fetch(
+    d: &Dataset,
+    offset: usize,
+    length: usize,
+    progress: &impl Fn(String),
+    stop: &AtomicBool,
+) -> Result<Json, String> {
     let url = format!(
         "{API}?dataset={}&config={}&split={}&offset={offset}&length={length}",
         d.name.replace('/', "%2F"),
         d.config,
         d.split
     );
+    // A Hugging Face token raises the rate limit; it goes through stdin so it
+    // never shows in the process list.
+    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
     let mut last = String::new();
-    for attempt in 0..5u64 {
+    for attempt in 0..ATTEMPTS {
         if stop.load(Ordering::SeqCst) {
             return Err("stopped".into());
         }
-        let out = Command::new("/usr/bin/curl")
-            .args(["-sSfL", "--max-time", "60", &url])
-            .output()
+        std::thread::sleep(PACE);
+        let mut cmd = Command::new("/usr/bin/curl");
+        cmd.args(["-sSfL", "--max-time", "60"]);
+        if token.is_some() {
+            cmd.args(["-H", "@-"]);
+        }
+        let mut child = cmd
+            .arg(&url)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
             .map_err(|e| format!("could not run curl: {e}"))?;
+        if let (Some(t), Some(mut stdin)) = (&token, child.stdin.take()) {
+            use std::io::Write;
+            let _ = writeln!(stdin, "Authorization: Bearer {t}");
+        }
+        let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
         if out.status.success() {
             return serde_json::from_slice(&out.stdout).map_err(|e| format!("{}: {e}", d.name));
         }
-        // Rate limits and hiccups: back off and retry.
         last = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        std::thread::sleep(Duration::from_secs(2 + 3 * attempt));
+        let limited = last.contains("429");
+        let secs = if limited {
+            15 * (attempt + 1)
+        } else {
+            2 + 3 * attempt
+        };
+        if attempt + 1 < ATTEMPTS {
+            progress(format!(
+                "{} · {}, retrying in {secs}s",
+                d.cat,
+                if limited {
+                    "Hugging Face is rate-limiting"
+                } else {
+                    "request failed"
+                }
+            ));
+            wait(secs, stop)?;
+        }
     }
-    Err(format!("{}: {last}", d.name))
+    Err(if last.contains("429") {
+        format!(
+            "{}: Hugging Face kept rate-limiting the download (HTTP 429). Try again in a few minutes (finished sets are kept), or set HF_TOKEN.",
+            d.name
+        )
+    } else {
+        format!("{}: {last}", d.name)
+    })
 }
 
 /// The seeded sample of one dataset as JSON lines.
 fn sample(d: &Dataset, progress: &impl Fn(String), stop: &AtomicBool) -> Result<String, String> {
     let mut rng = ChaCha8Rng::seed_from_u64(SEED ^ eval_hash(d.cat));
-    let first = fetch(d, 0, 100, stop)?;
+    let first = fetch(d, 0, 100, progress, stop)?;
     let total = first["num_rows_total"].as_u64().unwrap_or(0) as usize;
     if total == 0 {
         return Err(format!("{}: no rows", d.name));
@@ -186,7 +249,7 @@ fn sample(d: &Dataset, progress: &impl Fn(String), stop: &AtomicBool) -> Result<
         let mut rows: Vec<Json> = first["rows"].as_array().cloned().unwrap_or_default();
         while rows.len() < total {
             progress(format!("{} · {}/{total} rows", d.cat, rows.len()));
-            let page = fetch(d, rows.len(), 100, stop)?;
+            let page = fetch(d, rows.len(), 100, progress, stop)?;
             let batch = page["rows"].as_array().cloned().unwrap_or_default();
             if batch.is_empty() {
                 break;
@@ -200,23 +263,25 @@ fn sample(d: &Dataset, progress: &impl Fn(String), stop: &AtomicBool) -> Result<
                 .take(PER_SET),
         );
     } else {
-        // Too big to fetch whole (and sorted by subject): pick rows at random.
-        let mut order: Vec<usize> = (0..total).collect();
-        order.shuffle(&mut rng);
-        for idx in order {
-            if lines.len() == PER_SET {
+        // Too big to fetch whole, and sorted by subject: a few rows from each
+        // of many random places.
+        let mut windows: Vec<usize> = (0..total.div_ceil(WINDOW)).collect();
+        windows.shuffle(&mut rng);
+        for w in windows {
+            if lines.len() >= PER_SET {
                 break;
             }
             progress(format!("{} · {}/{PER_SET} questions", d.cat, lines.len()));
-            let page = fetch(d, idx, 1, stop)?;
-            if let Some(line) = page["rows"]
-                .get(0)
-                .and_then(d.convert)
-                .and_then(checked_line)
-            {
-                lines.push(line);
-            }
+            let page = fetch(d, w * WINDOW, WINDOW, progress, stop)?;
+            lines.extend(
+                page["rows"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|r| (d.convert)(r).and_then(checked_line)),
+            );
         }
+        lines.truncate(PER_SET);
     }
     if lines.is_empty() {
         return Err(format!("{}: no usable questions", d.name));
@@ -230,32 +295,42 @@ fn eval_hash(s: &str) -> u64 {
     })
 }
 
-/// Downloads every set into `dir`. Nothing is replaced unless all succeed.
+/// A finished set waiting for the others, so a failed install resumes.
+fn part_path(dir: &Path, cat: &str) -> PathBuf {
+    dir.join(format!("{cat}.jsonl.part"))
+}
+
+/// Downloads every set into `dir`. Each finished set is kept as a `.part`
+/// file, and the question files are only replaced once all of them are in.
 pub fn install(dir: &Path, progress: impl Fn(String), stop: &AtomicBool) -> Result<usize, String> {
-    let mut texts = Vec::new();
-    for d in &DATASETS {
-        progress(format!("{} · downloading {}", d.cat, d.name));
-        texts.push((d.cat, sample(d, &progress, stop)?));
-    }
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for d in &DATASETS {
+        let part = part_path(dir, d.cat);
+        if part.exists() {
+            continue;
+        }
+        progress(format!("{} · downloading {}", d.cat, d.name));
+        let text = sample(d, &progress, stop)?;
+        fs::write(&part, text).map_err(|e| format!("{}: {e}", part.display()))?;
+    }
     let mut count = 0;
-    for (cat, text) in &texts {
+    for (cat, _) in CATEGORIES {
+        let part = part_path(dir, cat);
         let path = dir.join(format!("{cat}.jsonl"));
-        let tmp = path.with_extension("jsonl.tmp");
-        fs::write(&tmp, text)
-            .and_then(|_| fs::rename(&tmp, &path))
-            .map_err(|e| format!("{}: {e}", path.display()))?;
-        count += text.lines().count();
+        count += fs::read_to_string(&part).map_or(0, |t| t.lines().count());
+        fs::rename(&part, &path).map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(count)
 }
 
-/// Deletes the question files (and the folder, if nothing else is in it).
+/// Deletes the question files and unfinished downloads (and the folder, if
+/// nothing else is in it).
 pub fn remove(dir: &Path) -> Result<(), String> {
     for (cat, _) in CATEGORIES {
-        let path = dir.join(format!("{cat}.jsonl"));
-        if path.exists() {
-            fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        for path in [dir.join(format!("{cat}.jsonl")), part_path(dir, cat)] {
+            if path.exists() {
+                fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            }
         }
     }
     fs::remove_dir(dir).ok();
@@ -374,9 +449,11 @@ mod tests {
         for (cat, _) in CATEGORIES {
             fs::write(dir.join(format!("{cat}.jsonl")), "x").unwrap();
         }
+        fs::write(part_path(&dir, "math"), "x").unwrap();
         fs::write(dir.join("notes.txt"), "keep").unwrap();
         remove(&dir).unwrap();
         assert!(!dir.join("math.jsonl").exists());
+        assert!(!part_path(&dir, "math").exists());
         assert!(dir.join("notes.txt").exists(), "other files stay");
         fs::remove_file(dir.join("notes.txt")).unwrap();
         remove(&dir).unwrap();

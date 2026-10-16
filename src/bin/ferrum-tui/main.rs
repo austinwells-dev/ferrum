@@ -14,6 +14,7 @@ mod chat;
 mod coding;
 mod editor;
 mod eval;
+mod evalcompare;
 mod evalsets;
 mod evalui;
 mod fields;

@@ -356,6 +356,9 @@ impl App {
             None => return self.go_home(),
         };
         if measure == Measure::Intelligence {
+            if self.bench.as_ref().is_some_and(|b| b.iq.compare.is_some()) {
+                return self.iq_compare_key(key);
+            }
             return match phase {
                 BenchPhase::Setup => self.iq_setup_key(key),
                 BenchPhase::Running => {
@@ -478,7 +481,9 @@ impl App {
         ])
         .areas(f.area());
         let model = self.models.get(b.model);
+        let comparing = b.measure == Measure::Intelligence && b.iq.compare.is_some();
         let (pill_text, pill_color) = match (b.phase, b.stopping) {
+            _ if comparing => ("COMPARE", GOLD),
             (BenchPhase::Setup, _) => ("SETUP", GOLD),
             (BenchPhase::Running, true) => ("STOPPING", GOLD),
             (BenchPhase::Running, false) => ("RUNNING", EMBER),
@@ -494,6 +499,7 @@ impl App {
         let area = centered(body, 104, body.height);
         let iq = b.measure == Measure::Intelligence;
         match (b.phase, iq) {
+            _ if comparing => self.draw_iq_compare(f, area, b),
             (BenchPhase::Setup, false) => self.draw_bench_setup(f, area, b),
             (BenchPhase::Running, false) => self.draw_bench_running(f, area, b),
             (BenchPhase::Results, false) => self.draw_bench_results(f, area, b),
@@ -502,7 +508,21 @@ impl App {
             (BenchPhase::Results, true) => self.draw_iq_results(f, area, b),
         }
         let keys: &[(&str, &str)] = match b.phase {
-            BenchPhase::Results if iq => &[("r", "run again"), ("esc", "home")],
+            _ if comparing => &[
+                ("↑↓", "move"),
+                ("enter", "details"),
+                ("t", "thinking"),
+                ("f", "full runs only"),
+                ("esc", "back"),
+            ],
+            BenchPhase::Setup if iq => &[
+                ("↑↓", "move"),
+                ("←→/space", "change"),
+                ("r", "run"),
+                ("c", "compare"),
+                ("esc", "back"),
+            ],
+            BenchPhase::Results if iq => &[("c", "compare"), ("r", "run again"), ("esc", "home")],
             BenchPhase::Setup => &[
                 ("↑↓", "move"),
                 ("←→/space", "change"),
