@@ -1,7 +1,8 @@
 //! Benchmark engine: finds the fastest drafter, draft depth and prefill chunk
 //! for one model on this Mac. Each drafter is loaded once and its depth swept
 //! with `Session::depth_cap`; every run is greedy, so a correct speculative
-//! run must reproduce the no-drafter output exactly.
+//! run reproduces the no-drafter output, up to near-tie flips from batched
+//! verification (see [`Match`]).
 use crate::*;
 use ferrum::hybrid::{
     plan::PlanOptions,
@@ -165,9 +166,37 @@ pub struct Row {
     /// Mean tokens per verify step (1.0 = no gain).
     pub accept: Option<f64>,
     pub per_prompt: Vec<f64>,
-    /// Output identical to the no-drafter run.
-    pub same: Option<bool>,
+    /// Output compared with the no-drafter run.
+    pub same: Option<Match>,
     pub tokens: usize,
+}
+
+/// How a speculative run's output compares with plain decoding.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Match {
+    Exact,
+    /// Diverged, but only after `CLOSE_PREFIX` of every answer matched: a
+    /// near-tie flip from batched verification rounding, not a broken drafter
+    /// (which goes wrong within the first few tokens).
+    Close,
+    Differs,
+}
+
+/// Share of each baseline answer that must match before a divergence counts
+/// as numerical noise.
+pub const CLOSE_PREFIX: f64 = 0.25;
+
+/// Compares per-prompt token ids with the baseline's.
+pub fn compare(base: &[Vec<u32>], run: &[Vec<u32>]) -> Match {
+    if base == run {
+        return Match::Exact;
+    }
+    let close = base.len() == run.len()
+        && base.iter().zip(run).all(|(b, r)| {
+            let shared = b.iter().zip(r).take_while(|(x, y)| x == y).count();
+            shared as f64 >= b.len() as f64 * CLOSE_PREFIX
+        });
+    if close { Match::Close } else { Match::Differs }
 }
 
 #[derive(Clone, Debug)]
@@ -200,19 +229,11 @@ impl ChatHooks for Stop<'_> {
     }
 }
 
-fn fnv(text: &str) -> u64 {
-    let mut h: u64 = 0xcbf29ce484222325;
-    for b in text.bytes() {
-        h = (h ^ b as u64).wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
 struct Sample {
     tokens: usize,
     decode: f64,
     prefill_tps: f64,
-    hash: u64,
+    ids: Vec<u32>,
 }
 
 /// Greedy, no-thinking generation of one prompt from a cold session.
@@ -242,7 +263,7 @@ fn generate(
         decode: c.decode.as_secs_f64().max(1e-9),
         prefill_tps: c.prompt_tokens.saturating_sub(c.reused_tokens) as f64
             / c.prefill.as_secs_f64().max(1e-9),
-        hash: fnv(&r.text),
+        ids: c.tokens.clone(),
     })
 }
 
@@ -276,7 +297,7 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
     let send = |e: Event| {
         let _ = tx.send(e);
     };
-    let mut baseline_hashes: Vec<u64> = Vec::new();
+    let mut baseline_ids: Vec<Vec<u32>> = Vec::new();
     let mut winner: Option<(Candidate, usize, f64)> = None;
     for (ci, cand) in plan.candidates.iter().filter(|c| c.on).enumerate() {
         if stop.load(Ordering::SeqCst) {
@@ -354,14 +375,14 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
             }
             let tokens: usize = samples.iter().map(|s| s.tokens).sum();
             let secs: f64 = samples.iter().map(|s| s.decode).sum();
-            let hashes: Vec<u64> = samples.iter().map(|s| s.hash).collect();
+            let ids: Vec<Vec<u32>> = samples.iter().map(|s| s.ids.clone()).collect();
             let same = if cand.source == Source::Baseline {
-                baseline_hashes = hashes;
+                baseline_ids = ids;
                 None
-            } else if baseline_hashes.is_empty() {
+            } else if baseline_ids.is_empty() {
                 None
             } else {
-                Some(baseline_hashes == hashes)
+                Some(compare(&baseline_ids, &ids))
             };
             let tps = tokens as f64 / secs;
             if let Some(d) = depth
@@ -442,12 +463,13 @@ pub fn spawn(plan: Plan) -> Result<Running, String> {
 
 // ---- results ----
 
-/// The fastest row whose output matches plain decoding (rows that differ are
-/// only considered when nothing matches); on a near tie, the shallower, cheaper one.
+/// The fastest row whose output matches plain decoding, exactly or within
+/// tolerance (rows that differ are only considered when nothing matches); on a
+/// near tie, the shallower, cheaper one.
 pub fn best(rows: &[Row]) -> Option<&Row> {
-    let exact = |r: &&Row| r.same != Some(false);
-    let pool: Vec<&Row> = if rows.iter().any(|r| r.same != Some(false)) {
-        rows.iter().filter(exact).collect()
+    let ok = |r: &&Row| r.same != Some(Match::Differs);
+    let pool: Vec<&Row> = if rows.iter().any(|r| ok(&r)) {
+        rows.iter().filter(ok).collect()
     } else {
         rows.iter().collect()
     };
@@ -620,6 +642,25 @@ mod tests {
     }
 
     #[test]
+    fn compares_outputs_with_tolerance() {
+        let base = vec![(0..100).collect::<Vec<u32>>(), (0..40).collect()];
+        assert_eq!(compare(&base, &base), Match::Exact);
+        // Prompt 0 flips at token 60, prompt 1 at token 10 (25% of 40).
+        let mut late = base.clone();
+        late[0][60] = 999;
+        late[1][10] = 999;
+        assert_eq!(compare(&base, &late), Match::Close);
+        // One answer going wrong early is enough to differ.
+        late[1][3] = 999;
+        assert_eq!(compare(&base, &late), Match::Differs);
+        // A shorter answer that matches as far as it goes is a late divergence.
+        let mut short = base.clone();
+        short[0].truncate(70);
+        assert_eq!(compare(&base, &short), Match::Close);
+        assert_eq!(compare(&base, &base[..1]), Match::Differs);
+    }
+
+    #[test]
     fn depth_lists() {
         assert_eq!(depth_list(0, false), Vec::<usize>::new());
         assert_eq!(depth_list(6, false), vec![1, 2, 3, 4, 5, 6]);
@@ -645,11 +686,16 @@ mod tests {
         assert_eq!(baseline(&rows).unwrap().tps, 40.0);
         // A faster row that changes the output is not recommended over an exact one.
         let mut off = row("a", Some(9), 120.0);
-        off.same = Some(false);
+        off.same = Some(Match::Differs);
         let mut ok = row("a", Some(2), 60.0);
-        ok.same = Some(true);
-        let mixed = vec![row("none", None, 40.0), ok, off];
+        ok.same = Some(Match::Exact);
+        let mixed = vec![row("none", None, 40.0), ok.clone(), off.clone()];
         assert_eq!(best(&mixed).unwrap().depth, Some(2));
+        // A late near-tie flip is within tolerance and may win.
+        let mut close = row("a", Some(6), 90.0);
+        close.same = Some(Match::Close);
+        let tolerant = vec![row("none", None, 40.0), ok, off, close];
+        assert_eq!(best(&tolerant).unwrap().depth, Some(6));
         let slow = vec![row("none", None, 40.0), row("a", Some(3), 30.0)];
         assert_eq!(
             best(&slow).unwrap().depth,

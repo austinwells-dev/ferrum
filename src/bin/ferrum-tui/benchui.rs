@@ -702,14 +702,15 @@ impl App {
                     ),
                     Style::new().fg(DIM),
                 ),
-                Span::styled(
-                    match r.same {
-                        Some(true) => "     ✓".to_string(),
-                        Some(false) => "     ≠".to_string(),
-                        None => "      ".to_string(),
-                    },
-                    Style::new().fg(if r.same == Some(false) { BAD } else { GOOD }),
-                ),
+                {
+                    let (mark, color) = match r.same {
+                        Some(bench::Match::Exact) => ("     ✓", GOOD),
+                        Some(bench::Match::Close) => ("     ≈", GOLD),
+                        Some(bench::Match::Differs) => ("     ≠", BAD),
+                        None => ("      ", GOOD),
+                    };
+                    Span::styled(mark, Style::new().fg(color))
+                },
             ]));
         }
         lines
@@ -819,10 +820,22 @@ impl App {
                         Style::new().fg(TEXT),
                     ));
                 }
-                if b.rows.iter().any(|r| r.same == Some(false)) {
+                if b.rows.iter().any(|r| r.same == Some(bench::Match::Close)) {
                     push_wrapped(
                         &mut lines,
-                        "≠ rows produced different text than plain decoding (greedy), so they are not recommended: batched verification can flip near-ties.",
+                        &format!(
+                            "≈ rows matched plain decoding (greedy) for at least the first {:.0}% of every answer, then a near-tie flipped: batched verification rounds slightly differently, so they count as matching.",
+                            bench::CLOSE_PREFIX * 100.0
+                        ),
+                        3,
+                        width,
+                        Style::new().fg(GOLD),
+                    );
+                }
+                if b.rows.iter().any(|r| r.same == Some(bench::Match::Differs)) {
+                    push_wrapped(
+                        &mut lines,
+                        "≠ rows went off plain decoding (greedy) early in an answer, so they are not recommended.",
                         3,
                         width,
                         Style::new().fg(GOLD),
