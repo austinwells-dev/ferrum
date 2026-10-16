@@ -90,10 +90,10 @@ To make generation faster, add a drafter: `--draft mtp` uses the prediction head
 - **Chat.** Streaming markdown, a separate reasoning view, file and image attachments, optional agent tools, and `/new` and `/resume` for saved sessions.
 - **Agents.** A local coding agent that works in a project folder. It can read, grep, edit, run commands and checks, search the web (DuckDuckGo, SearXNG, Brave or your own endpoint), load `SKILL.md` skills from the project and keep a plan, all inside a Seatbelt sandbox and with an approval mode you choose.
 - **Serve.** Starts `ferrum-server` and shows its endpoint, health and live log.
-- **Benchmark.** Finds the fastest drafter and draft depth for a model on *your* Mac. It checks that every candidate's output matches plain decoding and saves the winner as a favorite.
+- **Benchmark.** Finds the fastest drafter and draft depth for a model on *your* Mac. It checks that every candidate's output matches plain decoding, and that a drafter whose output drifts late still answers the same questions right, then saves the winner as a favorite. Switched to *intelligence*, it scores the model on math, knowledge, instruction-following and code-reading questions instead, and compares saved results across models and settings.
 - **Settings.** Model folders, favorites, the web search provider and startup options.
 
-Setups (model, sampling, drafter) are saved as favorites. The [TUI guide](docs/tui.md) covers the agent tools, the sandbox, context management and the benchmark in detail.
+Setups (model, sampling, drafter) are saved as favorites. The [TUI guide](docs/tui.md) covers the agent tools, the sandbox, context management and the speed and intelligence benchmarks in detail.
 
 ## Performance
 
@@ -173,7 +173,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | Guide | Contents |
 |---|---|
 | [Server](docs/server.md) | Endpoints, thinking controls, caching, streaming, vision, speculative decoding, flags |
-| [TUI](docs/tui.md) | Chat, the coding agent and its sandbox, context optimisers, the benchmark tab |
+| [TUI](docs/tui.md) | Chat, the coding agent and its sandbox, context optimisers, the speed and intelligence benchmarks |
 | [Development](docs/development.md) | Building, testing (including Metal validation layers), profiling, using Ferrum as a library |
 | [Architecture](docs/architecture.md) | Tensor and storage model, Metal backend, safety argument, the hybrid engine |
 | [Vision](docs/vision.md) | How image input is encoded and positioned |

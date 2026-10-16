@@ -5,7 +5,7 @@
 | Document | For |
 |---|---|
 | [server.md](server.md) | Running `ferrum-server` and `ferrum-cli`: endpoints, caching, thinking controls, speculative decoding, vision |
-| [tui.md](tui.md) | The full-screen launcher: chat, the sandboxed coding agent, the benchmark tab |
+| [tui.md](tui.md) | The full-screen launcher: chat, the sandboxed coding agent, the speed and intelligence benchmarks |
 | [development.md](development.md) | Building, testing, profiling and using the crate as a library |
 | [architecture.md](architecture.md) | How the system fits together, and the runtime's safety argument |
 | [vision.md](vision.md) | The image encoder and how image tokens are positioned |

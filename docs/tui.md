@@ -113,7 +113,7 @@ Serve starts `ferrum-server` with the chosen setup and shows its endpoint, healt
 
 ## Benchmark
 
-The Benchmark tab finds the fastest speculative-decoding setup for a model on *this* Mac.
+The Benchmark tab measures a model on *this* Mac. *Measure* switches between **speed** (below), which finds the fastest speculative-decoding setup, and **intelligence** ([Measuring intelligence](#measuring-intelligence)), which scores answers to question sets.
 
 1. Pick a model. The tab lists plain decoding, the model's MTP head (if the GGUF has a usable one) and every compatible drafter it can find. Compatibility is checked by hidden size, layer count and vocabulary.
 2. Each drafter is loaded once, and its draft depth is swept (`quick` tries a few depths, `full` tries every depth). The tab measures greedy decode speed on three prompts (code, prose and structured data) and the mean number of tokens accepted per verify step.

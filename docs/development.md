@@ -83,6 +83,15 @@ cargo bench --bench runtime -- --noplot
 
 The `examples/hybrid_*` programs measure the hybrid engine: `hybrid_bench` (prefill and decode), `hybrid_kld` (KL divergence against llama.cpp logits), `hybrid_spec` (speculative decoding, `--depth N --filler FILE` for long context), `hybrid_verify_cost` (verify cost against block width), `hybrid_attention` and `hybrid_prefill_attention` (attention kernels alone, per query width and K/V format), `hybrid_plan` (memory plan per K/V format) and `hybrid_needle` (long-context retrieval).
 
+To check that a drafter (or a kernel change) keeps plain decoding's answers, run the benchmark's `≈` answer check headless. It asks the 30 bundled math questions with and without the drafter and fails if the drafter loses more than one net answer:
+
+```sh
+FERRUM_CHECK_MODEL=/path/to/model.gguf FERRUM_CHECK_DRAFTER=/path/to/drafter \
+  FERRUM_CHECK_DEPTH=4 cargo test --release --bin ferrum-tui -- --ignored --nocapture keeps_its_answers
+```
+
+`FERRUM_CHECK_DRAFTER=mtp` uses the model's MTP head and `FERRUM_CHECK_QUANT=q8_0` loads the drafter in 8 bits. On a dense 27B each pass takes about 15 minutes.
+
 Python is only used by the optional comparison tools. To set up the reference environment:
 
 ```sh
