@@ -13,6 +13,8 @@ mod catalog;
 mod chat;
 mod coding;
 mod editor;
+mod eval;
+mod evalui;
 mod fields;
 mod highlight;
 mod home;

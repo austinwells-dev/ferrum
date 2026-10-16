@@ -1,6 +1,9 @@
 //! The Benchmark tab: choose a model and what to test, watch the sweep, then
-//! save the winning settings as a favorite.
+//! save the winning settings as a favorite. Measuring intelligence instead
+//! lives in [`crate::evalui`].
 use crate::bench::{self, Candidate, ChunkRow, Event, Machine, Plan, Row, Running, Saved, Source};
+use crate::eval;
+use crate::evalui::{IqState, Measure};
 use crate::*;
 
 const TOKENS: [usize; 3] = [128, 192, 256];
@@ -14,6 +17,8 @@ pub enum BenchPhase {
 
 pub struct BenchState {
     pub phase: BenchPhase,
+    pub measure: Measure,
+    pub iq: IqState,
     pub machine: Machine,
     /// Index into `App::models`.
     pub model: usize,
@@ -40,6 +45,7 @@ pub struct BenchState {
 #[derive(Clone, Copy, PartialEq)]
 enum Line_ {
     Model,
+    Measure,
     Cand(usize),
     Sweep,
     Tokens,
@@ -135,6 +141,8 @@ impl App {
             .unwrap_or_default();
         self.bench = Some(BenchState {
             phase: BenchPhase::Setup,
+            measure: Measure::Speed,
+            iq: IqState::new(),
             machine: Machine::detect(),
             model,
             cands,
@@ -159,11 +167,14 @@ impl App {
     }
 
     pub fn leave_bench(&mut self) {
-        if let Some(mut b) = self.bench.take()
-            && let Some(mut run) = b.run.take()
-        {
-            run.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-            if let Some(h) = run.handle.take() {
+        if let Some(mut b) = self.bench.take() {
+            if let Some(mut run) = b.run.take() {
+                run.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(h) = run.handle.take() {
+                    self.closing.push(h);
+                }
+            }
+            if let Some(h) = b.iq.stop() {
                 self.closing.push(h);
             }
         }
@@ -174,7 +185,7 @@ impl App {
         let Some(b) = &self.bench else {
             return Vec::new();
         };
-        let mut rows = vec![Line_::Model];
+        let mut rows = vec![Line_::Model, Line_::Measure];
         rows.extend((0..b.cands.len()).map(Line_::Cand));
         rows.extend([
             Line_::Sweep,
@@ -240,6 +251,13 @@ impl App {
     }
 
     pub fn bench_tick(&mut self) {
+        if self
+            .bench
+            .as_ref()
+            .is_some_and(|b| b.measure == Measure::Intelligence)
+        {
+            return self.iq_tick();
+        }
         let Some(b) = self.bench.as_mut() else { return };
         let Some(run) = b.run.as_ref() else { return };
         let mut done = false;
@@ -252,6 +270,11 @@ impl App {
                     draft_gib,
                 } => b.loaded = Some((context, weights_gib, draft_gib)),
                 Event::Row(r) => b.rows.push(r),
+                Event::Checked(i, v) => {
+                    if let Some(r) = b.rows.get_mut(i) {
+                        r.check = Some(v);
+                    }
+                }
                 Event::Chunk(c) => b.chunk_rows.push(c),
                 Event::Skipped(label, why) => b.skipped.push((label, why)),
                 Event::Done => done = true,
@@ -330,10 +353,21 @@ impl App {
     }
 
     pub fn bench_key(&mut self, key: KeyEvent) {
-        let phase = match &self.bench {
-            Some(b) => b.phase,
+        let (phase, measure) = match &self.bench {
+            Some(b) => (b.phase, b.measure),
             None => return self.go_home(),
         };
+        if measure == Measure::Intelligence {
+            return match phase {
+                BenchPhase::Setup => self.iq_setup_key(key),
+                BenchPhase::Running => {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                        self.iq_stop();
+                    }
+                }
+                BenchPhase::Results => self.iq_results_key(key),
+            };
+        }
         match phase {
             BenchPhase::Setup => self.bench_setup_key(key),
             BenchPhase::Running => {
@@ -386,6 +420,10 @@ impl App {
                             rebuild = true;
                         }
                     }
+                    Line_::Measure => {
+                        b.measure = Measure::Intelligence;
+                        b.iq.sel = 1;
+                    }
                     Line_::Cand(i) => {
                         if b.cands[i].source != Source::Baseline {
                             b.cands[i].on = !b.cands[i].on;
@@ -406,23 +444,28 @@ impl App {
             _ => {}
         }
         if rebuild {
-            let model = b.model;
-            let q8 = b.q8;
-            let cands = self
-                .models
-                .get(model)
-                .map(|m| self.bench_candidates(m, q8))
-                .unwrap_or_default();
-            if let Some(b) = self.bench.as_mut() {
-                b.cands = cands;
-            }
-            let last = self.bench_lines().len() - 1;
-            if let Some(b) = self.bench.as_mut() {
-                b.sel = b.sel.min(last);
-            }
+            self.bench_model_changed();
         }
         if start {
             self.start_bench();
+        }
+    }
+
+    /// Rebuild the candidate list after the model (or q8 choice) changed.
+    pub fn bench_model_changed(&mut self) {
+        let Some(b) = self.bench.as_ref() else { return };
+        let (model, q8) = (b.model, b.q8);
+        let cands = self
+            .models
+            .get(model)
+            .map(|m| self.bench_candidates(m, q8))
+            .unwrap_or_default();
+        if let Some(b) = self.bench.as_mut() {
+            b.cands = cands;
+        }
+        let last = self.bench_lines().len() - 1;
+        if let Some(b) = self.bench.as_mut() {
+            b.sel = b.sel.min(last);
         }
     }
 
@@ -451,12 +494,17 @@ impl App {
             vec![pill(pill_text, pill_color)],
         );
         let area = centered(body, 104, body.height);
-        match b.phase {
-            BenchPhase::Setup => self.draw_bench_setup(f, area, b),
-            BenchPhase::Running => self.draw_bench_running(f, area, b),
-            BenchPhase::Results => self.draw_bench_results(f, area, b),
+        let iq = b.measure == Measure::Intelligence;
+        match (b.phase, iq) {
+            (BenchPhase::Setup, false) => self.draw_bench_setup(f, area, b),
+            (BenchPhase::Running, false) => self.draw_bench_running(f, area, b),
+            (BenchPhase::Results, false) => self.draw_bench_results(f, area, b),
+            (BenchPhase::Setup, true) => self.draw_iq_setup(f, area, b),
+            (BenchPhase::Running, true) => self.draw_iq_running(f, area, b),
+            (BenchPhase::Results, true) => self.draw_iq_results(f, area, b),
         }
         let keys: &[(&str, &str)] = match b.phase {
+            BenchPhase::Results if iq => &[("r", "run again"), ("esc", "home")],
             BenchPhase::Setup => &[
                 ("↑↓", "move"),
                 ("←→/space", "change"),
@@ -523,6 +571,11 @@ impl App {
                             .map(|m| clip(&m.name, 44))
                             .unwrap_or_else(|| "none".into())
                     ),
+                    Style::new().fg(EMBER).add_modifier(Modifier::BOLD),
+                ),
+                Line_::Measure => (
+                    "Measure".into(),
+                    "‹ speed ›".into(),
                     Style::new().fg(EMBER).add_modifier(Modifier::BOLD),
                 ),
                 Line_::Cand(i) => {
@@ -705,7 +758,11 @@ impl App {
                 {
                     let (mark, color) = match r.same {
                         Some(bench::Match::Exact) => ("     ✓", GOOD),
-                        Some(bench::Match::Close) => ("     ≈", GOLD),
+                        Some(bench::Match::Close) => match &r.check {
+                            Some(v) if v.passed() => ("    ≈✓", GOOD),
+                            Some(_) => ("    ≈✗", BAD),
+                            None => ("    ≈?", GOLD),
+                        },
                         Some(bench::Match::Differs) => ("     ≠", BAD),
                         None => ("      ", GOOD),
                     };
@@ -824,13 +881,31 @@ impl App {
                     push_wrapped(
                         &mut lines,
                         &format!(
-                            "≈ rows matched plain decoding (greedy) for at least the first {:.0}% of every answer, then a near-tie flipped: batched verification rounds slightly differently, so they count as matching.",
-                            bench::CLOSE_PREFIX * 100.0
+                            "≈ rows matched plain decoding (greedy) for at least the first {:.0}% of every answer, then a near-tie flipped: batched verification rounds slightly differently. A ≈ row that would win is asked {} math questions first: ≈✓ kept plain decoding's right answers (it may be recommended), ≈✗ lost some, ≈? was not checked (neither is recommended).",
+                            bench::CLOSE_PREFIX * 100.0,
+                            eval::check_items().len()
                         ),
                         3,
                         width,
                         Style::new().fg(GOLD),
                     );
+                    for r in b.rows.iter() {
+                        let Some(v) = &r.check else { continue };
+                        lines.push(Line::styled(
+                            format!(
+                                "     {} {} · depth {} · {}: {}/{} same answers, {} lost, {} gained",
+                                if v.passed() { "≈✓" } else { "≈✗" },
+                                r.label,
+                                r.depth.unwrap_or(0),
+                                r.quant,
+                                v.same,
+                                v.n,
+                                v.lost,
+                                v.gained
+                            ),
+                            Style::new().fg(if v.passed() { GOOD } else { BAD }),
+                        ));
+                    }
                 }
                 if b.rows.iter().any(|r| r.same == Some(bench::Match::Differs)) {
                     push_wrapped(

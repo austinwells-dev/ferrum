@@ -117,7 +117,26 @@ The Benchmark tab finds the fastest speculative-decoding setup for a model on *t
 
 1. Pick a model. The tab lists plain decoding, the model's MTP head (if the GGUF has a usable one) and every compatible drafter it can find. Compatibility is checked by hidden size, layer count and vocabulary.
 2. Each drafter is loaded once, and its draft depth is swept (`quick` tries a few depths, `full` tries every depth). The tab measures greedy decode speed on three prompts (code, prose and structured data) and the mean number of tokens accepted per verify step.
-3. Every run's output is compared with plain decoding. Rows whose text differs are marked `≠` and are never recommended.
-4. An optional stage also sweeps the prefill chunk size.
+3. Every run's output is compared with plain decoding. Rows that match are marked `✓`. Rows whose text differs early are marked `≠` and are never recommended. Rows marked `≈` matched for at least the first 25% of every answer before a near-tie flipped (batched verification rounds slightly differently).
+4. If a `≈` row would beat every exact row, the tab first asks it 30 bundled math questions, and plain decoding the same questions (its answers are cached per model in `~/.config/ferrum/answer-check.json`). The row is marked `≈✓` and may be recommended if it gets at most one more question wrong than plain decoding, after subtracting questions only it got right. Otherwise it is marked `≈✗`. Rows marked `≈?` were not checked and are not recommended. Checks run fastest row first and stop at the first pass.
+5. An optional stage also sweeps the prefill chunk size.
 
 Results are ranked by speedup over plain decoding and remembered per machine and model in `~/.config/ferrum/bench.json`. Press `s` to save the winner as a Chat/Agents favorite, or `v` to save it as a Serve favorite (including the chunk size).
+
+### Measuring intelligence
+
+Set *Measure* to `intelligence` to score a model on four question sets instead of timing it: math (GSM8K), knowledge (MMLU), following instructions (IFEval) and reading code (CRUXEval, predicting what a function returns). Every answer is checked by a program, not by another model. Generation is greedy, so a result can be reproduced exactly.
+
+The question sets are not part of the binary. Install them once (this downloads samples from Hugging Face into `~/.config/ferrum/eval`, or `$FERRUM_EVAL_DIR`):
+
+```bash
+python3 tools/eval_import.py
+```
+
+- *Questions*: `quick` asks the first 15 questions of each set and **predicts** the full score with a 95% range (shown as `~62% ±9`). `full` asks all of them and gives the **actual** score.
+- *Thinking*: `off` (the default), or on with a reasoning budget per question. Thinking usually raises the score a lot and makes the run several times longer, so results with and without it are kept apart.
+- *Drafter*: `off` uses plain decoding. `tuned` uses the drafter this Mac's speed benchmark recommended for the model, which is faster and gives the same answers up to near-tie flips.
+
+The score is the mean of the four category scores. Complete runs are saved in `~/.config/ferrum/eval.json`, the newest per model, question files and setup. Previous results for the model are listed under the options. A stopped run is shown but not saved.
+
+These are public benchmarks that models may have seen in training. Use the scores to compare models and settings on this Mac, not as leaderboard numbers.

@@ -2,7 +2,9 @@
 //! for one model on this Mac. Each drafter is loaded once and its depth swept
 //! with `Session::depth_cap`; every run is greedy, so a correct speculative
 //! run reproduces the no-drafter output, up to near-tie flips from batched
-//! verification (see [`Match`]).
+//! verification (see [`Match`]). Near-tie rows that would win are then
+//! asked the answer-check questions ([`eval`]) before they are recommended.
+use crate::eval::{self, Verdict};
 use crate::*;
 use ferrum::hybrid::{
     plan::PlanOptions,
@@ -168,6 +170,8 @@ pub struct Row {
     pub per_prompt: Vec<f64>,
     /// Output compared with the no-drafter run.
     pub same: Option<Match>,
+    /// Answer check of a `Close` row (None: not checked).
+    pub check: Option<Verdict>,
     pub tokens: usize,
 }
 
@@ -213,6 +217,8 @@ pub enum Event {
         draft_gib: f64,
     },
     Row(Row),
+    /// The answer check of the row with this index (in `Row` order).
+    Checked(usize, Verdict),
     Chunk(ChunkRow),
     Skipped(String, String),
     Done,
@@ -229,31 +235,35 @@ impl ChatHooks for Stop<'_> {
     }
 }
 
-struct Sample {
+pub struct Sample {
     tokens: usize,
     decode: f64,
     prefill_tps: f64,
     ids: Vec<u32>,
+    /// The visible answer.
+    pub text: String,
 }
 
-/// Greedy, no-thinking generation of one prompt from a cold session.
-fn generate(
+/// Greedy generation of one prompt from a cold session. `thinking` is a
+/// reasoning budget (None: thinking off); it is added to `tokens`.
+pub fn generate(
     rt: &mut Runtime,
     prompt: &str,
     tokens: usize,
+    thinking: Option<usize>,
     stop: &AtomicBool,
 ) -> Result<Sample, String> {
     rt.session.reset();
     let mut vars = Map::new();
-    vars.insert("enable_thinking".into(), Json::Bool(false));
+    vars.insert("enable_thinking".into(), Json::Bool(thinking.is_some()));
     let request = ChatRequest {
         messages: vec![json!({"role": "user", "content": prompt})],
         tools: Vec::new(),
-        max_tokens: tokens,
+        max_tokens: tokens + thinking.unwrap_or(0),
         sampling: ferrum::hybrid::session::SamplingParams::default(),
         template_vars: vars,
         stop: Vec::new(),
-        reasoning_budget: None,
+        reasoning_budget: thinking,
         raw_reasoning: false,
     };
     let r = rt.chat(&request, Stop(stop)).map_err(|e| e.to_string())?;
@@ -264,10 +274,11 @@ fn generate(
         prefill_tps: c.prompt_tokens.saturating_sub(c.reused_tokens) as f64
             / c.prefill.as_secs_f64().max(1e-9),
         ids: c.tokens.clone(),
+        text: r.output.content.clone(),
     })
 }
 
-fn load(
+pub fn load(
     plan: &Plan,
     cand: &Candidate,
     depth: Option<usize>,
@@ -298,8 +309,9 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
         let _ = tx.send(e);
     };
     let mut baseline_ids: Vec<Vec<u32>> = Vec::new();
-    let mut winner: Option<(Candidate, usize, f64)> = None;
-    for (ci, cand) in plan.candidates.iter().filter(|c| c.on).enumerate() {
+    let mut rows: Vec<Row> = Vec::new();
+    let on: Vec<&Candidate> = plan.candidates.iter().filter(|c| c.on).collect();
+    for (ci, cand) in on.iter().copied().enumerate() {
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -349,7 +361,7 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
                     cand.label(),
                     depth.map_or("baseline".to_string(), |d| format!("depth {d}"))
                 )));
-                match generate(&mut rt, prompt, plan.tokens, &stop) {
+                match generate(&mut rt, prompt, plan.tokens, None, &stop) {
                     Ok(s) => {
                         per_prompt.push(s.tokens as f64 / s.decode);
                         let st = &rt.session.spec_stats;
@@ -384,13 +396,7 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
             } else {
                 Some(compare(&baseline_ids, &ids))
             };
-            let tps = tokens as f64 / secs;
-            if let Some(d) = depth
-                && winner.as_ref().is_none_or(|(_, _, best)| tps > *best)
-            {
-                winner = Some((cand.clone(), d, tps));
-            }
-            send(Event::Row(Row {
+            let row = Row {
                 cand: ci,
                 label: cand.label(),
                 draft_value: cand.draft_value(),
@@ -400,20 +406,26 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
                     String::new()
                 },
                 depth,
-                tps,
+                tps: tokens as f64 / secs,
                 accept: (steps > 0).then(|| (accepted + steps) as f64 / steps as f64),
                 per_prompt,
                 same,
+                check: None,
                 tokens,
-            }));
+            };
+            rows.push(row.clone());
+            send(Event::Row(row));
         }
         drop(rt);
     }
+    if !stop.load(Ordering::SeqCst) {
+        check_close_rows(&plan, &on, &mut rows, &send, &stop);
+    }
     if plan.chunks && !stop.load(Ordering::SeqCst) {
         // Prefill speed depends on how many prompt rows go through one pass.
-        let (cand, depth) = match &winner {
-            Some((c, d, _)) => (c.clone(), Some(*d)),
-            None => (plan.candidates[0].clone(), None),
+        let (cand, depth) = match best(&rows) {
+            Some(r) if r.depth.is_some() => (on[r.cand].clone(), r.depth),
+            _ => (plan.candidates[0].clone(), None),
         };
         let long = LONG_PARAGRAPH.repeat(14);
         for chunk in [256usize, 512, 1024, 2048] {
@@ -429,7 +441,7 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
             }
             rt.session.depth_cap = depth;
             rt.session.speculate = depth.is_some();
-            if let Ok(s) = generate(&mut rt, &long, 1, &stop) {
+            if let Ok(s) = generate(&mut rt, &long, 1, None, &stop) {
                 send(Event::Chunk(ChunkRow {
                     chunk,
                     prefill_tps: s.prefill_tps,
@@ -438,6 +450,104 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
         }
     }
     send(Event::Done);
+}
+
+/// Asks the answer-check questions of near-tie rows that would beat every
+/// exactly matching row, fastest first, until one keeps plain decoding's
+/// answers. Plain decoding's own answers are cached per model.
+fn check_close_rows(
+    plan: &Plan,
+    on: &[&Candidate],
+    rows: &mut [Row],
+    send: &impl Fn(Event),
+    stop: &AtomicBool,
+) {
+    let exact_top = rows
+        .iter()
+        .filter(|r| matches!(r.same, None | Some(Match::Exact)))
+        .map(|r| r.tps)
+        .fold(0.0, f64::max);
+    let mut order: Vec<usize> = (0..rows.len())
+        .filter(|&i| rows[i].same == Some(Match::Close) && rows[i].tps > exact_top)
+        .collect();
+    order.sort_by(|&a, &b| rows[b].tps.total_cmp(&rows[a].tps));
+    if order.is_empty() {
+        return;
+    }
+    let items = eval::check_items();
+    let cache = eval::cache_path();
+    let key = eval::CheckKey::new(&plan.model, plan.kv_cache);
+    let mut base = eval::cached_baseline(&cache, &key).filter(|b| b.len() == items.len());
+    for i in order {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        if base.is_none() {
+            let plain = Candidate {
+                source: Source::Baseline,
+                quant: "q4_0",
+                on: true,
+            };
+            match answer_check(plan, &plain, None, &items, send, stop) {
+                Ok(answers) => {
+                    eval::store_baseline(&cache, &key, &answers);
+                    base = Some(answers);
+                }
+                Err(e) => {
+                    if !stop.load(Ordering::SeqCst) {
+                        send(Event::Skipped("answer check".into(), e));
+                    }
+                    return;
+                }
+            }
+        }
+        let Some(base) = &base else { return };
+        let row = &rows[i];
+        let cand = on[row.cand];
+        match answer_check(plan, cand, row.depth, &items, send, stop) {
+            Ok(answers) => {
+                let verdict = eval::compare_answers(base, &answers);
+                let passed = verdict.passed();
+                rows[i].check = Some(verdict.clone());
+                send(Event::Checked(i, verdict));
+                if passed {
+                    return;
+                }
+            }
+            Err(_) if stop.load(Ordering::SeqCst) => return,
+            Err(e) => send(Event::Skipped(
+                format!("answer check of {}", cand.label()),
+                e,
+            )),
+        }
+    }
+}
+
+/// Loads `cand` at `depth` and grades its answers to `items`.
+pub fn answer_check(
+    plan: &Plan,
+    cand: &Candidate,
+    depth: Option<usize>,
+    items: &[eval::Item],
+    send: &impl Fn(Event),
+    stop: &AtomicBool,
+) -> Result<Vec<eval::Graded>, String> {
+    let label = match depth {
+        Some(d) => format!("{} · depth {d} · {}", cand.label(), cand.quant),
+        None => cand.label(),
+    };
+    send(Event::Stage(format!("answer check · loading {label}")));
+    let mut rt = load(plan, cand, depth, None)?;
+    rt.warmup().map_err(|e| e.to_string())?;
+    rt.session.depth_cap = depth;
+    rt.session.speculate = depth.is_some();
+    eval::answer_items(&mut rt, items, stop, |n| {
+        send(Event::Stage(format!(
+            "answer check · {label} · question {}/{}",
+            n + 1,
+            items.len()
+        )))
+    })
 }
 
 pub struct Running {
@@ -463,11 +573,15 @@ pub fn spawn(plan: Plan) -> Result<Running, String> {
 
 // ---- results ----
 
-/// The fastest row whose output matches plain decoding, exactly or within
-/// tolerance (rows that differ are only considered when nothing matches); on a
-/// near tie, the shallower, cheaper one.
+/// The fastest row whose output matches plain decoding: exactly, or within
+/// tolerance once the answer check passed (other rows are only considered
+/// when nothing matches); on a near tie, the shallower, cheaper one.
 pub fn best(rows: &[Row]) -> Option<&Row> {
-    let ok = |r: &&Row| r.same != Some(Match::Differs);
+    let ok = |r: &&Row| match r.same {
+        Some(Match::Differs) => false,
+        Some(Match::Close) => r.check.as_ref().is_some_and(Verdict::passed),
+        _ => true,
+    };
     let pool: Vec<&Row> = if rows.iter().any(|r| ok(&r)) {
         rows.iter().filter(ok).collect()
     } else {
@@ -637,6 +751,7 @@ mod tests {
             accept: depth.map(|_| 2.0),
             per_prompt: vec![tps; 3],
             same: None,
+            check: None,
             tokens: 600,
         }
     }
@@ -691,9 +806,39 @@ mod tests {
         ok.same = Some(Match::Exact);
         let mixed = vec![row("none", None, 40.0), ok.clone(), off.clone()];
         assert_eq!(best(&mixed).unwrap().depth, Some(2));
-        // A late near-tie flip is within tolerance and may win.
+        // A late near-tie flip may win once it keeps its answers.
         let mut close = row("a", Some(6), 90.0);
         close.same = Some(Match::Close);
+        let unchecked = vec![
+            row("none", None, 40.0),
+            ok.clone(),
+            off.clone(),
+            close.clone(),
+        ];
+        assert_eq!(
+            best(&unchecked).unwrap().depth,
+            Some(2),
+            "≈? is not recommended"
+        );
+        let verdict = |lost| Verdict {
+            n: 30,
+            lost,
+            gained: 0,
+            same: 30 - lost,
+        };
+        close.check = Some(verdict(3));
+        let failed = vec![
+            row("none", None, 40.0),
+            ok.clone(),
+            off.clone(),
+            close.clone(),
+        ];
+        assert_eq!(
+            best(&failed).unwrap().depth,
+            Some(2),
+            "≈✗ is not recommended"
+        );
+        close.check = Some(verdict(0));
         let tolerant = vec![row("none", None, 40.0), ok, off, close];
         assert_eq!(best(&tolerant).unwrap().depth, Some(6));
         let slow = vec![row("none", None, 40.0), row("a", Some(3), 30.0)];

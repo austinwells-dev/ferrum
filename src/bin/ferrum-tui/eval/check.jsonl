@@ -1,0 +1,30 @@
+{"id":"check-01","cat":"math","check":"number","answer":"18","prompt":"A baker makes 14 trays of muffins with 12 muffins on each tray. She sells 131 muffins and gives away 19. How many muffins are left?"}
+{"id":"check-02","cat":"math","check":"number","answer":"63","prompt":"A cyclist rides at 18 km/h for 2.5 hours, then at 12 km/h for 1.5 hours. How many kilometres does she ride in total?"}
+{"id":"check-03","cat":"math","check":"number","answer":"210","prompt":"A library has 2,400 books. 35% of them are fiction, and one quarter of the fiction books are mysteries. How many mystery books does the library have?"}
+{"id":"check-04","cat":"math","check":"number","answer":"32","prompt":"Tickets cost $7 for a child and $11 for an adult. A group of 3 adults and 5 children pays with a $100 bill. How many dollars of change do they get?"}
+{"id":"check-05","cat":"math","check":"number","answer":"15","prompt":"A tank holds 375 litres and is 40% full. A pump adds 15 litres per minute. How many minutes does it take to fill the tank?"}
+{"id":"check-06","cat":"math","check":"number","answer":"36","prompt":"Maria is three times as old as her son. In 12 years she will be twice as old as he is then. How old is Maria now?"}
+{"id":"check-07","cat":"math","check":"number","answer":"32.4","prompt":"A shirt costs $40. It is discounted by 25%, and then 8% sales tax is added to the discounted price. What is the final price in dollars?"}
+{"id":"check-08","cat":"math","check":"number","answer":"162","prompt":"A rectangle has a perimeter of 54 cm and its length is twice its width. What is its area in square centimetres?"}
+{"id":"check-09","cat":"math","check":"number","answer":"9","prompt":"A school orders 7 boxes of pencils with 36 pencils in each box. The pencils are shared equally among 28 students. How many pencils does each student get?"}
+{"id":"check-10","cat":"math","check":"number","answer":"230","prompt":"A train leaves at 9:15 and arrives at 13:05 the same day. How many minutes does the trip take?"}
+{"id":"check-11","cat":"math","check":"number","answer":"7","prompt":"A farmer keeps only chickens and cows. Together they have 30 heads and 74 legs. How many cows are there?"}
+{"id":"check-12","cat":"math","check":"number","answer":"408","prompt":"What is the sum of all multiples of 3 between 1 and 50?"}
+{"id":"check-13","cat":"math","check":"number","answer":"882","prompt":"A worker earns $18 per hour for the first 40 hours of a week and 1.5 times that rate for every hour beyond 40. How many dollars does she earn in a week of 46 hours?"}
+{"id":"check-14","cat":"math","check":"number","answer":"750","prompt":"A recipe for 4 people uses 300 g of flour. How many grams of flour are needed to make it for 10 people?"}
+{"id":"check-15","cat":"math","check":"number","answer":"39.78","prompt":"A car uses 6.5 litres of fuel per 100 km. Fuel costs $1.80 per litre. How many dollars does the fuel for a 340 km trip cost?"}
+{"id":"check-16","cat":"math","check":"number","answer":"140","prompt":"Sam reads 24 pages a day. His book has 500 pages. How many pages are left to read after 15 days?"}
+{"id":"check-17","cat":"math","check":"number","answer":"36","prompt":"A store sells pens only in packs of 6, at $4.50 per pack. How many dollars does it cost to buy enough packs to have at least 45 pens?"}
+{"id":"check-18","cat":"math","check":"number","answer":"16","prompt":"The average of five numbers is 17. Four of them are 12, 20, 15 and 22. What is the fifth number?"}
+{"id":"check-19","cat":"math","check":"number","answer":"70.5","prompt":"A water bill is a fixed $12 plus $3.25 per cubic metre used. How many dollars is the bill for a month in which 18 cubic metres were used?"}
+{"id":"check-20","cat":"math","check":"number","answer":"8820","prompt":"A town of 8,000 people grows by 5% each year. What is its population after 2 years?"}
+{"id":"check-21","cat":"math","check":"number","answer":"40","prompt":"Three friends split a bill of $96 in the ratio 3 : 4 : 5. How many dollars is the largest share?"}
+{"id":"check-22","cat":"math","check":"number","answer":"26","prompt":"A clock gains 4 minutes every hour. It is set to the correct time at noon. By how many minutes is it ahead at 6:30 pm the same day?"}
+{"id":"check-23","cat":"math","check":"number","answer":"54","prompt":"How many diagonals does a polygon with 12 sides have?"}
+{"id":"check-24","cat":"math","check":"number","answer":"60","prompt":"A jar holds red, blue and green marbles in the ratio 2 : 3 : 5. There are 18 blue marbles. How many marbles are in the jar?"}
+{"id":"check-25","cat":"math","check":"number","answer":"24","prompt":"A runner completes each 400 m lap in 96 seconds. At that pace, how many minutes does it take to run 6 km?"}
+{"id":"check-26","cat":"math","check":"number","answer":"456","prompt":"A bookstore buys 120 books at $8 each. It sells 85% of them at $13 each and the rest at $5 each. What is its profit in dollars?"}
+{"id":"check-27","cat":"math","check":"number","answer":"36","prompt":"A bus leaves the station every 12 minutes and a train every 18 minutes. Both leave together at 8:00. How many minutes later do they next leave together?"}
+{"id":"check-28","cat":"math","check":"number","answer":"50","prompt":"A garden is 15 m long and 8 m wide. A path 1 m wide runs all the way around the outside of it. What is the area of the path in square metres?"}
+{"id":"check-29","cat":"math","check":"number","answer":"144","prompt":"A shop offers: buy two items and get a third one at half price. Every item costs $24. How many dollars do 7 items cost if the deal is applied as many times as possible?"}
+{"id":"check-30","cat":"math","check":"number","answer":"830","prompt":"A savings account starts with $500. $75 is deposited at the end of every month, and $120 is withdrawn at the end of month 3. What is the balance after 6 months?"}
