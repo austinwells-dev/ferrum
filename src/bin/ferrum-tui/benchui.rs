@@ -174,9 +174,7 @@ impl App {
                     self.closing.push(h);
                 }
             }
-            if let Some(h) = b.iq.stop() {
-                self.closing.push(h);
-            }
+            self.closing.extend(b.iq.stop());
         }
         self.screen = Screen::Home;
     }

@@ -127,11 +127,7 @@ Results are ranked by speedup over plain decoding and remembered per machine and
 
 Set *Measure* to `intelligence` to score a model on four question sets instead of timing it: math (GSM8K), knowledge (MMLU), following instructions (IFEval) and reading code (CRUXEval, predicting what a function returns). Every answer is checked by a program, not by another model. Generation is greedy, so a result can be reproduced exactly.
 
-The question sets are not part of the binary. Install them once (this downloads samples from Hugging Face into `~/.config/ferrum/eval`, or `$FERRUM_EVAL_DIR`):
-
-```bash
-python3 tools/eval_import.py
-```
+The question sets are not part of the binary. Select *Question sets* and press Enter to install them: the tab downloads a fixed sample of 100 questions per set from Hugging Face (with the system `curl`) into `~/.config/ferrum/eval`, or `$FERRUM_EVAL_DIR`. The same questions are picked every time. Nothing is replaced unless all four sets download, and leaving the tab cancels the download. To remove the sets, press Enter on the line twice. Saved results stay. Results from different question files are never mixed, and older ones are marked as such.
 
 - *Questions*: `quick` asks the first 15 questions of each set and **predicts** the full score with a 95% range (shown as `~62% ±9`). `full` asks all of them and gives the **actual** score.
 - *Thinking*: `off` (the default), or on with a reasoning budget per question. Thinking usually raises the score a lot and makes the run several times longer, so results with and without it are kept apart.

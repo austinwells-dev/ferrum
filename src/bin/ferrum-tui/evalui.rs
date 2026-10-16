@@ -4,6 +4,7 @@
 use crate::bench::{self, Candidate, Source};
 use crate::benchui::{BenchPhase, ago};
 use crate::eval::{self, CATEGORIES, EvalEvent, EvalPlan, EvalResult, EvalRunning, Suite, Tally};
+use crate::evalsets::{self, InstallEvent, Installing};
 use crate::*;
 use std::sync::atomic::Ordering;
 
@@ -39,6 +40,13 @@ pub struct IqState {
     pub results: Vec<EvalResult>,
     /// The finished run was complete and saved.
     pub saved: bool,
+    install: Option<Installing>,
+    /// Latest download step while installing.
+    pub install_stage: String,
+    /// How the last install or removal went (text, succeeded).
+    pub install_note: Option<(String, bool)>,
+    /// Enter was pressed once on installed sets: the next press removes them.
+    pub confirm_remove: bool,
 }
 
 impl IqState {
@@ -61,14 +69,80 @@ impl IqState {
             stopping: false,
             results: eval::load_results(&eval::results_path()),
             saved: false,
+            install: None,
+            install_stage: String::new(),
+            install_note: None,
+            confirm_remove: false,
         }
     }
 
-    /// Ask a running evaluation to stop; returns its thread to join later.
-    pub fn stop(&mut self) -> Option<std::thread::JoinHandle<()>> {
-        let mut run = self.run.take()?;
-        run.stop.store(true, Ordering::SeqCst);
-        run.handle.take()
+    pub fn installing(&self) -> bool {
+        self.install.is_some()
+    }
+
+    /// Ask a running evaluation and download to stop; returns their threads
+    /// to join later.
+    pub fn stop(&mut self) -> Vec<std::thread::JoinHandle<()>> {
+        let mut out = Vec::new();
+        if let Some(mut run) = self.run.take() {
+            run.stop.store(true, Ordering::SeqCst);
+            out.extend(run.handle.take());
+        }
+        if let Some(mut install) = self.install.take() {
+            install.stop.store(true, Ordering::SeqCst);
+            out.extend(install.handle.take());
+        }
+        out
+    }
+
+    /// Pick up download progress; reload the sets when it finishes.
+    fn poll_install(&mut self) {
+        let Some(install) = self.install.as_ref() else {
+            return;
+        };
+        let mut done = None;
+        while let Ok(event) = install.rx.try_recv() {
+            match event {
+                InstallEvent::Progress(s) => self.install_stage = s,
+                InstallEvent::Done(r) => done = Some(r),
+            }
+        }
+        let Some(result) = done else { return };
+        if let Some(mut install) = self.install.take()
+            && let Some(h) = install.handle.take()
+        {
+            let _ = h.join();
+        }
+        self.install_note = Some(match result {
+            Ok(n) => (format!("installed {n} questions"), true),
+            Err(e) => (format!("install failed: {e}"), false),
+        });
+        self.suite = Suite::load(&eval::suite_dir());
+    }
+
+    /// Enter on the question-sets line: install, or remove after a confirm.
+    fn sets_action(&mut self) {
+        if self.installing() {
+            return;
+        }
+        if self.suite.is_err() {
+            self.confirm_remove = false;
+            self.install_note = None;
+            self.install_stage = "starting".into();
+            match evalsets::spawn_install(eval::suite_dir()) {
+                Ok(i) => self.install = Some(i),
+                Err(e) => self.install_note = Some((e, false)),
+            }
+        } else if self.confirm_remove {
+            self.confirm_remove = false;
+            self.install_note = Some(match evalsets::remove(&eval::suite_dir()) {
+                Ok(()) => ("removed the question sets".into(), true),
+                Err(e) => (format!("could not remove them: {e}"), false),
+            });
+            self.suite = Suite::load(&eval::suite_dir());
+        } else {
+            self.confirm_remove = true;
+        }
     }
 }
 
@@ -76,15 +150,17 @@ impl IqState {
 enum IqLine {
     Model,
     Measure,
+    Sets,
     Size,
     Thinking,
     Draft,
     Run,
 }
 
-const LINES: [IqLine; 6] = [
+const LINES: [IqLine; 7] = [
     IqLine::Model,
     IqLine::Measure,
+    IqLine::Sets,
     IqLine::Size,
     IqLine::Thinking,
     IqLine::Draft,
@@ -180,6 +256,13 @@ impl App {
             return;
         };
         let Some(b) = self.bench.as_mut() else { return };
+        if b.iq.installing() {
+            self.status = Some((
+                "wait for the question sets to finish installing".into(),
+                false,
+            ));
+            return;
+        }
         let suite = match &b.iq.suite {
             Ok(s) => s.clone(),
             Err(e) => {
@@ -212,6 +295,7 @@ impl App {
     pub fn iq_tick(&mut self) {
         let Some(b) = self.bench.as_mut() else { return };
         let iq = &mut b.iq;
+        iq.poll_install();
         let Some(run) = iq.run.as_ref() else { return };
         let mut done = false;
         while let Ok(event) = run.rx.try_recv() {
@@ -290,6 +374,8 @@ impl App {
         iq.sel = iq.sel.min(LINES.len() - 1);
         let mut model_changed = false;
         let mut start = false;
+        let removing = iq.confirm_remove;
+        iq.confirm_remove = false;
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => return self.leave_bench(),
             KeyCode::Up | KeyCode::Char('k') => iq.sel = iq.sel.saturating_sub(1),
@@ -310,6 +396,12 @@ impl App {
                     IqLine::Measure => {
                         b.measure = Measure::Speed;
                         b.sel = 1;
+                    }
+                    IqLine::Sets => {
+                        iq.confirm_remove = removing;
+                        if key.code != KeyCode::Left {
+                            iq.sets_action();
+                        }
                     }
                     IqLine::Size => iq.quick = !iq.quick,
                     IqLine::Thinking => {
@@ -428,8 +520,17 @@ impl App {
                 Style::new().fg(DIM).add_modifier(Modifier::BOLD),
             )
         };
-        let mut out: Vec<Line> = vec![title("QUESTION SETS")];
+        // What sits under the question-sets line.
+        let mut sets_info: Vec<Line> = Vec::new();
         match &iq.suite {
+            _ if iq.installing() => sets_info.push(Line::styled(
+                format!(
+                    "   {} {}",
+                    spinner(self.elapsed()),
+                    clip(&iq.install_stage, width.saturating_sub(6))
+                ),
+                Style::new().fg(EMBER),
+            )),
             Ok(s) => {
                 let sizes: Vec<String> = s
                     .sets
@@ -437,25 +538,40 @@ impl App {
                     .zip(CATEGORIES)
                     .map(|(set, (cat, _))| format!("{cat} {}", set.len()))
                     .collect();
-                out.push(Line::styled(
+                sets_info.push(Line::styled(
                     format!("   {} · {}", sizes.join(" · "), eval::suite_dir().display()),
-                    Style::new().fg(TEXT),
+                    Style::new().fg(FAINT),
                 ));
             }
-            Err(e) => {
-                out.push(Line::styled(format!("   ✗ {e}"), Style::new().fg(BAD)));
-                out.push(Line::styled(
-                    "   install them with: python3 tools/eval_import.py (downloads GSM8K, MMLU, IFEval and CRUXEval samples)",
-                    Style::new().fg(GOLD),
-                ));
-            }
+            Err(_) => sets_info.push(Line::styled(
+                format!(
+                    "   samples of GSM8K, MMLU, IFEval and CRUXEval ({} each), fetched from Hugging Face into {}",
+                    evalsets::PER_SET,
+                    eval::suite_dir().display()
+                ),
+                Style::new().fg(FAINT),
+            )),
         }
-        out.push(Line::default());
+        if let Some((note, ok)) = &iq.install_note {
+            sets_info.push(Line::styled(
+                format!(
+                    "   {} {}",
+                    if *ok { "✓" } else { "✗" },
+                    clip(note, width.saturating_sub(6))
+                ),
+                Style::new().fg(if *ok { GOOD } else { BAD }),
+            ));
+        }
+        let mut out: Vec<Line> = Vec::new();
         let tuned = self.tuned_draft();
         let model = self.models.get(b.model);
         let questions = iq.suite.as_ref().map_or(0, |s| s.questions(iq.quick).len());
         let mut sel_line = 0;
         for (n, &def) in LINES.iter().enumerate() {
+            if def == IqLine::Sets {
+                out.push(Line::default());
+                out.push(title("QUESTION SETS"));
+            }
             if def == IqLine::Size {
                 out.push(Line::default());
                 out.push(title("OPTIONS"));
@@ -479,6 +595,18 @@ impl App {
                     ),
                 ),
                 IqLine::Measure => ("Measure", "‹ intelligence ›".into()),
+                IqLine::Sets => (
+                    "Question sets",
+                    match &iq.suite {
+                        _ if iq.installing() => "installing…".into(),
+                        Ok(_) if iq.confirm_remove => "‹ press enter again to remove ›".into(),
+                        Ok(s) => format!(
+                            "‹ installed · {} questions · enter removes ›",
+                            s.sets.iter().map(Vec::len).sum::<usize>()
+                        ),
+                        Err(_) => "‹ not installed · enter installs ›".into(),
+                    },
+                ),
                 IqLine::Size => (
                     "Questions",
                     if iq.quick {
@@ -526,10 +654,20 @@ impl App {
                 ),
                 Span::styled(
                     format!(" {value} "),
-                    Style::new().fg(EMBER).add_modifier(Modifier::BOLD).bg(bg),
+                    Style::new()
+                        .fg(if def == IqLine::Sets && iq.confirm_remove {
+                            BAD
+                        } else {
+                            EMBER
+                        })
+                        .add_modifier(Modifier::BOLD)
+                        .bg(bg),
                 ),
                 Span::styled("  ", Style::new().bg(bg)),
             ]));
+            if def == IqLine::Sets {
+                out.append(&mut sets_info);
+            }
         }
         out.push(Line::default());
         if let (Some(plan), Ok(suite)) = (self.iq_plan(), &iq.suite) {

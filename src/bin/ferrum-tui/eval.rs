@@ -13,8 +13,8 @@
 //! - The answer check guards `≈` rows of the benchmark: a drafter whose output
 //!   left plain decoding late (a near-tie flip) must still get the same
 //!   questions right. Its questions are bundled.
-//! - Intelligence runs score a model on the suite installed by
-//!   `tools/eval_import.py` (GSM8K, MMLU, IFEval, CRUXEval samples): quick runs
+//! - Intelligence runs score a model on the suite installed from the TUI
+//!   ([`crate::evalsets`]: GSM8K, MMLU, IFEval, CRUXEval samples): quick runs
 //!   ask a fixed subset and predict the full score, full runs measure it.
 use crate::bench::{self, Candidate, Source};
 use crate::*;
@@ -611,10 +611,10 @@ pub const CATEGORIES: [(&str, &str); 4] = [
 ];
 
 /// Questions per category in a quick run: the first ones of each file, which
-/// the import script shuffled with a fixed seed.
+/// the installer shuffled with a fixed seed.
 pub const QUICK_PER_CAT: usize = 15;
 
-/// `$FERRUM_EVAL_DIR`, else `~/.config/ferrum/eval` (where the import script writes).
+/// `$FERRUM_EVAL_DIR`, else `~/.config/ferrum/eval`.
 pub fn suite_dir() -> PathBuf {
     std::env::var_os("FERRUM_EVAL_DIR")
         .map(PathBuf::from)
