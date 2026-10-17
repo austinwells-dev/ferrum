@@ -43,7 +43,7 @@ struct Dataset {
     rank: Option<fn(&Json) -> usize>,
 }
 
-const STANDARD: [Dataset; 4] = [
+const STANDARD: [Dataset; 5] = [
     Dataset {
         cat: "math",
         name: "openai/gsm8k",
@@ -76,9 +76,17 @@ const STANDARD: [Dataset; 4] = [
         convert: cruxeval,
         rank: None,
     },
+    Dataset {
+        cat: "coding",
+        name: "evalplus/mbppplus",
+        config: "default",
+        split: "test",
+        convert: mbpp,
+        rank: None,
+    },
 ];
 
-const HARD: [Dataset; 4] = [
+const HARD: [Dataset; 5] = [
     Dataset {
         cat: "math",
         name: "HuggingFaceH4/MATH-500",
@@ -111,9 +119,17 @@ const HARD: [Dataset; 4] = [
         convert: cruxeval,
         rank: Some(code_length),
     },
+    Dataset {
+        cat: "coding",
+        name: "openai/openai_humaneval",
+        config: "openai_humaneval",
+        split: "test",
+        convert: humaneval,
+        rank: None,
+    },
 ];
 
-fn datasets(difficulty: Difficulty) -> &'static [Dataset; 4] {
+fn datasets(difficulty: Difficulty) -> &'static [Dataset; 5] {
     match difficulty {
         Difficulty::Standard => &STANDARD,
         Difficulty::Hard => &HARD,
@@ -182,6 +198,321 @@ fn rule_count(r: &Json) -> usize {
 
 fn code_length(r: &Json) -> usize {
     r["row"]["code"].as_str().map_or(0, str::len)
+}
+
+/// MBPP: a task and one of its asserts shown, all of them run.
+fn mbpp(r: &Json) -> Option<Json> {
+    let row = &r["row"];
+    let tests: Vec<&str> = row["test_list"]
+        .as_array()?
+        .iter()
+        .filter_map(Json::as_str)
+        .collect();
+    let imports: Vec<&str> = row["test_imports"]
+        .as_array()
+        .map(|a| a.iter().filter_map(Json::as_str).collect())
+        .unwrap_or_default();
+    Some(json!({
+        "id": format!("mbpp-{}", row["task_id"]), "cat": "coding", "check": "program",
+        "prompt": format!(
+            "{}\n\nYour function must pass tests like this one:\n\n```python\n{}\n```",
+            row["prompt"].as_str()?.trim(),
+            tests.first()?
+        ),
+        "test": format!("{}\n{}", imports.join("\n"), tests.join("\n")),
+        "max_tokens": 768,
+    }))
+}
+
+/// HumanEval: complete the function; its `check` runs on the result.
+fn humaneval(r: &Json) -> Option<Json> {
+    let row = &r["row"];
+    Some(json!({
+        "id": format!("humaneval-{}", r["row_idx"]), "cat": "coding", "check": "program",
+        "prompt": format!(
+            "Complete this Python function:\n\n```python\n{}```",
+            row["prompt"].as_str()?
+        ),
+        "test": format!("{}\n\ncheck({})\n", row["test"].as_str()?, row["entry_point"].as_str()?),
+        "max_tokens": 1024,
+    }))
+}
+
+// ---- tool calling: BFCL ----
+
+const BFCL: &str = "https://huggingface.co/datasets/gorilla-llm/Berkeley-Function-Calling-Leaderboard/resolve/main";
+
+/// One call per request (choosing among several tools for `multiple`), or
+/// several calls in one turn for the hard sets.
+fn bfcl_sets(difficulty: Difficulty) -> [&'static str; 2] {
+    match difficulty {
+        Difficulty::Standard => ["simple", "multiple"],
+        Difficulty::Hard => ["parallel", "parallel_multiple"],
+    }
+}
+
+/// BFCL's Python-flavoured schema types as JSON Schema.
+fn json_schema(v: &Json) -> Json {
+    match v {
+        Json::Object(o) => Json::Object(
+            o.iter()
+                .filter_map(|(k, v)| {
+                    if k == "type" {
+                        let t = match v.as_str()? {
+                            "dict" => "object",
+                            "float" => "number",
+                            "tuple" => "array",
+                            "any" => return None,
+                            other => other,
+                        };
+                        Some((k.clone(), json!(t)))
+                    } else {
+                        Some((k.clone(), json_schema(v)))
+                    }
+                })
+                .collect(),
+        ),
+        Json::Array(a) => Json::Array(a.iter().map(json_schema).collect()),
+        other => other.clone(),
+    }
+}
+
+/// A BFCL question and its possible answers as an item. Dotted names
+/// become underscores, as for OpenAI models.
+fn bfcl_item(q: &Json, truth: &Json) -> Option<Json> {
+    let prompt: Vec<&str> = q["question"]
+        .get(0)?
+        .as_array()?
+        .iter()
+        .filter_map(|m| m["content"].as_str())
+        .collect();
+    let tools: Vec<Json> = q["function"]
+        .as_array()?
+        .iter()
+        .map(|f| {
+            json!({"type": "function", "function": {
+                "name": f["name"].as_str().unwrap_or("").replace('.', "_"),
+                "description": f["description"],
+                "parameters": json_schema(&f["parameters"]),
+            }})
+        })
+        .collect();
+    let calls: Vec<Json> = truth
+        .as_array()?
+        .iter()
+        .filter_map(|c| {
+            let (name, args) = c.as_object()?.iter().next()?;
+            Some(json!({"name": name.replace('.', "_"), "args": args}))
+        })
+        .collect();
+    Some(json!({
+        "id": format!("bfcl-{}", q["id"].as_str()?), "cat": "tools", "check": "calls",
+        "prompt": prompt.join("\n"), "tools": tools, "calls": calls,
+    }))
+}
+
+/// Half the questions from each of the difficulty's two BFCL sets.
+fn sample_bfcl(
+    difficulty: Difficulty,
+    progress: &impl Fn(String),
+    stop: &AtomicBool,
+) -> Result<String, String> {
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED ^ eval_hash("tools"));
+    let lines_of = |b: &[u8]| -> Vec<Json> {
+        String::from_utf8_lossy(b)
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect()
+    };
+    let mut lines = Vec::new();
+    for set in bfcl_sets(difficulty) {
+        progress(format!("tools · downloading BFCL {set}"));
+        let questions = lines_of(&curl(
+            &format!("{BFCL}/BFCL_v3_{set}.json"),
+            "tools",
+            progress,
+            stop,
+        )?);
+        let answers = lines_of(&curl(
+            &format!("{BFCL}/possible_answer/BFCL_v3_{set}.json"),
+            "tools",
+            progress,
+            stop,
+        )?);
+        let mut items: Vec<String> = questions
+            .iter()
+            .filter_map(|q| {
+                let truth = answers.iter().find(|a| a["id"] == q["id"])?;
+                bfcl_item(q, &truth["ground_truth"]).and_then(checked_line)
+            })
+            .collect();
+        items.shuffle(&mut rng);
+        lines.extend(items.into_iter().take(PER_SET / 2));
+    }
+    if lines.is_empty() {
+        return Err("BFCL: no usable questions".into());
+    }
+    lines.shuffle(&mut rng);
+    Ok(lines.join("\n") + "\n")
+}
+
+// ---- long context: generated ----
+
+const NAMES: [&str; 16] = [
+    "Ada", "Bruno", "Chiara", "Dmitri", "Elena", "Farid", "Greta", "Hiro", "Ines", "Jonas",
+    "Keiko", "Lars", "Mina", "Nadia", "Omar", "Priya",
+];
+const VERBS: [&str; 12] = [
+    "moved",
+    "inspected",
+    "repaired",
+    "labelled",
+    "weighed",
+    "counted",
+    "cleaned",
+    "photographed",
+    "packed",
+    "unloaded",
+    "logged",
+    "returned",
+];
+const THINGS: [&str; 16] = [
+    "crates of glassware",
+    "spare pumps",
+    "the cold-storage racks",
+    "two pallets of rice",
+    "the backup generator",
+    "a box of fuses",
+    "the delivery van",
+    "the loading ramp",
+    "the inventory tablets",
+    "three drums of oil",
+    "the night shift's keys",
+    "the fire doors",
+    "a roll of copper wire",
+    "the conveyor belt",
+    "the scales",
+    "the visitor badges",
+];
+const PLACES: [&str; 12] = [
+    "dock four",
+    "the north warehouse",
+    "the mezzanine",
+    "bay seven",
+    "the yard",
+    "the cold room",
+    "the east gate",
+    "the workshop",
+    "aisle twelve",
+    "the office",
+    "the rail siding",
+    "the roof",
+];
+const TIMES: [&str; 8] = [
+    "before dawn",
+    "at noon",
+    "after the rain stopped",
+    "during the inspection",
+    "late in the evening",
+    "on the second shift",
+    "while the trucks waited",
+    "just before closing",
+];
+const CITIES: [&str; 20] = [
+    "Lisbon",
+    "Oslo",
+    "Nairobi",
+    "Quito",
+    "Hanoi",
+    "Tbilisi",
+    "Perth",
+    "Montreal",
+    "Cusco",
+    "Tunis",
+    "Riga",
+    "Busan",
+    "Accra",
+    "Lyon",
+    "Bergen",
+    "Kraków",
+    "Valparaíso",
+    "Osaka",
+    "Ghent",
+    "Porto",
+];
+
+/// One filler sentence of a warehouse log.
+fn filler(rng: &mut ChaCha8Rng) -> String {
+    use rand::Rng;
+    let pick = |rng: &mut ChaCha8Rng, xs: &[&'static str]| xs[rng.random_range(0..xs.len())];
+    format!(
+        "{} {} {} at {} {}.",
+        pick(rng, &NAMES),
+        pick(rng, &VERBS),
+        pick(rng, &THINGS),
+        pick(rng, &PLACES),
+        pick(rng, &TIMES)
+    )
+}
+
+/// Questions about a fact (a vault code) hidden at five depths in logs of
+/// two lengths. The hard set uses longer logs and hides codes for other
+/// vaults too, so the model has to find the right one.
+fn context_set(difficulty: Difficulty) -> String {
+    use rand::Rng;
+    let mut rng = ChaCha8Rng::seed_from_u64(SEED ^ eval_hash("context"));
+    let (lengths, decoys) = match difficulty {
+        Difficulty::Standard => ([4096usize, 8192], 0),
+        Difficulty::Hard => ([16384, 32768], 4),
+    };
+    let mut lines = Vec::new();
+    for tokens in lengths {
+        for depth in [0.1, 0.3, 0.5, 0.7, 0.9] {
+            for rep in 0..5 {
+                // About four characters per token of English.
+                let mut sentences = Vec::new();
+                let mut chars = 0;
+                while chars < tokens * 4 {
+                    let s = filler(&mut rng);
+                    chars += s.len() + 1;
+                    sentences.push(s);
+                }
+                let mut cities = CITIES.to_vec();
+                cities.shuffle(&mut rng);
+                let code = rng.random_range(100_000..10_000_000u32);
+                let at = ((sentences.len() as f64) * depth) as usize;
+                for decoy in &cities[1..=decoys] {
+                    let other = rng.random_range(100_000..10_000_000u32);
+                    let pos = rng.random_range(0..sentences.len());
+                    sentences.insert(pos, format!("The vault code for {decoy} is {other}."));
+                }
+                sentences.insert(
+                    at.min(sentences.len()),
+                    format!("The vault code for {} is {code}.", cities[0]),
+                );
+                let log: String = sentences
+                    .chunks(6)
+                    .map(|p| p.join(" "))
+                    .collect::<Vec<_>>()
+                    .join("\n\n");
+                lines.push(
+                    json!({
+                        "id": format!("context-{}k-{}-{rep}", tokens / 1024, (depth * 100.0) as usize),
+                        "cat": "context", "check": "number", "answer": code.to_string(),
+                        "prompt": format!(
+                            "Here is a warehouse log.\n\n<log>\n{log}\n</log>\n\nWhat is the vault code for {}?",
+                            cities[0]
+                        ),
+                        "how": "Reply with the code on its own line as \"Answer: <number>\".",
+                        "max_tokens": 64,
+                    })
+                    .to_string(),
+                );
+            }
+        }
+    }
+    lines.shuffle(&mut rng);
+    lines.join("\n") + "\n"
 }
 
 fn gsm8k(r: &Json) -> Option<Json> {
@@ -280,6 +611,72 @@ fn wait(secs: u64, stop: &AtomicBool) -> Result<(), String> {
     Ok(())
 }
 
+/// GET `url` with the system curl, paced, retrying (longer after HTTP 429).
+/// `label` names the download in progress lines and errors.
+fn curl(
+    url: &str,
+    label: &str,
+    progress: &impl Fn(String),
+    stop: &AtomicBool,
+) -> Result<Vec<u8>, String> {
+    // A Hugging Face token raises the rate limit; it goes through stdin so it
+    // never shows in the process list.
+    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
+    let mut last = String::new();
+    for attempt in 0..ATTEMPTS {
+        if stop.load(Ordering::SeqCst) {
+            return Err("stopped".into());
+        }
+        std::thread::sleep(PACE);
+        let mut cmd = Command::new("/usr/bin/curl");
+        cmd.args(["-sSfL", "--max-time", "120"]);
+        if token.is_some() {
+            cmd.args(["-H", "@-"]);
+        }
+        let mut child = cmd
+            .arg(url)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("could not run curl: {e}"))?;
+        if let (Some(t), Some(mut stdin)) = (&token, child.stdin.take()) {
+            use std::io::Write;
+            let _ = writeln!(stdin, "Authorization: Bearer {t}");
+        }
+        let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
+        if out.status.success() {
+            return Ok(out.stdout);
+        }
+        last = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let limited = last.contains("429");
+        let secs = if limited {
+            15 * (attempt + 1)
+        } else {
+            2 + 3 * attempt
+        };
+        if attempt + 1 < ATTEMPTS {
+            progress(format!(
+                "{label} · {}, retrying in {secs}s",
+                if limited {
+                    "Hugging Face is rate-limiting"
+                } else {
+                    "request failed"
+                }
+            ));
+            wait(secs, stop)?;
+        }
+    }
+    Err(if last.contains("429") {
+        format!(
+            "{label}: Hugging Face kept rate-limiting the download (HTTP 429). Try again in a few minutes (finished sets are kept), or set HF_TOKEN."
+        )
+    } else {
+        format!("{label}: {last}")
+    })
+}
+
+/// One page of rows from the datasets-server API.
 fn fetch(
     d: &Dataset,
     offset: usize,
@@ -293,63 +690,8 @@ fn fetch(
         d.config,
         d.split
     );
-    // A Hugging Face token raises the rate limit; it goes through stdin so it
-    // never shows in the process list.
-    let token = std::env::var("HF_TOKEN").ok().filter(|t| !t.is_empty());
-    let mut last = String::new();
-    for attempt in 0..ATTEMPTS {
-        if stop.load(Ordering::SeqCst) {
-            return Err("stopped".into());
-        }
-        std::thread::sleep(PACE);
-        let mut cmd = Command::new("/usr/bin/curl");
-        cmd.args(["-sSfL", "--max-time", "60"]);
-        if token.is_some() {
-            cmd.args(["-H", "@-"]);
-        }
-        let mut child = cmd
-            .arg(&url)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("could not run curl: {e}"))?;
-        if let (Some(t), Some(mut stdin)) = (&token, child.stdin.take()) {
-            use std::io::Write;
-            let _ = writeln!(stdin, "Authorization: Bearer {t}");
-        }
-        let out = child.wait_with_output().map_err(|e| format!("curl: {e}"))?;
-        if out.status.success() {
-            return serde_json::from_slice(&out.stdout).map_err(|e| format!("{}: {e}", d.name));
-        }
-        last = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let limited = last.contains("429");
-        let secs = if limited {
-            15 * (attempt + 1)
-        } else {
-            2 + 3 * attempt
-        };
-        if attempt + 1 < ATTEMPTS {
-            progress(format!(
-                "{} · {}, retrying in {secs}s",
-                d.cat,
-                if limited {
-                    "Hugging Face is rate-limiting"
-                } else {
-                    "request failed"
-                }
-            ));
-            wait(secs, stop)?;
-        }
-    }
-    Err(if last.contains("429") {
-        format!(
-            "{}: Hugging Face kept rate-limiting the download (HTTP 429). Try again in a few minutes (finished sets are kept), or set HF_TOKEN.",
-            d.name
-        )
-    } else {
-        format!("{}: {last}", d.name)
-    })
+    let body = curl(&url, d.cat, progress, stop)?;
+    serde_json::from_slice(&body).map_err(|e| format!("{}: {e}", d.name))
 }
 
 /// The seeded sample of one dataset as JSON lines.
@@ -419,7 +761,7 @@ fn sample(d: &Dataset, progress: &impl Fn(String), stop: &AtomicBool) -> Result<
     Ok(lines.join("\n") + "\n")
 }
 
-fn eval_hash(s: &str) -> u64 {
+pub fn eval_hash(s: &str) -> u64 {
     s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
         (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
     })
@@ -447,6 +789,17 @@ pub fn install(
         progress(format!("{} · downloading {}", d.cat, d.name));
         let text = sample(d, &progress, stop)?;
         fs::write(&part, text).map_err(|e| format!("{}: {e}", part.display()))?;
+    }
+    let tools = part_path(dir, "tools");
+    if !tools.exists() {
+        let text = sample_bfcl(difficulty, &progress, stop)?;
+        fs::write(&tools, text).map_err(|e| format!("{}: {e}", tools.display()))?;
+    }
+    let context = part_path(dir, "context");
+    if !context.exists() {
+        progress("context · writing the long-context questions".into());
+        fs::write(&context, context_set(difficulty))
+            .map_err(|e| format!("{}: {e}", context.display()))?;
     }
     let mut count = 0;
     for (cat, _) in CATEGORIES {
@@ -581,6 +934,78 @@ mod tests {
             rule_count(&row(0, json!({"instruction_id_list": ["a", "b", "c"]}))),
             3
         );
+    }
+
+    #[test]
+    fn converts_coding_and_tool_sets() {
+        let m = mbpp(&row(
+            0,
+            json!({"task_id": 2, "prompt": "Write add.", "test_imports": ["import math"],
+                   "test_list": ["assert add(1, 2) == 3", "assert add(0, 0) == 0"]}),
+        ))
+        .and_then(checked_line)
+        .unwrap();
+        let item = &eval::parse_items(&m).unwrap()[0];
+        assert!(item.prompt.contains("assert add(1, 2) == 3"));
+        assert!(!item.prompt.contains("add(0, 0)"), "only one test is shown");
+        assert_eq!(
+            item.check,
+            eval::Check::Program(
+                "import math\nassert add(1, 2) == 3\nassert add(0, 0) == 0".into()
+            )
+        );
+        let h = humaneval(&row(
+            7,
+            json!({"prompt": "def f(x):\n", "test": "def check(c):\n    assert c(1)", "entry_point": "f"}),
+        ))
+        .and_then(checked_line)
+        .unwrap();
+        assert!(h.contains("check(f)") && h.contains("humaneval-7"));
+
+        let q = json!({"id": "parallel_0", "question": [[{"role": "user", "content": "Play two songs."}]],
+            "function": [{"name": "spotify.play", "description": "d",
+                "parameters": {"type": "dict", "properties": {"t": {"type": "float"}, "a": {"type": "any"}}}}]});
+        let truth = json!([{"spotify.play": {"t": [1.5]}}, {"spotify.play": {"t": [2.0]}}]);
+        let line = bfcl_item(&q, &truth).and_then(checked_line).unwrap();
+        let item = &eval::parse_items(&line).unwrap()[0];
+        assert_eq!(item.prompt, "Play two songs.");
+        let f = &item.tools[0]["function"];
+        assert_eq!(f["name"], "spotify_play");
+        assert_eq!(f["parameters"]["type"], "object");
+        assert_eq!(f["parameters"]["properties"]["t"]["type"], "number");
+        assert!(f["parameters"]["properties"]["a"].get("type").is_none());
+        match &item.check {
+            eval::Check::Calls(calls) => {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].name, "spotify_play");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn generates_long_context_questions() {
+        let standard = context_set(Difficulty::Standard);
+        assert_eq!(
+            standard,
+            context_set(Difficulty::Standard),
+            "the same every time"
+        );
+        let items = eval::parse_items(&standard).unwrap();
+        assert_eq!(items.len(), 50);
+        for item in &items {
+            let eval::Check::Number(code) = item.check else {
+                panic!("{:?}", item.check)
+            };
+            let fact = format!(" is {code}.");
+            assert_eq!(item.prompt.matches(&fact).count(), 1, "{}", item.id);
+            assert!(item.message().ends_with("\"Answer: <number>\"."));
+        }
+        let hard = eval::parse_items(&context_set(Difficulty::Hard)).unwrap();
+        let longest = hard.iter().map(|i| i.prompt.len()).max().unwrap();
+        assert!(longest > 32768 * 4 && longest < 32768 * 5, "{longest}");
+        // Hard logs hide codes for other vaults too.
+        assert!(hard[0].prompt.matches("The vault code for").count() == 5);
     }
 
     #[test]

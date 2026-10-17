@@ -4,6 +4,8 @@
 #![allow(unused_imports)]
 
 mod agent;
+mod agentbench;
+mod agentui;
 mod app;
 mod attach;
 mod bench;

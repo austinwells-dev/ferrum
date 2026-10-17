@@ -1,7 +1,7 @@
 //! The Compare view of the intelligence benchmark: every saved result, from
 //! every model, as one bar each, with its setup and this Mac's speedup.
 use crate::benchui::ago;
-use crate::eval::{self, Difficulty, EvalResult};
+use crate::eval::{self, CATEGORIES, Difficulty, EvalResult};
 use crate::evalui::{bar_ranged, score_color};
 use crate::*;
 
@@ -71,6 +71,38 @@ impl Compare {
     }
 }
 
+/// One line of a column's labels.
+type Label<'a> = Box<dyn Fn(&EvalResult) -> String + 'a>;
+
+/// Screen width from which Compare uses all of it and draws columns.
+pub const WIDE: u16 = 140;
+
+/// Eighths of a cell, for the tops of the columns.
+const EIGHTHS: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"];
+
+/// What one column cell shows at height `y` (in rows from the bottom): solid
+/// up to `solid` eighths, shaded (the predicted range) up to `upper`.
+fn column_cell(y: usize, solid: usize, upper: usize) -> &'static str {
+    let (lo, hi) = (y * 8, y * 8 + 8);
+    if hi <= solid {
+        "█"
+    } else if lo < solid {
+        EIGHTHS[solid - lo]
+    } else if lo < upper {
+        "▒"
+    } else {
+        " "
+    }
+}
+
+/// Text `s` centered in `w` cells (clipped when longer).
+fn centered_text(s: &str, w: usize) -> String {
+    let s = clip(s, w);
+    let n = s.chars().count();
+    let left = (w - n) / 2;
+    format!("{}{s}{}", " ".repeat(left), " ".repeat(w - n - left))
+}
+
 /// The model's file name without `.gguf`.
 fn model_name(path: &str) -> String {
     let name = Path::new(path)
@@ -126,10 +158,14 @@ impl App {
                 c.sel = 0;
             }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('c') => b.iq.compare = None,
-            KeyCode::Up | KeyCode::Char('k') => c.sel = c.sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                c.sel = (c.sel + 1).min(n.saturating_sub(1))
+            KeyCode::Up | KeyCode::Left | KeyCode::Char('k') | KeyCode::Char('h') => {
+                c.sel = c.sel.saturating_sub(1)
             }
+            KeyCode::Down
+            | KeyCode::Right
+            | KeyCode::Char('j')
+            | KeyCode::Char('l')
+            | KeyCode::Tab => c.sel = (c.sel + 1).min(n.saturating_sub(1)),
             KeyCode::Enter | KeyCode::Char(' ') => c.detail = !c.detail,
             KeyCode::Char('t') => {
                 c.thinking = c.thinking.next();
@@ -192,6 +228,11 @@ impl App {
                 },
                 Style::new().fg(GOLD),
             ));
+            f.render_widget(Paragraph::new(head), inner);
+            return;
+        }
+        if inner.width >= WIDE - 4 {
+            head.extend(self.compare_columns(b, c, &rows, inner, head.len()));
             f.render_widget(Paragraph::new(head), inner);
             return;
         }
@@ -306,10 +347,188 @@ impl App {
             .iter()
             .position(|l| l.spans.first().is_some_and(|s| s.content.starts_with(" ▌")))
             .unwrap_or(0);
-        let tail = if c.detail { 6 } else { 1 };
+        let tail = if c.detail { CATEGORIES.len() + 2 } else { 1 };
         let top = (sel_line + tail).saturating_sub(room);
         head.extend(list.into_iter().skip(top).take(room));
         f.render_widget(Paragraph::new(head), inner);
+    }
+
+    /// The wide layout: one column per result, best first, labels under the
+    /// axis, the selected result's details below.
+    fn compare_columns(
+        &self,
+        b: &BenchState,
+        c: &Compare,
+        rows: &[&EvalResult],
+        inner: Rect,
+        used: usize,
+    ) -> Vec<Line<'static>> {
+        let width = inner.width as usize;
+        let n = rows.len();
+        let col_w = ((width - 2) / n).clamp(9, 18);
+        let visible = ((width - 2) / col_w).max(1);
+        let sel = c.sel.min(n - 1);
+        let first = sel
+            .saturating_sub(visible - 1)
+            .min(n.saturating_sub(visible));
+        let shown = &rows[first..(first + visible).min(n)];
+        let details = if c.detail { CATEGORIES.len() + 3 } else { 3 };
+        let chart_h = (inner.height as usize)
+            .saturating_sub(used + 5 + details)
+            .max(6);
+        // The top row is kept for the value above a full column.
+        let full = (chart_h - 1) * 8;
+        let bar_w = col_w - 3;
+        let mut lines = Vec::new();
+        for row in 0..chart_h {
+            let y = chart_h - 1 - row;
+            let mut spans = vec![Span::raw(" ")];
+            for (k, r) in shown.iter().enumerate() {
+                let Some(s) = r.score() else { continue };
+                let on = first + k == sel;
+                let m = if s.predicted { s.margin } else { 0.0 };
+                let solid = ((s.share - m).clamp(0.0, 1.0) * full as f64).round() as usize;
+                let upper = ((s.share + m).clamp(0.0, 1.0) * full as f64).round() as usize;
+                let label_y = upper.max(solid).div_ceil(8);
+                let color = score_color(s.share);
+                if y == label_y {
+                    spans.push(Span::styled(
+                        centered_text(&s.label(), col_w),
+                        Style::new()
+                            .fg(if on { Color::White } else { color })
+                            .add_modifier(Modifier::BOLD),
+                    ));
+                } else {
+                    spans.push(Span::raw(" "));
+                    spans.push(Span::styled(
+                        column_cell(y, solid, upper).repeat(bar_w),
+                        Style::new().fg(color),
+                    ));
+                    spans.push(Span::raw("  "));
+                }
+            }
+            lines.push(Line::from(spans));
+        }
+        lines.push(Line::styled(
+            format!(" {}", "─".repeat(shown.len() * col_w)),
+            Style::new().fg(FAINT),
+        ));
+        let label_rows: [Label; 4] = [
+            Box::new(|r| model_name(&r.model)),
+            Box::new(|r| {
+                format!(
+                    "{} {}",
+                    r.difficulty.key(),
+                    if r.quick { "quick" } else { "full" }
+                )
+            }),
+            Box::new(|r| {
+                format!(
+                    "{}{}",
+                    r.thinking
+                        .map_or("no think".to_string(), |t| format!("think {t}")),
+                    if r.draft == "plain decoding" {
+                        ""
+                    } else {
+                        " +d"
+                    }
+                )
+            }),
+            Box::new(|r| {
+                b.saved
+                    .iter()
+                    .find(|x| x.machine == b.machine.label() && x.model == r.model)
+                    .map_or("–".to_string(), |x| format!("{:.2}×", x.speedup))
+            }),
+        ];
+        for (i, label) in label_rows.iter().enumerate() {
+            let mut spans = vec![Span::raw(" ")];
+            for (k, r) in shown.iter().enumerate() {
+                let on = first + k == sel;
+                spans.push(Span::styled(
+                    format!(" {:<w$}", clip(&label(r), col_w - 2), w = col_w - 1),
+                    Style::new()
+                        .fg(if on {
+                            Color::White
+                        } else if i == 0 {
+                            TEXT
+                        } else {
+                            DIM
+                        })
+                        .bg(if on { SELECTED } else { Color::Reset }),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        if n > visible {
+            lines.push(Line::styled(
+                format!(
+                    " results {}-{} of {n} · ←→ scrolls",
+                    first + 1,
+                    first + shown.len()
+                ),
+                Style::new().fg(FAINT),
+            ));
+        } else {
+            lines.push(Line::default());
+        }
+        // The selected result in full.
+        let r = rows[sel];
+        let stale = r.difficulty == b.iq.difficulty
+            && b.iq
+                .suite
+                .as_ref()
+                .ok()
+                .is_some_and(|s| s.fingerprint != r.suite);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" ▲ {}", model_name(&r.model)),
+                Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    "  {} · {} · K/V {} · {} wrong · {}{}",
+                    r.setup_label(),
+                    r.score().map_or(String::new(), |s| s.label()),
+                    r.kv_cache.to_lowercase(),
+                    r.wrong.len(),
+                    ago(r.when),
+                    if stale {
+                        " · older question files"
+                    } else {
+                        ""
+                    }
+                ),
+                Style::new().fg(DIM),
+            ),
+        ]));
+        if c.detail {
+            for (i, t) in r.tallies.iter().enumerate() {
+                let mut spans = vec![Span::styled(
+                    format!(
+                        "   {:<34} {:>3}/{:<3} ",
+                        r.difficulty.cat_name(i),
+                        t.right,
+                        t.n
+                    ),
+                    Style::new().fg(TEXT),
+                )];
+                if t.n > 0 {
+                    spans.extend(bar_ranged(t.share(), 0.0, 24, score_color(t.share())));
+                    spans.push(Span::styled(
+                        format!(" {:>4.0}%", t.share() * 100.0),
+                        Style::new().fg(score_color(t.share())),
+                    ));
+                }
+                lines.push(Line::from(spans));
+            }
+        } else {
+            lines.push(Line::styled(
+                "   enter shows its categories",
+                Style::new().fg(FAINT),
+            ));
+        }
+        lines
     }
 }
 
@@ -338,6 +557,18 @@ mod tests {
             ],
             wrong: Vec::new(),
         }
+    }
+
+    #[test]
+    fn draws_column_cells() {
+        // Solid to 12 eighths, shaded range to 20: one full row, half a row,
+        // then the range, then nothing.
+        assert_eq!(column_cell(0, 12, 20), "█");
+        assert_eq!(column_cell(1, 12, 20), "▄");
+        assert_eq!(column_cell(2, 12, 20), "▒");
+        assert_eq!(column_cell(3, 12, 20), " ");
+        assert_eq!(centered_text("85%", 9), "   85%   ");
+        assert_eq!(centered_text("a long label", 5).chars().count(), 5);
     }
 
     #[test]

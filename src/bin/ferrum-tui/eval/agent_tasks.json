@@ -1,0 +1,119 @@
+[
+  {
+    "id": "markdown-setext-mixed",
+    "lang": "python",
+    "repo": "https://github.com/Python-Markdown/markdown",
+    "pr": 1606,
+    "base": "e7a0efb3a7c36d6b8005403122705662bc17c904",
+    "fix": "ddead47873e7918829e1d8b0eaee6ab725793cc9",
+    "tests": ["tests/test_syntax/blocks/test_headers.py"],
+    "test": "python3 -m unittest tests.test_syntax.blocks.test_headers",
+    "issue": "Setext-style headings accept an underline that mixes `=` and `-`.\n\nA line followed by an underline such as `=-` or `-=-=` is rendered as a heading. A Setext underline has to be made only of `=` (for `<h1>`) or only of `-` (for `<h2>`); a mixed underline should leave both lines as an ordinary paragraph.\n\nFor example\n\n    This is not an H1\n    =-\n\nshould render as `<p>This is not an H1\\n=-</p>`, but today it becomes a heading."
+  },
+  {
+    "id": "markdown-inline-html-brackets",
+    "lang": "python",
+    "repo": "https://github.com/Python-Markdown/markdown",
+    "pr": 1649,
+    "base": "30025751dcb06d348ed046c47b84cb26c72be0f6",
+    "fix": "7a29324e03725fe279790c2f59d13ebda0eecbe1",
+    "tests": ["tests/test_syntax/inline/test_raw_html.py"],
+    "test": "python3 -m unittest tests.test_syntax.inline.test_raw_html",
+    "issue": "Inline raw HTML is not recognised when a quoted attribute value contains `<` or `>`.\n\nHTML allows angle brackets inside quoted attribute values, but this input\n\n    <span data-tip-txt=\"<kbd>Ctrl</kbd>\">Anything</span>\n\nis not passed through as raw HTML. It should render unchanged inside a paragraph:\n\n    <p><span data-tip-txt=\"<kbd>Ctrl</kbd>\">Anything</span></p>"
+  },
+  {
+    "id": "more-itertools-numeric-range-slice",
+    "lang": "python",
+    "repo": "https://github.com/more-itertools/more-itertools",
+    "pr": 1128,
+    "base": "1c21c3ae9c7991b73044fe16807b70d1cac61e0b",
+    "fix": "3bbe636e23bdfa359d80e6851e0c37abbc860d4c",
+    "tests": ["tests/test_more.py"],
+    "test": "python3 -m unittest tests.test_more",
+    "issue": "Slicing a `numeric_range` with a negative step and no start or stop gives an empty range.\n\n`list(numeric_range(0, 10, 2)[::-1])` is `[]`, although `list(reversed(numeric_range(0, 10, 2)))` is `[8, 6, 4, 2, 0]`, and the two should agree. With a negative step, an omitted start should mean the last element and an omitted stop should mean just past the first element, as with built-in `range` slicing."
+  },
+  {
+    "id": "more-itertools-one-falsy-exception",
+    "lang": "python",
+    "repo": "https://github.com/more-itertools/more-itertools",
+    "pr": 1279,
+    "base": "4ebeea3e569388911a0bec740092f3cf996d79f3",
+    "fix": "b2f3aff7633057d234ec9186c18a53f4df306d08",
+    "tests": ["tests/test_more.py"],
+    "test": "python3 -m unittest tests.test_more",
+    "issue": "`one()` and `only()` ignore a custom exception that is falsy.\n\nIf `too_long=` or `too_short=` is given an exception instance whose `__bool__` returns `False`, the functions raise their default `ValueError` instead of the exception you passed. Any exception you pass, falsy or not, should be the one raised.\n\nAlso, when a custom `too_long` is given, the default error message should not be built at all: building it calls `repr()` on the first items, which can be slow or can itself raise."
+  },
+  {
+    "id": "tomli-loads-type-error",
+    "lang": "python",
+    "repo": "https://github.com/hukkin/tomli",
+    "pr": 229,
+    "base": "facdab0f5aacc5eb223753c42604d5de7bdaee9d",
+    "fix": "4e245a4bbbefed99e550e196095ea65c851cf31d",
+    "tests": ["tests/test_error.py"],
+    "test": "PYTHONPATH=src python3 -m unittest tests.test_error",
+    "issue": "`tomli.loads()` given something other than a `str` fails with a confusing `AttributeError` from inside the parser.\n\nPassing bytes (`tomli.loads(b\"v = 1\")`) or another type (`tomli.loads(False)`) should raise a `TypeError` with the message `Expected str object, not '<type name>'`, for example `Expected str object, not 'bytes'` and `Expected str object, not 'bool'`."
+  },
+  {
+    "id": "simplejson-control-char-position",
+    "lang": "python",
+    "repo": "https://github.com/simplejson/simplejson",
+    "pr": 379,
+    "base": "639b2ee73b2de6b385fcd4d44e0e08054a4d8a0e",
+    "fix": "bded822467d955fe86a93aa3acdfe03d834f1eb3",
+    "tests": ["simplejson/tests/test_fail.py"],
+    "test": "python3 -m unittest simplejson.tests.test_fail",
+    "issue": "The pure-Python decoder reports the wrong character and position for a literal control character that follows other text inside a string.\n\n`simplejson.loads('\"d\\x18\"')` raises `JSONDecodeError: Invalid control character 'd' at: line 1 column 2 (char 1)`. It names the first character of the string's content and its position. It should name the control character and point at it: `Invalid control character '\\x18' at: line 1 column 3 (char 2)`."
+  },
+  {
+    "id": "idna-non-string-input",
+    "lang": "python",
+    "repo": "https://github.com/kjd/idna",
+    "pr": 224,
+    "base": "7e6df7196e6396b5b84b9530eab8272b5ad51898",
+    "fix": "0f4a28d88f8cce54269f0b6a42edf5e6a5424319",
+    "tests": ["tests/test_idna.py"],
+    "test": "python3 -m unittest tests.test_idna",
+    "issue": "`idna.encode()` and `idna.decode()` leak a raw `TypeError` for input that is not text or bytes.\n\nBoth functions are documented to raise `idna.IDNAError` on bad input. Values that are not `str`, `bytes` or bytes-like (for example `42`, `None`, `1.5`, `[\"a\", \"b\"]` or `{\"a\": 1}`) should raise `IDNAError` too, instead of a bare `TypeError`."
+  },
+  {
+    "id": "semver-less-than-prerelease",
+    "lang": "rust",
+    "repo": "https://github.com/dtolnay/semver",
+    "pr": 241,
+    "base": "cd33b80ddd33ad3ed4626b7ae1c48db32dba21f1",
+    "fix": "4b80b8071af613e63b8def3044575d1584f796fc",
+    "tests": ["tests/test_version_req.rs"],
+    "setup": "cargo fetch",
+    "test": "cargo test --offline --test test_version_req -q -- --skip test_parse_errors",
+    "issue": "A `<` comparator with the minor or patch left out matches prereleases it should exclude.\n\n`VersionReq::parse(\">1.0.0-alpha, <1.0\")` matches `1.0.0-beta`, and so does `>1.0.0-alpha, <1`. Both should not: `<1.0` and `<1` mean below every 1.0.0 version, including its prereleases. Written out in full, `>1.0.0-alpha, <1.0.0` should keep matching `1.0.0-beta` as it does now."
+  },
+  {
+    "id": "humantime-nanosecond-carry",
+    "lang": "rust",
+    "repo": "https://github.com/chronotope/humantime",
+    "pr": 73,
+    "base": "fc092817fa8689298eaac28ff49bd8bede4ff605",
+    "fix": "ed7cc7dcd2566facfce2a1a6af8087993d1887c3",
+    "setup": "cargo fetch",
+    "hidden": {
+      "tests/ferrum_hidden.rs": "use humantime::{parse_duration, DurationError};\n\n#[test]\nfn nanosecond_carry_into_seconds_overflows_cleanly() {\n    assert_eq!(\n        parse_duration(&format!(\"{}s1000ms\", u64::MAX)),\n        Err(DurationError::NumberOverflow)\n    );\n    assert_eq!(\n        parse_duration(&format!(\"{}s 999999999ns 1ns\", u64::MAX)),\n        Err(DurationError::NumberOverflow)\n    );\n}\n\n#[test]\nfn nanosecond_carry_still_adds_up() {\n    assert_eq!(\n        parse_duration(\"1s 999999999ns 1ns\"),\n        Ok(std::time::Duration::from_secs(2))\n    );\n}\n"
+    },
+    "test": "cargo test --offline --test ferrum_hidden -q",
+    "issue": "`parse_duration` panics instead of returning an error when nanoseconds carry over into a seconds value that is already at the maximum.\n\n`parse_duration(&format!(\"{}s1000ms\", u64::MAX))` should return `Err(DurationError::NumberOverflow)`, but it panics. The same goes for `format!(\"{}s 999999999ns 1ns\", u64::MAX)`. Carries that fit must still add up: `\"1s 999999999ns 1ns\"` is exactly 2 seconds."
+  },
+  {
+    "id": "bstr-debug-control-chars",
+    "lang": "rust",
+    "repo": "https://github.com/BurntSushi/bstr",
+    "pr": 201,
+    "base": "7cd46948f7c62ce4272b3df3341bb06fdeb20c5b",
+    "fix": "732fc99f3844d88dc40f33d95a7bc8f3f6bd2e5b",
+    "setup": "cargo fetch",
+    "hidden": {
+      "tests/ferrum_hidden.rs": "use bstr::ByteSlice;\n\n#[test]\nfn debug_escapes_all_control_characters_as_hex() {\n    assert_eq!(\n        format!(\"{:?}\", b\"\\x01\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f\\x7f\".as_bstr()),\n        r#\"\"\\x01\\x19\\x1a\\x1b\\x1c\\x1d\\x1e\\x1f\\x7f\"\"#\n    );\n    assert_eq!(format!(\"{:?}\", b\"a\\tb\\n\".as_bstr()), r#\"\"a\\tb\\n\"\"#);\n}\n"
+    },
+    "test": "cargo test --offline --test ferrum_hidden -q",
+    "issue": "`BStr`'s `Debug` output escapes some ASCII control characters differently from the rest.\n\nBytes `\\x1a` through `\\x1f` come out as Unicode escapes (`\\u{1a}` ... `\\u{1f}`) while the other control characters use hex escapes (`\\x01`, `\\x19`, `\\x7f`). All of them should use the `\\xNN` form, so `format!(\"{:?}\", b\"\\x19\\x1a\\x1f\".as_bstr())` should be `\"\\x19\\x1a\\x1f\"`. Tab and newline keep their short forms `\\t` and `\\n`."
+  }
+]

@@ -18,7 +18,7 @@
 //!   ask a fixed subset and predict the full score, full runs measure it.
 use crate::bench::{self, Candidate, Source};
 use crate::*;
-use ferrum::hybrid::runtime::Runtime;
+use ferrum::hybrid::{chat::ToolCall, runtime::Runtime};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -40,6 +40,18 @@ pub enum Check {
     Choice(char),
     Literal(String),
     Rules(Vec<Rule>),
+    /// The tool calls to make, in any order (BFCL).
+    Calls(Vec<Call>),
+    /// Python test code run after the model's code, in the sandbox.
+    Program(String),
+}
+
+/// An expected tool call: each argument lists the values allowed for it, an
+/// empty string meaning it may be left out (BFCL's possible answers).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Call {
+    pub name: String,
+    pub args: Map<String, Json>,
 }
 
 /// The IFEval instructions we can verify (`id` in brackets).
@@ -83,11 +95,18 @@ pub struct Item {
     pub prompt: String,
     pub check: Check,
     pub max_tokens: usize,
+    /// OpenAI-style tool definitions offered with the prompt.
+    pub tools: Vec<Json>,
+    /// How to state the answer, replacing the check's usual instruction.
+    pub how: Option<String>,
 }
 
 impl Item {
     /// The user message: the prompt plus how to state the answer.
     pub fn message(&self) -> String {
+        if let Some(how) = &self.how {
+            return format!("{}\n\n{how}", self.prompt);
+        }
         let how = match self.check {
             Check::Number(_) => {
                 "Work it out step by step, briefly, then give the final number on its own line as \"Answer: <number>\"."
@@ -98,7 +117,10 @@ impl Item {
             Check::Literal(_) => {
                 "Give the exact value as a Python literal on the last line as \"Answer: <value>\"."
             }
-            Check::Rules(_) => return self.prompt.clone(),
+            Check::Program(_) => {
+                "Write the complete Python solution, with any imports it needs, in a single ```python code block."
+            }
+            Check::Rules(_) | Check::Calls(_) => return self.prompt.clone(),
         };
         format!("{}\n\n{how}", self.prompt)
     }
@@ -149,6 +171,20 @@ fn parse_item(line: &str) -> Result<Item, String> {
                 .map(parse_rule)
                 .collect::<Result<_, _>>()?,
         ),
+        Some("calls") => Check::Calls(
+            v["calls"]
+                .as_array()
+                .ok_or("missing calls")?
+                .iter()
+                .map(|c| {
+                    Ok(Call {
+                        name: c["name"].as_str().ok_or("call without name")?.into(),
+                        args: c["args"].as_object().cloned().unwrap_or_default(),
+                    })
+                })
+                .collect::<Result<_, String>>()?,
+        ),
+        Some("program") => Check::Program(text("test")?),
         other => return Err(format!("unknown check {other:?}")),
     };
     let max_tokens = v["max_tokens"].as_u64().map_or(
@@ -157,6 +193,8 @@ fn parse_item(line: &str) -> Result<Item, String> {
             Check::Choice(_) => 128,
             Check::Literal(_) => 192,
             Check::Rules(_) => 512,
+            Check::Calls(_) => 256,
+            Check::Program(_) => 768,
         },
         |n| n as usize,
     );
@@ -165,6 +203,8 @@ fn parse_item(line: &str) -> Result<Item, String> {
         prompt: text("prompt")?,
         check,
         max_tokens,
+        tools: v["tools"].as_array().cloned().unwrap_or_default(),
+        how: v["how"].as_str().map(str::to_string),
     })
 }
 
@@ -236,8 +276,38 @@ pub struct Graded {
     pub answer: Option<String>,
 }
 
+/// Grade a text-only answer.
+#[cfg(test)]
 pub fn grade(check: &Check, text: &str) -> Graded {
+    grade_reply(check, text, &[])
+}
+
+/// Grade an answer and the tool calls that came with it. A `Program` check
+/// runs the answer's code with its tests in the sandbox.
+pub fn grade_reply(check: &Check, text: &str, calls: &[ToolCall]) -> Graded {
     match check {
+        Check::Calls(expected) => Graded {
+            correct: calls_match(expected, calls),
+            answer: Some(if calls.is_empty() {
+                "no tool call".into()
+            } else {
+                calls
+                    .iter()
+                    .map(|c| format!("{}({})", c.name, Json::Object(c.arguments.clone())))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            }),
+        },
+        Check::Program(test) => {
+            let result = match python_code(text) {
+                None => "no code".to_string(),
+                Some(code) => run_tests(&code, test),
+            };
+            Graded {
+                correct: result == "passed",
+                answer: Some(result),
+            }
+        }
         Check::Number(gold) => {
             let got = final_number(text);
             Graded {
@@ -374,6 +444,134 @@ fn normalize_literal(s: &str) -> String {
     out
 }
 
+// ---- tool calls ----
+
+/// BFCL's string comparison: case, spaces and punctuation do not count.
+fn loose_string(s: &str) -> String {
+    s.chars()
+        .filter(|c| !matches!(c, ' ' | ',' | '.' | '/' | '-' | '_' | '*' | '^'))
+        .flat_map(char::to_lowercase)
+        .map(|c| if c == '\'' { '"' } else { c })
+        .collect()
+}
+
+/// Whether `got` equals the allowed value `want` (numbers by value, strings
+/// loosely, lists and objects element by element).
+fn value_matches(want: &Json, got: &Json) -> bool {
+    match (want, got) {
+        (Json::Number(a), Json::Number(b)) => a.as_f64() == b.as_f64(),
+        (Json::Number(a), Json::String(b)) => b.trim().parse::<f64>().ok() == a.as_f64(),
+        (Json::String(a), Json::String(b)) => loose_string(a) == loose_string(b),
+        (Json::Array(a), Json::Array(b)) => {
+            a.len() == b.len() && a.iter().zip(b).all(|(x, y)| value_matches(x, y))
+        }
+        // Nested objects list allowed values per key, like the arguments.
+        (Json::Object(a), Json::Object(b)) => args_match(a, b),
+        (a, b) => a == b,
+    }
+}
+
+/// Each argument is one of its allowed values (or left out where allowed),
+/// and no argument is unexpected.
+fn args_match(want: &Map<String, Json>, got: &Map<String, Json>) -> bool {
+    let allowed = |w: &Json| match w {
+        Json::Array(options) => options.clone(),
+        other => vec![other.clone()],
+    };
+    got.keys().all(|k| want.contains_key(k))
+        && want.iter().all(|(k, w)| match got.get(k) {
+            None => allowed(w).iter().any(|o| o == &Json::String(String::new())),
+            Some(v) => allowed(w).iter().any(|o| value_matches(o, v)),
+        })
+}
+
+fn call_matches(want: &Call, got: &ToolCall) -> bool {
+    want.name.replace('.', "_") == got.name.replace('.', "_")
+        && args_match(&want.args, &got.arguments)
+}
+
+/// Every expected call made exactly once, in any order, and nothing else.
+fn calls_match(want: &[Call], got: &[ToolCall]) -> bool {
+    fn assign(want: &[Call], got: &[ToolCall], used: &mut Vec<bool>) -> bool {
+        let Some((first, rest)) = want.split_first() else {
+            return true;
+        };
+        for i in 0..got.len() {
+            if !used[i] && call_matches(first, &got[i]) {
+                used[i] = true;
+                if assign(rest, got, used) {
+                    return true;
+                }
+                used[i] = false;
+            }
+        }
+        false
+    }
+    want.len() == got.len() && assign(want, got, &mut vec![false; got.len()])
+}
+
+// ---- code ----
+
+/// The last ```python block of an answer (or any fenced block, or the whole
+/// answer when it has no fence).
+fn python_code(text: &str) -> Option<String> {
+    let mut best = None;
+    let mut rest = text;
+    while let Some(start) = rest.find("```") {
+        let after = &rest[start + 3..];
+        let body_start = after.find('\n').map_or(after.len(), |i| i + 1);
+        let lang = after[..body_start].trim();
+        let body = &after[body_start..];
+        let Some(end) = body.find("```") else { break };
+        if lang.is_empty() || lang.eq_ignore_ascii_case("python") || lang == "py" {
+            best = Some(body[..end].to_string());
+        }
+        rest = &body[end + 3..];
+    }
+    let code = best.unwrap_or_else(|| text.to_string());
+    (!code.trim().is_empty()).then_some(code)
+}
+
+/// Imports the solutions may lean on without stating them.
+const PRELUDE: &str = "import math, re, itertools, collections, heapq, functools, string, bisect\nfrom typing import *\n";
+
+/// How long one program may run.
+const RUN_LIMIT: Duration = Duration::from_secs(10);
+
+/// Runs `code` then `test` with python3 in a sandbox that can write nothing
+/// and reach no network: "passed", "failed", "timed out" or why it could not run.
+fn run_tests(code: &str, test: &str) -> String {
+    let program = format!("{PRELUDE}\n{code}\n\n{test}\n");
+    let spawned = crate::agent::confined(&["python3", "-I", "-B", "-c", &program])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match spawned {
+        Ok(c) => c,
+        Err(e) => return format!("could not run python3: {e}"),
+    };
+    let deadline = Instant::now() + RUN_LIMIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return if status.success() {
+                    "passed".into()
+                } else if status.code() == Some(127) {
+                    "python3 not found".into()
+                } else {
+                    "failed".into()
+                };
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return "timed out".into();
+            }
+        }
+    }
+}
+
 /// Non-overlapping `delim…delim` spans on one line with non-blank content
 /// (IFEval's highlight regexes).
 fn wrapped(text: &str, delim: &str) -> usize {
@@ -468,12 +666,19 @@ pub fn answer_items(
     let mut out = Vec::with_capacity(items.len());
     for item in items {
         progress(out.len());
-        let s = crate::bench::generate(rt, &item.message(), item.max_tokens, None, stop)
-            .map_err(|e| format!("{}: {e}", item.id))?;
+        let s = bench::generate_with_tools(
+            rt,
+            &item.message(),
+            &item.tools,
+            item.max_tokens,
+            None,
+            stop,
+        )
+        .map_err(|e| format!("{}: {e}", item.id))?;
         if stop.load(Ordering::SeqCst) {
             return Err("stopped".into());
         }
-        out.push(grade(&item.check, &s.text));
+        out.push(grade_reply(&item.check, &s.text, &s.calls));
     }
     Ok(out)
 }
@@ -603,11 +808,14 @@ pub fn store_baseline(path: &Path, key: &CheckKey, answers: &[Graded]) {
 // ---- the intelligence suite ----
 
 /// Question sets, one `<name>.jsonl` each in the suite folder.
-pub const CATEGORIES: [(&str, &str); 4] = [
+pub const CATEGORIES: [(&str, &str); 7] = [
     ("math", "Math"),
     ("knowledge", "Knowledge"),
     ("instructions", "Instructions"),
     ("code", "Code reading"),
+    ("tools", "Tool calling"),
+    ("context", "Long context"),
+    ("coding", "Writing code"),
 ];
 
 /// Which question sets a run uses. Each difficulty has its own folder and
@@ -646,10 +854,26 @@ impl Difficulty {
     }
 
     /// The dataset behind each category, in `CATEGORIES` order.
-    pub fn datasets(self) -> [&'static str; 4] {
+    pub fn datasets(self) -> [&'static str; 7] {
         match self {
-            Self::Standard => ["GSM8K", "MMLU", "IFEval", "CRUXEval"],
-            Self::Hard => ["MATH-500", "MMLU-Pro", "IFEval multi-rule", "CRUXEval long"],
+            Self::Standard => [
+                "GSM8K",
+                "MMLU",
+                "IFEval",
+                "CRUXEval",
+                "BFCL single",
+                "4K-8K tokens",
+                "MBPP",
+            ],
+            Self::Hard => [
+                "MATH-500",
+                "MMLU-Pro",
+                "IFEval multi-rule",
+                "CRUXEval long",
+                "BFCL parallel",
+                "16K-32K tokens",
+                "HumanEval",
+            ],
         }
     }
 
@@ -730,6 +954,20 @@ impl Suite {
             }
         }
         out
+    }
+
+    /// Context a run needs for its longest question (about 3.5 characters
+    /// per token, plus the answer and thinking budget), at least 8192.
+    pub fn context_needed(&self, quick: bool, thinking: Option<usize>) -> usize {
+        let longest = self
+            .questions(quick)
+            .iter()
+            .map(|(_, i)| i.prompt.len() * 2 / 7 + i.max_tokens + 512)
+            .max()
+            .unwrap_or(0);
+        (longest + thinking.unwrap_or(0))
+            .max(8192)
+            .next_multiple_of(1024)
     }
 
     /// Empty tallies, one per category.
@@ -832,14 +1070,16 @@ impl EvalPlan {
         }
     }
 
-    /// Rough run time: typical answers at a typical 30 tok/s.
+    /// Rough run time: typical answers at a typical 30 tok/s, and prompts
+    /// (the long-context ones count) at 800 tok/s.
     pub fn estimate_secs(&self, suite: &Suite) -> usize {
-        let tokens: usize = suite
-            .questions(self.quick)
+        let questions = suite.questions(self.quick);
+        let answers: usize = questions
             .iter()
             .map(|(_, i)| i.max_tokens / 2 + self.thinking.map_or(0, |b| b * 3 / 4))
             .sum();
-        30 + tokens / 30
+        let prompts: usize = questions.iter().map(|(_, i)| i.prompt.len() / 4).sum();
+        30 + answers / 30 + prompts / 800
     }
 }
 
@@ -930,9 +1170,10 @@ fn run(plan: EvalPlan, suite: Suite, tx: Sender<EvalEvent>, stop: Arc<AtomicBool
             n + 1,
             questions.len()
         )));
-        match bench::generate(
+        match bench::generate_with_tools(
             &mut rt,
             &item.message(),
+            &item.tools,
             item.max_tokens,
             plan.thinking,
             &stop,
@@ -940,7 +1181,7 @@ fn run(plan: EvalPlan, suite: Suite, tx: Sender<EvalEvent>, stop: Arc<AtomicBool
             // A stopped generation is cut short: do not grade it.
             Ok(_) if stop.load(Ordering::SeqCst) => break,
             Ok(s) => {
-                let g = grade(&item.check, &s.text);
+                let g = grade_reply(&item.check, &s.text, &s.calls);
                 send(EvalEvent::Answered {
                     cat: *cat,
                     id: item.id.clone(),
@@ -1313,6 +1554,8 @@ mod tests {
             prompt: "p".into(),
             check: Check::Number(1.0),
             max_tokens: 100,
+            tools: Vec::new(),
+            how: None,
         };
         Suite {
             sets: sizes
@@ -1331,16 +1574,17 @@ mod tests {
         let line = |id: &str| {
             format!(r#"{{"id":"{id}","cat":"c","prompt":"p","check":"number","answer":"1"}}"#)
         };
-        for (cat, _) in &CATEGORIES[..3] {
+        let last = CATEGORIES.len() - 1;
+        for (cat, _) in &CATEGORIES[..last] {
             fs::write(dir.join(format!("{cat}.jsonl")), line(cat)).unwrap();
         }
         let err = Suite::load(&dir).unwrap_err();
-        assert!(err.contains("code"), "{err}");
-        fs::write(dir.join("code.jsonl"), line("code")).unwrap();
+        assert!(err.contains("coding"), "{err}");
+        fs::write(dir.join("coding.jsonl"), line("coding")).unwrap();
         let s = Suite::load(&dir).unwrap();
-        assert_eq!(s.sets.iter().map(Vec::len).sum::<usize>(), 4);
+        assert_eq!(s.sets.iter().map(Vec::len).sum::<usize>(), CATEGORIES.len());
         let before = s.fingerprint.clone();
-        fs::write(dir.join("code.jsonl"), line("code2")).unwrap();
+        fs::write(dir.join("coding.jsonl"), line("coding2")).unwrap();
         assert_ne!(Suite::load(&dir).unwrap().fingerprint, before);
         fs::remove_dir_all(dir).ok();
     }
@@ -1399,7 +1643,7 @@ mod tests {
                     n: 15,
                     total: 100
                 };
-                4
+                CATEGORIES.len()
             ],
             wrong: vec!["gsm8k-1".into()],
         };
@@ -1416,6 +1660,87 @@ mod tests {
             "hard · full · thinking ≤1024 · plain decoding"
         );
         fs::remove_dir_all(dir).ok();
+    }
+
+    fn call(name: &str, args: Json) -> ToolCall {
+        ToolCall {
+            name: name.into(),
+            arguments: args.as_object().cloned().unwrap(),
+        }
+    }
+
+    #[test]
+    fn matches_tool_calls_like_bfcl() {
+        let line =
+            r#"{"id":"t","cat":"tools","prompt":"p","check":"calls","tools":[{"type":"function"}],
+            "calls":[{"name":"math.hypot","args":{"x":[4],"y":[5],"z":["",0]}},
+                     {"name":"city_info","args":{"city":["New York","NYC"],"tags":[["a","b"]]}}]}"#
+                .replace('\n', " ");
+        let item = &parse_items(&line).unwrap()[0];
+        assert_eq!(item.tools.len(), 1);
+        assert_eq!(item.message(), "p");
+        let ok = [
+            call("city_info", json!({"city": "new-york", "tags": ["A", "b"]})),
+            call("math_hypot", json!({"x": 4.0, "y": "5"})),
+        ];
+        let g = grade_reply(&item.check, "", &ok);
+        assert!(g.correct, "{g:?}");
+        // A wrong value, an extra argument, a missing call or no call at all.
+        let bad = |calls: &[ToolCall]| !grade_reply(&item.check, "", calls).correct;
+        assert!(bad(&[
+            ok[0].clone(),
+            call("math_hypot", json!({"x": 4, "y": 6}))
+        ]));
+        assert!(bad(&[
+            ok[0].clone(),
+            call("math_hypot", json!({"x": 4, "y": 5, "w": 1}))
+        ]));
+        assert!(bad(&ok[..1]));
+        assert_eq!(
+            grade_reply(&item.check, "I can't", &[]).answer.as_deref(),
+            Some("no tool call")
+        );
+        // A required argument left out.
+        assert!(bad(&[ok[0].clone(), call("math_hypot", json!({"x": 4}))]));
+    }
+
+    #[test]
+    fn finds_python_code_in_answers() {
+        let text =
+            "Here:\n```python\ndef f():\n    return 1\n```\nand a shell line\n```sh\nls\n```";
+        assert_eq!(python_code(text).unwrap(), "def f():\n    return 1\n");
+        assert_eq!(python_code("def g(): pass").unwrap(), "def g(): pass");
+        assert_eq!(python_code("```\nx = 1\n```").unwrap(), "x = 1\n");
+        assert_eq!(python_code("  "), None);
+    }
+
+    #[test]
+    fn runs_programs_in_the_sandbox() {
+        if Command::new("python3").arg("--version").output().is_err() {
+            return; // no python3 on this machine
+        }
+        let check = Check::Program("assert add(2, 3) == 5".into());
+        let pass = grade(&check, "```python\ndef add(a, b):\n    return a + b\n```");
+        assert!(pass.correct, "{pass:?}");
+        assert_eq!(
+            grade(&check, "def add(a, b):\n    return a - b")
+                .answer
+                .as_deref(),
+            Some("failed")
+        );
+        // The sandbox stops writes outside it.
+        let write = Check::Program("open('/tmp/ferrum-eval-escape', 'w').write('x')".into());
+        assert!(!grade(&write, "x = 1").correct);
+        assert!(!Path::new("/tmp/ferrum-eval-escape").exists());
+    }
+
+    #[test]
+    fn sizes_the_context_for_the_longest_question() {
+        let mut s = suite([1, 0, 0, 0]);
+        assert_eq!(s.context_needed(true, None), 8192);
+        s.sets[0][0].prompt = "x".repeat(35_000 * 4);
+        let c = s.context_needed(true, Some(4096));
+        assert!(c >= 40_000 + 4096 && c.is_multiple_of(1024), "{c}");
     }
 
     #[test]

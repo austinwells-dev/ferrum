@@ -1,6 +1,7 @@
 //! The Benchmark tab: choose a model and what to test, watch the sweep, then
 //! save the winning settings as a favorite. Measuring intelligence instead
 //! lives in [`crate::evalui`].
+use crate::agentui::AgentState;
 use crate::bench::{self, Candidate, ChunkRow, Event, Machine, Plan, Row, Running, Saved, Source};
 use crate::eval;
 use crate::evalui::{IqState, Measure};
@@ -19,6 +20,7 @@ pub struct BenchState {
     pub phase: BenchPhase,
     pub measure: Measure,
     pub iq: IqState,
+    pub ag: AgentState,
     pub machine: Machine,
     /// Index into `App::models`.
     pub model: usize,
@@ -143,6 +145,7 @@ impl App {
             phase: BenchPhase::Setup,
             measure: Measure::Speed,
             iq: IqState::new(),
+            ag: AgentState::new(),
             machine: Machine::detect(),
             model,
             cands,
@@ -175,6 +178,7 @@ impl App {
                 }
             }
             self.closing.extend(b.iq.stop());
+            self.closing.extend(b.ag.stop());
         }
         self.screen = Screen::Home;
     }
@@ -249,12 +253,10 @@ impl App {
     }
 
     pub fn bench_tick(&mut self) {
-        if self
-            .bench
-            .as_ref()
-            .is_some_and(|b| b.measure == Measure::Intelligence)
-        {
-            return self.iq_tick();
+        match self.bench.as_ref().map(|b| b.measure) {
+            Some(Measure::Intelligence) => return self.iq_tick(),
+            Some(Measure::Agent) => return self.agent_tick(),
+            _ => {}
         }
         let Some(b) = self.bench.as_mut() else { return };
         let Some(run) = b.run.as_ref() else { return };
@@ -355,6 +357,17 @@ impl App {
             Some(b) => (b.phase, b.measure),
             None => return self.go_home(),
         };
+        if measure == Measure::Agent {
+            return match phase {
+                BenchPhase::Setup => self.agent_setup_key(key),
+                BenchPhase::Running => {
+                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                        self.agent_stop();
+                    }
+                }
+                BenchPhase::Results => self.agent_results_key(key),
+            };
+        }
         if measure == Measure::Intelligence {
             if self.bench.as_ref().is_some_and(|b| b.iq.compare.is_some()) {
                 return self.iq_compare_key(key);
@@ -482,7 +495,12 @@ impl App {
         .areas(f.area());
         let model = self.models.get(b.model);
         let comparing = b.measure == Measure::Intelligence && b.iq.compare.is_some();
-        let (pill_text, pill_color) = match (b.phase, b.stopping) {
+        let stopping = match b.measure {
+            Measure::Speed => b.stopping,
+            Measure::Intelligence => b.iq.stopping,
+            Measure::Agent => b.ag.stopping,
+        };
+        let (pill_text, pill_color) = match (b.phase, stopping) {
             _ if comparing => ("COMPARE", GOLD),
             (BenchPhase::Setup, _) => ("SETUP", GOLD),
             (BenchPhase::Running, true) => ("STOPPING", GOLD),
@@ -496,10 +514,23 @@ impl App {
             &["Benchmark", name],
             vec![pill(pill_text, pill_color)],
         );
-        let area = centered(body, 104, body.height);
+        // Compare spreads out on a wide screen (it draws columns there).
+        let area = if comparing && body.width >= crate::evalcompare::WIDE {
+            Rect {
+                x: body.x + 1,
+                width: body.width - 2,
+                ..body
+            }
+        } else {
+            centered(body, 104, body.height)
+        };
         let iq = b.measure == Measure::Intelligence;
+        let agent = b.measure == Measure::Agent;
         match (b.phase, iq) {
             _ if comparing => self.draw_iq_compare(f, area, b),
+            (BenchPhase::Setup, _) if agent => self.draw_agent_setup(f, area, b),
+            (BenchPhase::Running, _) if agent => self.draw_agent_running(f, area, b),
+            (BenchPhase::Results, _) if agent => self.draw_agent_results(f, area, b),
             (BenchPhase::Setup, false) => self.draw_bench_setup(f, area, b),
             (BenchPhase::Running, false) => self.draw_bench_running(f, area, b),
             (BenchPhase::Results, false) => self.draw_bench_results(f, area, b),
@@ -517,6 +548,7 @@ impl App {
                 ("x", "clear"),
                 ("esc", "back"),
             ],
+            BenchPhase::Results if agent => &[("r", "run again"), ("esc", "home")],
             BenchPhase::Setup if iq => &[
                 ("↑↓", "move"),
                 ("←→/space", "change"),

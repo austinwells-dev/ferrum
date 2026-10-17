@@ -90,6 +90,12 @@ FERRUM_CHECK_MODEL=/path/to/model.gguf FERRUM_CHECK_DRAFTER=/path/to/drafter \
   FERRUM_CHECK_DEPTH=4 cargo test --release --bin ferrum-tui -- --ignored --nocapture keeps_its_answers
 ```
 
+The agent benchmark's tasks can be checked without a model as well. This installs all ten into a temporary folder and checks, in the sandbox, that each fails as checked out and passes with its real fix:
+
+```sh
+cargo test --release --bin ferrum-tui -- --ignored --nocapture tasks_fail_before
+```
+
 `FERRUM_CHECK_DRAFTER=mtp` uses the model's MTP head and `FERRUM_CHECK_QUANT=q8_0` loads the drafter in 8 bits. On a dense 27B each pass takes about 15 minutes.
 
 Python is only used by the optional comparison tools. To set up the reference environment:

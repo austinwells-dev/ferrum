@@ -242,6 +242,8 @@ pub struct Sample {
     ids: Vec<u32>,
     /// The visible answer.
     pub text: String,
+    /// Tool calls the answer made.
+    pub calls: Vec<ferrum::hybrid::chat::ToolCall>,
 }
 
 /// Greedy generation of one prompt from a cold session. `thinking` is a
@@ -253,12 +255,24 @@ pub fn generate(
     thinking: Option<usize>,
     stop: &AtomicBool,
 ) -> Result<Sample, String> {
+    generate_with_tools(rt, prompt, &[], tokens, thinking, stop)
+}
+
+/// [`generate`] with OpenAI-style tool definitions offered to the model.
+pub fn generate_with_tools(
+    rt: &mut Runtime,
+    prompt: &str,
+    tools: &[Json],
+    tokens: usize,
+    thinking: Option<usize>,
+    stop: &AtomicBool,
+) -> Result<Sample, String> {
     rt.session.reset();
     let mut vars = Map::new();
     vars.insert("enable_thinking".into(), Json::Bool(thinking.is_some()));
     let request = ChatRequest {
         messages: vec![json!({"role": "user", "content": prompt})],
-        tools: Vec::new(),
+        tools: tools.to_vec(),
         max_tokens: tokens + thinking.unwrap_or(0),
         sampling: ferrum::hybrid::session::SamplingParams::default(),
         template_vars: vars,
@@ -275,6 +289,7 @@ pub fn generate(
             / c.prefill.as_secs_f64().max(1e-9),
         ids: c.tokens.clone(),
         text: r.output.content.clone(),
+        calls: r.output.tool_calls.clone(),
     })
 }
 

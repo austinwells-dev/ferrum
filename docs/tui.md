@@ -113,7 +113,7 @@ Serve starts `ferrum-server` with the chosen setup and shows its endpoint, healt
 
 ## Benchmark
 
-The Benchmark tab measures a model on *this* Mac. *Measure* switches between **speed** (below), which finds the fastest speculative-decoding setup, and **intelligence** ([Measuring intelligence](#measuring-intelligence)), which scores answers to question sets.
+The Benchmark tab measures a model on *this* Mac. *Measure* cycles through **speed** (below), which finds the fastest speculative-decoding setup; **intelligence** ([Measuring intelligence](#measuring-intelligence)), which scores answers to question sets; and **agent** ([Measuring agentic coding](#measuring-agentic-coding)), which has the coding agent fix real bugs.
 
 1. Pick a model. The tab lists plain decoding, the model's MTP head (if the GGUF has a usable one) and every compatible drafter it can find. Compatibility is checked by hidden size, layer count and vocabulary.
 2. Each drafter is loaded once, and its draft depth is swept (`quick` tries a few depths, `full` tries every depth). The tab measures greedy decode speed on three prompts (code, prose and structured data) and the mean number of tokens accepted per verify step.
@@ -125,7 +125,7 @@ Results are ranked by speedup over plain decoding and remembered per machine and
 
 ### Measuring intelligence
 
-Set *Measure* to `intelligence` to score a model on four question sets instead of timing it: math, knowledge, following instructions and reading code (predicting what a Python function returns). Every answer is checked by a program, not by another model. Generation is greedy, so a result can be reproduced exactly.
+Set *Measure* to `intelligence` to score a model on seven question sets instead of timing it. Four are about answering questions: math, knowledge, following instructions and reading code (predicting what a Python function returns). Three are about real work: calling tools, finding a fact in a long document, and writing code that has to pass tests. Every answer is checked by a program, not by another model. Generation is greedy, so a result can be reproduced exactly.
 
 *Difficulty* picks the sets:
 
@@ -135,17 +135,36 @@ Set *Measure* to `intelligence` to score a model on four question sets instead o
 | Knowledge | MMLU-Pro (10 options) | MMLU (4 options) |
 | Instructions | IFEval, the prompts with the most rules | IFEval |
 | Code reading | CRUXEval, the longest functions | CRUXEval |
+| Tool calling | BFCL parallel and parallel-multiple: several calls in one turn | BFCL simple and multiple: one call, sometimes choosing among tools |
+| Long context | a vault code hidden at 10-90% depth in 16K and 32K-token logs, with codes for other vaults as decoys | the same in 4K and 8K-token logs, no decoys |
+| Writing code | HumanEval: complete a function, then its tests run | MBPP: write a function from a description and one example test |
 
-The standard sets are easy for current mid-size models, which mostly score in the 80s and 90s. Use them for small models. Each difficulty is installed and scored separately, and its results are never mixed with the other's.
+The standard question sets are easy for current mid-size models, which mostly score in the 80s and 90s. Use them for small models. Each difficulty is installed and scored separately, and its results are never mixed with the other's.
 
-The question sets are not part of the binary. Select *Question sets* and press Enter to install them: the tab downloads a fixed sample of 100 questions per set from Hugging Face (with the system `curl`) into `~/.config/ferrum/eval` (the hard sets into its `hard` folder), or `$FERRUM_EVAL_DIR`. The same questions are picked every time. Requests are spaced out, and if Hugging Face rate-limits the download (HTTP 429), the tab waits and retries. Each finished set is kept, so if the install fails or you leave the tab (which cancels it), installing again picks up where it stopped. The question files are only replaced once all four sets are in. Setting `HF_TOKEN` raises the rate limit. To remove the sets, press Enter on the line twice. Saved results stay. Results from different question files are never mixed, and older ones are marked as such.
+Tool calls are graded like BFCL: the right functions, each called once in any order, with every argument one of its allowed values (numbers by value, strings ignoring case, spaces and punctuation) and nothing extra. Code is graded by running the answer's last ```` ```python ```` block and the hidden tests with `python3`, inside the same Seatbelt sandbox the agent uses but with no writes and no network, for at most 10 seconds. Writing code needs `python3` on your `PATH`. Long-context questions need a bigger context, so a run sizes its context from its longest question (about 38K tokens for the hard sets, plus the thinking budget). On a model that cannot fit that next to its weights, the run fails at load with the reason.
 
-- *Questions*: `quick` asks the first 15 questions of each set and **predicts** the full score with a 95% range (shown as `~62% ±9`). `full` asks all of them and gives the **actual** score.
+The question sets are not part of the binary. Select *Question sets* and press Enter to install them: the tab downloads a fixed sample of 100 questions per set from Hugging Face (with the system `curl`, 50 for long context, which is generated locally) into `~/.config/ferrum/eval` (the hard sets into its `hard` folder), or `$FERRUM_EVAL_DIR`. The same questions are picked every time. Requests are spaced out, and if Hugging Face rate-limits the download (HTTP 429), the tab waits and retries. Each finished set is kept, so if the install fails or you leave the tab (which cancels it), installing again picks up where it stopped. The question files are only replaced once all seven sets are in. Setting `HF_TOKEN` raises the rate limit. To remove the sets, press Enter on the line twice. Saved results stay. Results from different question files are never mixed, and older ones are marked as such.
+
+- *Questions*: `quick` asks the first 15 questions of each set (105 in all) and **predicts** the full score with a 95% range (shown as `~62% ±9`). `full` asks all of them and gives the **actual** score.
 - *Thinking*: `off` (the default), or on with a reasoning budget per question. Thinking usually raises the score a lot and makes the run several times longer, so results with and without it are kept apart.
 - *Drafter*: `off` uses plain decoding. `tuned` uses the drafter this Mac's speed benchmark recommended for the model, which is faster and gives the same answers up to near-tie flips.
 
-The score is the mean of the four category scores. Complete runs are saved in `~/.config/ferrum/eval.json`, the newest per model, question files and setup. Previous results for the model are listed under the options. A stopped run is shown but not saved.
+The score is the mean of the seven category scores. Complete runs are saved in `~/.config/ferrum/eval.json`, the newest per model, question files and setup. Previous results for the model are listed under the options. A stopped run is shown but not saved.
 
-Press `c` in the intelligence setup or results to open **Compare**: every saved result from every model, best first, one bar each. Each row is labeled with the model, the difficulty, the run size, thinking, and whether a drafter was used, plus this Mac's best speedup for the model from the speed benchmark. A predicted score's 95% range is shaded (`▒`). It opens on the setup's difficulty. `d` cycles difficulty (hard, standard, both), `t` cycles thinking (all, off, on), `f` shows only full runs, and Enter opens a result's four category bars. Pressing `x` twice deletes every saved result.
+Press `c` in the intelligence setup or results to open **Compare**: every saved result from every model, best first, one bar each. Each row is labeled with the model, the difficulty, the run size, thinking, and whether a drafter was used, plus this Mac's best speedup for the model from the speed benchmark. A predicted score's 95% range is shaded (`▒`). On a screen at least 140 columns wide, Compare uses the full width and draws each result as a column, best on the left, with its labels under the axis and the selected result's details below; `←`/`→` move between columns. It opens on the setup's difficulty. `d` cycles difficulty (hard, standard, both), `t` cycles thinking (all, off, on), `f` shows only full runs, and Enter opens a result's category bars. Pressing `x` twice deletes every saved result.
 
 These are public benchmarks that models may have seen in training. Use the scores to compare models and settings on this Mac, not as leaderboard numbers.
+
+### Measuring agentic coding
+
+Set *Measure* to `agent` to see how well a model works as a coding agent. This is a separate measurement from intelligence. There are ten tasks, each a real merged bug-fix pull request from a small open-source project with no dependencies: seven in Python (Python-Markdown, more-itertools, tomli, simplejson, idna) and three in Rust (semver, humantime, bstr). For each task:
+
+1. The repository is checked out at the commit before the fix, and only that commit, so the fix is not in its history.
+2. The model gets a description of the bug, written like an issue, and the command that runs the tests. It works with the same tools and Seatbelt sandbox as the Agents tab, with the network off. It has up to 50 replies and 30 minutes.
+3. Afterwards the tests from the actual pull request are added (for the Rust tasks whose tests sit inside the source, a test written from them) and run in the sandbox. The task is solved if they pass. They include the project's existing tests in the same file, so a fix that breaks something else fails.
+
+Each task was checked to fail before its fix and pass after it.
+
+Select *Tasks* and press Enter to install them: this clones each repository at its commit with `git`, and for Rust runs `cargo fetch` so the tests can run offline. They go into `~/.config/ferrum/agent` (or `$FERRUM_AGENT_DIR`). Pressing Enter twice removes them. The tasks need `git`, `python3` and `cargo`. *Thinking* and *Drafter* work as for intelligence. The agent runs with a 64K context, or 32K when that does not fit.
+
+The result is the number of tasks solved, plus what they cost: tokens generated (thinking included), prompt tokens read (not counting ones reused from the cache), replies and time, per task and in total. **Generated tokens per solved task** is the efficiency figure. Two models that solve the same number of tasks are told apart by it. Complete runs are saved in `~/.config/ferrum/agent.json`, the newest per model and setup. The setup and results screens list every saved run, most tasks solved first, then fewest generated tokens. A full run takes from minutes to several hours, depending on the model.

@@ -19,6 +19,7 @@ pub const THINKING: [Option<usize>; 4] = [None, Some(1024), Some(2048), Some(409
 pub enum Measure {
     Speed,
     Intelligence,
+    Agent,
 }
 
 pub struct IqState {
@@ -238,7 +239,7 @@ fn shown_answer(cat: usize, answer: Option<&str>) -> String {
 impl App {
     /// The drafter and depth this Mac's last speed benchmark of the model
     /// recommended, if it still exists.
-    fn tuned_draft(&self) -> Option<(Candidate, usize)> {
+    pub fn tuned_draft(&self) -> Option<(Candidate, usize)> {
         let b = self.bench.as_ref()?;
         let model = self.models.get(b.model)?.path.display().to_string();
         let s = b
@@ -295,7 +296,9 @@ impl App {
             quick: b.iq.quick,
             thinking: THINKING[b.iq.thinking],
             draft: if b.iq.tuned { self.tuned_draft() } else { None },
-            context: 8192,
+            context: b.iq.suite.as_ref().map_or(8192, |s| {
+                s.context_needed(b.iq.quick, THINKING[b.iq.thinking])
+            }),
             kv_cache: self.kv_cache().unwrap_or_default(),
         })
     }
@@ -446,8 +449,8 @@ impl App {
                         }
                     }
                     IqLine::Measure => {
-                        b.measure = Measure::Speed;
-                        b.sel = 1;
+                        b.measure = Measure::Agent;
+                        b.ag.sel = 1;
                     }
                     IqLine::Difficulty => iq.toggle_difficulty(),
                     IqLine::Sets => {
