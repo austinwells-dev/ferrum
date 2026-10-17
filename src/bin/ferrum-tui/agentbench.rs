@@ -145,7 +145,10 @@ pub fn installed(dir: &Path, tasks: &[Task]) -> usize {
 }
 
 fn git(args: &[&str], cwd: &Path) -> Result<Vec<u8>, String> {
+    // No background gc or maintenance: it keeps writing into `.git` after
+    // the command returns, and the folder may be deleted right away.
     let out = Command::new("/usr/bin/git")
+        .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
         .args(args)
         .current_dir(cwd)
         .output()
@@ -161,12 +164,38 @@ fn git(args: &[&str], cwd: &Path) -> Result<Vec<u8>, String> {
     }
 }
 
+/// Delete a folder, retrying briefly: something (Spotlight, a lingering
+/// child process) may still be writing into it.
+fn remove_tree(dir: &Path) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..10 {
+        match fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => last = e.to_string(),
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    Err(format!("could not delete {}: {last}", dir.display()))
+}
+
 /// A checkout of `url` at `sha` alone: no other commit is fetched, so the
 /// fix cannot be found in its history.
 fn checkout(url: &str, sha: &str, dir: &Path) -> Result<(), String> {
     fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     git(&["init", "-q"], dir)?;
-    git(&["fetch", "-q", "--depth", "1", url, sha], dir)?;
+    git(
+        &[
+            "fetch",
+            "-q",
+            "--no-auto-maintenance",
+            "--depth",
+            "1",
+            url,
+            sha,
+        ],
+        dir,
+    )?;
     git(&["checkout", "-q", "FETCH_HEAD"], dir)?;
     git(&["config", "user.name", "Ferrum Agent"], dir)?;
     git(&["config", "user.email", "agent@ferrum.invalid"], dir)?;
@@ -174,7 +203,7 @@ fn checkout(url: &str, sha: &str, dir: &Path) -> Result<(), String> {
 }
 
 fn install_task(t: &Task, dir: &Path, progress: &impl Fn(String)) -> Result<(), String> {
-    let _ = fs::remove_dir_all(dir);
+    remove_tree(dir)?;
     progress(format!("{} · fetching {}", t.id, t.source()));
     checkout(&t.repo, &t.base, &dir.join("repo"))?;
     let hidden = dir.join("hidden");
@@ -188,7 +217,7 @@ fn install_task(t: &Task, dir: &Path, progress: &impl Fn(String)) -> Result<(), 
             fs::create_dir_all(to.parent().unwrap_or(&hidden)).map_err(|e| e.to_string())?;
             fs::write(&to, text).map_err(|e| format!("{}: {e}", to.display()))?;
         }
-        fs::remove_dir_all(&fix).map_err(|e| e.to_string())?;
+        remove_tree(&fix)?;
     }
     for (path, text) in &t.hidden {
         let to = hidden.join(path);
@@ -229,10 +258,7 @@ pub fn install(dir: &Path, progress: impl Fn(String), stop: &AtomicBool) -> Resu
 }
 
 pub fn remove(dir: &Path) -> Result<(), String> {
-    if dir.exists() {
-        fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    Ok(())
+    remove_tree(dir)
 }
 
 pub fn spawn_install(dir: PathBuf) -> Result<Installing, String> {
@@ -818,7 +844,19 @@ mod tests {
                 let work = dir.join(format!("{}-{fixed}", t.id));
                 copy_tree(&src.join("repo"), &work).unwrap();
                 if fixed {
-                    git(&["fetch", "-q", "--depth", "1", &t.repo, &t.fix], &work).unwrap();
+                    git(
+                        &[
+                            "fetch",
+                            "-q",
+                            "--no-auto-maintenance",
+                            "--depth",
+                            "1",
+                            &t.repo,
+                            &t.fix,
+                        ],
+                        &work,
+                    )
+                    .unwrap();
                     git(&["checkout", "-q", "FETCH_HEAD", "--", "."], &work).unwrap();
                 }
                 let work = fs::canonicalize(&work).unwrap();
