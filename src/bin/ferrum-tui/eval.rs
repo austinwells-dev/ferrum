@@ -187,17 +187,9 @@ fn parse_item(line: &str) -> Result<Item, String> {
         Some("program") => Check::Program(text("test")?),
         other => return Err(format!("unknown check {other:?}")),
     };
-    let max_tokens = v["max_tokens"].as_u64().map_or(
-        match check {
-            Check::Number(_) => 512,
-            Check::Choice(_) => 128,
-            Check::Literal(_) => 192,
-            Check::Rules(_) => 512,
-            Check::Calls(_) => 256,
-            Check::Program(_) => 768,
-        },
-        |n| n as usize,
-    );
+    let max_tokens = v["max_tokens"]
+        .as_u64()
+        .map_or_else(|| default_budget(&check), |n| n as usize);
     Ok(Item {
         id: text("id")?,
         prompt: text("prompt")?,
@@ -207,6 +199,52 @@ fn parse_item(line: &str) -> Result<Item, String> {
         how: v["how"].as_str().map(str::to_string),
     })
 }
+
+/// Answer tokens for an item without its own `max_tokens`. Rules and calls
+/// get room for the answer they ask for: 1.6 tokens per required word (80 per
+/// required paragraph) and about 3 characters per token of the expected calls.
+/// Changing these changes the scores, so bump `BUDGETS` with them.
+fn default_budget(check: &Check) -> usize {
+    match check {
+        Check::Number(_) => 512,
+        Check::Choice(_) => 128,
+        Check::Literal(_) => 192,
+        Check::Rules(rules) => {
+            let need = rules
+                .iter()
+                .map(|r| match r {
+                    Rule::Words { less: false, n } => n * 8 / 5,
+                    Rule::Paragraphs(n) => n * 80,
+                    _ => 0,
+                })
+                .max()
+                .unwrap_or(0);
+            (need + 160).max(512)
+        }
+        Check::Calls(calls) => {
+            let need: usize = calls
+                .iter()
+                .map(|c| {
+                    let args: Map<String, Json> = c
+                        .args
+                        .iter()
+                        .filter_map(|(k, v)| {
+                            let first = v.as_array()?.first()?;
+                            (first != "").then(|| (k.clone(), first.clone()))
+                        })
+                        .collect();
+                    json!({"name": c.name, "arguments": args}).to_string().len() / 3 + 24
+                })
+                .sum();
+            (need + 64).max(256)
+        }
+        Check::Program(_) => 768,
+    }
+}
+
+/// Folded into `Suite::fingerprint`, so results scored under other answer
+/// budgets are marked as older. v2: budgets derived from rules and calls.
+const BUDGETS: &str = "answer budgets v2";
 
 /// One rule from IFEval's `instruction_id` plus its kwargs, flattened.
 fn parse_rule(v: &Json) -> Result<Rule, String> {
@@ -927,6 +965,7 @@ impl Suite {
                 dir.display()
             ));
         }
+        all.push_str(BUDGETS);
         Ok(Suite {
             sets,
             fingerprint: format!("{:016x}", fingerprint(&all)),
@@ -1366,6 +1405,31 @@ mod tests {
 
     fn rule(json: Json) -> Rule {
         parse_rule(&json).unwrap()
+    }
+
+    #[test]
+    fn budgets_fit_the_answer_asked_for() {
+        let items = parse_items(
+            r#"{"id":"long","cat":"i","prompt":"p","check":"rules","rules":[{"id":"length_constraints:number_words","relation":"at least","num_words":400},{"id":"startend:quotation"}]}
+{"id":"short","cat":"i","prompt":"p","check":"rules","rules":[{"id":"length_constraints:number_words","relation":"less than","num_words":400}]}
+{"id":"paras","cat":"i","prompt":"p","check":"rules","rules":[{"id":"length_constraints:number_paragraphs","num_paragraphs":8}]}
+{"id":"set","cat":"i","prompt":"p","check":"rules","rules":[{"id":"length_constraints:number_words","relation":"at least","num_words":400}],"max_tokens":300}
+{"id":"one","cat":"t","prompt":"p","check":"calls","calls":[{"name":"f","args":{"x":[1]}}]}"#,
+        )
+        .unwrap();
+        let budget: Vec<usize> = items.iter().map(|i| i.max_tokens).collect();
+        assert!(budget[0] > 640, "400 words need more than 640 tokens");
+        assert_eq!(budget[0], 400 * 8 / 5 + 160);
+        assert_eq!(budget[1], 512, "a word limit asks for nothing extra");
+        assert_eq!(budget[2], 8 * 80 + 160);
+        assert_eq!(budget[3], 300, "an item's own max_tokens wins");
+        assert_eq!(budget[4], 256);
+        // Eight calls with long arguments outgrow the 256-token floor.
+        let call = r#"{"name":"weather.forecast_for_city","args":{"city":["San Francisco, California"],"days":[14],"units":["metric",""]}}"#;
+        let calls = [call; 8].join(",");
+        let line =
+            format!(r#"{{"id":"many","cat":"t","prompt":"p","check":"calls","calls":[{calls}]}}"#);
+        assert!(parse_items(&line).unwrap()[0].max_tokens > 400);
     }
 
     #[test]
