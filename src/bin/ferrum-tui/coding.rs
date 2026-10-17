@@ -62,6 +62,9 @@ impl Proc {
     fn kill(&mut self) {
         let _ = Command::new("/bin/kill")
             .args(["-KILL", &format!("-{}", self.child.id())])
+            // The group may be gone already: keep kill's complaint off the screen.
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
         let _ = self.child.kill();
         let _ = self.child.wait();

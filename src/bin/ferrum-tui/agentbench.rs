@@ -532,8 +532,12 @@ fn attempt(
         let c = &r.completion;
         generated += c.tokens.len();
         prompt += c.prompt_tokens.saturating_sub(c.reused_tokens);
+        // Paths inside the workspace read better relative to it.
+        let root = work.display().to_string();
         let last = match r.output.tool_calls.first() {
-            Some(call) => crate::agent::summary(&call.name, &call.arguments),
+            Some(call) => crate::agent::summary(&call.name, &call.arguments)
+                .replace(&format!("{root}/"), "")
+                .replace(&root, "."),
             None => "answered".into(),
         };
         send(AgentEvent::Turn {

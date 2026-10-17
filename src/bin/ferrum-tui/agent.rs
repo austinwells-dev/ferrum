@@ -450,6 +450,9 @@ impl Sandbox {
                 killed = true;
                 let _ = Command::new("/bin/kill")
                     .args(["-KILL", &format!("-{}", child.id())])
+                    // The group may be gone already: keep kill's complaint off the screen.
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
                     .status();
                 let _ = child.kill();
                 let _ = child.wait();
@@ -462,6 +465,9 @@ impl Sandbox {
         if !killed {
             let _ = Command::new("/bin/kill")
                 .args(["-KILL", &format!("-{}", child.id())])
+                // The group may be gone already: keep kill's complaint off the screen.
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .status();
         }
         // Whatever escaped the group may still hold the pipe; stop waiting soon.

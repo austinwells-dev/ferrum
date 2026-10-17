@@ -706,13 +706,16 @@ impl App {
         if let Some((task, turn, generated, prompt, last)) = &ag.current {
             let id = ag.tasks.get(*task).map_or("", |t| t.id.as_str());
             lines.push(Line::styled(
-                format!(
-                    " {id} · reply {turn}/{} · {} generated · {} read · {} of {} min",
-                    agentbench::MAX_TURNS,
-                    kilo(*generated),
-                    kilo(*prompt),
-                    duration(ag.task_started.elapsed().as_secs_f64()),
-                    agentbench::TASK_LIMIT.as_secs() / 60
+                clip(
+                    &format!(
+                        " {id} · reply {turn}/{} · {} generated · {} read · {} of {} min",
+                        agentbench::MAX_TURNS,
+                        kilo(*generated),
+                        kilo(*prompt),
+                        duration(ag.task_started.elapsed().as_secs_f64()),
+                        agentbench::TASK_LIMIT.as_secs() / 60
+                    ),
+                    width,
                 ),
                 Style::new().fg(TEXT),
             ));
