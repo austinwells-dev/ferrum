@@ -5,11 +5,34 @@ ferrum-tui                 # or: ferrum-tui MODEL.gguf
 alias ferrum=ferrum-tui    # optional
 ```
 
-After a short startup animation, the home screen offers **Chat**, **Agents**, **Serve**, **Benchmark** and **Settings**. Choosing Chat, Agents or Serve lists your saved **favorites** (a model, its settings and an optional drafter), along with **New setup** (saved as a favorite when you launch it) and **One-time run**.
+After a short startup animation, Ferrum opens on **Home**: one button per tab. The tabs run along the top of every screen: **1 Home**, **2 Chat**, **3 Agents**, **4 Serve**, **5 Bench**, **6 Models** and **7 Settings**. Press a number to switch tabs, `?` to list the keys of the current screen, and ctrl-p for a command palette. Changing tabs never stops anything: a loaded chat model, a running server and a benchmark run all keep going, and the right end of the tab bar names the model that is loaded (by a chat, an agent, the server or a benchmark run), what it is doing right now (thinking, writing, running a tool, the benchmark task or question it is on, with the newest words it wrote), and how much memory the models hold.
 
-Ferrum looks for models in the current folder, `./models`, `~/models`, `~/Downloads`, the Hugging Face cache and LM Studio's folders. You can add more folders in Settings. Models, quants and drafters that Ferrum can't run are greyed out with the reason, for example an unsupported architecture or a drafter whose hidden size doesn't match the model.
+Chat, Agents and Serve show your saved **favorites** (a model, its settings and an optional drafter), along with **New setup** (saved as a favorite when you launch it) and **One-time run**. The preview beside the list shows the setup's settings, how its model measured on this Mac and the exact command. Once a session or the server is running, its tab shows that instead. Only one model is loaded at a time: launching something else (a chat, an agent, the server or a benchmark) while a model is loaded asks you to press the key again to unload the first.
+
+Ferrum looks for models in the current folder, `./models`, `~/models`, `~/Downloads`, the Hugging Face cache and LM Studio's folders. You can add more folders in Settings. **Models** lists every file it found in one table with its quant, size, architecture, context, vision support, the drafters that fit it, and its best speed, intelligence and agent results on this Mac (`o` changes the sort). Files Ferrum can't run stay listed with the reason, such as an unsupported architecture. From the table, `enter` starts a chat with the model, `a` an agent, `s` a server and `b` a benchmark.
 
 Type `/help` in any chat for the full command list.
+
+## Layout
+
+Every screen fills the window with panes, and one pane in each split takes whatever room the others leave, so no rows go unused. On a narrow window (under 100 columns by default) the panes stack, and Bench shows one group at a time (`tab` moves between them).
+
+`[` and `]` move the split on the current screen, and the setting is kept. **Settings › Layout** holds the same sizes and a few more:
+
+| Setting | What it changes |
+|---|---|
+| Setup list width | the list's share of the width in Chat, Agents and Serve |
+| Bench setup column | the setup and queue column's share on Bench |
+| Serve endpoint column | the endpoint column's share beside the server log |
+| Models table height | the most of the height the model table takes |
+| Chat side panel | `auto` (from 110 columns), `always` or `off`; ctrl-b toggles it in a session |
+| Side panel width | columns of the chat and agent side panel |
+| Chat text width | where chat prose wraps; the conversation pane itself always fills |
+| One pane group below | the width under which screens stack their panes |
+
+They are saved in `~/.config/ferrum/tui.json` under `layout`. The key bar lists the keys for whatever is selected, and messages appear at its right end. Settings, the setup editor and Bench pin a short explanation of the selected row at the bottom of their pane.
+
+In a chat, typing goes to the message box. Esc on an empty box hands the keys to the conversation: ↑↓ scroll, the number keys switch tabs, and typing goes back to the box. ctrl-d there unloads the model.
 
 Each setup's **Model** group has *Context* and *KV cache*. *KV cache* `q8` stores the attention cache in 8 bits, which nearly halves its memory (so `auto` context grows) and speeds up long conversations; `f16` (the default) is exact. It applies to Chat, Agents, Serve and the Benchmark tab, and is saved with favorites. See [K/V cache format](server.md#kv-cache-format).
 
@@ -109,11 +132,11 @@ Every chat and agent session is saved after each reply to `~/.config/ferrum/sess
 
 ## Serve
 
-Serve starts `ferrum-server` with the chosen setup and shows its endpoint, health and live log. See the [server guide](server.md).
+Serve starts `ferrum-server` with the chosen setup and shows its endpoint, routes and live log, with a traffic chart of each request's decode speed. The server keeps running on other tabs; `x` twice stops it. See the [server guide](server.md).
 
 ## Benchmark
 
-The Benchmark tab measures a model on *this* Mac. *Measure* cycles through **speed** (below), which finds the fastest speculative-decoding setup; **intelligence** ([Measuring intelligence](#measuring-intelligence)), which scores answers to question sets; and **agent** ([Measuring agentic coding](#measuring-agentic-coding)), which has the coding agent fix real bugs.
+The Bench tab measures a model on *this* Mac. Every measure uses the same frame: the setup and its queue on the left, a chart and a table of rows filling the rest, and notes on the marks in a third column on windows 170 columns or wider. `m` (or the *Measure* row) cycles through **speed** (below), which finds the fastest speculative-decoding setup; **intelligence** ([Measuring intelligence](#measuring-intelligence)), which scores answers to question sets; and **agent** ([Measuring agentic coding](#measuring-agentic-coding)), which has the coding agent fix real bugs.
 
 1. Pick a model. The tab lists plain decoding, the model's MTP head (if the GGUF has a usable one) and every compatible drafter it can find. Compatibility is checked by hidden size, layer count and vocabulary.
 2. Each drafter is loaded once, and its draft depth is swept (`quick` tries a few depths, `full` tries every depth). The tab measures greedy decode speed on three prompts (code, prose and structured data) and the mean number of tokens accepted per verify step.
@@ -155,6 +178,8 @@ Press `c` in the intelligence setup or results to open **Compare**: every saved 
 
 These are public benchmarks that models may have seen in training. Use the scores to compare models and settings on this Mac, not as leaderboard numbers.
 
+While the test runs, the category chart shrinks to one line per category and a live feed fills the rest of the tab: each question as it is asked (long-context questions show their first and last lines), the model's thinking and answer as they stream, and whether the answer was graded right, with the answer the grader read. The feed keeps roughly the last 200,000 characters.
+
 ### Measuring agentic coding
 
 Set *Measure* to `agent` to see how well a model works as a coding agent. This is a separate measurement from intelligence. There are ten tasks, each a real merged bug-fix pull request from a small open-source project with no dependencies: seven in Python (Python-Markdown, more-itertools, tomli, simplejson, idna) and three in Rust (semver, humantime, bstr). For each task:
@@ -167,4 +192,4 @@ Each task was checked to fail before its fix and pass after it.
 
 Select *Tasks* and press Enter to install them: this clones each repository at its commit with `git`, and for Rust runs `cargo fetch` so the tests can run offline. They go into `~/.config/ferrum/agent` (or `$FERRUM_AGENT_DIR`). Pressing Enter twice removes them. The tasks need `git`, `python3` and `cargo`. *Thinking* and *Drafter* work as for intelligence. The agent runs with a 64K context, or 32K when that does not fit.
 
-The result is the number of tasks solved, plus what they cost: tokens generated (thinking included), prompt tokens read (not counting ones reused from the cache), replies and time, per task and in total. **Generated tokens per solved task** is the efficiency figure. Two models that solve the same number of tasks are told apart by it. Complete runs are saved in `~/.config/ferrum/agent.json`, the newest per model and setup. The setup and results screens list every saved run, most tasks solved first, then fewest generated tokens. A full run takes from minutes to several hours, depending on the model.
+The result is the number of tasks solved, plus what they cost: tokens generated (thinking included), prompt tokens read (not counting ones reused from the cache), replies and time, per task and in total. **Generated tokens per solved task** is the efficiency figure. Two models that solve the same number of tasks are told apart by it. Each task's transcript is saved in `~/.config/ferrum/agent-runs/<run>/<task>.json`: the whole conversation (replies, thinking, tool calls and their output), the agent's changes as a diff, and the test output. While the run goes on, the task tiles shrink to one line each and the rest of the tab shows a live feed of the current task: the model's thinking (dimmed behind a `┊`), its replies as they stream, and each tool call with whether it worked and the first lines of its output. On the results screen, `↑`/`↓` pick a finished task and Enter opens its transcript. That is where to look for why a task failed: a loop, a wrong guess, or a fix that was nearly right. Complete runs are saved in `~/.config/ferrum/agent.json`, the newest per model and setup. The setup and results screens list every saved run, most tasks solved first, then fewest generated tokens. Press `c` on either screen for **Compare**. It shows one column per run with the tasks it solved, and under it the model, thinking and drafter, tokens per solved task and time. Below the columns is a grid of ✓/✗ per task, lined up with them, which shows exactly which tasks separate two models. It uses the full width on wide screens. `←`/`→` pick a run, `t` filters by thinking, and pressing `x` twice deletes every saved agent run. A full run takes from minutes to several hours, depending on the model.

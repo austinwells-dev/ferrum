@@ -8,6 +8,12 @@ pub const FAINT: Color = Color::Rgb(70, 70, 86);
 pub const GOOD: Color = Color::Rgb(124, 220, 164);
 pub const BAD: Color = Color::Rgb(255, 104, 104);
 pub const SELECTED: Color = Color::Rgb(38, 33, 31);
+/// The selected row of a pane that is not focused.
+pub const SELECTED_DIM: Color = Color::Rgb(30, 27, 27);
+/// Behind a key name in the footer.
+pub const KEYCAP: Color = Color::Rgb(46, 40, 38);
+/// The empty part of a bar.
+pub const TRACK: Color = Color::Rgb(28, 28, 36);
 
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")

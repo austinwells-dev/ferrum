@@ -1,4 +1,6 @@
-//! The coding agent's sidebar: project, plan, files, processes and context.
+//! The panels beside a conversation: the coding agent's (project, plan,
+//! files, processes, context) and a chat's (model, settings, last reply).
+use crate::chat::Role;
 use crate::coding::{TodoState, Touch};
 use crate::*;
 
@@ -111,31 +113,7 @@ impl App {
         }
 
         lines.push(head("CONTEXT"));
-        match chat.ctx_use() {
-            Some((used, cap)) => {
-                let ratio = (used as f64 / cap.max(1) as f64).clamp(0.0, 1.0);
-                let bar_w = w.saturating_sub(10).clamp(6, 24);
-                let filled = (ratio * bar_w as f64).round() as usize;
-                let color = if ratio > 0.8 {
-                    BAD
-                } else if ratio > 0.55 {
-                    GOLD
-                } else {
-                    GOOD
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(" ", dim),
-                    Span::styled("█".repeat(filled), Style::new().fg(color)),
-                    Span::styled("░".repeat(bar_w - filled), Style::new().fg(FAINT)),
-                    Span::styled(format!(" {:.0}%", ratio * 100.0), Style::new().fg(color)),
-                ]));
-                lines.push(Line::styled(format!(" {used} / {cap} tokens"), dim));
-            }
-            None => lines.push(Line::styled(
-                " shown after each reply",
-                Style::new().fg(FAINT),
-            )),
-        }
+        lines.extend(context_lines(chat, w));
         if let Ok(g) = &shared
             && (g.store.saved > 0 || g.evicted > 0 || g.compactions > 0)
         {
@@ -156,6 +134,135 @@ impl App {
         let lines: Vec<Line> = lines.into_iter().map(|l| fit(l, w)).collect();
         f.render_widget(Paragraph::new(lines), inner);
     }
+
+    /// A chat's panel: what is loaded, how it is set, how the last reply went.
+    pub fn draw_chat_side(&self, f: &mut Frame, area: Rect, chat: &Chat) {
+        let block = panel("Session", false);
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        let w = inner.width as usize;
+        let head = |s: &str| {
+            Line::styled(
+                format!(" {s}"),
+                Style::new().fg(DIM).add_modifier(Modifier::BOLD),
+            )
+        };
+        let dim = Style::new().fg(DIM);
+        let text = Style::new().fg(TEXT);
+        let row = |k: &str, v: String, style: Style| {
+            Line::from(vec![
+                Span::styled(format!(" {k:<10}"), dim),
+                Span::styled(v, style),
+            ])
+        };
+        let mut lines: Vec<Line> = Vec::new();
+        lines.push(head("MODEL"));
+        match &chat.info {
+            Some(i) => {
+                lines.push(Line::styled(
+                    format!(" {}", i.name),
+                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
+                ));
+                lines.push(row(
+                    "weights",
+                    format!("{:.1} GiB · loaded in {:.1}s", i.weights_gib, i.load_secs),
+                    text,
+                ));
+                lines.push(row("sampling", i.sampling.clone(), text));
+            }
+            None => lines.push(Line::styled(format!(" {}", chat.label), text)),
+        }
+        lines.push(Line::default());
+        lines.push(head("SETTINGS"));
+        let on_off = |b: bool| if b { "on" } else { "off" };
+        lines.push(row(
+            "thinking",
+            format!(
+                "{}{}",
+                on_off(chat.think),
+                if chat.think && !chat.show_thinking {
+                    " · hidden"
+                } else {
+                    ""
+                }
+            ),
+            text,
+        ));
+        if let Some(i) = &chat.info {
+            lines.push(match &i.drafter {
+                Some(d) => row("drafter", format!("⚡ {d}"), Style::new().fg(GOLD)),
+                None => row("drafter", "off".into(), Style::new().fg(FAINT)),
+            });
+            lines.push(match &i.vision {
+                Some(_) => row("vision", "👁 images supported".into(), text),
+                None => row("vision", "text only".into(), Style::new().fg(FAINT)),
+            });
+        }
+        lines.push(row("tools", chat.tools.label().into(), text));
+        lines.push(Line::default());
+
+        let stats = chat.turns.iter().rev().find_map(|t| t.stats.as_deref());
+        lines.push(head("LAST REPLY"));
+        match stats {
+            Some(st) => {
+                let mut parts = st.split(" · ");
+                if let Some(speed) = parts.next() {
+                    lines.push(Line::styled(
+                        format!(" {speed}"),
+                        Style::new().fg(GOOD).add_modifier(Modifier::BOLD),
+                    ));
+                }
+                for p in parts {
+                    lines.push(Line::styled(format!(" {p}"), text));
+                }
+            }
+            None => lines.push(Line::styled(
+                " speed and tokens appear here",
+                Style::new().fg(FAINT),
+            )),
+        }
+        lines.push(Line::default());
+        let asked = chat.turns.iter().filter(|t| t.role == Role::User).count();
+        lines.push(head(&format!(
+            "CONTEXT  {asked} message{}",
+            if asked == 1 { "" } else { "s" }
+        )));
+        lines.extend(context_lines(chat, w));
+        let lines: Vec<Line> = lines.into_iter().map(|l| fit(l, w)).collect();
+        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+/// How full the context window is: a bar and the token counts.
+fn context_lines(chat: &Chat, w: usize) -> Vec<Line<'static>> {
+    let dim = Style::new().fg(DIM);
+    let mut lines = Vec::new();
+    match chat.ctx_use() {
+        Some((used, cap)) => {
+            let ratio = (used as f64 / cap.max(1) as f64).clamp(0.0, 1.0);
+            let bar_w = w.saturating_sub(10).clamp(6, 24);
+            let filled = (ratio * bar_w as f64).round() as usize;
+            let color = if ratio > 0.8 {
+                BAD
+            } else if ratio > 0.55 {
+                GOLD
+            } else {
+                GOOD
+            };
+            lines.push(Line::from(vec![
+                Span::styled(" ", dim),
+                Span::styled("█".repeat(filled), Style::new().fg(color)),
+                Span::styled("░".repeat(bar_w - filled), Style::new().fg(FAINT)),
+                Span::styled(format!(" {:.0}%", ratio * 100.0), Style::new().fg(color)),
+            ]));
+            lines.push(Line::styled(format!(" {used} / {cap} tokens"), dim));
+        }
+        None => lines.push(Line::styled(
+            " shown after each reply",
+            Style::new().fg(FAINT),
+        )),
+    }
+    lines
 }
 
 /// Cut a line to `width` columns, ending in an ellipsis, so nothing is clipped mid-word by the border.

@@ -1,4 +1,5 @@
 //! "Chat" / "Serve": choose a favorite, build a new setup, or run one once.
+use crate::layout;
 use crate::*;
 
 #[derive(Clone, Copy, PartialEq)]
@@ -43,10 +44,8 @@ impl App {
         let entry = entries[self.pick_sel];
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => self.pick_sel = self.pick_sel.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.pick_sel = (self.pick_sel + 1).min(last)
-            }
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => self.go_home(),
+            KeyCode::Down | KeyCode::Char('j') => self.pick_sel = (self.pick_sel + 1).min(last),
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left => self.go_tab(Tab::Home),
             KeyCode::Char('n') => self.open_editor(self.mode, Origin::Custom),
             KeyCode::Char('o') => self.open_editor(self.mode, Origin::OneTime),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char(' ') => match entry {
@@ -111,74 +110,53 @@ impl App {
         }
     }
 
-    pub fn draw_pick(&self, f: &mut Frame) {
-        let [head, body, footer] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(8),
-            Constraint::Length(1),
-        ])
-        .areas(f.area());
-        header(
-            f,
-            head,
-            &[self.mode.label(), "choose a setup"],
-            vec![pill(self.mode.pill(), EMBER)],
-        );
-        let [list, preview] =
-            Layout::horizontal([Constraint::Percentage(46), Constraint::Percentage(54)])
-                .areas(body);
-
+    pub fn draw_pick(&self, f: &mut Frame, body: Rect, footer: Rect) {
         let entries = self.pick_entries();
         let sel = self.pick_sel.min(entries.len() - 1);
-        let block = panel("Setups", true);
-        let inner = block.inner(list);
-        f.render_widget(block, list);
-        let width = inner.width as usize;
-        let mut lines: Vec<Line> = Vec::new();
-        let mut sel_line = 0;
+        let (list, side) = layout::columns(body, self.prefs.setups, 40, 50, self.prefs.compact);
+        let width = inner_w(list);
         let fav_count = entries
             .iter()
             .filter(|e| matches!(e, Entry::Fav(_)))
             .count();
-        let heading = |s: &str| {
-            Line::styled(
-                format!("  {s}"),
-                Style::new().fg(DIM).add_modifier(Modifier::BOLD),
-            )
-        };
-        lines.push(heading("FAVORITES"));
+        let mut lines: Vec<Line> = Vec::new();
+        let mut sel_line = 0;
+        lines.push(layout::heading_note(
+            "favorites",
+            &fav_count.to_string(),
+            width,
+        ));
         if fav_count == 0 {
             lines.push(Line::styled(
-                "  none yet · create one with New setup",
+                "  none yet · n makes one",
                 Style::new().fg(FAINT),
             ));
         }
         for (n, entry) in entries.iter().enumerate() {
             if *entry == Entry::Custom {
                 lines.push(Line::default());
-                lines.push(heading("OTHER"));
+                lines.push(layout::heading("new"));
             }
             let on = n == sel;
-            let bg = if on { SELECTED } else { Color::Reset };
-            let bar = Span::styled(
-                if on { " ▌ " } else { "   " },
-                Style::new().fg(EMBER).bg(bg),
-            );
-            let (title, sub, tail, bad) = match entry {
+            if on {
+                sel_line = lines.len();
+            }
+            match entry {
                 Entry::Fav(i) => {
                     let fav = &self.favs[*i];
                     let model = self.fav_model(fav);
-                    let sub = match model {
+                    let (sub, bad) = match model {
                         Some(m) => match &m.problem {
                             Some(why) => (format!("✗ {why}"), true),
                             None => (
                                 format!(
-                                    "{}{}",
-                                    m.name,
+                                    "{} · {}{}",
+                                    gib(m.size),
+                                    fav.mode.key(),
                                     fav.values
                                         .get("context")
                                         .and_then(|v| v.as_str())
-                                        .map(|c| format!(" · ctx {c}"))
+                                        .map(|c| format!(" · context {c}"))
                                         .unwrap_or_default()
                                 ),
                                 false,
@@ -186,125 +164,160 @@ impl App {
                         },
                         None => ("✗ model file not found".to_string(), true),
                     };
-                    (
-                        format!("★ {}", fav.name),
-                        sub.0,
-                        self.drafter_badge(fav),
-                        sub.1,
-                    )
+                    let speed = model
+                        .and_then(|m| {
+                            self.dashboard()
+                                .speed_of(&m.path.display().to_string())
+                                .map(|s| format!("{:.2}×", s.speedup))
+                        })
+                        .unwrap_or_default();
+                    let badge = self.drafter_badge(fav);
+                    let tail = format!(
+                        "{badge}{}{speed} ",
+                        if speed.is_empty() { "" } else { "  " }
+                    );
+                    let name_w = width.saturating_sub(text_width(&tail) + 4);
+                    lines.push(layout::list_row(
+                        on,
+                        true,
+                        width,
+                        vec![
+                            Span::styled(" ★ ", Style::new().fg(GOLD)),
+                            Span::styled(
+                                layout::fit_w(&fav.name, name_w),
+                                Style::new()
+                                    .fg(if on { Color::White } else { TEXT })
+                                    .add_modifier(if on {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(badge.clone(), Style::new().fg(GOLD)),
+                            Span::styled(
+                                format!("{}{speed} ", if speed.is_empty() { "" } else { "  " }),
+                                Style::new().fg(GOOD).add_modifier(Modifier::BOLD),
+                            ),
+                        ],
+                    ));
+                    lines.push(layout::list_row(
+                        on,
+                        true,
+                        width,
+                        vec![Span::styled(
+                            format!("   {}", clip(&sub, width.saturating_sub(5))),
+                            Style::new().fg(if bad { BAD } else { DIM }),
+                        )],
+                    ));
                 }
-                Entry::Custom => (
-                    "＋ New setup".to_string(),
-                    "pick a model and settings, saved as a favorite".to_string(),
-                    String::new(),
-                    false,
-                ),
-                Entry::OneTime => (
-                    "▷ One-time run".to_string(),
-                    "configure and launch without saving".to_string(),
-                    String::new(),
-                    false,
-                ),
-            };
-            if on {
-                sel_line = lines.len();
+                Entry::Custom | Entry::OneTime => {
+                    let (title, what) = if *entry == Entry::Custom {
+                        ("+ New setup", "saved as a favorite when you launch it")
+                    } else {
+                        ("▷ One-time run", "your last settings, nothing saved")
+                    };
+                    lines.push(layout::list_row(
+                        on,
+                        true,
+                        width,
+                        vec![
+                            Span::styled(
+                                format!(" {title}  "),
+                                Style::new()
+                                    .fg(if on { Color::White } else { TEXT })
+                                    .add_modifier(if on {
+                                        Modifier::BOLD
+                                    } else {
+                                        Modifier::empty()
+                                    }),
+                            ),
+                            Span::styled(
+                                clip(what, width.saturating_sub(text_width(title) + 5)),
+                                Style::new().fg(FAINT),
+                            ),
+                        ],
+                    ));
+                }
             }
-            let name_w = width.saturating_sub(tail.chars().count() + 5);
-            lines.push(Line::from(vec![
-                bar.clone(),
-                Span::styled(
-                    format!("{:<name_w$}", clip(&title, name_w)),
-                    Style::new()
-                        .fg(if on { Color::White } else { TEXT })
-                        .bg(bg)
-                        .add_modifier(if on {
-                            Modifier::BOLD
-                        } else {
-                            Modifier::empty()
-                        }),
-                ),
-                Span::styled(format!(" {tail} "), Style::new().fg(GOLD).bg(bg)),
-            ]));
-            lines.push(Line::from(vec![
-                bar,
-                Span::styled(
-                    format!(
-                        "{:<w$}",
-                        clip(&sub, width.saturating_sub(5)),
-                        w = width.saturating_sub(5)
-                    ),
-                    Style::new().fg(if bad { BAD } else { DIM }).bg(bg),
-                ),
-                Span::styled("  ", Style::new().bg(bg)),
-            ]));
         }
-        let h = inner.height as usize;
-        let top = (sel_line + 2).saturating_sub(h);
-        f.render_widget(
-            Paragraph::new(lines.into_iter().skip(top).take(h).collect::<Vec<_>>()),
-            inner,
-        );
-
+        // Side by side, or stacked: the list takes what it needs (up to
+        // half) and the preview the rest.
+        let (list, preview) = match side {
+            Some(side) => (list, side),
+            None => {
+                let h = (lines.len() as u16 + 2).clamp(6, list.height / 2);
+                let [top, bottom] =
+                    Layout::vertical([Constraint::Length(h), Constraint::Min(4)]).areas(list);
+                (top, bottom)
+            }
+        };
+        let title = match self.mode {
+            Mode::Chat => "Chat setups",
+            Mode::Agent => "Agent setups",
+            Mode::Serve => "Server setups",
+        };
+        let inner = layout::pane(f, list, title, true, "");
+        layout::show(f, inner, lines, Some(sel_line + 1));
         self.draw_preview(f, preview, entries[sel]);
         let keys: &[(&str, &str)] = match entries[sel] {
             Entry::Fav(_) => &[
-                ("↑↓", "move"),
-                ("enter", "run"),
+                ("↑↓", "choose"),
+                ("enter", "launch"),
                 ("e", "edit"),
                 ("x", "delete"),
                 ("n", "new"),
                 ("o", "one-time"),
-                ("esc", "back"),
+                ("[ ]", "resize"),
             ],
             _ => &[
-                ("↑↓", "move"),
+                ("↑↓", "choose"),
                 ("enter", "open"),
                 ("n", "new"),
                 ("o", "one-time"),
-                ("esc", "back"),
             ],
         };
-        keys_footer(f, footer, keys, &self.status);
+        self.footer(f, footer, keys);
     }
 
     fn draw_preview(&self, f: &mut Frame, area: Rect, entry: Entry) {
-        let block = panel("Preview", false);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let w = inner.width as usize;
+        let w = inner_w(area);
         let dim = Style::new().fg(DIM);
         let mut lines: Vec<Line> = Vec::new();
+        let title = match entry {
+            Entry::Fav(i) => self.favs[i].name.clone(),
+            Entry::Custom => "New setup".into(),
+            Entry::OneTime => "One-time run".into(),
+        };
         match entry {
             Entry::Fav(i) => {
                 let fav = &self.favs[i];
-                lines.push(Line::styled(
-                    format!(" ★ {}", fav.name),
-                    Style::new().fg(GOLD).add_modifier(Modifier::BOLD),
-                ));
-                match self.fav_model(fav) {
+                let model = self.fav_model(fav);
+                match model {
                     Some(m) => {
-                        lines.push(Line::styled(
-                            format!(" {}", clip(&m.name, w.saturating_sub(2))),
-                            Style::new().fg(TEXT),
+                        lines.push(layout::kv(
+                            "model",
+                            format!("{} · {}", m.name, gib(m.size)),
+                            Style::new().fg(Color::White),
+                            10,
                         ));
-                        match &m.problem {
-                            Some(why) => lines.push(Line::styled(
-                                format!(" ✗ can't run: {}", clip(why, w.saturating_sub(14))),
+                        if let Some(why) = &m.problem {
+                            lines.push(layout::kv(
+                                "status",
+                                format!("✗ can't run: {why}"),
                                 Style::new().fg(BAD),
-                            )),
-                            None => lines.push(Line::styled(
-                                format!(" {} · ✓ supported", gib(m.size)),
-                                Style::new().fg(GOOD),
-                            )),
+                                10,
+                            ));
                         }
                     }
-                    None => lines.push(Line::styled(
-                        " ✗ model file not found",
+                    None => lines.push(layout::kv(
+                        "model",
+                        "✗ model file not found".into(),
                         Style::new().fg(BAD),
+                        10,
                     )),
                 }
                 lines.push(Line::default());
-                lines.push(Line::styled(" SETTINGS", dim.add_modifier(Modifier::BOLD)));
+                lines.push(layout::heading("settings"));
                 let mut any = false;
                 for fl in &self.fields {
                     let in_scope = fl.scope.applies(fav.mode);
@@ -325,69 +338,88 @@ impl App {
                         v.to_string()
                     };
                     lines.push(Line::from(vec![
-                        Span::styled(format!("  {:<20}", fl.label), dim),
-                        Span::styled(clip(&shown, w.saturating_sub(24)), Style::new().fg(EMBER)),
+                        Span::styled(format!(" {:<20}", fl.label), dim),
+                        Span::styled(clip(&shown, w.saturating_sub(22)), Style::new().fg(EMBER)),
                     ]));
                 }
                 if !any {
                     lines.push(Line::styled(
-                        "  defaults for everything",
+                        " defaults for everything",
                         Style::new().fg(FAINT),
                     ));
                 }
+                if let Some(m) = model {
+                    lines.push(Line::default());
+                    lines.extend(self.measured_lines(&m.path.display().to_string(), w));
+                }
                 lines.push(Line::default());
-                lines.push(Line::styled(" COMMAND", dim.add_modifier(Modifier::BOLD)));
-                let (bin, args) = self.command_for(
-                    fav.mode,
-                    self.fav_model(fav).map(|m| m.path.as_path()),
-                    &|k| {
+                lines.push(layout::heading("command"));
+                let (bin, args) =
+                    self.command_for(fav.mode, model.map(|m| m.path.as_path()), &|k| {
                         fav.values
                             .get(k)
                             .and_then(|v| v.as_str())
                             .unwrap_or("")
                             .to_string()
-                    },
-                );
-                let mut spans = vec![Span::styled(format!(" {bin}"), Style::new().fg(GOOD))];
-                for a in &args {
-                    spans.push(if a.starts_with('-') {
-                        Span::styled(format!(" {a}"), Style::new().fg(GOLD))
-                    } else {
-                        Span::styled(format!(" {}", shell_quote(a)), Style::new().fg(TEXT))
                     });
-                }
-                lines.push(Line::from(spans));
+                lines.extend(command_lines(bin, &args, w));
             }
             Entry::Custom => {
-                lines.push(Line::styled(
-                    " ＋ New setup",
-                    Style::new().fg(GOLD).add_modifier(Modifier::BOLD),
+                lines.extend(layout::wrapped(
+                    "Start from the defaults: pick a model, tune sampling and reasoning, add a DSpark, DFlash or MTP drafter. When you launch you name it, and it is kept here as a favorite.",
+                    1,
+                    w,
+                    Style::new().fg(TEXT),
                 ));
                 lines.push(Line::default());
-                for s in [
-                    "Start from the defaults: pick a model, tune",
-                    "sampling and reasoning, add a DSpark / DFlash",
-                    "drafter. When you launch you'll name it and it",
-                    "is saved here as a favorite.",
-                ] {
-                    lines.push(Line::styled(format!(" {s}"), Style::new().fg(TEXT)));
-                }
+                lines.extend(layout::wrapped(
+                    "Bench › speed finds the fastest drafter for a model and can save it as a favorite for you.",
+                    1,
+                    w,
+                    Style::new().fg(DIM),
+                ));
             }
             Entry::OneTime => {
-                lines.push(Line::styled(
-                    " ▷ One-time run",
-                    Style::new().fg(GOLD).add_modifier(Modifier::BOLD),
+                lines.extend(layout::wrapped(
+                    "Starts from the settings you used last, lets you change anything, and launches without saving a favorite.",
+                    1,
+                    w,
+                    Style::new().fg(TEXT),
                 ));
-                lines.push(Line::default());
-                for s in [
-                    "Starts from the settings you used last, lets you",
-                    "change anything, and launches without saving a",
-                    "favorite.",
-                ] {
-                    lines.push(Line::styled(format!(" {s}"), Style::new().fg(TEXT)));
-                }
             }
         }
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+        let inner = layout::pane(f, area, &title, false, "");
+        f.render_widget(Paragraph::new(lines), inner);
     }
+}
+
+/// A command one flag per line, each continued with a backslash, so it reads
+/// at a glance and still pastes into a shell. Long values wrap under the flag.
+pub fn command_lines(bin: &str, args: &[String], width: usize) -> Vec<Line<'static>> {
+    let flag = Style::new().fg(GOLD);
+    let value = Style::new().fg(TEXT);
+    let mut groups: Vec<Vec<Sc>> = vec![
+        format!(" {bin}")
+            .chars()
+            .map(|c| (c, Style::new().fg(GOOD).add_modifier(Modifier::BOLD)))
+            .collect(),
+    ];
+    for a in args {
+        if a.starts_with('-') {
+            groups.push(format!("   {a}").chars().map(|c| (c, flag)).collect());
+        } else if let Some(g) = groups.last_mut() {
+            g.extend(format!(" {}", shell_quote(a)).chars().map(|c| (c, value)));
+        }
+    }
+    let n = groups.len();
+    let mut out = Vec::new();
+    for (i, mut g) in groups.into_iter().enumerate() {
+        if i + 1 < n {
+            g.extend(" \\".chars().map(|c| (c, Style::new().fg(FAINT))));
+        }
+        for row in wrap_styled(&g, width, 5) {
+            out.push(to_line(&row, Vec::new()));
+        }
+    }
+    out
 }

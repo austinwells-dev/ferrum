@@ -856,6 +856,57 @@ impl Chat {
     }
 
     /// The model is writing or its tools are running.
+    /// What the model is doing right now, for the tab bar: a short label
+    /// and, while it writes, the tail of what it is writing or thinking.
+    pub fn activity(&self) -> (String, String, Color) {
+        match &self.phase {
+            Phase::Loading(stage) => ("loading".into(), stage.clone(), GOLD),
+            Phase::Failed(_) => ("load failed".into(), String::new(), BAD),
+            Phase::Ready => ("ready".into(), String::new(), DIM),
+            Phase::Tools if self.approval.is_some() => {
+                ("waiting for your approval".into(), String::new(), GOLD)
+            }
+            Phase::Tools => {
+                let tool = self
+                    .turns
+                    .iter()
+                    .rev()
+                    .find_map(|t| t.tool.as_ref())
+                    .map(|v| v.summary.clone())
+                    .unwrap_or_default();
+                ("running tools".into(), tool, EMBER)
+            }
+            Phase::Generating => {
+                if let Some((done, total)) = self.prefill {
+                    return (
+                        format!("reading the prompt {done}/{total}"),
+                        String::new(),
+                        GOLD,
+                    );
+                }
+                let tps = self
+                    .first_token
+                    .map(|s| self.gen_tokens as f64 / s.elapsed().as_secs_f64().max(0.05))
+                    .unwrap_or(0.0);
+                let last = self.turns.last().filter(|t| t.role == Role::Assistant);
+                let (verb, text) = match last {
+                    Some(t) if t.content.trim().is_empty() && !t.reasoning.is_empty() => {
+                        ("thinking", t.reasoning.as_str())
+                    }
+                    Some(t) => ("writing", t.content.as_str()),
+                    None => ("writing", ""),
+                };
+                let tail: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                let label = if tps > 0.0 {
+                    format!("{verb} {tps:.0} tok/s")
+                } else {
+                    verb.to_string()
+                };
+                (label, tail, EMBER)
+            }
+        }
+    }
+
     pub fn ctx_use(&self) -> Option<(usize, usize)> {
         self.ctx
     }
@@ -1996,14 +2047,25 @@ impl App {
             self.screen = Screen::Home;
             return;
         };
-        let busy = matches!(chat.phase, Phase::Loading(_) | Phase::Failed(_));
-        if busy {
-            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
-                || (ctrl && key.code == KeyCode::Char('c'))
-            {
-                self.leave_chat();
+        match chat.phase {
+            // Loading carries on in the background; ctrl-c cancels it.
+            Phase::Loading(_) => {
+                if ctrl && key.code == KeyCode::Char('c') {
+                    self.leave_chat();
+                } else if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                    self.go_tab(Tab::Home);
+                }
+                return;
             }
-            return;
+            Phase::Failed(_) => {
+                if matches!(key.code, KeyCode::Esc | KeyCode::Char('q'))
+                    || (ctrl && key.code == KeyCode::Char('c'))
+                {
+                    self.leave_chat();
+                }
+                return;
+            }
+            _ => {}
         }
         if let Some(p) = chat.preview.as_mut() {
             match key.code {
@@ -2074,6 +2136,33 @@ impl App {
             }
             return;
         }
+        // The conversation has the keys: scroll, or start typing again.
+        if !self.chat_box {
+            match key.code {
+                KeyCode::Esc => {
+                    self.go_tab(Tab::Home);
+                }
+                KeyCode::Up | KeyCode::Char('k') => chat.scroll(true, 1),
+                KeyCode::Down | KeyCode::Char('j') => chat.scroll(false, 1),
+                KeyCode::PageUp => {
+                    let page = chat.page.get().max(2) - 1;
+                    chat.scroll(true, page)
+                }
+                KeyCode::PageDown => {
+                    let page = chat.page.get().max(2) - 1;
+                    chat.scroll(false, page)
+                }
+                KeyCode::Char('d') if ctrl => self.leave_chat(),
+                KeyCode::Enter | KeyCode::Tab => self.chat_box = true,
+                KeyCode::Char(c) if !ctrl && !alt => {
+                    self.chat_box = true;
+                    let mut buf = [0u8; 4];
+                    chat.insert_str(c.encode_utf8(&mut buf));
+                }
+                _ => {}
+            }
+            return;
+        }
         let palette = chat.palette();
         if !palette.is_empty() && !alt && !shift {
             let n = palette.len();
@@ -2113,9 +2202,11 @@ impl App {
                     chat.input.clear();
                     chat.cursor = 0;
                 } else {
-                    self.leave_chat();
+                    // Out of the box: digits switch tabs, the model stays loaded.
+                    self.chat_box = false;
                 }
             }
+            KeyCode::Tab => self.chat_box = false,
             KeyCode::Char('c') if ctrl => {
                 if chat.generating() {
                     chat.stop_generation();
@@ -2218,19 +2309,20 @@ impl App {
         }
     }
 
-    pub fn draw_chat(&self, f: &mut Frame) {
+    pub fn draw_chat(&self, f: &mut Frame, full: Rect, footer: Rect) {
         let Some(chat) = self.chat.as_ref() else {
             return;
         };
-        let full = f.area();
-        let (area, side) = if chat.agent.is_some() && full.width >= 112 {
+        let (area, side) = if self.panel_shown(full.width) && full.width >= 80 {
+            let w = self.prefs.panel_w.min(full.width / 2);
             let [main, side] =
-                Layout::horizontal([Constraint::Min(70), Constraint::Length(38)]).areas(full);
+                Layout::horizontal([Constraint::Min(40), Constraint::Length(w)]).areas(full);
             (main, Some(side))
         } else {
             (full, None)
         };
-        let content_w = (area.width.saturating_sub(2) as usize).min(110);
+        // Prose keeps a readable width inside a pane that fills the window.
+        let content_w = (area.width.saturating_sub(6) as usize).min(self.prefs.prose as usize);
         let input_w = content_w.saturating_sub(6).max(8);
         let rows = wrap_rows(&chat.input, input_w);
         let input_rows = rows.len().clamp(1, 6) as u16;
@@ -2249,48 +2341,43 @@ impl App {
             Vec::new()
         };
         let strip_h = if pending.is_empty() { 0 } else { STRIP_ROWS };
-        let [head, mid, status, strip, chips, input, footer] = Layout::vertical([
-            Constraint::Length(2),
+        let [mid, status, strip, chips, input] = Layout::vertical([
             Constraint::Min(4),
             Constraint::Length(1),
             Constraint::Length(strip_h),
             Constraint::Length(chips_h),
             Constraint::Length(input_rows + 2),
-            Constraint::Length(1),
         ])
         .areas(area);
 
         let t = self.elapsed();
         let (state, color) = match &chat.phase {
-            Phase::Loading(_) => ("LOADING", GOLD),
-            Phase::Ready => ("READY", GOOD),
-            Phase::Generating => ("THINKING", EMBER),
-            Phase::Tools => ("WORKING", EMBER),
-            Phase::Failed(_) => ("FAILED", BAD),
+            Phase::Loading(_) => ("loading", GOLD),
+            Phase::Ready => ("ready", GOOD),
+            Phase::Generating => ("writing", EMBER),
+            Phase::Tools => ("working", EMBER),
+            Phase::Failed(_) => ("failed", BAD),
         };
-        let mut sub = vec![chat.label.clone()];
-        if let Some(i) = &chat.info {
-            sub.push(format!("ctx {}", i.context));
-            if let Some(d) = &i.drafter {
-                sub.push(format!("⚡ {}", d.split(" · ").next().unwrap_or("")));
-            }
-            if i.vision.is_some() {
-                sub.push("👁 vision".into());
-            }
-        }
-        let crumb = sub.join(" · ");
-        let title = if chat.agent.is_some() {
-            "Agents"
-        } else {
-            "Chat"
-        };
-        header(f, head, &[title, &crumb], vec![pill(state, color)]);
         if let Some(side) = side {
-            self.draw_agent_side(f, side, chat);
+            if chat.agent.is_some() {
+                self.draw_agent_side(f, side, chat);
+            } else {
+                self.draw_chat_side(f, side, chat);
+            }
         }
-
+        let title = chat.title.clone().unwrap_or_else(|| {
+            if chat.agent.is_some() {
+                "New agent session".into()
+            } else {
+                "New chat".into()
+            }
+        });
+        let block = panel(&title, !self.chat_box)
+            .title_top(Line::styled(format!(" {state} "), Style::new().fg(color)).right_aligned());
+        let mid_inner = block.inner(mid);
+        f.render_widget(block, mid);
         let col = |r: Rect| centered(r, content_w as u16 + 2, r.height);
-        let mid = col(mid);
+        let mid = col(mid_inner);
         match &chat.phase {
             Phase::Loading(stage) => self.draw_loading(f, mid, chat, stage, t),
             Phase::Failed(e) => {
@@ -2312,7 +2399,12 @@ impl App {
             _ => self.draw_transcript(f, mid, chat, t),
         }
 
-        self.draw_chat_status(f, col(status), chat, t);
+        let inset = |r: Rect| Rect {
+            x: r.x + 1,
+            width: r.width.saturating_sub(2),
+            ..r
+        };
+        self.draw_chat_status(f, inset(status), chat, t);
         if strip_h > 0 {
             // Attachments waiting to be sent, side by side.
             let strip = col(strip);
@@ -2355,11 +2447,10 @@ impl App {
                     spans.push(Span::styled(" · ctrl-o previews", Style::new().fg(FAINT)));
                 }
             }
-            f.render_widget(Paragraph::new(Line::from(spans)), col(chips));
+            f.render_widget(Paragraph::new(Line::from(spans)), inset(chips));
         }
 
-        let ready = chat.phase == Phase::Ready;
-        let input = col(input);
+        let ready = chat.phase == Phase::Ready && self.chat_box;
         let block = Block::bordered()
             .border_type(BorderType::Rounded)
             .border_style(Style::new().fg(if ready { EMBER } else { FAINT }))
@@ -2415,7 +2506,7 @@ impl App {
             }
         }
         f.render_widget(Paragraph::new(lines), inner);
-        if (ready || chat.generating()) && chat.preview.is_none() {
+        if (ready || (chat.generating() && self.chat_box)) && chat.preview.is_none() {
             let (s, _) = rows[cursor_row];
             let before: String = chars[s..chat.cursor.min(chars.len())].iter().collect();
             let x = inner.x + 3 + text_width(&before) as u16;
@@ -2506,6 +2597,12 @@ impl App {
             ]
         } else {
             match chat.phase {
+                _ if !self.chat_box => &[
+                    ("↑↓", "scroll"),
+                    ("type", "back to the message"),
+                    ("ctrl-d", "unload"),
+                    ("esc", "home"),
+                ],
                 Phase::Generating => &[
                     ("esc", "stop"),
                     ("pgup/pgdn", "scroll"),
@@ -2519,12 +2616,14 @@ impl App {
                     ("ctrl-v", "attach clipboard"),
                     ("ctrl-t", "thinking"),
                     ("/help", "commands"),
-                    ("esc", "leave"),
+                    ("esc", "leave the box"),
+                    ("ctrl-b", "panel"),
                 ],
+                Phase::Loading(_) => &[("esc", "home, keep loading"), ("ctrl-c", "cancel")],
                 _ => &[("esc", "back")],
             }
         };
-        keys_footer(f, footer, keys, &self.status);
+        self.footer(f, footer, keys);
         // Kitty images sit above the text, so popups hide them.
         if chat.preview.is_some()
             || chat.resume.is_some()
@@ -2534,7 +2633,7 @@ impl App {
             chat.wants.borrow_mut().clear();
         }
         if let Some(p) = &chat.preview {
-            p.draw(f, full, &chat.wants);
+            p.draw(f, f.area(), &chat.wants);
         }
     }
 

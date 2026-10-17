@@ -319,11 +319,21 @@ pub struct TaskResult {
     pub end: String,
     /// passed, failed or timed out.
     pub test: String,
+    /// The saved transcript (conversation, changes, test output).
+    pub log: Option<String>,
 }
 
 impl TaskResult {
     pub fn tokens(&self) -> usize {
         self.generated + self.prompt
+    }
+
+    fn to_json(&self) -> Json {
+        json!({
+            "id": self.id, "solved": self.solved, "turns": self.turns,
+            "generated": self.generated, "prompt": self.prompt, "secs": self.secs,
+            "end": self.end, "test": self.test, "log": self.log,
+        })
     }
 }
 
@@ -342,6 +352,19 @@ pub enum AgentEvent {
         last: String,
     },
     TaskDone(TaskResult),
+    /// Task `task` (an index into the run's tasks) begins.
+    TaskStart(usize),
+    /// Text of the reply being written, as it streams.
+    Delta {
+        reasoning: bool,
+        text: String,
+    },
+    /// A tool call ran: what it was, whether it worked, the start of its output.
+    Tool {
+        summary: String,
+        ok: bool,
+        output: String,
+    },
     Failed(String),
     Done,
 }
@@ -371,10 +394,17 @@ pub fn spawn(plan: AgentPlan, tasks: Vec<Task>) -> Result<AgentRunning, String> 
 struct Hooks<'a> {
     stop: &'a AtomicBool,
     deadline: Instant,
+    /// Streams the reply to the Bench tab's live feed.
+    send: &'a dyn Fn(AgentEvent),
 }
 
 impl ChatHooks for Hooks<'_> {
-    fn delta(&mut self, _: Delta) -> ferrum::Result<()> {
+    fn delta(&mut self, delta: Delta) -> ferrum::Result<()> {
+        let (reasoning, text) = match delta {
+            Delta::Reasoning(t) => (true, t),
+            Delta::Content(t) => (false, t),
+        };
+        (self.send)(AgentEvent::Delta { reasoning, text });
         Ok(())
     }
     fn cancelled(&self) -> bool {
@@ -408,10 +438,21 @@ fn load(plan: &AgentPlan, context: usize) -> Result<Runtime, String> {
     Ok(rt)
 }
 
+/// Where transcripts go: a folder per run, a file per task.
+pub fn runs_dir() -> PathBuf {
+    home().join(".config/ferrum/agent-runs")
+}
+
 fn run(plan: AgentPlan, tasks: Vec<Task>, tx: Sender<AgentEvent>, stop: Arc<AtomicBool>) {
     let send = |e: AgentEvent| {
         let _ = tx.send(e);
     };
+    let stem = plan
+        .model
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let run_dir = runs_dir().join(format!("{}-{stem}", bench::now()));
     send(AgentEvent::Stage(format!("loading {}", plan.draft_label())));
     let loaded = load(&plan, CONTEXT).or_else(|_| load(&plan, CONTEXT_FALLBACK));
     let mut rt = match loaded {
@@ -436,7 +477,7 @@ fn run(plan: AgentPlan, tasks: Vec<Task>, tx: Sender<AgentEvent>, stop: Arc<Atom
             tasks.len(),
             task.id
         )));
-        match attempt(&mut rt, &plan, i, task, &send, &stop) {
+        match attempt(&mut rt, &plan, i, task, &run_dir, &send, &stop) {
             Ok(r) => send(AgentEvent::TaskDone(r)),
             Err(e) => {
                 if !stop.load(Ordering::SeqCst) {
@@ -479,6 +520,7 @@ fn attempt(
     plan: &AgentPlan,
     index: usize,
     task: &Task,
+    run_dir: &Path,
     send: &impl Fn(AgentEvent),
     stop: &AtomicBool,
 ) -> Result<TaskResult, String> {
@@ -499,6 +541,7 @@ fn attempt(
         json!({"role": "system", "content": brain::system_prompt(&work, Ponytail::Full, false, false, "", None)}),
         json!({"role": "user", "content": task_message(task)}),
     ];
+    send(AgentEvent::TaskStart(index));
     let started = Instant::now();
     let deadline = started + TASK_LIMIT;
     let (mut turns, mut generated, mut prompt) = (0, 0, 0);
@@ -521,7 +564,14 @@ fn attempt(
             reasoning_budget: plan.thinking,
             raw_reasoning: false,
         };
-        let r = match rt.chat(&request, Hooks { stop, deadline }) {
+        let r = match rt.chat(
+            &request,
+            Hooks {
+                stop,
+                deadline,
+                send,
+            },
+        ) {
             Ok(r) => r,
             Err(e) => {
                 end = format!("error: {e}");
@@ -564,6 +614,7 @@ fn attempt(
             reply["reasoning_content"] = Json::String(reasoning.clone());
         }
         if r.output.tool_calls.is_empty() {
+            messages.push(reply);
             end = "finished".into();
             break;
         }
@@ -589,11 +640,27 @@ fn attempt(
                 .lock()
                 .map(|mut g| g.is_loop(&call.name, &call.arguments))
                 .unwrap_or(false);
-            let out = if looping {
-                "error: you already made this exact call twice. Do something different.".to_string()
+            let (ok, out) = if looping {
+                (
+                    false,
+                    "error: you already made this exact call twice. Do something different."
+                        .to_string(),
+                )
             } else {
-                coding::execute(&shared, &sb, &call.name, &call.arguments, &cancel).1
+                coding::execute(&shared, &sb, &call.name, &call.arguments, &cancel)
             };
+            let root = work.display().to_string();
+            send(AgentEvent::Tool {
+                summary: format!(
+                    "{} {}",
+                    call.name,
+                    crate::agent::summary(&call.name, &call.arguments)
+                        .replace(&format!("{root}/"), "")
+                        .replace(&root, ".")
+                ),
+                ok: ok && !out.starts_with("error"),
+                output: out.lines().take(6).collect::<Vec<_>>().join("\n"),
+            });
             messages.push(json!({
                 "role": "tool", "tool_call_id": id, "name": call.name, "content": out,
             }));
@@ -601,9 +668,11 @@ fn attempt(
     }
     // Background processes the agent started end with its state.
     drop(shared);
-    let test = grade(task, &source, &sb, stop);
+    // What the agent changed, before the task's tests are added.
+    let diff = changes(&work);
+    let (test, output) = grade(task, &source, &sb, stop);
     let _ = fs::remove_dir_all(&tmp);
-    Ok(TaskResult {
+    let mut result = TaskResult {
         id: task.id.clone(),
         solved: test == "passed",
         turns,
@@ -612,23 +681,66 @@ fn attempt(
         secs: started.elapsed().as_secs_f64(),
         end,
         test,
-    })
+        log: None,
+    };
+    let log = run_dir.join(format!("{}.json", task.id));
+    let saved = fs::create_dir_all(run_dir).and_then(|_| {
+        fs::write(
+            &log,
+            serde_json::to_string_pretty(&json!({
+                "task": task.id, "source": task.source(), "test_command": task.test,
+                "result": result.to_json(), "messages": messages,
+                "changes": diff, "test_output": output,
+            }))
+            .unwrap_or_default(),
+        )
+    });
+    if saved.is_ok() {
+        result.log = Some(log.display().to_string());
+    }
+    Ok(result)
+}
+
+/// The agent's changes: `git diff` of the checkout plus the files it added.
+/// Git runs confined: the agent could have planted settings that run programs.
+fn changes(work: &Path) -> String {
+    let w = work.display().to_string();
+    let git = |args: &[&str]| {
+        let mut argv = vec!["git", "--no-optional-locks", "-C", w.as_str()];
+        argv.extend_from_slice(args);
+        crate::agent::confined(&argv)
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default()
+    };
+    let mut out = git(&["diff"]);
+    for file in git(&["ls-files", "--others", "--exclude-standard"]).lines() {
+        out.push_str(&format!("new file: {file}\n"));
+    }
+    out
 }
 
 /// Puts the task's tests in the workspace (over any the agent changed) and
-/// runs them in the sandbox: "passed", "failed", "timed out" or an error.
-fn grade(task: &Task, source: &Path, sb: &Sandbox, stop: &AtomicBool) -> String {
+/// runs them in the sandbox: ("passed", "failed", "timed out" or an error,
+/// the end of their output).
+fn grade(task: &Task, source: &Path, sb: &Sandbox, stop: &AtomicBool) -> (String, String) {
     let hidden = source.join("hidden");
     if hidden.exists()
         && let Err(e) = copy_tree(&hidden.join("."), &sb.workspace)
     {
-        return format!("could not add the tests: {e}");
+        return (format!("could not add the tests: {e}"), String::new());
     }
+    let tail = |out: &str| {
+        let chars: Vec<char> = out.chars().collect();
+        chars[chars.len().saturating_sub(6000)..]
+            .iter()
+            .collect::<String>()
+    };
     match sb.run(&["/bin/bash", "-c", &task.test], TEST_LIMIT, stop) {
-        Ok((Some(0), _, _)) => "passed".into(),
-        Ok((Some(_), _, _)) => "failed".into(),
-        Ok((None, _, _)) => "timed out".into(),
-        Err(e) => format!("could not run the tests: {e}"),
+        Ok((Some(0), out, _)) => ("passed".into(), tail(&out)),
+        Ok((Some(_), out, _)) => ("failed".into(), tail(&out)),
+        Ok((None, out, _)) => ("timed out".into(), tail(&out)),
+        Err(e) => (format!("could not run the tests: {e}"), String::new()),
     }
 }
 
@@ -694,16 +806,7 @@ impl AgentResult {
     }
 
     fn to_json(&self) -> Json {
-        let results: Vec<Json> = self
-            .results
-            .iter()
-            .map(|r| {
-                json!({
-                    "id": r.id, "solved": r.solved, "turns": r.turns, "generated": r.generated,
-                    "prompt": r.prompt, "secs": r.secs, "end": r.end, "test": r.test,
-                })
-            })
-            .collect();
+        let results: Vec<Json> = self.results.iter().map(TaskResult::to_json).collect();
         json!({
             "model": self.model, "when": self.when, "thinking": self.thinking,
             "draft": self.draft, "kv_cache": self.kv_cache, "tasks": self.tasks,
@@ -734,6 +837,7 @@ impl AgentResult {
                             secs: t["secs"].as_f64().unwrap_or(0.0),
                             end: s(&t["end"]),
                             test: s(&t["test"]),
+                            log: t["log"].as_str().map(str::to_string),
                         })
                         .collect()
                 })
@@ -803,6 +907,7 @@ mod tests {
             secs: 10.0,
             end: "finished".into(),
             test: if solved { "passed" } else { "failed" }.into(),
+            log: Some(format!("/runs/{id}.json")),
         }
     }
 
@@ -865,7 +970,7 @@ mod tests {
                 }
                 let work = fs::canonicalize(&work).unwrap();
                 let sb = Sandbox::with_state(work, dir.join("state"), false).unwrap();
-                let got = grade(&t, &src, &sb, &AtomicBool::new(false));
+                let (got, _) = grade(&t, &src, &sb, &AtomicBool::new(false));
                 eprintln!("{} fixed={fixed}: {got}", t.id);
                 assert_eq!(got == "passed", fixed, "{} fixed={fixed}: {got}", t.id);
             }

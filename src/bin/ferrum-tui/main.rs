@@ -5,11 +5,13 @@
 
 mod agent;
 mod agentbench;
+mod agentcompare;
 mod agentui;
 mod app;
 mod attach;
 mod bench;
 mod benchui;
+mod benchview;
 mod brain;
 mod catalog;
 mod chat;
@@ -22,12 +24,17 @@ mod evalui;
 mod fields;
 mod highlight;
 mod home;
+mod layout;
+mod models;
 mod pick;
 mod preview;
+#[cfg(test)]
+mod screens;
 mod search;
 mod serve;
 mod sessions;
 mod settings;
+mod shell;
 mod side;
 mod skills;
 mod splash;
@@ -57,12 +64,14 @@ pub use std::{
     time::{Duration, Instant},
 };
 
+pub use crate::layout::{Prefs, inner_w};
 pub use agent::ToolMode;
 pub use benchui::BenchState;
 pub use catalog::*;
 pub use chat::Chat;
 pub use fields::*;
 pub use serve::Serve;
+pub use shell::{Overlay, Tab};
 pub use text::*;
 pub use theme::*;
 pub use ui::*;
@@ -101,6 +110,7 @@ pub enum Screen {
     Chat,
     Serve,
     Bench,
+    Models,
 }
 
 /// Why the editor is open: decides what launching does.
@@ -196,6 +206,29 @@ pub struct App {
     pub closing: Vec<std::thread::JoinHandle<()>>,
     /// The kitty-protocol image currently on screen.
     pub gfx: preview::Kitty,
+    /// Split sizes and widths (Settings › Layout).
+    pub prefs: Prefs,
+    /// Saved measurements per model, refreshed every few seconds.
+    pub dash: std::cell::RefCell<Option<models::Dashboard>>,
+    pub overlay: Overlay,
+    /// In a chat, typing goes to the message box (false: the conversation
+    /// has the keys, so digits switch tabs).
+    pub chat_box: bool,
+    /// ctrl-b's choice for the chat side panel, over Settings.
+    pub panel_override: Option<bool>,
+    /// The window size at the last draw.
+    pub size: std::cell::Cell<(u16, u16)>,
+    pub machine: bench::Machine,
+    /// GiB of weights the running server holds.
+    pub serve_gib: f64,
+    /// The keys the footer showed last, for the key list.
+    pub keys_shown: std::cell::RefCell<Vec<(String, String)>>,
+    /// The pane group shown on a narrow Bench.
+    pub bench_pane: usize,
+    pub models_sel: usize,
+    pub models_sort: models::Sort,
+    /// Models tab: the table (false) or the detail has the keys.
+    pub models_detail: bool,
 }
 
 impl App {
@@ -203,42 +236,53 @@ impl App {
         self.started.elapsed().as_secs_f32()
     }
 
+    /// Sessions, the server and runs keep going whichever tab is showing.
     pub fn tick(&mut self) {
-        match self.screen {
-            Screen::Splash if self.elapsed() >= splash::SPLASH_SECS => self.screen = Screen::Home,
-            Screen::Chat => {
-                if let Some(c) = self.chat.as_mut() {
-                    c.pump();
-                }
-            }
-            Screen::Serve => {
-                if let Some(s) = self.serve.as_mut() {
-                    s.pump();
-                }
-            }
-            Screen::Bench => self.bench_tick(),
-            _ => {}
+        if self.screen == Screen::Splash && self.elapsed() >= splash::SPLASH_SECS {
+            self.screen = Screen::Home;
+        }
+        if let Some(c) = self.chat.as_mut() {
+            c.pump();
+        }
+        if let Some(s) = self.serve.as_mut() {
+            s.pump();
+        }
+        if self.bench.is_some() {
+            self.bench_tick();
         }
     }
 
     pub fn poll_interval(&self) -> Duration {
+        let busy = self.chat.is_some()
+            || self.serve.is_some()
+            || self
+                .bench
+                .as_ref()
+                .is_some_and(|b| b.phase == benchui::BenchPhase::Running);
         Duration::from_millis(match self.screen {
-            Screen::Splash | Screen::Home | Screen::Chat | Screen::Serve | Screen::Bench => 33,
+            Screen::Splash | Screen::Home => 33,
+            _ if busy => 33,
             _ => 200,
         })
     }
 
     pub fn draw(&self, f: &mut Frame) {
-        match self.screen {
-            Screen::Splash => splash::draw_splash(f, self.elapsed()),
-            Screen::Home => self.draw_home(f),
-            Screen::Pick => self.draw_pick(f),
-            Screen::Editor => self.draw_editor(f),
-            Screen::Settings => self.draw_settings_screen(f),
-            Screen::Chat => self.draw_chat(f),
-            Screen::Serve => self.draw_serve(f),
-            Screen::Bench => self.draw_bench(f),
+        if self.screen == Screen::Splash {
+            return splash::draw_splash(f, self.elapsed());
         }
+        let (body, footer) = self.draw_frame(f);
+        match self.screen {
+            Screen::Splash => {}
+            Screen::Home => self.draw_home(f, body, footer),
+            Screen::Pick => self.draw_pick(f, body, footer),
+            Screen::Editor => self.draw_editor(f, body, footer),
+            Screen::Settings => self.draw_settings_screen(f, body, footer),
+            Screen::Chat => self.draw_chat(f, body, footer),
+            Screen::Serve => self.draw_serve(f, body, footer),
+            Screen::Bench => self.draw_bench(f, body, footer),
+            Screen::Models => self.draw_models_tab(f, body, footer),
+        }
+        self.draw_overlay(f);
         if self.picker.is_some() {
             self.draw_picker(f);
         }
@@ -283,6 +327,9 @@ impl App {
             self.text_key(key);
             return;
         }
+        if self.shell_key(key) {
+            return;
+        }
         if ctrl && key.code == KeyCode::Char('c') {
             match self.screen {
                 Screen::Chat => self.chat_key(key),
@@ -302,6 +349,7 @@ impl App {
             Screen::Chat => self.chat_key(key),
             Screen::Serve => self.serve_key(key),
             Screen::Bench => self.bench_key(key),
+            Screen::Models => self.models_key(key),
         }
     }
 

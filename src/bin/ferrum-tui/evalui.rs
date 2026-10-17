@@ -1,13 +1,16 @@
 //! The intelligence side of the Benchmark tab: score a model on the installed
 //! question sets, quick (a fixed subset, predicting the full score) or full,
 //! and keep the results per model and setup.
+use crate::agentui::{Feed, feed_lines, feed_push, shorten, stream};
 use crate::bench::{self, Candidate, Source};
 use crate::benchui::{BenchPhase, ago};
+use crate::benchview::{Chart, ChartBar, Parts, Widths, form_row};
 use crate::eval::{
     self, CATEGORIES, Difficulty, EvalEvent, EvalPlan, EvalResult, EvalRunning, Suite, Tally,
 };
 use crate::evalcompare::Compare;
 use crate::evalsets::{self, InstallEvent, Installing};
+use crate::layout::fit_w;
 use crate::*;
 use std::sync::atomic::Ordering;
 
@@ -54,6 +57,8 @@ pub struct IqState {
     pub confirm_remove: bool,
     /// The Compare view, when open.
     pub compare: Option<Compare>,
+    /// The questions as they are asked, with the model's replies streaming.
+    pub feed: Vec<Feed>,
 }
 
 impl IqState {
@@ -82,6 +87,7 @@ impl IqState {
             install_note: None,
             confirm_remove: false,
             compare: None,
+            feed: Vec::new(),
         }
     }
 
@@ -181,6 +187,36 @@ enum IqLine {
     Run,
 }
 
+/// What a setup row does.
+fn iq_help(line: IqLine) -> &'static str {
+    match line {
+        IqLine::Model => {
+            "The model to test. Results are kept per model and setup, so runs compare."
+        }
+        IqLine::Measure => {
+            "Intelligence asks graded questions and checks each answer with a program. m switches to speed or agentic coding."
+        }
+        IqLine::Difficulty => {
+            "Hard sets separate current models; standard ones are mostly solved by them."
+        }
+        IqLine::Sets => {
+            "The question files, downloaded once from Hugging Face. Enter installs them, or (twice) removes them."
+        }
+        IqLine::Size => {
+            "Quick asks a fixed subset and predicts the full score with a 95% range; full asks everything."
+        }
+        IqLine::Thinking => {
+            "Let the model reason before it answers, up to this many tokens per question. Slower, usually better."
+        }
+        IqLine::Draft => {
+            "Use the drafter the speed benchmark picked for this Mac, so the test finishes sooner."
+        }
+        IqLine::Run => {
+            "Start the test. Esc while it runs stops it; a stopped run is shown but not saved."
+        }
+    }
+}
+
 const LINES: [IqLine; 8] = [
     IqLine::Model,
     IqLine::Measure,
@@ -202,13 +238,6 @@ pub fn score_color(share: f64) -> Color {
     }
 }
 
-/// `width`-cell bar filled to `share`.
-fn bar(share: f64, width: usize, color: Color) -> Vec<Span<'static>> {
-    bar_ranged(share, 0.0, width, color)
-}
-
-/// A bar solid up to `share - margin`, shaded (`▒`) across the range
-/// `share ± margin`, empty after.
 pub fn bar_ranged(share: f64, margin: f64, width: usize, color: Color) -> Vec<Span<'static>> {
     let cells = |x: f64| ((x.clamp(0.0, 1.0)) * width as f64).round() as usize;
     let (solid, upper) = if margin > 0.0 {
@@ -304,6 +333,9 @@ impl App {
     }
 
     fn start_iq(&mut self) {
+        if !self.make_room("the benchmark", false, false) {
+            return;
+        }
         let Some(plan) = self.iq_plan() else {
             self.status = Some(("no supported model to test".into(), false));
             return;
@@ -333,6 +365,7 @@ impl App {
                 iq.run = Some(run);
                 iq.plan = Some(plan);
                 iq.answers.clear();
+                iq.feed.clear();
                 iq.failed = None;
                 iq.loaded = None;
                 iq.stopping = false;
@@ -368,8 +401,28 @@ impl App {
                         t.n += 1;
                         t.right += usize::from(correct);
                     }
+                    feed_push(
+                        &mut iq.feed,
+                        Feed::Verdict {
+                            correct,
+                            answer: shown_answer(cat, answer.as_deref()),
+                        },
+                    );
                     iq.answers.push((cat, id, correct, answer));
                 }
+                EvalEvent::Question { cat, id, text } => feed_push(
+                    &mut iq.feed,
+                    Feed::Question {
+                        title: format!(
+                            "{} · {id} · question {} of {}",
+                            CATEGORIES[cat].1,
+                            iq.answers.len() + 1,
+                            iq.expected
+                        ),
+                        text: shorten(&text),
+                    },
+                ),
+                EvalEvent::Delta { reasoning, text } => stream(&mut iq.feed, reasoning, text),
                 EvalEvent::Failed(e) => iq.failed = Some(e),
                 EvalEvent::Done => done = true,
             }
@@ -501,14 +554,14 @@ impl App {
     // ---- drawing ----
 
     /// Saved results for the selected model, newest first.
-    fn iq_history(&self, b: &BenchState, width: usize) -> Vec<Line<'static>> {
+    fn iq_history(&self, b: &BenchState, width: usize, most: usize) -> Vec<Line<'static>> {
         let Some(model) = self.models.get(b.model) else {
             return Vec::new();
         };
         let path = model.path.display().to_string();
         let current = b.iq.suite.as_ref().ok().map(|s| s.fingerprint.as_str());
         let mut lines = Vec::new();
-        for r in b.iq.results.iter().filter(|r| r.model == path).take(8) {
+        for r in b.iq.results.iter().filter(|r| r.model == path).take(most) {
             let Some(s) = r.score() else { continue };
             let stale = r.difficulty == b.iq.difficulty && current.is_some_and(|f| f != r.suite);
             lines.push(Line::from(vec![
@@ -544,417 +597,359 @@ impl App {
         lines
     }
 
-    /// One row per category: name, right of asked, bar, share.
-    pub fn iq_table(tallies: &[Tally], difficulty: Difficulty, width: usize) -> Vec<Line<'static>> {
-        let bar_w = width.saturating_sub(66).clamp(10, 30);
-        tallies
-            .iter()
-            .enumerate()
-            .map(|(i, t)| {
-                let mut spans = vec![Span::styled(
-                    format!(
-                        "   {:<34} {:>3}/{:<3}  ",
-                        difficulty.cat_name(i),
-                        t.right,
-                        t.n
-                    ),
-                    Style::new().fg(TEXT),
-                )];
-                if t.n == 0 {
-                    spans.push(Span::styled("not asked", Style::new().fg(FAINT)));
-                } else {
-                    spans.extend(bar(t.share(), bar_w, score_color(t.share())));
-                    spans.push(Span::styled(
-                        format!(" {:>4.0}%", t.share() * 100.0),
-                        Style::new().fg(score_color(t.share())),
-                    ));
-                }
-                Line::from(spans)
-            })
-            .collect()
-    }
-
-    pub fn draw_iq_setup(&self, f: &mut Frame, area: Rect, b: &BenchState) {
-        let block = panel("Measure intelligence", true);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let width = inner.width as usize;
+    /// The intelligence measure's panes.
+    pub fn iq_parts(&self, b: &BenchState, w: Widths) -> Parts {
         let iq = &b.iq;
-        let title = |s: &str| {
-            Line::styled(
-                format!("  {s}"),
-                Style::new().fg(DIM).add_modifier(Modifier::BOLD),
-            )
-        };
-        // What sits under the question-sets line.
-        let mut sets_info: Vec<Line> = Vec::new();
-        match &iq.suite {
-            _ if iq.installing() => sets_info.push(Line::styled(
-                format!(
-                    "   {} {}",
-                    spinner(self.elapsed()),
-                    clip(&iq.install_stage, width.saturating_sub(6))
-                ),
-                Style::new().fg(EMBER),
-            )),
-            Ok(s) => {
-                let sizes: Vec<String> = s
-                    .sets
-                    .iter()
-                    .zip(CATEGORIES)
-                    .map(|(set, (cat, _))| format!("{cat} {}", set.len()))
-                    .collect();
-                sets_info.push(Line::styled(
-                    clip(
-                        &format!(
-                            "   {} · {}",
-                            sizes.join(" · "),
-                            eval::suite_dir(iq.difficulty).display()
-                        ),
-                        width,
-                    ),
-                    Style::new().fg(FAINT),
-                ));
-            }
-            Err(_) => sets_info.push(Line::styled(
-                clip(
-                    &format!(
-                        "   {} questions each from {}, from Hugging Face",
-                        evalsets::PER_SET,
-                        iq.difficulty.datasets().join(", ")
-                    ),
-                    width,
-                ),
-                Style::new().fg(FAINT),
-            )),
-        }
-        if let Some((note, ok)) = &iq.install_note {
-            // Errors carry advice: wrap them instead of cutting them off.
-            let text = format!("{} {note}", if *ok { "✓" } else { "✗" });
-            let chars: Vec<char> = text.chars().collect();
-            for (a, z) in wrap_rows(&text, width.saturating_sub(5)) {
-                sets_info.push(Line::styled(
-                    format!("   {}", chars[a..z].iter().collect::<String>()),
-                    Style::new().fg(if *ok { GOOD } else { BAD }),
-                ));
-            }
-        }
-        let mut out: Vec<Line> = Vec::new();
+        let setup = b.phase == BenchPhase::Setup;
         let tuned = self.tuned_draft();
         let model = self.models.get(b.model);
         let questions = iq.suite.as_ref().map_or(0, |s| s.questions(iq.quick).len());
-        let mut sel_line = 0;
+        let sel = iq.sel.min(LINES.len() - 1);
+        let mut form = Vec::new();
+        let mut form_sel = None;
         for (n, &def) in LINES.iter().enumerate() {
-            if def == IqLine::Difficulty {
-                out.push(Line::default());
-                out.push(title("QUESTION SETS"));
-            }
-            if def == IqLine::Size {
-                out.push(Line::default());
-                out.push(title("OPTIONS"));
-            }
-            if def == IqLine::Run {
-                out.push(Line::default());
-            }
-            let on = n == iq.sel;
-            let bg = if on { SELECTED } else { Color::Reset };
-            if on {
-                sel_line = out.len();
-            }
+            let on = n == sel && setup;
             let (label, value): (&str, String) = match def {
                 IqLine::Model => (
                     "Model",
-                    format!(
-                        "‹ {} ›",
-                        model
-                            .map(|m| clip(&m.name, 44))
-                            .unwrap_or_else(|| "none".into())
-                    ),
+                    model
+                        .map(|m| m.name.clone())
+                        .unwrap_or_else(|| "none".into()),
                 ),
-                IqLine::Measure => ("Measure", "‹ intelligence ›".into()),
+                IqLine::Measure => ("Measure", "intelligence".into()),
                 IqLine::Difficulty => (
                     "Difficulty",
                     match iq.difficulty {
-                        Difficulty::Hard => "‹ hard ›".into(),
-                        Difficulty::Standard => "‹ standard (easy for current models) ›".into(),
+                        Difficulty::Hard => "hard".into(),
+                        Difficulty::Standard => "standard · easy now".into(),
                     },
                 ),
                 IqLine::Sets => (
                     "Question sets",
                     match &iq.suite {
                         _ if iq.installing() => "installing…".into(),
-                        Ok(_) if iq.confirm_remove => "‹ press enter again to remove ›".into(),
-                        Ok(s) => format!(
-                            "‹ installed · {} questions · enter removes ›",
-                            s.sets.iter().map(Vec::len).sum::<usize>()
-                        ),
-                        Err(_) => "‹ not installed · enter installs ›".into(),
+                        Ok(_) if iq.confirm_remove => "enter again removes".into(),
+                        Ok(s) => {
+                            format!("installed · {}", s.sets.iter().map(Vec::len).sum::<usize>())
+                        }
+                        Err(_) => "enter installs".into(),
                     },
                 ),
                 IqLine::Size => (
                     "Questions",
                     if iq.suite.is_err() {
-                        "install the question sets first".into()
+                        "install the sets first".into()
                     } else if iq.quick {
-                        format!("‹ quick: {questions}, predicts the full score ›")
+                        format!("quick · {questions}")
                     } else {
-                        format!("‹ full: all {questions} ›")
+                        format!("full · {questions}")
                     },
                 ),
                 IqLine::Thinking => (
                     "Thinking",
                     match THINKING[iq.thinking] {
-                        None => "‹ off ›".into(),
-                        Some(t) => format!("‹ on, up to {t} tokens ›"),
+                        None => "off".into(),
+                        Some(t) => format!("≤ {t} tokens"),
                     },
                 ),
                 IqLine::Draft => (
                     "Drafter",
                     match (&tuned, iq.tuned) {
                         (Some((c, d)), true) => {
-                            format!("‹ tuned: {} · depth {d} ›", clip(&c.label(), 30))
+                            format!("tuned · {} d{d}", crate::benchui::short_drafter(&c.label()))
                         }
-                        (Some(_), false) => "‹ off (tuned one available) ›".into(),
-                        (None, _) => "off · run the speed benchmark to tune one".into(),
+                        (Some(_), false) => "off · tuned available".into(),
+                        (None, _) => "off · none tuned yet".into(),
                     },
                 ),
-                IqLine::Run => ("▶  Run intelligence test", String::new()),
+                IqLine::Run => ("▶ Run intelligence test", String::new()),
             };
-            let run = def == IqLine::Run;
-            let label_w = width.saturating_sub(value.chars().count() + 7);
-            out.push(Line::from(vec![
-                Span::styled(
-                    if on { " ▌ " } else { "   " },
-                    Style::new().fg(EMBER).bg(bg),
-                ),
-                Span::styled(
-                    format!("{:<label_w$}", clip(label, label_w)),
-                    if run {
-                        Style::new()
-                            .fg(if on { Color::Black } else { EMBER })
-                            .bg(if on { EMBER } else { Color::Reset })
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::new().fg(if on { Color::White } else { TEXT }).bg(bg)
-                    },
-                ),
-                Span::styled(
-                    format!(" {value} "),
-                    Style::new()
-                        .fg(if def == IqLine::Sets && iq.confirm_remove {
-                            BAD
-                        } else {
-                            EMBER
-                        })
-                        .add_modifier(Modifier::BOLD)
-                        .bg(bg),
-                ),
-                Span::styled("  ", Style::new().bg(bg)),
-            ]));
-            if def == IqLine::Sets {
-                out.append(&mut sets_info);
+            if def == IqLine::Run {
+                form.push(Line::default());
             }
+            if on {
+                form_sel = Some(form.len());
+            }
+            let value = clip(&value, w.form.saturating_sub(label.len() + 8));
+            let warn = def == IqLine::Sets && iq.confirm_remove;
+            form.push(form_row(on, true, w.form, label, &value, warn, !setup));
         }
-        out.push(Line::default());
         if let (Some(plan), Ok(suite)) = (self.iq_plan(), &iq.suite) {
-            out.push(Line::styled(
+            form.push(Line::styled(
                 format!(
-                    "   about {} min · greedy decoding · each answer is checked by a program, not by a model",
+                    "   about {} min · checked by a program",
                     plan.estimate_secs(suite).div_ceil(60)
                 ),
                 Style::new().fg(FAINT),
             ));
         }
-        out.push(Line::default());
-        out.extend(self.iq_history(b, width));
-        let h = inner.height as usize;
-        let top = (sel_line + 4).saturating_sub(h);
-        f.render_widget(
-            Paragraph::new(out.into_iter().skip(top).take(h).collect::<Vec<_>>()),
-            inner,
-        );
-    }
 
-    pub fn draw_iq_running(&self, f: &mut Frame, area: Rect, b: &BenchState) {
-        let block = panel("Running", true);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let width = inner.width as usize;
-        let iq = &b.iq;
-        let done = iq.answers.len();
-        let secs = iq.started.elapsed().as_secs();
-        let eta =
-            (done > 0).then(|| secs * (iq.expected.saturating_sub(done)) as u64 / done as u64);
-        let frac = done as f64 / iq.expected.max(1) as f64;
-        let bar_w = width.saturating_sub(40).clamp(10, 60);
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(
-                    format!(" {} ", spinner(self.elapsed())),
-                    Style::new().fg(EMBER),
-                ),
-                Span::styled(
-                    clip(&iq.stage, width.saturating_sub(6)),
-                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(
-                [Span::styled(" ", Style::new())]
-                    .into_iter()
-                    .chain(bar(frac, bar_w, EMBER))
-                    .chain([Span::styled(
-                        format!(
-                            "  {done}/{}  {}m{:02}s{}",
-                            iq.expected,
-                            secs / 60,
-                            secs % 60,
-                            eta.map_or(String::new(), |e| format!(
-                                " · ~{} min left",
-                                e.div_ceil(60)
-                            ))
-                        ),
-                        Style::new().fg(DIM),
-                    )])
-                    .collect::<Vec<_>>(),
-            ),
-        ];
-        if let Some(plan) = &iq.plan {
-            lines.push(Line::styled(
+        // The queue: the seven question sets, and how each is going.
+        let difficulty = iq.plan.as_ref().map_or(iq.difficulty, |p| p.difficulty);
+        let mut queue = Vec::new();
+        if iq.installing() {
+            queue.push(Line::styled(
                 format!(
-                    " {} · thinking {} · {}{}",
-                    if plan.quick { "quick" } else { "full" },
-                    plan.thinking.map_or("off".to_string(), |t| format!("≤{t}")),
-                    plan.draft_label(),
-                    iq.loaded.map_or(String::new(), |(c, w)| format!(
-                        " · context {c} · weights {w:.1} GiB"
-                    ))
+                    " {} {}",
+                    spinner(self.elapsed()),
+                    clip(&iq.install_stage, w.form.saturating_sub(4))
                 ),
+                Style::new().fg(EMBER),
+            ));
+        }
+        if let Some((note, ok)) = &iq.install_note {
+            queue.extend(crate::layout::wrapped(
+                &format!("{} {note}", if *ok { "✓" } else { "✗" }),
+                1,
+                w.form,
+                Style::new().fg(if *ok { GOOD } else { BAD }),
+            ));
+        }
+        for (i, (_, name)) in CATEGORIES.iter().enumerate() {
+            let right = match (setup, iq.tallies.get(i), &iq.suite) {
+                (false, Some(t), _) if t.n > 0 => format!("{}/{}", t.right, t.n),
+                (false, _, _) => "·".into(),
+                (true, _, Ok(s)) => format!("{} q", s.sets.get(i).map_or(0, Vec::len)),
+                (true, _, Err(_)) => "–".into(),
+            };
+            let color = match iq.tallies.get(i) {
+                Some(t) if !setup && t.n > 0 => score_color(t.share()),
+                _ => DIM,
+            };
+            let mark = if iq.suite.is_ok() { "✓" } else { "·" };
+            queue.push(Line::from(vec![
+                Span::styled(
+                    format!(" {mark} "),
+                    Style::new().fg(if iq.suite.is_ok() { GOOD } else { FAINT }),
+                ),
+                Span::styled(
+                    fit_w(name, w.form.saturating_sub(text_width(&right) + 6)),
+                    Style::new().fg(TEXT),
+                ),
+                Span::styled(
+                    format!(" {right}"),
+                    Style::new().fg(color).add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            queue.push(Line::styled(
+                format!("   {}", difficulty.datasets()[i]),
                 Style::new().fg(FAINT),
             ));
         }
-        if let Some(e) = &iq.failed {
-            lines.push(Line::styled(
-                format!(" ✗ {}", clip(e, width.saturating_sub(4))),
-                Style::new().fg(BAD),
-            ));
-        }
-        lines.push(Line::default());
-        if let Some(s) = eval::score(&iq.tallies) {
-            lines.push(Line::styled(
-                format!(" so far {}", s.label()),
-                Style::new()
-                    .fg(score_color(s.share))
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        lines.extend(Self::iq_table(
-            &iq.tallies,
-            iq.plan.as_ref().map_or(iq.difficulty, |p| p.difficulty),
-            width,
-        ));
-        lines.push(Line::default());
-        for (cat, id, correct, answer) in iq.answers.iter().rev().take(8) {
-            lines.push(Line::styled(
-                format!(
-                    "   {} {:<22} {:<12} {}",
-                    if *correct { "✓" } else { "✗" },
-                    clip(id, 22),
-                    CATEGORIES[*cat].0,
-                    clip(&shown_answer(*cat, answer.as_deref()), 30)
-                ),
-                Style::new().fg(if *correct { DIM } else { BAD }),
-            ));
-        }
-        let h = inner.height as usize;
-        f.render_widget(
-            Paragraph::new(lines.into_iter().take(h).collect::<Vec<_>>()),
-            inner,
-        );
-    }
 
-    pub fn draw_iq_results(&self, f: &mut Frame, area: Rect, b: &BenchState) {
-        let block = panel("Results", true);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let width = inner.width as usize;
-        let iq = &b.iq;
-        let mut lines: Vec<Line> = Vec::new();
-        let asked = iq.answers.len();
-        match eval::score(&iq.tallies) {
-            Some(s) => {
-                lines.push(Line::from(vec![
-                    Span::styled(" ★ ", Style::new().fg(EMBER)),
-                    Span::styled(
-                        s.label(),
-                        Style::new()
-                            .fg(score_color(s.share))
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        if s.predicted {
-                            let total: usize = iq.tallies.iter().map(|t| t.total).sum();
-                            format!(
-                                "  predicted for all {total} questions from {asked} (95% range)"
-                            )
-                        } else {
-                            format!("  actual, all {asked} questions")
-                        },
-                        Style::new().fg(TEXT),
-                    ),
-                ]));
-                if let Some(plan) = &iq.plan {
-                    lines.push(Line::styled(
-                        format!(
-                            "   thinking {} · {} · mean of the category scores",
-                            plan.thinking
-                                .map_or("off".to_string(), |t| format!("up to {t} tokens")),
-                            plan.draft_label()
-                        ),
-                        Style::new().fg(DIM),
-                    ));
+        // The chart: the leaderboard before a run, the categories after.
+        let (chart_title, chart_note, chart) = if setup {
+            let path = model.map(|m| m.path.display().to_string());
+            let mut best: Vec<(&EvalResult, eval::Score)> = Vec::new();
+            for r in iq.results.iter().filter(|r| r.difficulty == iq.difficulty) {
+                let Some(sc) = r.score() else { continue };
+                match best.iter_mut().find(|(x, _)| x.model == r.model) {
+                    Some(slot) if sc.share > slot.1.share => *slot = (r, sc),
+                    Some(_) => {}
+                    None => best.push((r, sc)),
                 }
             }
-            None => lines.push(Line::styled(
-                " no question was answered",
-                Style::new().fg(GOLD),
-            )),
-        }
-        if iq.saved {
-            lines.push(Line::styled(
-                format!("   ✓ saved to {}", eval::results_path().display()),
-                Style::new().fg(GOOD),
+            best.sort_by(|a, c| c.1.share.total_cmp(&a.1.share));
+            let bars: Vec<ChartBar> = best
+                .iter()
+                .map(|(r, sc)| ChartBar {
+                    label: crate::evalcompare::model_name(&r.model),
+                    sub: String::new(),
+                    share: sc.share,
+                    margin: if sc.predicted { sc.margin } else { 0.0 },
+                    color: score_color(sc.share),
+                    value: format!("{} · {}", sc.label(), ago(r.when)),
+                    value_color: score_color(sc.share),
+                    star: path.as_deref() == Some(r.model.as_str()),
+                    pending: false,
+                })
+                .collect();
+            let chart = if bars.is_empty() {
+                Chart::Empty(crate::layout::wrapped(
+                    "No scores yet. r runs a quick test on the model on the left: a fixed subset of every set that predicts the full score.",
+                    2,
+                    w.chart,
+                    Style::new().fg(DIM),
+                ))
+            } else {
+                Chart::Bars(bars)
+            };
+            (
+                format!("Best score per model · {}", iq.difficulty.key()),
+                "▒ 95% range of a quick run".to_string(),
+                chart,
+            )
+        } else {
+            let bars: Vec<ChartBar> = iq
+                .tallies
+                .iter()
+                .enumerate()
+                .map(|(i, t)| ChartBar {
+                    label: CATEGORIES[i].1.to_string(),
+                    sub: String::new(),
+                    share: t.share(),
+                    margin: 0.0,
+                    color: score_color(t.share()),
+                    value: if t.n == 0 {
+                        "not asked".into()
+                    } else {
+                        format!("{:>3.0}%  {}/{}", t.share() * 100.0, t.right, t.n)
+                    },
+                    value_color: if t.n == 0 {
+                        FAINT
+                    } else {
+                        score_color(t.share())
+                    },
+                    star: false,
+                    pending: false,
+                })
+                .collect();
+            let title = match eval::score(&iq.tallies) {
+                Some(sc) if b.phase == BenchPhase::Results => format!(
+                    "★ {} {}",
+                    sc.label(),
+                    if sc.predicted {
+                        format!(
+                            "predicted for all {} questions",
+                            iq.tallies.iter().map(|t| t.total).sum::<usize>()
+                        )
+                    } else {
+                        "on every question".into()
+                    }
+                ),
+                Some(sc) => format!("Score by category · so far {}", sc.label()),
+                None => "Score by category".into(),
+            };
+            let note = match &iq.plan {
+                Some(p) => format!(
+                    "{} · thinking {} · {}",
+                    if p.quick { "quick" } else { "full" },
+                    p.thinking.map_or("off".to_string(), |t| format!("≤{t}")),
+                    p.draft_label()
+                ),
+                None => String::new(),
+            };
+            (title, note, Chart::Bars(bars))
+        };
+
+        // Rows: this model's earlier results, or the answers as they come.
+        let (rows_title, rows_note, rows) = if setup {
+            let mut rows = self.iq_history(b, w.rows, 40);
+            if rows.is_empty() {
+                rows.push(Line::styled(
+                    " no results for this model yet",
+                    Style::new().fg(FAINT),
+                ));
+            } else {
+                rows.remove(0);
+            }
+            (
+                "This model's results".to_string(),
+                "newest first".to_string(),
+                rows,
+            )
+        } else if b.phase == BenchPhase::Running {
+            // The live feed: each question, then the reply as it streams.
+            let mut rows = feed_lines(&iq.feed, w.rows);
+            rows.push(Line::styled(
+                format!(" {}", spinner(self.elapsed())),
+                Style::new().fg(EMBER),
             ));
-        } else if iq.failed.is_none() {
-            lines.push(Line::styled(
+            let right = iq.answers.iter().filter(|a| a.2).count();
+            (
                 format!(
-                    "   stopped after {asked} of {} questions · not saved",
+                    "Live · question {} of {}",
+                    iq.answers.len() + 1,
                     iq.expected
                 ),
-                Style::new().fg(GOLD),
-            ));
-        }
+                format!("{right} right of {} so far", iq.answers.len()),
+                rows,
+            )
+        } else {
+            let answer_w = w.rows.saturating_sub(42).max(12);
+            let rows: Vec<Line> = iq
+                .answers
+                .iter()
+                .rev()
+                .map(|(cat, id, correct, answer)| {
+                    Line::styled(
+                        format!(
+                            " {} {:<22} {:<13} {}",
+                            if *correct { "✓" } else { "✗" },
+                            clip(id, 22),
+                            CATEGORIES[*cat].0,
+                            clip(&shown_answer(*cat, answer.as_deref()), answer_w)
+                        ),
+                        Style::new().fg(if *correct { DIM } else { BAD }),
+                    )
+                })
+                .collect();
+            let right = iq.answers.iter().filter(|a| a.2).count();
+            (
+                "Answers".to_string(),
+                format!("{right} right of {} · newest first", iq.answers.len()),
+                rows,
+            )
+        };
+
+        let mut notes: Vec<Line> = Vec::new();
         if let Some(e) = &iq.failed {
-            lines.push(Line::styled(
-                "   ✗ the run failed · not saved",
+            notes.push(Line::styled(
+                " ✗ the run failed · not saved",
                 Style::new().fg(BAD),
             ));
-            for (a, z) in wrap_rows(e, width.saturating_sub(6)) {
-                let chars: Vec<char> = e.chars().collect();
-                lines.push(Line::styled(
-                    format!("     {}", chars[a..z].iter().collect::<String>()),
-                    Style::new().fg(DIM),
-                ));
-            }
+            notes.extend(crate::layout::wrapped(e, 3, w.notes, Style::new().fg(DIM)));
+            notes.push(Line::default());
+        } else if b.phase == BenchPhase::Results {
+            notes.push(if iq.saved {
+                Line::styled(" ✓ saved", Style::new().fg(GOOD))
+            } else {
+                Line::styled(
+                    format!(
+                        " stopped after {} of {} · not saved",
+                        iq.answers.len(),
+                        iq.expected
+                    ),
+                    Style::new().fg(GOLD),
+                )
+            });
+            notes.push(Line::default());
         }
-        lines.push(Line::default());
-        lines.extend(Self::iq_table(
-            &iq.tallies,
-            iq.plan.as_ref().map_or(iq.difficulty, |p| p.difficulty),
-            width,
-        ));
-        lines.push(Line::default());
-        lines.extend(self.iq_history(b, width));
-        f.render_widget(Paragraph::new(lines), inner);
+        for (k, what) in [
+            (
+                "quick",
+                "a fixed subset of every set; the full score is predicted with a 95% range (the ±)",
+            ),
+            ("full", "every question; the score is exact"),
+            ("hard", "sets that still separate current models"),
+            (
+                "graded",
+                "each answer is checked by a program: exact match, test cases or rule checks",
+            ),
+            ("compare", "c lines up every saved result, any model"),
+        ] {
+            notes.extend(crate::benchview::legend(k, what, TEXT, w.notes));
+        }
+        Parts {
+            form,
+            form_sel,
+            queue_title: "Question sets".into(),
+            queue_note: iq.difficulty.key().into(),
+            queue,
+            queue_sel: None,
+            help: iq_help(LINES[sel]).into(),
+            chart_title,
+            chart_note,
+            chart,
+            rows_title,
+            rows_note,
+            rows,
+            rows_keep: None,
+            rows_tail: b.phase == BenchPhase::Running,
+            notes,
+            running: b.phase == BenchPhase::Running,
+            small_chart: b.phase == BenchPhase::Running,
+        }
     }
 }
 
@@ -964,15 +959,6 @@ mod tests {
 
     #[test]
     fn bars_fill_to_the_share() {
-        let text = |share| {
-            bar(share, 10, GOOD)
-                .iter()
-                .map(|s| s.content.to_string())
-                .collect::<String>()
-        };
-        assert_eq!(text(0.5), "█████░░░░░");
-        assert_eq!(text(1.2), "██████████");
-        assert_eq!(text(-1.0), "░░░░░░░░░░");
         assert_eq!(score_color(0.8), GOOD);
         let ranged = bar_ranged(0.5, 0.2, 10, GOOD)
             .iter()

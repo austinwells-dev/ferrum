@@ -91,6 +91,19 @@ impl App {
             bench: None,
             closing: Vec::new(),
             gfx: Default::default(),
+            prefs: Prefs::load(&saved["layout"]),
+            dash: Default::default(),
+            overlay: Overlay::None,
+            chat_box: true,
+            panel_override: None,
+            size: Default::default(),
+            machine: bench::Machine::detect(),
+            serve_gib: 0.0,
+            keys_shown: Default::default(),
+            bench_pane: 0,
+            models_sel: 0,
+            models_sort: models::Sort::Speed,
+            models_detail: false,
         };
         app.load_info();
         app
@@ -111,6 +124,7 @@ impl App {
             "model": self.selected().map(|m| m.path.display().to_string()),
             "values": self.values_map(),
             "extra": self.extra,
+            "layout": self.prefs.to_json(),
             "favorites": self.favs.iter().map(|f| json!({
                 "name": f.name,
                 "model": f.model,
@@ -397,15 +411,26 @@ impl App {
             self.status = Some((why, false));
             return;
         }
+        let what = match self.mode {
+            Mode::Chat => "this chat",
+            Mode::Agent => "this agent",
+            Mode::Serve => "this server",
+        };
+        if !self.make_room(what, false, false) {
+            return;
+        }
         self.save();
         self.reap();
+        let size = self.selected().map_or(0, |m| m.size);
         let started = match self.mode {
             Mode::Chat | Mode::Agent => Chat::start(self).map(|c| {
                 self.chat = Some(c);
+                self.chat_box = true;
                 Screen::Chat
             }),
             Mode::Serve => Serve::start(self).map(|s| {
                 self.serve = Some(s);
+                self.serve_gib = size as f64 / (1u64 << 30) as f64;
                 Screen::Serve
             }),
         };

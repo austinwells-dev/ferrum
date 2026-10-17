@@ -3,8 +3,10 @@
 //! lives in [`crate::evalui`].
 use crate::agentui::AgentState;
 use crate::bench::{self, Candidate, ChunkRow, Event, Machine, Plan, Row, Running, Saved, Source};
+use crate::benchview::{Chart, ChartBar, Parts, Widths, form_row};
 use crate::eval;
 use crate::evalui::{IqState, Measure};
+use crate::layout::{fit_w, list_row};
 use crate::*;
 
 const TOKENS: [usize; 3] = [128, 192, 256];
@@ -54,21 +56,6 @@ enum Line_ {
     Q8,
     Chunks,
     Run,
-}
-
-/// Append `text` wrapped to `width` columns, each row indented by `indent` spaces.
-fn push_wrapped(
-    lines: &mut Vec<Line<'static>>,
-    text: &str,
-    indent: usize,
-    width: usize,
-    style: Style,
-) {
-    let chars: Vec<char> = text.chars().collect();
-    for (a, b) in wrap_rows(text, width.saturating_sub(indent + 1)) {
-        let part: String = chars[a..b].iter().collect();
-        lines.push(Line::styled(format!("{}{part}", " ".repeat(indent)), style));
-    }
 }
 
 pub fn ago(secs: u64) -> String {
@@ -169,18 +156,20 @@ impl App {
         self.screen = Screen::Bench;
     }
 
+    /// Home, keeping the tab as it is. A run in progress is asked to stop
+    /// instead, and shows what finished.
     pub fn leave_bench(&mut self) {
-        if let Some(mut b) = self.bench.take() {
-            if let Some(mut run) = b.run.take() {
-                run.stop.store(true, std::sync::atomic::Ordering::SeqCst);
-                if let Some(h) = run.handle.take() {
-                    self.closing.push(h);
-                }
-            }
-            self.closing.extend(b.iq.stop());
-            self.closing.extend(b.ag.stop());
+        let running = self
+            .bench
+            .as_ref()
+            .filter(|b| b.phase == BenchPhase::Running)
+            .map(|b| b.measure);
+        match running {
+            Some(Measure::Speed) => self.speed_stop(),
+            Some(Measure::Intelligence) => self.iq_stop(),
+            Some(Measure::Agent) => self.agent_stop(),
+            None => self.screen = Screen::Home,
         }
-        self.screen = Screen::Home;
     }
 
     fn bench_lines(&self) -> Vec<Line_> {
@@ -226,6 +215,9 @@ impl App {
     }
 
     fn start_bench(&mut self) {
+        if !self.make_room("the benchmark", false, false) {
+            return;
+        }
         let Some(plan) = self.bench_plan() else {
             self.status = Some(("no supported model to benchmark".into(), false));
             return;
@@ -357,14 +349,63 @@ impl App {
             Some(b) => (b.phase, b.measure),
             None => return self.go_home(),
         };
+        let comparing = self
+            .bench
+            .as_ref()
+            .is_some_and(|b| b.iq.compare.is_some() || b.ag.compare.is_some());
+        let viewing = self.bench.as_ref().is_some_and(|b| b.ag.viewer.is_some());
+        // A narrow window shows one group of panes; tab moves between them.
+        if key.code == KeyCode::Tab
+            && !comparing
+            && !viewing
+            && self.size.get().0 < self.prefs.compact
+        {
+            self.bench_pane = (self.bench_pane + 1) % crate::benchview::GROUPS.len();
+            return;
+        }
+        let before = phase;
+        self.bench_key_inner(key, phase, measure, comparing);
+        if before != BenchPhase::Running
+            && self
+                .bench
+                .as_ref()
+                .is_some_and(|b| b.phase == BenchPhase::Running)
+        {
+            self.bench_pane = 1;
+        }
+    }
+
+    fn bench_key_inner(
+        &mut self,
+        key: KeyEvent,
+        phase: BenchPhase,
+        measure: Measure,
+        comparing: bool,
+    ) {
+        if phase != BenchPhase::Running
+            && !comparing
+            && key.code == KeyCode::Char('m')
+            && let Some(b) = self.bench.as_mut()
+        {
+            b.phase = BenchPhase::Setup;
+            b.measure = match b.measure {
+                Measure::Speed => Measure::Intelligence,
+                Measure::Intelligence => Measure::Agent,
+                Measure::Agent => Measure::Speed,
+            };
+            // Land on the Measure row, as switching there would.
+            b.sel = 1;
+            b.iq.sel = 1;
+            b.ag.sel = 1;
+            return;
+        }
         if measure == Measure::Agent {
+            if self.bench.as_ref().is_some_and(|b| b.ag.compare.is_some()) {
+                return self.agent_compare_key(key);
+            }
             return match phase {
                 BenchPhase::Setup => self.agent_setup_key(key),
-                BenchPhase::Running => {
-                    if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-                        self.agent_stop();
-                    }
-                }
+                BenchPhase::Running => self.agent_running_key(key),
                 BenchPhase::Results => self.agent_results_key(key),
             };
         }
@@ -485,61 +526,29 @@ impl App {
 
     // ---- drawing ----
 
-    pub fn draw_bench(&self, f: &mut Frame) {
+    pub fn draw_bench(&self, f: &mut Frame, body: Rect, footer: Rect) {
         let Some(b) = self.bench.as_ref() else { return };
-        let [head, body, footer] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(8),
-            Constraint::Length(1),
-        ])
-        .areas(f.area());
-        let model = self.models.get(b.model);
-        let comparing = b.measure == Measure::Intelligence && b.iq.compare.is_some();
-        let stopping = match b.measure {
-            Measure::Speed => b.stopping,
-            Measure::Intelligence => b.iq.stopping,
-            Measure::Agent => b.ag.stopping,
-        };
-        let (pill_text, pill_color) = match (b.phase, stopping) {
-            _ if comparing => ("COMPARE", GOLD),
-            (BenchPhase::Setup, _) => ("SETUP", GOLD),
-            (BenchPhase::Running, true) => ("STOPPING", GOLD),
-            (BenchPhase::Running, false) => ("RUNNING", EMBER),
-            (BenchPhase::Results, _) => ("RESULTS", GOOD),
-        };
-        let name = model.map(|m| m.name.as_str()).unwrap_or("");
-        header(
-            f,
-            head,
-            &["Benchmark", name],
-            vec![pill(pill_text, pill_color)],
-        );
-        // Compare spreads out on a wide screen (it draws columns there).
-        let area = if comparing && body.width >= crate::evalcompare::WIDE {
-            Rect {
-                x: body.x + 1,
-                width: body.width - 2,
-                ..body
-            }
-        } else {
-            centered(body, 104, body.height)
-        };
+        let comparing = (b.measure == Measure::Intelligence && b.iq.compare.is_some())
+            || (b.measure == Measure::Agent && b.ag.compare.is_some());
         let iq = b.measure == Measure::Intelligence;
         let agent = b.measure == Measure::Agent;
-        match (b.phase, iq) {
-            _ if comparing => self.draw_iq_compare(f, area, b),
-            (BenchPhase::Setup, _) if agent => self.draw_agent_setup(f, area, b),
-            (BenchPhase::Running, _) if agent => self.draw_agent_running(f, area, b),
-            (BenchPhase::Results, _) if agent => self.draw_agent_results(f, area, b),
-            (BenchPhase::Setup, false) => self.draw_bench_setup(f, area, b),
-            (BenchPhase::Running, false) => self.draw_bench_running(f, area, b),
-            (BenchPhase::Results, false) => self.draw_bench_results(f, area, b),
-            (BenchPhase::Setup, true) => self.draw_iq_setup(f, area, b),
-            (BenchPhase::Running, true) => self.draw_iq_running(f, area, b),
-            (BenchPhase::Results, true) => self.draw_iq_results(f, area, b),
+        let viewing = agent && b.ag.viewer.is_some();
+        let narrow = body.width < self.prefs.compact;
+        match () {
+            _ if comparing && agent => self.draw_agent_compare(f, body, b),
+            _ if comparing => self.draw_iq_compare(f, body, b),
+            // Transcripts are laid out 104 wide (`agent_pick_key`).
+            _ if viewing => self.draw_agent_viewer(f, centered(body, 108, body.height), b),
+            _ => self.draw_bench_view(f, body, b),
         }
-        let keys: &[(&str, &str)] = match b.phase {
-            _ if comparing => &[
+        let mut keys: Vec<(&str, &str)> = match b.phase {
+            _ if comparing && agent => vec![
+                ("←→", "move"),
+                ("t", "thinking"),
+                ("x", "clear"),
+                ("esc", "back"),
+            ],
+            _ if comparing => vec![
                 ("↑↓", "move"),
                 ("enter", "details"),
                 ("d", "difficulty"),
@@ -548,198 +557,507 @@ impl App {
                 ("x", "clear"),
                 ("esc", "back"),
             ],
-            BenchPhase::Results if agent => &[("r", "run again"), ("esc", "home")],
-            BenchPhase::Setup if iq => &[
-                ("↑↓", "move"),
-                ("←→/space", "change"),
-                ("r", "run"),
+            _ if viewing => vec![
+                ("↑↓", "scroll"),
+                ("pgup/pgdn", "page"),
+                ("g/G", "top/end"),
+                ("esc", "close"),
+            ],
+            BenchPhase::Running if agent => vec![("esc", "stop, keep what finished")],
+            BenchPhase::Results if agent => vec![
+                ("↑↓", "task"),
+                ("enter", "transcript"),
                 ("c", "compare"),
-                ("esc", "back"),
+                ("r", "run again"),
+                ("m", "measure"),
             ],
-            BenchPhase::Results if iq => &[("c", "compare"), ("r", "run again"), ("esc", "home")],
-            BenchPhase::Setup => &[
+            BenchPhase::Setup if agent || iq => vec![
+                ("↑↓", "move"),
+                ("←→", "change"),
+                ("r", "run"),
+                ("m", "measure"),
+                ("c", "compare"),
+            ],
+            BenchPhase::Results if iq => {
+                vec![("c", "compare"), ("r", "run again"), ("m", "measure")]
+            }
+            BenchPhase::Setup => vec![
                 ("↑↓", "move"),
                 ("←→/space", "change"),
                 ("r", "run"),
-                ("esc", "back"),
+                ("m", "measure"),
             ],
-            BenchPhase::Running => &[("esc", "stop and show what finished")],
-            BenchPhase::Results => &[
+            BenchPhase::Running => vec![("esc", "stop, keep what finished")],
+            BenchPhase::Results => vec![
                 ("s", "save as favorite"),
                 ("v", "save for Serve"),
                 ("r", "run again"),
-                ("esc", "home"),
+                ("m", "measure"),
             ],
         };
-        keys_footer(f, footer, keys, &self.status);
+        if narrow && !comparing && !viewing {
+            keys.insert(0, ("tab", "next group"));
+        }
+        if !comparing && !viewing && b.phase != BenchPhase::Running {
+            keys.push(("[ ]", "resize"));
+        }
+        self.footer(f, footer, &keys);
     }
 
-    fn draw_bench_setup(&self, f: &mut Frame, area: Rect, b: &BenchState) {
-        let block = panel("Tune this Mac", true);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let width = inner.width as usize;
-        let title = |s: &str| {
-            Line::styled(
-                format!("  {s}"),
-                Style::new().fg(DIM).add_modifier(Modifier::BOLD),
-            )
-        };
+    /// What the selected setup row does.
+    fn bench_help(&self, line: Line_, b: &BenchState) -> String {
+        match line {
+            Line_::Model => "The model to tune. Only models ferrum can run are offered.".into(),
+            Line_::Measure => "Speed finds the fastest drafter and depth for this Mac; intelligence scores answers; agentic coding runs real bug fixes. m switches.".into(),
+            Line_::Cand(i) if b.cands.get(i).is_some_and(|c| c.source == Source::Baseline) => {
+                "Plain decoding, no drafter: the speed and the answers every drafter is checked against.".into()
+            }
+            Line_::Cand(_) => "A drafter guesses several tokens ahead and the model checks them in one step. Space includes or skips it.".into(),
+            Line_::Sweep => "Quick tries a few draft depths per drafter; full tries every depth up to the drafter's maximum.".into(),
+            Line_::Tokens => "Tokens generated per prompt. More gives steadier numbers and takes longer.".into(),
+            Line_::Q8 => "Also try each drafter at q8_0: more memory, sometimes more accepted drafts.".into(),
+            Line_::Chunks => "Also find the fastest prefill chunk for the server: how many prompt rows go through per pass.".into(),
+            Line_::Run => "Start the sweep. Esc while it runs stops it and keeps what finished.".into(),
+        }
+    }
+
+    /// The speed measure's panes.
+    pub fn speed_parts(&self, b: &BenchState, w: Widths) -> Parts {
         let lines_def = self.bench_lines();
         let sel = b.sel.min(lines_def.len() - 1);
-        let mut out: Vec<Line> = Vec::new();
-        let mut sel_line = 0;
-        out.push(title("THIS MAC"));
-        out.push(Line::styled(
-            format!("   {}", b.machine.label()),
-            Style::new().fg(TEXT),
-        ));
-        out.push(Line::default());
+        let setup = b.phase == BenchPhase::Setup;
         let model = self.models.get(b.model);
+        // The form: every row but the candidates, which are the queue.
+        let mut form = Vec::new();
+        let mut form_sel = None;
+        let mut queue = Vec::new();
+        let mut queue_sel = None;
         for (n, &def) in lines_def.iter().enumerate() {
-            match def {
-                Line_::Cand(0) => {
-                    out.push(Line::default());
-                    out.push(title("WHAT TO TEST"));
+            let on = n == sel && setup;
+            if let Line_::Cand(i) = def {
+                let c = &b.cands[i];
+                if on {
+                    queue_sel = Some(queue.len());
                 }
-                Line_::Sweep => {
-                    out.push(Line::default());
-                    out.push(title("OPTIONS"));
-                }
-                Line_::Run => out.push(Line::default()),
-                _ => {}
+                queue.extend(self.candidate_lines(b, i, c, on, w.form));
+                continue;
             }
-            let on = n == sel;
-            let bg = if on { SELECTED } else { Color::Reset };
-            if on {
-                sel_line = out.len();
-            }
-            let (label, value, value_style): (String, String, Style) = match def {
+            let (label, value) = match def {
                 Line_::Model => (
-                    "Model".into(),
-                    format!(
-                        "‹ {} ›",
-                        model
-                            .map(|m| clip(&m.name, 44))
-                            .unwrap_or_else(|| "none".into())
-                    ),
-                    Style::new().fg(EMBER).add_modifier(Modifier::BOLD),
+                    "Model",
+                    model
+                        .map(|m| m.name.clone())
+                        .unwrap_or_else(|| "none".into()),
                 ),
-                Line_::Measure => (
-                    "Measure".into(),
-                    "‹ speed ›".into(),
-                    Style::new().fg(EMBER).add_modifier(Modifier::BOLD),
-                ),
-                Line_::Cand(i) => {
-                    let c = &b.cands[i];
-                    let locked = c.source == Source::Baseline;
-                    let mark = if locked {
-                        "[✓]"
-                    } else if c.on {
-                        "[x]"
-                    } else {
-                        "[ ]"
-                    };
-                    let depth = if c.max_depth() > 0 {
-                        format!("up to {} drafts · {}", c.max_depth(), c.quant)
-                    } else {
-                        "always measured first".to_string()
-                    };
-                    (
-                        format!("{mark} {}", clip(&c.label(), width.saturating_sub(46))),
-                        depth,
-                        Style::new().fg(if c.on { DIM } else { FAINT }),
-                    )
-                }
+                Line_::Measure => ("Measure", "speed".into()),
                 Line_::Sweep => (
-                    "Depth sweep".into(),
+                    "Depth sweep",
                     if b.quick {
-                        "‹ quick: a few depths ›"
+                        "quick · a few depths"
                     } else {
-                        "‹ full: every depth ›"
+                        "full · every depth"
                     }
                     .into(),
-                    Style::new().fg(EMBER).add_modifier(Modifier::BOLD),
                 ),
-                Line_::Tokens => (
-                    "Tokens per prompt".into(),
-                    format!("‹ {} ›", TOKENS[b.tokens]),
-                    Style::new().fg(EMBER).add_modifier(Modifier::BOLD),
-                ),
-                Line_::Q8 => (
-                    "Also test q8_0 drafters".into(),
-                    if b.q8 { "‹ yes ›" } else { "‹ no ›" }.into(),
-                    Style::new().fg(EMBER).add_modifier(Modifier::BOLD),
-                ),
+                Line_::Tokens => ("Tokens per prompt", TOKENS[b.tokens].to_string()),
+                Line_::Q8 => ("q8_0 drafters too", if b.q8 { "yes" } else { "no" }.into()),
                 Line_::Chunks => (
-                    "Tune prefill chunk".into(),
+                    "Tune prefill chunk",
                     if b.chunks {
-                        "‹ yes (4 more loads) ›"
+                        "yes · 4 more loads"
                     } else {
-                        "‹ no ›"
+                        "no"
                     }
                     .into(),
-                    Style::new().fg(EMBER).add_modifier(Modifier::BOLD),
                 ),
-                Line_::Run => ("▶  Run benchmark".into(), String::new(), Style::new()),
+                Line_::Run => ("▶ Run benchmark", String::new()),
+                Line_::Cand(_) => continue,
             };
-            let label_w = width.saturating_sub(value.chars().count() + 7);
-            let run = def == Line_::Run;
-            out.push(Line::from(vec![
-                Span::styled(
-                    if on { " ▌ " } else { "   " },
-                    Style::new().fg(EMBER).bg(bg),
-                ),
-                Span::styled(
-                    format!("{:<label_w$}", clip(&label, label_w)),
-                    if run {
-                        Style::new()
-                            .fg(if on { Color::Black } else { EMBER })
-                            .bg(if on { EMBER } else { Color::Reset })
-                            .add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::new().fg(if on { Color::White } else { TEXT }).bg(bg)
-                    },
-                ),
-                Span::styled(format!(" {value} "), value_style.bg(bg)),
-                Span::styled("  ", Style::new().bg(bg)),
-            ]));
+            if def == Line_::Run {
+                form.push(Line::default());
+            }
+            if on {
+                form_sel = Some(form.len());
+            }
+            let value = clip(&value, w.form.saturating_sub(label.len() + 8));
+            form.push(form_row(on, true, w.form, label, &value, false, !setup));
         }
-        out.push(Line::default());
         if let Some(plan) = self.bench_plan() {
-            out.push(Line::styled(
+            form.push(Line::styled(
                 format!(
-                    "   about {} min · greedy decoding on {} prompts, results are checked against the no-drafter output",
+                    "   about {} min · {} prompts, greedy",
                     plan.estimate_secs().div_ceil(60),
                     bench::PROMPTS.len()
                 ),
                 Style::new().fg(FAINT),
             ));
         }
-        if let Some(m) = model {
-            let path = m.path.display().to_string();
-            if let Some(s) = b
+        let on_count = b.cands.iter().filter(|c| c.on).count();
+        let (queue_title, queue_note) = if setup {
+            (
+                "What to test".to_string(),
+                format!("{on_count} of {}", b.cands.len()),
+            )
+        } else {
+            ("Queue".to_string(), format!("{} done", b.rows.len()))
+        };
+
+        // The chart: earlier results before a run, this run's rows after.
+        let base = bench::baseline(&b.rows).map(|r| r.tps);
+        let best = bench::best(&b.rows);
+        let (chart_title, chart_note, chart) = if setup {
+            let mut saved: Vec<&Saved> = b
                 .saved
                 .iter()
-                .find(|s| s.machine == b.machine.label() && s.model == path)
-            {
-                out.push(Line::styled(
-                    format!(
-                        "   last result here ({}): {} → {:.2}×",
-                        ago(s.when),
-                        s.best,
-                        s.speedup
+                .filter(|s| s.machine == b.machine.label())
+                .collect();
+            saved.sort_by(|a, c| c.speedup.total_cmp(&a.speedup));
+            let path = model
+                .map(|m| m.path.display().to_string())
+                .unwrap_or_default();
+            let top = saved.iter().map(|s| s.speedup).fold(2.0, f64::max);
+            let bars: Vec<ChartBar> = saved
+                .iter()
+                .map(|s| ChartBar {
+                    label: crate::evalcompare::model_name(&s.model),
+                    sub: String::new(),
+                    share: s.speedup / top,
+                    margin: 0.0,
+                    color: if s.model == path { EMBER } else { GOLD },
+                    value: format!("{:.2}× · {}", s.speedup, ago(s.when)),
+                    value_color: if s.speedup >= 1.2 { GOOD } else { GOLD },
+                    star: s.model == path,
+                    pending: false,
+                })
+                .collect();
+            let chart = if bars.is_empty() {
+                Chart::Empty(crate::layout::wrapped(
+                    "Nothing measured on this Mac yet. r runs the sweep for the model on the left: each drafter at a few depths, on the same prompts, checked against plain decoding.",
+                    2,
+                    w.chart,
+                    Style::new().fg(DIM),
+                ))
+            } else {
+                Chart::Bars(bars)
+            };
+            (
+                "Best speedup per model on this Mac".to_string(),
+                "from earlier runs".to_string(),
+                chart,
+            )
+        } else {
+            let mut rows: Vec<&Row> = b.rows.iter().collect();
+            if b.phase == BenchPhase::Results {
+                rows.sort_by(|a, c| c.tps.total_cmp(&a.tps));
+            }
+            let top = rows.iter().map(|r| r.tps).fold(1.0, f64::max);
+            let mut bars: Vec<ChartBar> = rows
+                .iter()
+                .map(|r| {
+                    let is_best = best.is_some_and(|x| std::ptr::eq(*r, x));
+                    let (mark, mark_color) = speed_mark(r);
+                    ChartBar {
+                        label: short_drafter(&r.label),
+                        sub: r.depth.map_or(String::new(), |d| format!("d{d}")),
+                        share: r.tps / top,
+                        margin: 0.0,
+                        color: if is_best {
+                            EMBER
+                        } else if r.same == Some(bench::Match::Differs) {
+                            FAINT
+                        } else {
+                            GOLD
+                        },
+                        value: format!(
+                            "{:.1}{}",
+                            r.tps,
+                            if mark.trim().is_empty() {
+                                String::new()
+                            } else {
+                                format!(" {}", mark.trim())
+                            }
+                        ),
+                        value_color: mark_color,
+                        star: is_best && b.phase == BenchPhase::Results,
+                        pending: false,
+                    }
+                })
+                .collect();
+            if b.phase == BenchPhase::Running {
+                let pulse = (self.elapsed() % 2.0) as f64 / 2.0;
+                bars.push(ChartBar {
+                    label: clip(&b.stage, 28),
+                    sub: String::new(),
+                    share: pulse,
+                    margin: 0.0,
+                    color: EMBER,
+                    value: "measuring…".into(),
+                    value_color: EMBER,
+                    star: false,
+                    pending: true,
+                });
+            }
+            let title = match (b.phase, best, base) {
+                (BenchPhase::Results, Some(best), Some(base)) => match best.depth {
+                    Some(d) => format!(
+                        "★ {} · depth {d} · {} → {:.2}× plain decoding",
+                        short_drafter(&best.label),
+                        best.quant,
+                        best.tps / base.max(1e-9)
                     ),
-                    Style::new().fg(GOOD),
+                    None => "No drafter beats plain decoding here".to_string(),
+                },
+                (BenchPhase::Results, _, _) => "Not enough finished to recommend anything".into(),
+                _ => "Decode speed · tok/s".into(),
+            };
+            let note = match b.loaded {
+                Some((ctx, wg, d)) => format!(
+                    "context {ctx} · {wg:.1} GiB{}",
+                    if d > 0.0 {
+                        format!(" + {d:.1}")
+                    } else {
+                        String::new()
+                    }
+                ),
+                None => format!("{} tokens · greedy", TOKENS[b.tokens]),
+            };
+            (title, note, Chart::Bars(bars))
+        };
+
+        // Rows: the plan before a run, the measured table during and after.
+        let (rows_title, rows_note, rows, rows_tail) = if setup {
+            let mut rows = vec![crate::benchview::table_head(&[
+                ("candidate", w.rows.saturating_sub(30).min(48), false),
+                ("depths", 16, false),
+                ("quant", 6, false),
+            ])];
+            let mut runs = 0;
+            for c in b.cands.iter().filter(|c| c.on) {
+                let depths = match c.source {
+                    Source::Baseline => vec![],
+                    _ => bench::depth_list(c.max_depth(), b.quick),
+                };
+                runs += depths.len().max(1);
+                rows.push(Line::styled(
+                    format!(
+                        "  {} {} {}",
+                        fit_w(
+                            &short_drafter(&c.label()),
+                            w.rows.saturating_sub(30).min(48)
+                        ),
+                        fit_w(
+                            &if depths.is_empty() {
+                                "baseline".to_string()
+                            } else {
+                                depths
+                                    .iter()
+                                    .map(|d| d.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            },
+                            16
+                        ),
+                        if depths.is_empty() { "–" } else { c.quant }
+                    ),
+                    Style::new().fg(TEXT),
                 ));
             }
+            ("Plan".to_string(), format!("{runs} runs"), rows, false)
+        } else {
+            let mut sorted: Vec<&Row> = b.rows.iter().collect();
+            if b.phase == BenchPhase::Results {
+                sorted.sort_by(|a, c| c.tps.total_cmp(&a.tps));
+            }
+            let table = self.result_table(
+                &sorted,
+                base,
+                if b.phase == BenchPhase::Results {
+                    best
+                } else {
+                    None
+                },
+                w.rows,
+            );
+            let mut rows = table;
+            for c in &b.chunk_rows {
+                rows.push(Line::styled(
+                    format!(
+                        "   prefill chunk {:>5}   {:>7.0} tok/s",
+                        c.chunk, c.prefill_tps
+                    ),
+                    Style::new().fg(DIM),
+                ));
+            }
+            (
+                "Rows".to_string(),
+                format!("{} measured", b.rows.len()),
+                rows,
+                b.phase == BenchPhase::Running,
+            )
+        };
+        let notes = self.speed_notes(b, w.notes);
+        Parts {
+            form,
+            form_sel,
+            queue_title,
+            queue_note,
+            queue,
+            queue_sel,
+            help: self.bench_help(lines_def[sel], b),
+            chart_title,
+            chart_note,
+            chart,
+            rows_title,
+            rows_note,
+            rows,
+            rows_keep: None,
+            rows_tail,
+            notes,
+            running: b.phase == BenchPhase::Running,
+            small_chart: false,
         }
-        let h = inner.height as usize;
-        let top = (sel_line + 4).saturating_sub(h);
-        f.render_widget(
-            Paragraph::new(out.into_iter().skip(top).take(h).collect::<Vec<_>>()),
-            inner,
-        );
+    }
+
+    /// A candidate in the queue: checkbox before a run, progress during it.
+    fn candidate_lines(
+        &self,
+        b: &BenchState,
+        i: usize,
+        c: &Candidate,
+        on: bool,
+        w: usize,
+    ) -> Vec<Line<'static>> {
+        let planned = match c.source {
+            Source::Baseline => 1,
+            _ => bench::depth_list(c.max_depth(), b.quick).len(),
+        };
+        let measured: Vec<&Row> = b.rows.iter().filter(|r| r.cand == i).collect();
+        let skipped = b.skipped.iter().any(|(l, _)| *l == c.label());
+        let running = b.phase == BenchPhase::Running;
+        // Candidates run in order: the first unfinished one is running.
+        let now = running
+            && !skipped
+            && measured.len() < planned
+            && b.cands[..i].iter().enumerate().all(|(j, cj)| {
+                !cj.on
+                    || b.rows.iter().filter(|r| r.cand == j).count()
+                        >= match cj.source {
+                            Source::Baseline => 1,
+                            _ => bench::depth_list(cj.max_depth(), b.quick).len(),
+                        }
+                    || b.skipped.iter().any(|(l, _)| *l == cj.label())
+            });
+        let (mark, color) = match b.phase {
+            BenchPhase::Setup if c.source == Source::Baseline => ("[✓]".to_string(), TEXT),
+            BenchPhase::Setup if c.on => ("[x]".to_string(), TEXT),
+            BenchPhase::Setup => ("[ ]".to_string(), FAINT),
+            _ if !c.on => (" – ".to_string(), FAINT),
+            _ if skipped => (" ✗ ".to_string(), BAD),
+            _ if measured.len() >= planned => (" ✓ ".to_string(), GOOD),
+            _ if now => (format!(" {} ", spinner(self.elapsed())), EMBER),
+            _ => (" · ".to_string(), FAINT),
+        };
+        let right = match b.phase {
+            BenchPhase::Setup if c.source == Source::Baseline => "baseline".to_string(),
+            BenchPhase::Setup => format!("≤{} · {}", c.max_depth(), c.quant),
+            _ => format!("{}/{planned}", measured.len()),
+        };
+        let best = measured.iter().map(|r| r.tps).fold(0.0, f64::max);
+        let sub = match b.phase {
+            BenchPhase::Setup => String::new(),
+            _ if skipped => "skipped".into(),
+            _ if best > 0.0 => format!("best {best:.1} tok/s"),
+            _ if now => "measuring…".into(),
+            _ => "waiting".into(),
+        };
+        let name_w = w.saturating_sub(text_width(&right) + 7);
+        let mut out = vec![list_row(
+            on,
+            true,
+            w,
+            vec![
+                Span::styled(mark, Style::new().fg(color)),
+                Span::styled(
+                    format!(" {}", fit_w(&short_drafter(&c.label()), name_w)),
+                    Style::new().fg(if c.on || running { TEXT } else { FAINT }),
+                ),
+                Span::styled(format!(" {right}"), Style::new().fg(DIM)),
+            ],
+        )];
+        if !sub.is_empty() {
+            out.push(Line::styled(format!("     {sub}"), Style::new().fg(FAINT)));
+        }
+        out
+    }
+
+    /// The legend, the answer checks, skips and what was saved.
+    fn speed_notes(&self, b: &BenchState, w: usize) -> Vec<Line<'static>> {
+        let mut out: Vec<Line> = Vec::new();
+        if let Some(note) = &b.note {
+            out.extend(crate::layout::wrapped(
+                &format!("✓ {note}"),
+                1,
+                w,
+                Style::new().fg(GOOD),
+            ));
+            out.push(Line::default());
+        }
+        for (label, why) in &b.skipped {
+            out.push(Line::styled(
+                format!(" ✗ {label} was skipped"),
+                Style::new().fg(BAD),
+            ));
+            out.extend(crate::layout::wrapped(why, 3, w, Style::new().fg(DIM)));
+            out.push(Line::default());
+        }
+        for r in &b.rows {
+            let Some(v) = &r.check else { continue };
+            out.push(Line::styled(
+                format!(
+                    " {} {} d{}: {}/{} same, {} lost, {} gained",
+                    if v.passed() { "≈✓" } else { "≈✗" },
+                    short_drafter(&r.label),
+                    r.depth.unwrap_or(0),
+                    v.same,
+                    v.n,
+                    v.lost,
+                    v.gained
+                ),
+                Style::new().fg(if v.passed() { GOOD } else { BAD }),
+            ));
+        }
+        let legend = [
+            ("✓", "same as plain decoding, token for token", GOOD),
+            (
+                "≈✓",
+                "a near-tie flipped after 25% matched; kept plain decoding's right answers on the math check",
+                GOOD,
+            ),
+            ("≈✗", "the same, but lost answers: not recommended", BAD),
+            ("≈?", "not checked, so not recommended", GOLD),
+            ("≠", "went off plain decoding early: never recommended", BAD),
+            (
+                "accept",
+                "tokens taken per verify step; 1.0 is no gain",
+                DIM,
+            ),
+        ];
+        out.push(crate::layout::heading("marks"));
+        for (k, what, color) in legend {
+            out.extend(crate::benchview::legend(k, what, color, w));
+        }
+        let _ = eval::check_items;
+        out
+    }
+
+    /// Stop a speed run; it keeps what finished.
+    fn speed_stop(&mut self) {
+        if let Some(b) = self.bench.as_mut()
+            && let Some(run) = &b.run
+        {
+            run.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            b.stopping = true;
+        }
     }
 
     fn result_table(
@@ -769,7 +1087,7 @@ impl App {
             lines.push(Line::from(vec![
                 Span::styled(if is_best { " ★ " } else { "   " }, Style::new().fg(EMBER)),
                 Span::styled(
-                    format!("{:<label_w$}", clip(&r.label, label_w)),
+                    format!("{:<label_w$}", clip(&short_drafter(&r.label), label_w)),
                     Style::new()
                         .fg(if is_best { Color::White } else { TEXT })
                         .add_modifier(if is_best {
@@ -824,186 +1142,77 @@ impl App {
         }
         lines
     }
+}
 
-    fn draw_bench_running(&self, f: &mut Frame, area: Rect, b: &BenchState) {
-        let block = panel("Running", true);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let t = self.elapsed();
-        let secs = b.started.elapsed().as_secs();
-        let done = b.rows.len() + b.chunk_rows.len();
-        let frac = (done as f64 / b.expected.max(1) as f64).clamp(0.0, 1.0);
-        let bar_w = (inner.width as usize).saturating_sub(24).clamp(10, 60);
-        let filled = (frac * bar_w as f64) as usize;
-        let mut lines = vec![
-            Line::from(vec![
-                Span::styled(format!(" {} ", spinner(t)), Style::new().fg(EMBER)),
-                Span::styled(
-                    clip(&b.stage, inner.width as usize - 6),
-                    Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(vec![
-                Span::styled(" ", Style::new()),
-                Span::styled("█".repeat(filled), Style::new().fg(EMBER)),
-                Span::styled("░".repeat(bar_w - filled), Style::new().fg(FAINT)),
-                Span::styled(
-                    format!("  {done}/{}  {}m{:02}s", b.expected, secs / 60, secs % 60),
-                    Style::new().fg(DIM),
-                ),
-            ]),
-        ];
-        if let Some((ctx, w, d)) = b.loaded {
-            lines.push(Line::styled(
-                format!(
-                    " context {ctx} · weights {w:.1} GiB{}",
-                    if d > 0.0 {
-                        format!(" · drafter {d:.1} GiB")
-                    } else {
-                        String::new()
-                    }
-                ),
-                Style::new().fg(FAINT),
-            ));
-        }
-        for (label, why) in &b.skipped {
-            lines.push(Line::styled(
-                format!(" ✗ {} skipped: {}", label, clip(why, 70)),
-                Style::new().fg(BAD),
-            ));
-        }
-        lines.push(Line::default());
-        let refs: Vec<&Row> = b.rows.iter().collect();
-        let base = bench::baseline(&b.rows).map(|r| r.tps);
-        lines.extend(self.result_table(&refs, base, None, inner.width as usize));
-        let h = inner.height as usize;
-        let skip = lines.len().saturating_sub(h);
-        f.render_widget(
-            Paragraph::new(lines.into_iter().skip(skip).collect::<Vec<_>>()),
-            inner,
-        );
+/// A drafter label without the model's own name in it.
+pub fn short_drafter(label: &str) -> String {
+    let (org, rest) = label.split_once('/').unwrap_or(("", label));
+    let kind = rest.find(" (").map_or("", |i| &rest[i..]);
+    let name = rest.trim_end_matches(kind);
+    let parts: Vec<&str> = name.split(['-', '.', '_']).collect();
+    // Drop the parts that repeat the model (Qwen3.8, 27B…), keep the rest.
+    let keep: Vec<&str> = parts
+        .iter()
+        .copied()
+        .filter(|p| {
+            let l = p.to_lowercase();
+            !(l.starts_with("qwen")
+                || l.ends_with('b') && l[..l.len() - 1].parse::<f64>().is_ok()
+                || l.starts_with('a') && l.ends_with('b') && l.len() <= 4
+                || l.parse::<f64>().is_ok())
+        })
+        .collect();
+    let short = if keep.is_empty() {
+        name.to_string()
+    } else {
+        keep.join("-")
+    };
+    match org {
+        "" => short,
+        o => format!("{o} {short}"),
     }
+}
 
-    fn draw_bench_results(&self, f: &mut Frame, area: Rect, b: &BenchState) {
-        let block = panel("Results", true);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
-        let width = inner.width as usize;
-        let mut lines: Vec<Line> = Vec::new();
-        let best = bench::best(&b.rows);
-        let base = bench::baseline(&b.rows).map(|r| r.tps);
-        match (best, base) {
-            (Some(best), Some(base)) => {
-                lines.push(Line::from(vec![
-                    Span::styled(" ★ ", Style::new().fg(EMBER)),
-                    Span::styled(
-                        match best.depth {
-                            Some(d) => format!("{} · depth {d} · {}", best.label, best.quant),
-                            None => "no drafter".to_string(),
-                        },
-                        Style::new().fg(Color::White).add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                lines.push(Line::styled(
-                    if best.depth.is_some() {
-                        format!(
-                            "   {:.1} tok/s, {:.2}× the {:.1} tok/s of plain decoding on {}",
-                            best.tps,
-                            best.tps / base.max(1e-9),
-                            base,
-                            b.machine.label()
-                        )
-                    } else {
-                        format!("   no drafter beats plain decoding here ({base:.1} tok/s): keep drafting off")
-                    },
-                    Style::new().fg(GOOD),
-                ));
-                if let Some(chunk) = bench::best_chunk(&b.chunk_rows) {
-                    let tps = b
-                        .chunk_rows
-                        .iter()
-                        .find(|c| c.chunk == chunk)
-                        .map_or(0.0, |c| c.prefill_tps);
-                    lines.push(Line::styled(
-                        format!("   prefill chunk {chunk} ({tps:.0} tok/s prompt processing)"),
-                        Style::new().fg(TEXT),
-                    ));
-                }
-                if b.rows.iter().any(|r| r.same == Some(bench::Match::Close)) {
-                    push_wrapped(
-                        &mut lines,
-                        &format!(
-                            "≈ rows matched plain decoding (greedy) for at least the first {:.0}% of every answer, then a near-tie flipped: batched verification rounds slightly differently. A ≈ row that would win is asked {} math questions first: ≈✓ kept plain decoding's right answers (it may be recommended), ≈✗ lost some, ≈? was not checked (neither is recommended).",
-                            bench::CLOSE_PREFIX * 100.0,
-                            eval::check_items().len()
-                        ),
-                        3,
-                        width,
-                        Style::new().fg(GOLD),
-                    );
-                    for r in b.rows.iter() {
-                        let Some(v) = &r.check else { continue };
-                        lines.push(Line::styled(
-                            format!(
-                                "     {} {} · depth {} · {}: {}/{} same answers, {} lost, {} gained",
-                                if v.passed() { "≈✓" } else { "≈✗" },
-                                r.label,
-                                r.depth.unwrap_or(0),
-                                r.quant,
-                                v.same,
-                                v.n,
-                                v.lost,
-                                v.gained
-                            ),
-                            Style::new().fg(if v.passed() { GOOD } else { BAD }),
-                        ));
-                    }
-                }
-                if b.rows.iter().any(|r| r.same == Some(bench::Match::Differs)) {
-                    push_wrapped(
-                        &mut lines,
-                        "≠ rows went off plain decoding (greedy) early in an answer, so they are not recommended.",
-                        3,
-                        width,
-                        Style::new().fg(GOLD),
-                    );
-                }
-            }
-            _ => lines.push(Line::styled(
-                " not enough finished to recommend anything (the baseline needs to complete)",
-                Style::new().fg(GOLD),
-            )),
+/// The match mark of a row and its colour.
+fn speed_mark(r: &Row) -> (&'static str, Color) {
+    match r.same {
+        Some(bench::Match::Exact) => ("✓", GOOD),
+        Some(bench::Match::Close) => match &r.check {
+            Some(v) if v.passed() => ("≈✓", GOOD),
+            Some(_) => ("≈✗", BAD),
+            None => ("≈?", GOLD),
+        },
+        Some(bench::Match::Differs) => ("≠", BAD),
+        None => ("base", DIM),
+    }
+}
+
+impl BenchState {
+    /// GiB of weights a running measure holds.
+    pub fn loaded_gib(&self) -> Option<f64> {
+        match self.measure {
+            Measure::Speed => self.loaded.map(|(_, w, d)| w + d),
+            Measure::Intelligence => self.iq.loaded.map(|(_, w)| w),
+            Measure::Agent => self.ag.loaded.map(|(_, w)| w),
         }
-        if let Some(note) = &b.note {
-            lines.push(Line::styled(format!("   ✓ {note}"), Style::new().fg(GOOD)));
-        }
-        for (label, why) in &b.skipped {
-            lines.push(Line::styled(
-                format!("   ✗ {label} was skipped"),
-                Style::new().fg(BAD),
-            ));
-            push_wrapped(&mut lines, why, 5, width, Style::new().fg(DIM));
-        }
-        lines.push(Line::default());
-        let mut sorted: Vec<&Row> = b.rows.iter().collect();
-        sorted.sort_by(|a, c| c.tps.total_cmp(&a.tps));
-        lines.extend(self.result_table(&sorted, base, best, width));
-        if !b.chunk_rows.is_empty() {
-            lines.push(Line::default());
-            lines.push(Line::styled(
-                " PREFILL CHUNK",
-                Style::new().fg(DIM).add_modifier(Modifier::BOLD),
-            ));
-            for c in &b.chunk_rows {
-                lines.push(Line::styled(
-                    format!(
-                        "   {:>5} rows per pass   {:>7.0} tok/s",
-                        c.chunk, c.prefill_tps
-                    ),
-                    Style::new().fg(TEXT),
-                ));
-            }
-        }
-        f.render_widget(Paragraph::new(lines), inner);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drafter_labels_drop_the_model_name() {
+        assert_eq!(
+            short_drafter("z-lab/Qwen3.8-27B-DFlash2 (dflash)"),
+            "z-lab DFlash2"
+        );
+        assert_eq!(
+            short_drafter("RedHatAI/Qwen3.8-27B-speculator.dspark (dspark)"),
+            "RedHatAI speculator-dspark"
+        );
+        assert_eq!(short_drafter("MTP head"), "MTP head");
+        assert_eq!(short_drafter("no drafter"), "no drafter");
     }
 }

@@ -1095,6 +1095,17 @@ pub enum EvalEvent {
         correct: bool,
         answer: Option<String>,
     },
+    /// A question is asked: its category, id and text.
+    Question {
+        cat: usize,
+        id: String,
+        text: String,
+    },
+    /// The reply being written, as it streams.
+    Delta {
+        reasoning: bool,
+        text: String,
+    },
     Failed(String),
     Done,
 }
@@ -1170,13 +1181,20 @@ fn run(plan: EvalPlan, suite: Suite, tx: Sender<EvalEvent>, stop: Arc<AtomicBool
             n + 1,
             questions.len()
         )));
-        match bench::generate_with_tools(
+        let message = item.message();
+        send(EvalEvent::Question {
+            cat: *cat,
+            id: item.id.clone(),
+            text: message.clone(),
+        });
+        match bench::generate_streaming(
             &mut rt,
-            &item.message(),
+            &message,
             &item.tools,
             item.max_tokens,
             plan.thinking,
             &stop,
+            &mut |reasoning, text| send(EvalEvent::Delta { reasoning, text }),
         ) {
             // A stopped generation is cut short: do not grade it.
             Ok(_) if stop.load(Ordering::SeqCst) => break,

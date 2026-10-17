@@ -1,77 +1,94 @@
-//! Home screen: the wordmark and four big buttons.
+//! Home: the wordmark and one button per tab.
 use crate::*;
 
-const BUTTONS: [(&str, &str, &str); 6] = [
-    ("◆", "Chat", "talk to a model right here"),
-    ("▣", "Agents", "a coding agent for your project"),
-    ("◈", "Serve", "OpenAI & Anthropic compatible API"),
-    ("◷", "Benchmark", "find the fastest drafter and depth"),
-    ("⚙", "Settings", "folders, favorites, startup"),
-    ("✕", "Quit", "see you soon"),
+/// (tab, icon, name, what it is for).
+const BUTTONS: [(Tab, &str, &str, &str); 6] = [
+    (Tab::Chat, "◆", "Chat", "talk to a model right here"),
+    (
+        Tab::Agents,
+        "▣",
+        "Agents",
+        "a coding agent for your project",
+    ),
+    (
+        Tab::Serve,
+        "◈",
+        "Serve",
+        "OpenAI & Anthropic compatible API",
+    ),
+    (
+        Tab::Bench,
+        "◷",
+        "Bench",
+        "speed, intelligence and agentic coding",
+    ),
+    (
+        Tab::Models,
+        "▤",
+        "Models",
+        "every model and drafter on this Mac",
+    ),
+    (Tab::Settings, "⚙", "Settings", "folders, layout, favorites"),
 ];
+
+/// The buttons, Quit last.
+const ROWS: usize = BUTTONS.len() + 1;
 
 impl App {
     pub fn home_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                self.home_sel = (self.home_sel + BUTTONS.len() - 1) % BUTTONS.len()
-            }
+            KeyCode::Up | KeyCode::Char('k') => self.home_sel = (self.home_sel + ROWS - 1) % ROWS,
             KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => {
-                self.home_sel = (self.home_sel + 1) % BUTTONS.len()
+                self.home_sel = (self.home_sel + 1) % ROWS
             }
-            KeyCode::Char(c @ '1'..='6') => {
-                self.home_sel = c as usize - '1' as usize;
-                self.home_activate();
-            }
-            KeyCode::Char('c') => {
-                self.home_sel = 0;
-                self.home_activate();
-            }
-            KeyCode::Char('a') => {
-                self.home_sel = 1;
-                self.home_activate();
-            }
-            KeyCode::Char('s') => {
-                self.home_sel = 2;
-                self.home_activate();
-            }
-            KeyCode::Char('b') => {
-                self.home_sel = 3;
-                self.home_activate();
-            }
+            KeyCode::Char('c') => self.go_tab(Tab::Chat),
+            KeyCode::Char('a') => self.go_tab(Tab::Agents),
+            KeyCode::Char('s') => self.go_tab(Tab::Serve),
+            KeyCode::Char('b') => self.go_tab(Tab::Bench),
+            KeyCode::Char('m') => self.go_tab(Tab::Models),
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => self.home_activate(),
+            KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Right => {
+                match BUTTONS.get(self.home_sel) {
+                    Some(b) => self.go_tab(b.0),
+                    None => self.quit = true,
+                }
+            }
             _ => {}
         }
     }
 
-    fn home_activate(&mut self) {
-        match self.home_sel {
-            0 => self.open_pick(Mode::Chat),
-            1 => self.open_pick(Mode::Agent),
-            2 => self.open_pick(Mode::Serve),
-            3 => self.open_bench(),
-            4 => {
-                self.set_sel = 0;
-                self.screen = Screen::Settings;
-            }
-            _ => self.quit = true,
+    /// A word on what a tab has running, for its button.
+    fn tab_note(&self, tab: Tab) -> Option<(String, Color)> {
+        let session = self.chat.as_ref().map(|c| c.agent.is_some());
+        match tab {
+            Tab::Chat if session == Some(false) => Some(("● open".into(), GOOD)),
+            Tab::Agents if session == Some(true) => Some(("● open".into(), GOOD)),
+            Tab::Serve => self
+                .serve
+                .as_ref()
+                .filter(|s| s.exit.is_none())
+                .map(|s| (format!("● {}", s.port_label()), GOOD)),
+            Tab::Bench => self
+                .bench
+                .as_ref()
+                .filter(|b| b.phase == benchui::BenchPhase::Running)
+                .map(|_| ("● running".into(), EMBER)),
+            _ => None,
         }
     }
 
-    pub fn draw_home(&self, f: &mut Frame) {
-        let area = f.area();
+    pub fn draw_home(&self, f: &mut Frame, area: Rect, footer: Rect) {
         let t = self.elapsed();
-        let boxed = area.height >= 30;
+        let boxed = area.height >= 34;
         let (btn_h, gap): (u16, u16) = if boxed { (3, 0) } else { (1, 1) };
-        let buttons_h = 6 * btn_h + 5 * gap;
-        let total = 5 + 2 + 2 + buttons_h + 2;
-        let top = area.y + area.height.saturating_sub(total + 1) / 2;
+        let buttons_h = ROWS as u16 * btn_h + (ROWS as u16 - 1) * gap;
+        let total = 5 + 2 + 2 + buttons_h;
+        let top = area.y + area.height.saturating_sub(total) / 2;
         let x0 = area.x + area.width.saturating_sub(35) / 2;
 
         let embers = Rect::new(
             x0.saturating_sub(10),
-            top.saturating_sub(3),
+            top.saturating_sub(3).max(area.y),
             (35 + 20).min(area.width),
             9,
         );
@@ -82,12 +99,26 @@ impl App {
         let tx = area.x + area.width.saturating_sub(tag.chars().count() as u16) / 2;
         put(f, tx, top + 6, tag, Style::new().fg(DIM));
 
-        let w = 62u16.min(area.width.saturating_sub(4));
+        let w = 64u16.min(area.width.saturating_sub(4));
         let bx = area.x + (area.width - w) / 2;
         let mut y = top + 9;
-        for (i, (icon, title, desc)) in BUTTONS.iter().enumerate() {
+        for i in 0..ROWS {
+            let (icon, title, desc, badge, note) = match BUTTONS.get(i) {
+                Some(&(tab, icon, title, desc)) => {
+                    let n = shell::TABS.iter().position(|(t, _)| *t == tab).unwrap_or(0) + 1;
+                    (icon, title, desc, n.to_string(), self.tab_note(tab))
+                }
+                None => ("✕", "Quit", "see you soon", "q".to_string(), None),
+            };
             let on = i == self.home_sel;
-            let badge = format!("{}", i + 1);
+            let desc = match &note {
+                Some((n, _)) => n.as_str(),
+                None => desc,
+            };
+            let desc_color = note.as_ref().map(|(_, c)| *c);
+            if y + btn_h > area.y + area.height {
+                break;
+            }
             if boxed {
                 let rect = Rect::new(bx, y, w, 3);
                 let block = Block::bordered()
@@ -104,44 +135,29 @@ impl App {
                         &badge,
                         on,
                         inner.width as usize,
+                        desc_color,
                     )),
                     inner,
                 );
             } else {
-                let rect = Rect::new(bx, y, w, 1);
                 f.render_widget(
-                    Paragraph::new(button_line(icon, title, desc, &badge, on, w as usize)),
-                    rect,
+                    Paragraph::new(button_line(
+                        icon, title, desc, &badge, on, w as usize, desc_color,
+                    )),
+                    Rect::new(bx, y, w, 1),
                 );
             }
             y += btn_h + gap;
         }
-
-        let status = format!(
-            "{} models ready · {} favorites · {} drafters",
-            self.runnable(),
-            self.favs.len(),
-            self.drafters.len()
-        );
-        let sx = area.x + area.width.saturating_sub(status.chars().count() as u16) / 2;
-        put(f, sx, y + 1, &status, Style::new().fg(FAINT));
-
-        let footer = Rect::new(
-            area.x,
-            area.y + area.height.saturating_sub(1),
-            area.width,
-            1,
-        );
-        keys_footer(
+        self.footer(
             f,
             footer,
             &[
                 ("↑↓", "move"),
-                ("enter", "select"),
-                ("1-6", "jump"),
+                ("enter", "open"),
+                ("2-7", "jump"),
                 ("q", "quit"),
             ],
-            &self.status,
         );
     }
 }
@@ -153,6 +169,7 @@ fn button_line(
     badge: &str,
     on: bool,
     width: usize,
+    desc_color: Option<Color>,
 ) -> Line<'static> {
     let bg = if on { SELECTED } else { Color::Reset };
     let left = format!(" {} {} {title}", if on { "▸" } else { " " }, icon);
@@ -175,7 +192,12 @@ fn button_line(
                 }),
         ),
         Span::styled(" ".repeat(pad), Style::new().bg(bg)),
-        Span::styled(desc, Style::new().fg(if on { GOLD } else { DIM }).bg(bg)),
+        Span::styled(
+            desc,
+            Style::new()
+                .fg(desc_color.unwrap_or(if on { GOLD } else { DIM }))
+                .bg(bg),
+        ),
         Span::styled(tail, Style::new().fg(FAINT).bg(bg)),
     ])
 }

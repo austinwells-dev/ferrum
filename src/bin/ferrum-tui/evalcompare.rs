@@ -82,7 +82,7 @@ const EIGHTHS: [&str; 8] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇"
 
 /// What one column cell shows at height `y` (in rows from the bottom): solid
 /// up to `solid` eighths, shaded (the predicted range) up to `upper`.
-fn column_cell(y: usize, solid: usize, upper: usize) -> &'static str {
+pub fn column_cell(y: usize, solid: usize, upper: usize) -> &'static str {
     let (lo, hi) = (y * 8, y * 8 + 8);
     if hi <= solid {
         "█"
@@ -96,7 +96,7 @@ fn column_cell(y: usize, solid: usize, upper: usize) -> &'static str {
 }
 
 /// Text `s` centered in `w` cells (clipped when longer).
-fn centered_text(s: &str, w: usize) -> String {
+pub fn centered_text(s: &str, w: usize) -> String {
     let s = clip(s, w);
     let n = s.chars().count();
     let left = (w - n) / 2;
@@ -104,7 +104,7 @@ fn centered_text(s: &str, w: usize) -> String {
 }
 
 /// The model's file name without `.gguf`.
-fn model_name(path: &str) -> String {
+pub fn model_name(path: &str) -> String {
     let name = Path::new(path)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())

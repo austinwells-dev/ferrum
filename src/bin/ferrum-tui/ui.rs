@@ -128,18 +128,42 @@ pub fn keys_footer(
     keys: &[(&str, &str)],
     status: &Option<(String, bool)>,
 ) {
-    let mut spans: Vec<Span> = Vec::new();
+    // The status sits on the right and wins the room: it is what just happened.
+    let status_w = status.as_ref().map_or(0, |(msg, _)| {
+        (text_width(msg) as u16 + 4).min(area.width.saturating_sub(20).max(area.width / 2))
+    });
+    let [left, right] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(status_w)]).areas(area);
+    let mut spans: Vec<Span> = vec![Span::raw(" ")];
+    let mut used = 1;
     for (k, w) in keys {
-        spans.push(Span::styled(format!(" {k}"), Style::new().fg(GOLD)));
-        spans.push(Span::styled(format!(" {w} "), Style::new().fg(DIM)));
-    }
-    if let Some((msg, ok)) = status {
+        // Whole hints only: a key without its meaning is noise.
+        let need = text_width(k) + text_width(w) + 5;
+        if used + need > left.width as usize {
+            break;
+        }
+        used += need;
         spans.push(Span::styled(
-            format!(" · {msg}"),
-            Style::new().fg(if *ok { GOOD } else { BAD }),
+            format!(" {k} "),
+            Style::new()
+                .fg(GOLD)
+                .bg(KEYCAP)
+                .add_modifier(Modifier::BOLD),
         ));
+        spans.push(Span::styled(format!(" {w}  "), Style::new().fg(DIM)));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(Paragraph::new(Line::from(spans)), left);
+    if let Some((msg, ok)) = status {
+        let mark = if *ok { "✓" } else { "!" };
+        f.render_widget(
+            Paragraph::new(Line::styled(
+                clip(&format!("{mark} {msg} "), right.width as usize),
+                Style::new().fg(if *ok { GOOD } else { BAD }),
+            ))
+            .alignment(Alignment::Right),
+            right,
+        );
+    }
 }
 
 /// A one-line text prompt in the middle of the screen; the terminal cursor

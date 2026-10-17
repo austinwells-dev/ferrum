@@ -224,17 +224,6 @@ pub enum Event {
     Done,
 }
 
-struct Stop<'a>(&'a AtomicBool);
-
-impl ChatHooks for Stop<'_> {
-    fn delta(&mut self, _: Delta) -> ferrum::Result<()> {
-        Ok(())
-    }
-    fn cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
 pub struct Sample {
     tokens: usize,
     decode: f64,
@@ -258,6 +247,25 @@ pub fn generate(
     generate_with_tools(rt, prompt, &[], tokens, thinking, stop)
 }
 
+/// Passes each piece of the reply on as it streams: (reasoning, text).
+struct Streaming<'a> {
+    stop: &'a AtomicBool,
+    on: &'a mut dyn FnMut(bool, String),
+}
+
+impl ChatHooks for Streaming<'_> {
+    fn delta(&mut self, delta: Delta) -> ferrum::Result<()> {
+        match delta {
+            Delta::Reasoning(t) => (self.on)(true, t),
+            Delta::Content(t) => (self.on)(false, t),
+        }
+        Ok(())
+    }
+    fn cancelled(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+}
+
 /// [`generate`] with OpenAI-style tool definitions offered to the model.
 pub fn generate_with_tools(
     rt: &mut Runtime,
@@ -266,6 +274,19 @@ pub fn generate_with_tools(
     tokens: usize,
     thinking: Option<usize>,
     stop: &AtomicBool,
+) -> Result<Sample, String> {
+    generate_streaming(rt, prompt, tools, tokens, thinking, stop, &mut |_, _| {})
+}
+
+/// [`generate_with_tools`], handing `on` the reply as it streams.
+pub fn generate_streaming(
+    rt: &mut Runtime,
+    prompt: &str,
+    tools: &[Json],
+    tokens: usize,
+    thinking: Option<usize>,
+    stop: &AtomicBool,
+    on: &mut dyn FnMut(bool, String),
 ) -> Result<Sample, String> {
     rt.session.reset();
     let mut vars = Map::new();
@@ -280,7 +301,9 @@ pub fn generate_with_tools(
         reasoning_budget: thinking,
         raw_reasoning: false,
     };
-    let r = rt.chat(&request, Stop(stop)).map_err(|e| e.to_string())?;
+    let r = rt
+        .chat(&request, Streaming { stop, on })
+        .map_err(|e| e.to_string())?;
     let c = &r.completion;
     Ok(Sample {
         tokens: c.tokens.len(),

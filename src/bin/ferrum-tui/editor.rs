@@ -1,3 +1,4 @@
+use crate::layout;
 use crate::*;
 
 impl App {
@@ -222,6 +223,13 @@ impl App {
                 self.save();
                 self.screen = Screen::Pick;
             }
+            KeyCode::BackTab => {
+                self.focus = if self.focus == Focus::Models {
+                    Focus::Settings
+                } else {
+                    Focus::Models
+                };
+            }
             KeyCode::Char('l') | KeyCode::F(5) => self.launch(),
             KeyCode::Char('a') => {
                 self.editing = Editing::AddPath;
@@ -240,7 +248,7 @@ impl App {
                 self.fresh = true;
                 self.editing = Editing::FavName;
             }
-            KeyCode::Tab | KeyCode::BackTab => {
+            KeyCode::Tab => {
                 self.focus = if self.focus == Focus::Models {
                     Focus::Settings
                 } else {
@@ -302,33 +310,47 @@ impl App {
 
     // ---- drawing ----
 
-    pub fn draw_editor(&self, f: &mut Frame) {
-        let [head, body, command, footer] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(10),
-            Constraint::Length(7),
-            Constraint::Length(1),
-        ])
-        .areas(f.area());
-        let what = match &self.origin {
-            Origin::Custom => "new setup".to_string(),
-            Origin::OneTime => "one-time run".to_string(),
-            Origin::Edit(name) => format!("edit {name}"),
-        };
-        header(
-            f,
-            head,
-            &[self.mode.label(), &what],
-            vec![pill(self.mode.pill(), EMBER)],
+    pub fn draw_editor(&self, f: &mut Frame, body: Rect, footer: Rect) {
+        // The command takes the rows it needs; the panes above take the rest.
+        let (bin, args) = self.command();
+        let cmd_len: usize =
+            text_width(bin) + 3 + args.iter().map(|a| text_width(a) + 3).sum::<usize>();
+        let cmd_rows = cmd_len.div_ceil(body.width.saturating_sub(6).max(20) as usize) as u16;
+        let note = u16::from(
+            self.models
+                .get(self.cursor)
+                .is_some_and(|m| m.problem.is_some()),
         );
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .areas(body);
-        let [list, details] =
-            Layout::vertical([Constraint::Min(6), Constraint::Length(8)]).areas(left);
-        self.draw_models(f, list);
-        self.draw_details(f, details);
-        self.draw_settings(f, right);
+        let [top, command] = Layout::vertical([
+            Constraint::Min(10),
+            Constraint::Length((cmd_rows + note + 2).clamp(3, 10)),
+        ])
+        .areas(body);
+        match layout::columns(top, 0.34, 40, 56, self.prefs.compact) {
+            (left, Some(right)) => {
+                let [list, details] =
+                    Layout::vertical([Constraint::Min(6), Constraint::Length(9)]).areas(left);
+                self.draw_models(f, list);
+                self.draw_details(f, details);
+                self.draw_settings(f, right);
+            }
+            // Stacked: models over settings, details when there is room.
+            (left, None) => {
+                let models_h = (self.models.len() as u16 * 2 + 2).clamp(6, left.height * 2 / 5);
+                let details_h = if left.height >= 44 { 9 } else { 0 };
+                let [list, details, settings] = Layout::vertical([
+                    Constraint::Length(models_h),
+                    Constraint::Length(details_h),
+                    Constraint::Min(6),
+                ])
+                .areas(left);
+                self.draw_models(f, list);
+                if details_h > 0 {
+                    self.draw_details(f, details);
+                }
+                self.draw_settings(f, settings);
+            }
+        }
         self.draw_command(f, command);
         self.draw_footer(f, footer);
     }
@@ -559,14 +581,32 @@ impl App {
             Mode::Serve => "Server settings",
             Mode::Agent => "Agent settings",
         };
-        let block = self.panel(title, focused);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
+        let what = match &self.origin {
+            Origin::Custom => "new setup".to_string(),
+            Origin::OneTime => "one-time run".to_string(),
+            Origin::Edit(name) => format!("editing {name}"),
+        };
+        let inner = layout::pane(f, area, title, focused, &what);
+        let help = match self.current_field() {
+            Some(i) if focused => self.fields[i].help,
+            _ if focused => {
+                "Launch with these settings. Enter starts it; a new setup is named and saved first."
+            }
+            _ => "Pick a model on the left, then tab over to adjust its settings.",
+        };
+        let inner = layout::draw_help(f, inner, help);
         let visible = self.visible();
+        // Two columns of groups when the pane is wide.
+        let two = inner.width >= 112;
         // (line, is the selected row)
         let mut rows: Vec<(Line, bool)> = Vec::new();
         let mut group = "";
-        let width = inner.width as usize;
+        let mut starts: Vec<usize> = Vec::new();
+        let width = if two {
+            (inner.width as usize - 2) / 2
+        } else {
+            inner.width as usize
+        };
         let mut selected_row = 0;
         for (n, &i) in visible.iter().enumerate() {
             let fl = &self.fields[i];
@@ -575,6 +615,7 @@ impl App {
                 if !rows.is_empty() {
                     rows.push((Line::default(), false));
                 }
+                starts.push(rows.len());
                 rows.push((
                     Line::from(vec![Span::styled(
                         format!("  {}", group.to_uppercase()),
@@ -615,14 +656,44 @@ impl App {
             false,
         ));
         let height = inner.height as usize;
-        let top = (selected_row + 2).saturating_sub(height);
-        let lines: Vec<Line> = rows
-            .into_iter()
-            .skip(top)
-            .take(height)
-            .map(|(l, _)| l)
-            .collect();
-        f.render_widget(Paragraph::new(lines), inner);
+        let view = |rows: Vec<(Line<'static>, bool)>, sel: Option<usize>| -> Vec<Line<'static>> {
+            let top = sel.map_or(0, |s| (s + 2).saturating_sub(height));
+            rows.into_iter()
+                .skip(top)
+                .take(height)
+                .map(|(l, _)| l)
+                .collect()
+        };
+        if !two {
+            f.render_widget(Paragraph::new(view(rows, Some(selected_row))), inner);
+            return;
+        }
+        // Break at the group start that best evens out the two columns.
+        let total = rows.len();
+        let at = starts
+            .iter()
+            .copied()
+            .filter(|&s| s > 0)
+            .min_by_key(|&s| (s.max(total - s), total - s))
+            .unwrap_or(total);
+        let mut right = rows.split_off(at);
+        if right.first().is_some_and(|(l, _)| l.width() == 0) {
+            right.remove(0);
+        }
+        let shift = total - rows.len() - right.len();
+        let [a, _, b] = Layout::horizontal([
+            Constraint::Length(width as u16),
+            Constraint::Length(2),
+            Constraint::Length(width as u16),
+        ])
+        .areas(inner);
+        let (sel_a, sel_b) = if selected_row < at {
+            (Some(selected_row), None)
+        } else {
+            (None, Some(selected_row - at - shift))
+        };
+        f.render_widget(Paragraph::new(view(rows, sel_a)), a);
+        f.render_widget(Paragraph::new(view(right, sel_b)), b);
     }
 
     pub fn field_line(&self, i: usize, on: bool, width: usize) -> Line<'static> {
@@ -678,42 +749,35 @@ impl App {
     }
 
     pub fn draw_command(&self, f: &mut Frame, area: Rect) {
-        let block = self.panel("Command", false);
-        let inner = block.inner(area);
-        f.render_widget(block, area);
+        let inner = layout::pane(f, area, "Command", false, "what launch runs");
         let (bin, args) = self.command();
-        let mut cmd = vec![
-            Span::styled(" $ ", Style::new().fg(EMBER)),
-            Span::styled(bin, Style::new().fg(GOOD).add_modifier(Modifier::BOLD)),
-        ];
+        let mut cmd: Vec<Sc> = " $ ".chars().map(|c| (c, Style::new().fg(EMBER))).collect();
+        let bin_style = Style::new().fg(GOOD).add_modifier(Modifier::BOLD);
+        cmd.extend(bin.chars().map(|c| (c, bin_style)));
         for a in &args {
-            let shown = if a.starts_with('-') {
-                Span::styled(format!(" {a}"), Style::new().fg(GOLD))
+            let (text, style) = if a.starts_with('-') {
+                (format!(" {a}"), Style::new().fg(GOLD))
             } else {
-                Span::styled(format!(" {}", shell_quote(a)), Style::new().fg(TEXT))
+                (format!(" {}", shell_quote(a)), Style::new().fg(TEXT))
             };
-            cmd.push(shown);
+            cmd.extend(text.chars().map(|c| (c, style)));
         }
-        let hint = self
-            .current_field()
-            .filter(|_| self.focus == Focus::Settings)
-            .map(|i| self.fields[i].help)
-            .unwrap_or("Pick a model, adjust settings, then launch.");
-        let note = match self
+        // Wrapped rows keep the indent, so the command reads as one block.
+        let mut lines: Vec<Line> = wrap_styled(&cmd, inner.width as usize, 3)
+            .iter()
+            .map(|row| to_line(row, Vec::new()))
+            .collect();
+        if let Some(why) = self
             .models
             .get(self.cursor)
             .and_then(|m| m.problem.as_ref())
         {
-            Some(why) => Line::styled(
+            lines.push(Line::styled(
                 format!(" ✗ can't run this model: {why}"),
                 Style::new().fg(BAD),
-            ),
-            None => Line::styled(format!(" {hint}"), Style::new().fg(DIM)),
-        };
-        f.render_widget(
-            Paragraph::new(vec![Line::from(cmd), note]).wrap(Wrap { trim: false }),
-            inner,
-        );
+            ));
+        }
+        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
     }
 
     pub fn draw_footer(&self, f: &mut Frame, area: Rect) {
@@ -732,6 +796,6 @@ impl App {
         } else {
             &[("enter", "confirm"), ("esc", "cancel")]
         };
-        keys_footer(f, area, keys, &self.status);
+        self.footer(f, area, keys);
     }
 }
