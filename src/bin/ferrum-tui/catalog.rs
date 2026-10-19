@@ -1,4 +1,14 @@
 use crate::*;
+use ferrum::{
+    hybrid::draft::{
+        DraftModel, DraftOptions, Kind as DraftKind, check_drafter_tokenizer, is_dflash,
+    },
+    loader::gguf::GgufFile,
+};
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::Mutex,
+};
 
 pub struct Model {
     pub path: PathBuf,
@@ -15,6 +25,8 @@ pub struct Model {
     pub vision: Option<PathBuf>,
     /// Why ferrum cannot run this file; None means it can.
     pub problem: Option<String>,
+    /// The header's scalar `tokenizer.*` keys, to check GGUF drafters against.
+    pub tokenizer: BTreeMap<String, MetadataValue>,
 }
 
 pub fn make_model(path: PathBuf, name: String, size: u64) -> Model {
@@ -37,6 +49,7 @@ pub fn make_model(path: PathBuf, name: String, size: u64) -> Model {
         mtp: checked.mtp,
         mtp_why: checked.mtp_why,
         problem: checked.problem,
+        tokenizer: checked.tokenizer,
     }
 }
 
@@ -137,6 +150,57 @@ pub struct Drafter {
     pub problem: Option<String>,
     /// Rows in its Markov output head, i.e. the vocabulary it was trained on.
     pub head_rows: Option<usize>,
+    /// GGUF drafters only: why it cannot serve each model checked so far.
+    pub fits: Mutex<HashMap<PathBuf, Option<String>>>,
+}
+
+impl Drafter {
+    /// A llama.cpp DFlash / DFlash2 GGUF rather than a checkpoint directory.
+    pub fn is_gguf(&self) -> bool {
+        self.path.is_file()
+    }
+
+    /// A GGUF drafter in the model's own folder, paired with it the way a
+    /// sibling mmproj is.
+    pub fn is_sibling(&self, m: &Model) -> bool {
+        self.is_gguf() && self.path.parent() == m.path.parent()
+    }
+}
+
+/// A DFlash / DFlash2 GGUF, told apart by its header alone.
+pub fn gguf_drafter(path: &Path) -> Option<Drafter> {
+    let file = fs::File::open(path).ok()?;
+    let gguf = GgufFile::from_reader_skipping_arrays(file, 4096).ok()?;
+    if !is_dflash(&gguf) {
+        return None;
+    }
+    let (config, problem) = match DraftConfig::from_gguf(&gguf) {
+        Ok(c) => (Some(c), None),
+        Err(e) => (None, Some(e.to_string())),
+    };
+    Some(Drafter {
+        kind: match config.as_ref().map(|c| c.kind) {
+            Some(DraftKind::DFlash2 { .. }) => "dflash2",
+            _ => "dflash",
+        },
+        label: path
+            .file_stem()
+            .map_or(String::new(), |s| s.to_string_lossy().into_owned()),
+        path: path.to_path_buf(),
+        config,
+        problem,
+        head_rows: None,
+        fits: Mutex::default(),
+    })
+}
+
+/// GGUFs worth opening as possible drafters: drafter-named, or small enough
+/// to be one (headers decide).
+fn maybe_gguf_drafter(lower: &str, size: u64) -> bool {
+    lower.ends_with(".gguf")
+        && !lower.contains("mmproj")
+        && !lower.contains("vocab")
+        && (is_drafter(lower) || size < (8 << 30))
 }
 
 /// The folder holding `config.json` (an HF cache entry resolves to its newest snapshot).
@@ -199,12 +263,27 @@ pub fn find_drafters(
     for entry in entries.flatten() {
         let path = entry.path();
         let name = entry.file_name().to_string_lossy().to_string();
-        if name.starts_with('.') || !path.is_dir() {
+        if name.starts_with('.') {
             continue;
         }
+        let Ok(meta) = fs::metadata(&path) else {
+            continue;
+        };
         let lower = name.to_ascii_lowercase();
+        if meta.is_file() {
+            if maybe_gguf_drafter(&lower, meta.len()) {
+                push_gguf_drafter(&path, seen, out);
+            }
+            continue;
+        }
         let hf = lower.starts_with("models--");
-        if is_drafter(&lower) && (hf || path.join("config.json").exists()) {
+        // A `-GGUF` HF repo holds drafter files, not a checkpoint.
+        let checkpoint = if hf {
+            !lower.contains("gguf")
+        } else {
+            path.join("config.json").exists()
+        };
+        if is_drafter(&lower) && checkpoint {
             let canonical = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
             if seen.insert(canonical) {
                 let (config, problem) = read_draft(&path);
@@ -219,14 +298,27 @@ pub fn find_drafters(
                         "dspark"
                     },
                     path,
+                    fits: Mutex::default(),
                 });
             }
-        } else if !hf
-            && depth > 0
-            && !matches!(name.as_str(), "node_modules" | "target" | "Library")
+        } else if depth > 0
+            && !matches!(
+                name.as_str(),
+                "node_modules" | "target" | "Library" | "blobs"
+            )
         {
             find_drafters(&path, depth - 1, seen, out);
         }
+    }
+}
+
+fn push_gguf_drafter(path: &Path, seen: &mut HashSet<PathBuf>, out: &mut Vec<Drafter>) {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !seen.contains(&canonical)
+        && let Some(d) = gguf_drafter(path)
+    {
+        seen.insert(canonical);
+        out.push(d);
     }
 }
 
@@ -235,6 +327,8 @@ pub fn scan_drafters(extra: &[String]) -> Vec<Drafter> {
     for (root, depth) in roots(extra) {
         if root.is_dir() {
             find_drafters(&root, depth, &mut seen, &mut out);
+        } else if root.is_file() {
+            push_gguf_drafter(&root, &mut seen, &mut out);
         }
     }
     out.sort_by_key(|a| a.label.to_lowercase());
@@ -248,6 +342,19 @@ pub fn drafter_problem(d: &Drafter, m: &Model) -> Option<String> {
         return Some(p.clone());
     }
     let (c, t) = (d.config.as_ref()?, m.hybrid.as_ref()?);
+    if d.is_gguf() {
+        // The loader's own checks; memoised, as lists redraw every frame.
+        let mut fits = d.fits.lock().unwrap_or_else(|e| e.into_inner());
+        return fits
+            .entry(m.path.clone())
+            .or_insert_with(|| {
+                DraftModel::memory(&d.path, t, 512, DraftOptions::default())
+                    .err()
+                    .or_else(|| check_drafter_tokenizer(&d.path, &m.tokenizer).err())
+                    .map(|e| e.to_string())
+            })
+            .clone();
+    }
     if c.hidden != t.hidden {
         return Some(format!("hidden size {} ≠ model's {}", c.hidden, t.hidden));
     }
@@ -320,6 +427,8 @@ pub fn scan(extra: &[String]) -> Vec<Model> {
             .flat_map(|j| j.join().unwrap_or_default())
             .collect()
     });
+    // DFlash GGUFs are drafters (see `scan_drafters`), not chat models.
+    models.retain(|m| m.info.as_ref().is_none_or(|i| i.arch != DFLASH_ARCH));
     models.sort_by_key(|m| (m.problem.is_some(), m.name.to_lowercase()));
     models
 }
@@ -360,7 +469,11 @@ pub struct Checked {
     pub mtp: bool,
     pub mtp_why: String,
     pub problem: Option<String>,
+    pub tokenizer: BTreeMap<String, MetadataValue>,
 }
+
+/// `general.architecture` of llama.cpp's DFlash / DFlash2 drafters.
+const DFLASH_ARCH: &str = "dflash";
 
 pub fn type_name(id: u32) -> String {
     match id {
@@ -404,6 +517,7 @@ pub fn check(path: &Path) -> Checked {
         mtp: false,
         mtp_why: String::new(),
         problem: Some(problem),
+        tokenizer: BTreeMap::new(),
     };
     let opened = fs::File::open(path)
         .map_err(|e| ferrum::Error::Gguf(format!("{}: {e}", path.display())))
@@ -477,7 +591,18 @@ pub fn check(path: &Path) -> Checked {
         mtp: false,
         mtp_why: "this GGUF has no MTP head".into(),
         problem: None,
+        tokenizer: md
+            .iter()
+            .filter(|(k, v)| {
+                k.starts_with("tokenizer.") && !matches!(v, MetadataValue::Array { .. })
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
     };
+    if arch == DFLASH_ARCH {
+        result.problem = Some("a DFlash drafter, not a chat model".into());
+        return result;
+    }
     if !matches!(arch.as_str(), "qwen35" | "qwen35moe") {
         result.problem = Some(format!("architecture {arch}: needs qwen35 or qwen35moe"));
         return result;

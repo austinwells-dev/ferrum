@@ -498,7 +498,7 @@ impl App {
                 Span::styled(
                     tail,
                     Style::new().fg(match kind {
-                        "dflash" => EMBER,
+                        "dflash" | "dflash2" => EMBER,
                         "mtp" => TEAL,
                         _ => GOLD,
                     }),
@@ -518,7 +518,7 @@ impl App {
                 won,
             );
         }
-        for dr in &self.drafters {
+        for dr in self.drafters_for(Some(m)) {
             let Some(config) = &dr.config else { continue };
             if drafter_problem(dr, m).is_some() {
                 continue;

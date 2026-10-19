@@ -264,6 +264,15 @@ impl App {
         (if serve { "ferrum-server" } else { "ferrum-cli" }, args)
     }
 
+    /// The detected drafters, with GGUF drafters in `m`'s own folder first.
+    pub fn drafters_for(&self, m: Option<&Model>) -> Vec<&Drafter> {
+        let mut v: Vec<&Drafter> = self.drafters.iter().collect();
+        if let Some(m) = m {
+            v.sort_by_key(|d| !d.is_sibling(m));
+        }
+        v
+    }
+
     pub fn draft_values(&self) -> Vec<String> {
         let mut v = vec!["off".to_string()];
         let model = self.selected();
@@ -271,8 +280,8 @@ impl App {
             v.push("mtp".to_string());
         }
         v.extend(
-            self.drafters
-                .iter()
+            self.drafters_for(model)
+                .into_iter()
                 .filter(|d| model.is_some_and(|m| drafter_problem(d, m).is_none()))
                 .map(|d| d.path.display().to_string()),
         );

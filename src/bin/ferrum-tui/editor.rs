@@ -27,19 +27,25 @@ impl App {
             None => opt("mtp", "MTP", "no model selected", Fit::Blocked),
         });
         let (mut fits, mut blocked) = (Vec::new(), Vec::new());
-        for d in &self.drafters {
+        for d in self.drafters_for(model) {
             let why = match model {
                 Some(m) => drafter_problem(d, m),
                 None => Some("no model selected".into()),
             };
             let path = d.path.display().to_string();
             match why {
+                None if model.is_some_and(|m| d.is_sibling(m)) => fits.push(opt(
+                    &path,
+                    &d.label,
+                    &format!("{} · paired", d.kind),
+                    Fit::Fits,
+                )),
                 None => fits.push(opt(&path, &d.label, d.kind, Fit::Fits)),
                 Some(why) => blocked.push(opt(&path, &d.label, &why, Fit::Blocked)),
             }
         }
         options.extend(fits);
-        options.push(opt("", "Custom path…", "type a directory", Fit::Plain));
+        options.push(opt("", "Custom path…", "a directory or .gguf", Fit::Plain));
         options.extend(blocked);
         let current = self.value("draft");
         let cur = options
