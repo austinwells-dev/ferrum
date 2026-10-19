@@ -202,55 +202,8 @@ impl Loader<'_> {
         self.stacked(name, 1, rows, cols)
     }
 
-    /// Load `[experts][rows][cols]` (GGUF dims `[cols, rows, experts]`).
     fn stacked(&mut self, name: &str, experts: usize, rows: usize, cols: usize) -> Result<Matrix> {
-        let info = self.file.tensor(name)?.clone();
-        let expected: Vec<usize> = if experts == 1 {
-            vec![cols, rows]
-        } else {
-            vec![cols, rows, experts]
-        };
-        if info.dimensions != expected {
-            return Err(Error::Weight {
-                name: name.into(),
-                message: format!(
-                    "expected GGUF dims {expected:?}, found {:?}",
-                    info.dimensions
-                ),
-            });
-        }
-        let format = Format::from_type(info.type_id).ok_or_else(|| Error::Weight {
-            name: name.into(),
-            message: format!("GGML type {} has no hybrid kernel", info.type_id),
-        })?;
-        let layout = block_layout(info.type_id)?;
-        if !cols.is_multiple_of(layout.elements)
-            || (format != Format::F32 && !cols.is_multiple_of(256))
-        {
-            return Err(Error::Weight {
-                name: name.into(),
-                message: "row width is not a whole number of blocks".into(),
-            });
-        }
-        let row_bytes = cols / layout.elements * layout.bytes;
-        if row_bytes * rows * experts != info.byte_len {
-            return Err(Error::Weight {
-                name: name.into(),
-                message: "byte length differs from geometry".into(),
-            });
-        }
-        let file = &mut *self.file;
-        let storage = PackedStorage::from_reader(self.device, info.byte_len, |dst| {
-            file.read_tensor_into(name, dst)
-        })?;
-        Ok(Matrix {
-            rows: rows * experts,
-            cols,
-            experts,
-            format,
-            row_bytes,
-            storage,
-        })
+        gguf_matrix(self.device, self.file, name, experts, rows, cols)
     }
 
     fn vector(&mut self, name: &str, len: usize) -> Result<Tensor> {
@@ -273,6 +226,63 @@ impl Loader<'_> {
         }
         Ok(tensor)
     }
+}
+
+/// Load `[experts][rows][cols]` (GGUF dims `[cols, rows, experts]`) in its
+/// stored encoding.
+pub(crate) fn gguf_matrix(
+    device: &MetalDevice,
+    file: &mut GgufFile,
+    name: &str,
+    experts: usize,
+    rows: usize,
+    cols: usize,
+) -> Result<Matrix> {
+    let info = file.tensor(name)?.clone();
+    let expected: Vec<usize> = if experts == 1 {
+        vec![cols, rows]
+    } else {
+        vec![cols, rows, experts]
+    };
+    if info.dimensions != expected {
+        return Err(Error::Weight {
+            name: name.into(),
+            message: format!(
+                "expected GGUF dims {expected:?}, found {:?}",
+                info.dimensions
+            ),
+        });
+    }
+    let format = Format::from_type(info.type_id).ok_or_else(|| Error::Weight {
+        name: name.into(),
+        message: format!("GGML type {} has no hybrid kernel", info.type_id),
+    })?;
+    let layout = block_layout(info.type_id)?;
+    if !cols.is_multiple_of(layout.elements) || (format != Format::F32 && !cols.is_multiple_of(256))
+    {
+        return Err(Error::Weight {
+            name: name.into(),
+            message: "row width is not a whole number of blocks".into(),
+        });
+    }
+    let row_bytes = cols / layout.elements * layout.bytes;
+    if row_bytes * rows * experts != info.byte_len {
+        return Err(Error::Weight {
+            name: name.into(),
+            message: "byte length differs from geometry".into(),
+        });
+    }
+    let storage = PackedStorage::from_reader(device, info.byte_len, |dst| {
+        file.read_tensor_into(name, dst)
+    })?;
+    Ok(Matrix {
+        rows: rows * experts,
+        cols,
+        experts,
+        format,
+        row_bytes,
+        storage,
+    })
 }
 
 pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Result<Weights> {
@@ -461,10 +471,32 @@ impl Matrix {
         bf16: &[u8],
         format: Format,
     ) -> Result<Self> {
-        if bf16.len() != rows * cols * 2 || !cols.is_multiple_of(32) {
+        if bf16.len() != rows * cols * 2 {
             return Err(Error::Shape(format!(
                 "BF16 matrix [{rows}, {cols}] from {} bytes",
                 bf16.len()
+            )));
+        }
+        Self::from_rows(device, rows, cols, format, |r, row| {
+            let src = &bf16[r * cols * 2..(r + 1) * cols * 2];
+            for (v, b) in row.iter_mut().zip(src.chunks_exact(2)) {
+                *v = f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
+            }
+        })
+    }
+
+    /// Quantize `rows` rows of `cols` values into `format` (Q8_0, Q4_0 or
+    /// F32), in parallel; `fill(r, row)` writes row `r` as F32.
+    pub(crate) fn from_rows(
+        device: &MetalDevice,
+        rows: usize,
+        cols: usize,
+        format: Format,
+        fill: impl Fn(usize, &mut [f32]) + Sync,
+    ) -> Result<Self> {
+        if !cols.is_multiple_of(32) {
+            return Err(Error::Shape(format!(
+                "matrix [{rows}, {cols}]: width is not a multiple of 32"
             )));
         }
         let row_bytes = match format {
@@ -475,6 +507,7 @@ impl Matrix {
                 return Err(Error::Parameter(format!("cannot quantize to {}", f.name())));
             }
         };
+        let fill = &fill;
         let storage = PackedStorage::from_reader(device, rows * row_bytes, |dst| {
             let threads = std::thread::available_parallelism().map_or(4, |n| n.get());
             let per = rows.div_ceil(threads).max(1);
@@ -484,12 +517,7 @@ impl Matrix {
                     scope.spawn(move || {
                         let mut row = vec![0f32; cols];
                         for (r, out_row) in out.chunks_mut(row_bytes).enumerate() {
-                            let src = &bf16[(first + r) * cols * 2..(first + r + 1) * cols * 2];
-                            for (v, b) in row.iter_mut().zip(src.chunks_exact(2)) {
-                                *v = f32::from_bits(
-                                    u32::from(u16::from_le_bytes([b[0], b[1]])) << 16,
-                                );
-                            }
+                            fill(first + r, &mut row);
                             quantize_row(&row, out_row, format);
                         }
                     });
@@ -505,6 +533,12 @@ impl Matrix {
             row_bytes,
             storage,
         })
+    }
+
+    /// The packed bytes, for tests that compare two loads.
+    #[cfg(test)]
+    pub(crate) fn packed_bytes(&self) -> Vec<u8> {
+        self.storage.with_bytes(<[u8]>::to_vec)
     }
 }
 

@@ -55,8 +55,9 @@ memory:
   --snapshots N             recurrent snapshots kept for prefix reuse (default 2)
   --chunk N                 prompt tokens per forward pass (default 512)
 speculative decoding (lossless; off by default):
-  --draft mtp|DIR           drafter: the GGUF's MTP block, or a DFlash / DFlash2 /
-                            DSpark checkpoint directory (or its HF cache entry)
+  --draft mtp|DIR|FILE      drafter: the GGUF's MTP block, a DFlash / DFlash2 /
+                            DSpark checkpoint directory (or its HF cache entry),
+                            or a DFlash / DFlash2 GGUF
   --draft-max N             drafts per step (default: 3 for MTP; the trained block
                             for dense targets, 2 for MoE targets)
   --draft-quant q4_0|q8_0   draft weight precision (default q4_0)

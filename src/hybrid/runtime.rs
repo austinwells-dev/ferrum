@@ -6,7 +6,7 @@ use super::{
     HybridConfig, LoadedHybrid, Variant,
     chat::{ChatTemplate, ParsedOutput, parse_output},
     config::uint,
-    draft::{DraftModel, DraftOptions, DraftQuant},
+    draft::{DraftModel, DraftOptions, DraftQuant, check_drafter_tokenizer},
     engine::ImageSpan,
     engine::{SpecGeometry, spec_bytes},
     mtp::{Mtp, mtp_state_bytes, mtp_weight_bytes},
@@ -44,7 +44,8 @@ pub struct Vision {
 pub enum DraftSource {
     /// The target GGUF's own NextN/MTP block.
     Mtp,
-    /// A DFlash / DFlash2 / DSpark checkpoint directory (or HF cache entry).
+    /// A DFlash / DFlash2 / DSpark checkpoint directory (or HF cache entry),
+    /// or a DFlash / DFlash2 GGUF from llama.cpp's converter.
     Checkpoint(PathBuf),
 }
 
@@ -81,7 +82,7 @@ impl SpecOptions {
 
     /// Apply one command-line flag shared by `ferrum-cli` and
     /// `ferrum-server`; returns false when `key` is not a draft flag.
-    /// `--draft mtp|DIR` enables speculation; the others tune it:
+    /// `--draft mtp|DIR|FILE.gguf` enables speculation; the others tune it:
     /// `--draft-max N`, `--draft-quant q8_0|q4_0`, `--draft-context N`
     /// (context slots for drafts without a sliding window) and
     /// `--draft-p-min P` (DSpark confidence cut-off).
@@ -152,6 +153,7 @@ impl SpecOptions {
                 })
             }
             DraftSource::Checkpoint(dir) => {
+                check_drafter_tokenizer(dir, file.metadata())?;
                 let (config, weights, state) = DraftModel::memory(dir, target, chunk, self.draft)?;
                 let k = self.drafts(target, config.max_drafts());
                 let geometry = SpecGeometry {
@@ -190,6 +192,10 @@ impl SpecOptions {
                 )?)
             }
             DraftSource::Checkpoint(dir) => {
+                let header = std::fs::File::open(target_path)
+                    .map_err(|e| Error::Gguf(format!("{}: {e}", target_path.display())))?;
+                let header = GgufFile::from_reader_skipping_arrays(header, 4096)?;
+                check_drafter_tokenizer(dir, header.metadata())?;
                 let (config, _, _) =
                     DraftModel::memory(dir, &model.config, model.chunk(), self.draft)?;
                 let k = self.drafts(&model.config, config.max_drafts());

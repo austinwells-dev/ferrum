@@ -10,17 +10,29 @@
 //! context slots and the block itself, and reads draft tokens through the
 //! target's LM head.
 //!
+//! Drafters load from an HF checkpoint directory (`config.json` +
+//! `model.safetensors`) or from a GGUF written by llama.cpp's converter
+//! (`general.architecture` `dflash`; see `gguf`).
+//!
 //! References: the HF `dflash.py`/`dspark.py` shipped with
 //! `RadixArk/Qwen3.8-27B-DSpark`, and llama.cpp 9710a32 (`src/models/dflash.cpp`,
 //! `common/speculative.cpp`, `conversion/qwen.py`).
 #![forbid(unsafe_code)]
+mod gguf;
+#[cfg(test)]
+mod tests;
+pub use gguf::{check_tokenizer, is_dflash};
+
 use super::{
     HybridConfig,
     engine::{HybridModel, Params, SpecGeometry, page},
     speculative::Drafter,
-    weights::{Format, Matrix},
+    weights::{Format, Matrix, gguf_matrix},
 };
-use crate::{DType, Error, MetalDevice, Result, Tensor};
+use crate::{
+    DType, Error, MetalDevice, Result, Tensor,
+    loader::gguf::{GgufFile, MetadataValue, TensorInfo, block_layout},
+};
 use serde_json::Value as Json;
 use std::{
     collections::HashMap,
@@ -40,8 +52,8 @@ pub enum Kind {
     DSpark { rank: usize, confidence: bool },
 }
 
-/// Draft architecture read from `config.json`.
-#[derive(Debug, Clone)]
+/// Draft architecture read from `config.json` or GGUF metadata.
+#[derive(Debug, Clone, PartialEq)]
 pub struct DraftConfig {
     pub kind: Kind,
     pub hidden: usize,
@@ -385,48 +397,136 @@ fn bf16_to_f32(bytes: &[u8]) -> Vec<f32> {
         .collect()
 }
 
+/// Where a drafter's tensors are read from. Names are the HF checkpoint's;
+/// GGUF reads map them with `gguf::tensor_name`.
+enum Source {
+    Safetensors(Safetensors),
+    Gguf(GgufFile),
+}
+
+/// A GGUF tensor under its GGUF name, its dims checked against the HF
+/// (row-major) `shape`.
+fn gguf_info(file: &GgufFile, name: &str, shape: &[usize]) -> Result<(String, TensorInfo)> {
+    let g = gguf::tensor_name(name).ok_or_else(|| Error::Weight {
+        name: name.into(),
+        message: "has no GGUF name".into(),
+    })?;
+    let info = file.tensor(&g).map_err(|_| Error::Weight {
+        name: g.clone(),
+        message: "missing from the draft GGUF".into(),
+    })?;
+    let dims: Vec<usize> = info.dimensions.iter().rev().copied().collect();
+    if dims != shape {
+        return Err(Error::Weight {
+            name: g,
+            message: format!("expected {shape:?}, found {dims:?}"),
+        });
+    }
+    Ok((g, info.clone()))
+}
+
+/// A GGUF tensor's values as F32.
+fn gguf_f32s(file: &mut GgufFile, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+    let (g, info) = gguf_info(file, name, shape)?;
+    let mut raw = vec![0u8; info.byte_len];
+    file.read_tensor_into(&g, &mut raw)?;
+    let mut out = vec![0f32; shape.iter().product()];
+    gguf::dequantize(info.type_id, &raw, &mut out)?;
+    Ok(out)
+}
+
+impl Source {
+    fn has(&self, name: &str) -> bool {
+        match self {
+            Self::Safetensors(st) => st.has(name),
+            Self::Gguf(file) => gguf::tensor_name(name).is_some_and(|g| file.tensor(&g).is_ok()),
+        }
+    }
+
+    /// Shape in HF (row-major) order.
+    fn shape(&self, name: &str) -> Result<Vec<usize>> {
+        let missing = || Error::Weight {
+            name: name.into(),
+            message: "missing from the draft checkpoint".into(),
+        };
+        match self {
+            Self::Safetensors(st) => st
+                .tensors
+                .get(name)
+                .map(|t| t.1.clone())
+                .ok_or_else(missing),
+            Self::Gguf(file) => {
+                let g = gguf::tensor_name(name).ok_or_else(missing)?;
+                let info = file.tensor(&g).map_err(|_| missing())?;
+                Ok(info.dimensions.iter().rev().copied().collect())
+            }
+        }
+    }
+
+    fn f32s(&mut self, name: &str, shape: &[usize]) -> Result<Vec<f32>> {
+        match self {
+            Self::Safetensors(st) => st.f32s(name, shape),
+            Self::Gguf(file) => gguf_f32s(file, name, shape),
+        }
+    }
+
+    /// BF16 bit patterns of `name` (GGUF tensors in other encodings are
+    /// decoded and rounded to BF16).
+    fn bf16_words(&mut self, name: &str, shape: &[usize]) -> Result<Vec<u16>> {
+        let words = |b: &[u8]| -> Vec<u16> {
+            b.chunks_exact(2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                .collect()
+        };
+        match self {
+            Self::Safetensors(st) => Ok(words(&st.bf16(name, shape)?)),
+            Self::Gguf(file) => {
+                let (g, info) = gguf_info(file, name, shape)?;
+                if info.type_id == 30 {
+                    let mut raw = vec![0u8; info.byte_len];
+                    file.read_tensor_into(&g, &mut raw)?;
+                    return Ok(words(&raw));
+                }
+                Ok(gguf_f32s(file, name, shape)?
+                    .into_iter()
+                    .map(gguf::to_bf16)
+                    .collect())
+            }
+        }
+    }
+}
+
 /// Reads draft tensors, quantizing matrices, and counts their device bytes.
 struct WeightLoader<'a> {
     d: &'a MetalDevice,
-    st: &'a mut Safetensors,
+    src: &'a mut Source,
     bytes: usize,
 }
 
 impl WeightLoader<'_> {
     fn matrix(&mut self, name: &str, rows: usize, cols: usize, format: Format) -> Result<Matrix> {
-        let m = Matrix::from_bf16(
-            self.d,
-            rows,
-            cols,
-            &self.st.bf16(name, &[rows, cols])?,
-            format,
-        )?;
+        let m = match &mut *self.src {
+            Source::Safetensors(st) => {
+                Matrix::from_bf16(self.d, rows, cols, &st.bf16(name, &[rows, cols])?, format)?
+            }
+            Source::Gguf(file) => gguf_weight(self.d, file, name, rows, cols, format)?,
+        };
         self.bytes += page(m.byte_size());
         Ok(m)
     }
 
     fn vector(&mut self, name: &str, len: usize) -> Result<Tensor> {
         self.bytes += page(len * 4);
-        Tensor::from_f32(self.d, [len], DType::F32, &self.st.f32s(name, &[len])?)
+        Tensor::from_f32(self.d, [len], DType::F32, &self.src.f32s(name, &[len])?)
     }
 
     fn conv(&mut self, conv: Option<(usize, usize)>, prefix: &str) -> Result<Option<Conv>> {
         let Some((kernel, group)) = conv else {
             return Ok(None);
         };
-        let (_, shape, _, _) = self
-            .st
-            .tensors
-            .get(&format!("{prefix}.base_kernel"))
-            .cloned()
-            .ok_or_else(|| Error::Weight {
-                name: format!("{prefix}.base_kernel"),
-                message: "missing from the draft checkpoint".into(),
-            })?;
-        let hidden = shape.last().copied().unwrap_or(0);
-        let base = self
-            .st
-            .f32s(&format!("{prefix}.base_kernel"), &[2, kernel, hidden])?;
+        let base = format!("{prefix}.base_kernel");
+        let hidden = self.src.shape(&base)?.last().copied().unwrap_or(0);
+        let base = self.src.f32s(&base, &[2, kernel, hidden])?;
         self.bytes += page(base.len() * 4);
         Ok(Some(Conv {
             base: Tensor::from_f32(self.d, [base.len()], DType::F32, &base)?,
@@ -441,13 +541,38 @@ impl WeightLoader<'_> {
 
     /// A BF16 `[rows, cols]` table kept in host memory.
     fn codebook(&mut self, name: &str, rows: usize, cols: usize) -> Result<Vec<u16>> {
-        Ok(self
-            .st
-            .bf16(name, &[rows, cols])?
-            .chunks_exact(2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-            .collect())
+        self.src.bf16_words(name, &[rows, cols])
     }
+}
+
+/// A GGUF matrix in `format`: its stored blocks when they already are, else
+/// decoded and re-quantized row by row.
+fn gguf_weight(
+    d: &MetalDevice,
+    file: &mut GgufFile,
+    name: &str,
+    rows: usize,
+    cols: usize,
+    format: Format,
+) -> Result<Matrix> {
+    let (g, info) = gguf_info(file, name, &[rows, cols])?;
+    let stored = matches!(
+        (format, info.type_id),
+        (Format::F32, 0) | (Format::Q4_0, 2) | (Format::Q8_0, 8)
+    );
+    if stored && cols.is_multiple_of(256) {
+        return gguf_matrix(d, file, &g, 1, rows, cols);
+    }
+    let layout = block_layout(info.type_id)?;
+    let row_bytes = cols / layout.elements * layout.bytes;
+    let mut raw = vec![0u8; info.byte_len];
+    file.read_tensor_into(&g, &mut raw)?;
+    // Decode one row up front so the parallel fill below cannot fail.
+    gguf::dequantize(info.type_id, &raw[..row_bytes], &mut vec![0f32; cols])?;
+    Matrix::from_rows(d, rows, cols, format, |r, row| {
+        gguf::dequantize(info.type_id, &raw[r * row_bytes..(r + 1) * row_bytes], row)
+            .expect("row decoding checked above");
+    })
 }
 
 struct Conv {
@@ -520,6 +645,98 @@ struct Buffers {
     conf: Tensor,
 }
 
+/// A drafter's weights, `bytes` of device memory.
+struct DraftWeights {
+    fc: Matrix,
+    hidden_norm: Tensor,
+    norm: Tensor,
+    layers: Vec<Layer>,
+    markov: Option<Markov>,
+    selector: Option<Selector>,
+    bytes: usize,
+}
+
+/// Read and encode the weights of `c` for a target of `target_hidden` and
+/// `vocab` (the Markov head keeps the `vocab_limit` prefix).
+fn load_weights(
+    d: &MetalDevice,
+    c: &DraftConfig,
+    src: &mut Source,
+    target_hidden: usize,
+    vocab: usize,
+    vocab_limit: usize,
+    precision: DraftQuant,
+) -> Result<DraftWeights> {
+    let quant = match precision {
+        DraftQuant::Q8_0 => Format::Q8_0,
+        DraftQuant::Q4_0 => Format::Q4_0,
+    };
+    let (h, hd) = (c.hidden, c.head_dim);
+    let mut l = WeightLoader { d, src, bytes: 0 };
+    let fc = l.matrix("fc.weight", h, c.target_layers.len() * target_hidden, quant)?;
+    let hidden_norm = l.vector("hidden_norm.weight", h)?;
+    let norm = l.vector("norm.weight", h)?;
+    let mut layers = Vec::with_capacity(c.layers);
+    for i in 0..c.layers {
+        let n = |s: &str| format!("layers.{i}.{s}");
+        let q_rows = c.heads * hd;
+        let kv_rows = c.kv_heads * hd;
+        layers.push(Layer {
+            in_norm: l.vector(&n("input_layernorm.weight"), h)?,
+            post_norm: l.vector(&n("post_attention_layernorm.weight"), h)?,
+            q: l.matrix(&n("self_attn.q_proj.weight"), q_rows, h, quant)?,
+            k: l.matrix(&n("self_attn.k_proj.weight"), kv_rows, h, quant)?,
+            v: l.matrix(&n("self_attn.v_proj.weight"), kv_rows, h, quant)?,
+            o: l.matrix(&n("self_attn.o_proj.weight"), h, q_rows, quant)?,
+            q_norm: l.vector(&n("self_attn.q_norm.weight"), hd)?,
+            k_norm: l.vector(&n("self_attn.k_norm.weight"), hd)?,
+            gate: l.matrix(&n("mlp.gate_proj.weight"), c.ffn, h, quant)?,
+            up: l.matrix(&n("mlp.up_proj.weight"), c.ffn, h, quant)?,
+            down: l.matrix(&n("mlp.down_proj.weight"), h, c.ffn, quant)?,
+            attn_conv: l.conv(c.conv, &n("attention_conv"))?,
+            mlp_conv: l.conv(c.conv, &n("mlp_conv"))?,
+        });
+    }
+    let markov = match c.kind {
+        Kind::DSpark { rank, confidence } => Some(Markov {
+            w1: l.matrix("markov_head.markov_w1.weight", vocab, rank, Format::Q8_0)?,
+            w2_head: l
+                .matrix("markov_head.markov_w2.weight", vocab, rank, Format::Q8_0)?
+                .prefix_rows(vocab_limit),
+            confidence: if confidence && l.src.has("confidence_head.proj.weight") {
+                let w = l.src.f32s("confidence_head.proj.weight", &[1, h + rank])?;
+                let b = l.src.f32s("confidence_head.proj.bias", &[1])?[0];
+                Some((Tensor::from_f32(d, [h + rank], DType::F32, &w)?, b))
+            } else {
+                None
+            },
+        }),
+        _ => None,
+    };
+    let selector = match c.kind {
+        Kind::DFlash2 { rank, .. } => Some(Selector {
+            hidden: l.matrix(
+                "candidate_selector.hidden_projection.weight",
+                rank,
+                h,
+                Format::Q8_0,
+            )?,
+            prev: l.codebook("candidate_selector.predecessor_codebook", vocab, rank)?,
+            next: l.codebook("candidate_selector.successor_codebook", vocab, rank)?,
+        }),
+        _ => None,
+    };
+    Ok(DraftWeights {
+        fc,
+        hidden_norm,
+        norm,
+        layers,
+        markov,
+        selector,
+        bytes: l.bytes,
+    })
+}
+
 pub struct DraftModel {
     pub config: DraftConfig,
     name: String,
@@ -545,91 +762,41 @@ pub struct DraftModel {
 }
 
 impl DraftModel {
-    /// Load a draft checkpoint directory (`config.json` + `model.safetensors`)
-    /// for `target`. `max_drafts` caps the block (default: the trained size).
+    /// Load a drafter for `target`: a checkpoint directory (`config.json` +
+    /// `model.safetensors`, or its HF cache entry) or a DFlash GGUF.
+    /// `max_drafts` caps the block (default: the trained size).
     pub fn load(
         d: &MetalDevice,
-        dir: impl AsRef<Path>,
+        path: impl AsRef<Path>,
         target: &HybridModel,
         capacity: usize,
         max_drafts: Option<usize>,
         options: DraftOptions,
     ) -> Result<Self> {
-        let dir = resolve(dir.as_ref())?;
-        let json: Json =
-            serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(io)?)
-                .map_err(|e| Error::Config(format!("draft config.json: {e}")))?;
-        let config = DraftConfig::from_json(&json)?;
+        let (config, mut src, label) = open(path.as_ref())?;
         let t = &target.config;
         check_target(&config, t)?;
-        let mut st = Safetensors::open(&dir.join("model.safetensors"))?;
-        let quant = match options.quant {
-            DraftQuant::Q8_0 => Format::Q8_0,
-            DraftQuant::Q4_0 => Format::Q4_0,
-        };
-        let c = &config;
-        let (h, hd) = (c.hidden, c.head_dim);
-        let mut l = WeightLoader {
-            d,
-            st: &mut st,
-            bytes: 0,
-        };
-        let fc = l.matrix("fc.weight", h, c.target_layers.len() * t.hidden, quant)?;
-        let hidden_norm = l.vector("hidden_norm.weight", h)?;
-        let norm = l.vector("norm.weight", h)?;
-        let mut layers = Vec::with_capacity(c.layers);
-        for i in 0..c.layers {
-            let n = |s: &str| format!("layers.{i}.{s}");
-            let q_rows = c.heads * hd;
-            let kv_rows = c.kv_heads * hd;
-            layers.push(Layer {
-                in_norm: l.vector(&n("input_layernorm.weight"), h)?,
-                post_norm: l.vector(&n("post_attention_layernorm.weight"), h)?,
-                q: l.matrix(&n("self_attn.q_proj.weight"), q_rows, h, quant)?,
-                k: l.matrix(&n("self_attn.k_proj.weight"), kv_rows, h, quant)?,
-                v: l.matrix(&n("self_attn.v_proj.weight"), kv_rows, h, quant)?,
-                o: l.matrix(&n("self_attn.o_proj.weight"), h, q_rows, quant)?,
-                q_norm: l.vector(&n("self_attn.q_norm.weight"), hd)?,
-                k_norm: l.vector(&n("self_attn.k_norm.weight"), hd)?,
-                gate: l.matrix(&n("mlp.gate_proj.weight"), c.ffn, h, quant)?,
-                up: l.matrix(&n("mlp.up_proj.weight"), c.ffn, h, quant)?,
-                down: l.matrix(&n("mlp.down_proj.weight"), h, c.ffn, quant)?,
-                attn_conv: l.conv(c.conv, &n("attention_conv"))?,
-                mlp_conv: l.conv(c.conv, &n("mlp_conv"))?,
-            });
-        }
         let vocab = t.vocab;
         let vocab_limit = options.vocab.map_or(vocab, |v| v.clamp(1024, vocab));
-        let markov = match c.kind {
-            Kind::DSpark { rank, confidence } => Some(Markov {
-                w1: l.matrix("markov_head.markov_w1.weight", vocab, rank, Format::Q8_0)?,
-                w2_head: l
-                    .matrix("markov_head.markov_w2.weight", vocab, rank, Format::Q8_0)?
-                    .prefix_rows(vocab_limit),
-                confidence: if confidence && l.st.has("confidence_head.proj.weight") {
-                    let w = l.st.f32s("confidence_head.proj.weight", &[1, h + rank])?;
-                    let b = l.st.f32s("confidence_head.proj.bias", &[1])?[0];
-                    Some((Tensor::from_f32(d, [h + rank], DType::F32, &w)?, b))
-                } else {
-                    None
-                },
-            }),
-            _ => None,
-        };
-        let selector = match c.kind {
-            Kind::DFlash2 { rank, .. } => Some(Selector {
-                hidden: l.matrix(
-                    "candidate_selector.hidden_projection.weight",
-                    rank,
-                    h,
-                    Format::Q8_0,
-                )?,
-                prev: l.codebook("candidate_selector.predecessor_codebook", vocab, rank)?,
-                next: l.codebook("candidate_selector.successor_codebook", vocab, rank)?,
-            }),
-            _ => None,
-        };
-        let weight_bytes = l.bytes;
+        let DraftWeights {
+            fc,
+            hidden_norm,
+            norm,
+            layers,
+            markov,
+            selector,
+            bytes: weight_bytes,
+        } = load_weights(
+            d,
+            &config,
+            &mut src,
+            t.hidden,
+            vocab,
+            vocab_limit,
+            options.quant,
+        )?;
+        let c = &config;
+        let (h, hd) = (c.hidden, c.head_dim);
         let window = c.window.unwrap_or(options.context_cap.min(capacity));
         let ring = window.min(capacity).max(1);
         let block = c.block_size;
@@ -687,8 +854,7 @@ impl DraftModel {
                 Kind::DFlash2 { .. } => "dflash2",
                 Kind::DSpark { .. } => "dspark",
             },
-            dir.file_name()
-                .map_or(String::new(), |n| n.to_string_lossy().into_owned())
+            label
         );
         Ok(Self {
             inv_freq: Tensor::from_f32(d, [c.inv_freq.len()], DType::F32, &c.inv_freq)?,
@@ -1014,6 +1180,8 @@ impl DraftModel {
 }
 
 /// A Hugging Face cache directory resolves to its newest snapshot.
+/// A checkpoint directory holding `config.json` (an HF cache entry resolves
+/// to its `refs/main` snapshot).
 fn resolve(dir: &Path) -> Result<PathBuf> {
     if dir.join("config.json").exists() {
         return Ok(dir.to_owned());
@@ -1027,9 +1195,57 @@ fn resolve(dir: &Path) -> Result<PathBuf> {
         }
     }
     Err(Error::Config(format!(
-        "{} is not a draft checkpoint (no config.json)",
+        "{} is not a draft checkpoint (no config.json) or DFlash GGUF",
         dir.display()
     )))
+}
+
+fn is_gguf(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+}
+
+/// A drafter's GGUF header, without the tokenizer's vocabulary and merges.
+fn open_gguf(path: &Path) -> Result<GgufFile> {
+    let file =
+        std::fs::File::open(path).map_err(|e| Error::Gguf(format!("{}: {e}", path.display())))?;
+    GgufFile::from_reader_skipping_arrays(file, 4096)
+}
+
+/// The drafter at `path`: its config, tensor source and a short label.
+fn open(path: &Path) -> Result<(DraftConfig, Source, String)> {
+    if is_gguf(path) {
+        let file = open_gguf(path)?;
+        let config = DraftConfig::from_gguf(&file)?;
+        let label = path
+            .file_stem()
+            .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+        return Ok((config, Source::Gguf(file), label));
+    }
+    let dir = resolve(path)?;
+    let json: Json = serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(io)?)
+        .map_err(|e| Error::Config(format!("draft config.json: {e}")))?;
+    let config = DraftConfig::from_json(&json)?;
+    let st = Safetensors::open(&dir.join("model.safetensors"))?;
+    let label = dir
+        .file_name()
+        .map_or(String::new(), |n| n.to_string_lossy().into_owned());
+    Ok((config, Source::Safetensors(st), label))
+}
+
+/// Check a GGUF drafter's tokenizer against the target's metadata (a
+/// checkpoint directory carries none, so it passes).
+pub fn check_drafter_tokenizer(
+    path: impl AsRef<Path>,
+    target: &std::collections::BTreeMap<String, MetadataValue>,
+) -> Result<()> {
+    let path = path.as_ref();
+    if !is_gguf(path) {
+        return Ok(());
+    }
+    check_tokenizer(open_gguf(path)?.metadata(), target)
 }
 
 fn check_target(c: &DraftConfig, t: &HybridConfig) -> Result<()> {
@@ -1085,27 +1301,42 @@ fn state_bytes(c: &DraftConfig, t: &HybridConfig, ring: usize, chunk: usize) -> 
 }
 
 impl DraftModel {
-    /// Device bytes a checkpoint will take for `target` without loading it:
+    /// Device bytes a drafter will take for `target` without loading it:
     /// (weights, buffers and context ring). Context rings of drafts without
     /// a window are sized for `options.context_cap`.
     pub fn memory(
-        dir: impl AsRef<Path>,
+        path: impl AsRef<Path>,
         target: &HybridConfig,
         chunk: usize,
         options: DraftOptions,
     ) -> Result<(DraftConfig, usize, usize)> {
-        let dir = resolve(dir.as_ref())?;
-        let json: Json =
-            serde_json::from_slice(&std::fs::read(dir.join("config.json")).map_err(io)?)
-                .map_err(|e| Error::Config(format!("draft config.json: {e}")))?;
-        let config = DraftConfig::from_json(&json)?;
+        let (config, src, _) = open(path.as_ref())?;
         check_target(&config, target)?;
-        let st = Safetensors::open(&dir.join("model.safetensors"))?;
         let quantized = |cols: usize| match options.quant {
             DraftQuant::Q8_0 => cols / 32 * 34,
             DraftQuant::Q4_0 => cols / 32 * 18,
         };
         let mut weights = 0;
+        let st = match src {
+            Source::Safetensors(st) => st,
+            Source::Gguf(file) => {
+                for (name, info) in file.tensors() {
+                    let dims = &info.dimensions;
+                    weights += if gguf::host_tensor(name) || gguf::target_tensor(name) {
+                        0
+                    } else if dims.len() == 2 && dims[1] > 1 {
+                        let (rows, cols) = (dims[1], dims[0]);
+                        let q8 = name.contains("conv_proj") || name.starts_with("selector_");
+                        page(rows * if q8 { cols / 32 * 34 } else { quantized(cols) })
+                    } else {
+                        page(dims.iter().product::<usize>() * 4)
+                    };
+                }
+                let ring = config.window.unwrap_or(options.context_cap);
+                let state = state_bytes(&config, target, ring, chunk);
+                return Ok((config, weights, state));
+            }
+        };
         for (name, (_, shape, _, _)) in &st.tensors {
             let numel: usize = shape.iter().product();
             // Host-side codebooks and scalars, and the target's own
