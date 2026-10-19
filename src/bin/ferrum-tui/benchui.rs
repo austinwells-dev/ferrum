@@ -46,7 +46,7 @@ pub struct BenchState {
     pub note: Option<String>,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Line_ {
     Model,
     Measure,
@@ -56,6 +56,22 @@ enum Line_ {
     Q8,
     Chunks,
     Run,
+}
+
+/// Cursor order of the speed setup: the Setup form top to bottom, then the
+/// candidates in the "What to test" list below it, as `speed_parts` draws them.
+fn line_order(cands: usize) -> Vec<Line_> {
+    let mut rows = vec![
+        Line_::Model,
+        Line_::Measure,
+        Line_::Sweep,
+        Line_::Tokens,
+        Line_::Q8,
+        Line_::Chunks,
+        Line_::Run,
+    ];
+    rows.extend((0..cands).map(Line_::Cand));
+    rows
 }
 
 pub fn ago(secs: u64) -> String {
@@ -173,19 +189,9 @@ impl App {
     }
 
     fn bench_lines(&self) -> Vec<Line_> {
-        let Some(b) = &self.bench else {
-            return Vec::new();
-        };
-        let mut rows = vec![Line_::Model, Line_::Measure];
-        rows.extend((0..b.cands.len()).map(Line_::Cand));
-        rows.extend([
-            Line_::Sweep,
-            Line_::Tokens,
-            Line_::Q8,
-            Line_::Chunks,
-            Line_::Run,
-        ]);
-        rows
+        self.bench
+            .as_ref()
+            .map_or_else(Vec::new, |b| line_order(b.cands.len()))
     }
 
     fn bench_plan(&self) -> Option<Plan> {
@@ -1214,5 +1220,28 @@ mod tests {
         );
         assert_eq!(short_drafter("MTP head"), "MTP head");
         assert_eq!(short_drafter("no drafter"), "no drafter");
+    }
+
+    #[test]
+    fn cursor_walks_the_setup_form_before_the_candidates() {
+        let rows = line_order(3);
+        // Down from Measure reaches the next form row, not the list.
+        let measure = rows.iter().position(|&r| r == Line_::Measure).unwrap();
+        assert_eq!(rows[measure + 1], Line_::Sweep);
+        // Every form row comes before every candidate, in drawing order.
+        let first_cand = rows
+            .iter()
+            .position(|r| matches!(r, Line_::Cand(_)))
+            .unwrap();
+        assert_eq!(rows[first_cand - 1], Line_::Run);
+        assert!(
+            rows[first_cand..]
+                .iter()
+                .all(|r| matches!(r, Line_::Cand(_)))
+        );
+        assert_eq!(
+            rows[first_cand..],
+            [Line_::Cand(0), Line_::Cand(1), Line_::Cand(2)]
+        );
     }
 }
