@@ -157,6 +157,7 @@ impl Plan {
 
 #[derive(Clone, Debug)]
 pub struct Row {
+    /// Index into `Plan::candidates` (ticked or not), as the queue lists them.
     pub cand: usize,
     pub label: String,
     pub draft_value: String,
@@ -348,8 +349,9 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
     };
     let mut baseline_ids: Vec<Vec<u32>> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
-    let on: Vec<&Candidate> = plan.candidates.iter().filter(|c| c.on).collect();
-    for (ci, cand) in on.iter().copied().enumerate() {
+    // `Row::cand` is the candidate's place in `plan.candidates`, ticked or
+    // not, as the queue on screen lists them.
+    for (ci, cand) in plan.candidates.iter().enumerate().filter(|(_, c)| c.on) {
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -457,12 +459,12 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
         drop(rt);
     }
     if !stop.load(Ordering::SeqCst) {
-        check_close_rows(&plan, &on, &mut rows, &send, &stop);
+        check_close_rows(&plan, &mut rows, &send, &stop);
     }
     if plan.chunks && !stop.load(Ordering::SeqCst) {
         // Prefill speed depends on how many prompt rows go through one pass.
         let (cand, depth) = match best(&rows) {
-            Some(r) if r.depth.is_some() => (on[r.cand].clone(), r.depth),
+            Some(r) if r.depth.is_some() => (plan.candidates[r.cand].clone(), r.depth),
             _ => (plan.candidates[0].clone(), None),
         };
         let long = LONG_PARAGRAPH.repeat(14);
@@ -493,13 +495,7 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
 /// Asks the answer-check questions of near-tie rows that would beat every
 /// exactly matching row, fastest first, until one keeps plain decoding's
 /// answers. Plain decoding's own answers are cached per model.
-fn check_close_rows(
-    plan: &Plan,
-    on: &[&Candidate],
-    rows: &mut [Row],
-    send: &impl Fn(Event),
-    stop: &AtomicBool,
-) {
+fn check_close_rows(plan: &Plan, rows: &mut [Row], send: &impl Fn(Event), stop: &AtomicBool) {
     let exact_top = rows
         .iter()
         .filter(|r| matches!(r.same, None | Some(Match::Exact)))
@@ -541,7 +537,7 @@ fn check_close_rows(
         }
         let Some(base) = &base else { return };
         let row = &rows[i];
-        let cand = on[row.cand];
+        let cand = &plan.candidates[row.cand];
         match answer_check(plan, cand, row.depth, &items, send, stop) {
             Ok(answers) => {
                 let verdict = eval::compare_answers(base, &answers);

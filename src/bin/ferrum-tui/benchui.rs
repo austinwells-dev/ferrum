@@ -11,7 +11,7 @@ use crate::*;
 
 const TOKENS: [usize; 3] = [128, 192, 256];
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BenchPhase {
     Setup,
     Running,
@@ -56,6 +56,20 @@ enum Line_ {
     Q8,
     Chunks,
     Run,
+}
+
+/// `fresh` with each candidate ticked as it was in `old` (same drafter and
+/// quant), so switching q8_0 or the model does not re-tick what was cleared.
+fn keep_ticks(old: &[Candidate], mut fresh: Vec<Candidate>) -> Vec<Candidate> {
+    for c in &mut fresh {
+        if let Some(o) = old
+            .iter()
+            .find(|o| o.source == c.source && o.quant == c.quant)
+        {
+            c.on = o.on;
+        }
+    }
+    fresh
 }
 
 /// Cursor order of the speed setup: the Setup form top to bottom, then the
@@ -522,7 +536,7 @@ impl App {
             .map(|m| self.bench_candidates(m, q8))
             .unwrap_or_default();
         if let Some(b) = self.bench.as_mut() {
-            b.cands = cands;
+            b.cands = keep_ticks(&b.cands, cands);
         }
         let last = self.bench_lines().len() - 1;
         if let Some(b) = self.bench.as_mut() {
@@ -924,7 +938,8 @@ impl App {
         }
     }
 
-    /// A candidate in the queue: checkbox before a run, progress during it.
+    /// A candidate in the queue: checkbox before a run, progress during it
+    /// (nothing for one left unticked, which the run skips).
     fn candidate_lines(
         &self,
         b: &BenchState,
@@ -933,6 +948,9 @@ impl App {
         on: bool,
         w: usize,
     ) -> Vec<Line<'static>> {
+        if b.phase != BenchPhase::Setup && !c.on {
+            return Vec::new();
+        }
         let planned = match c.source {
             Source::Baseline => 1,
             _ => bench::depth_list(c.max_depth(), b.quick).len(),
@@ -957,7 +975,6 @@ impl App {
             BenchPhase::Setup if c.source == Source::Baseline => ("[✓]".to_string(), TEXT),
             BenchPhase::Setup if c.on => ("[x]".to_string(), TEXT),
             BenchPhase::Setup => ("[ ]".to_string(), FAINT),
-            _ if !c.on => (" – ".to_string(), FAINT),
             _ if skipped => (" ✗ ".to_string(), BAD),
             _ if measured.len() >= planned => (" ✓ ".to_string(), GOOD),
             _ if now => (format!(" {} ", spinner(self.elapsed())), EMBER),
@@ -1220,6 +1237,34 @@ mod tests {
         );
         assert_eq!(short_drafter("MTP head"), "MTP head");
         assert_eq!(short_drafter("no drafter"), "no drafter");
+    }
+
+    #[test]
+    fn rebuilding_candidates_keeps_ticks() {
+        let drafter = |label: &str| Source::Drafter {
+            path: PathBuf::from(format!("/m/{label}.gguf")),
+            label: label.into(),
+            kind: "dflash2",
+            max_depth: 7,
+        };
+        let cand = |source: Source, quant, on| Candidate { source, quant, on };
+        // Only the OrcaCyber drafter left ticked; then q8_0 is switched on.
+        let old = vec![
+            cand(Source::Baseline, "q4_0", true),
+            cand(Source::Mtp, "q4_0", false),
+            cand(drafter("orca"), "q4_0", true),
+            cand(drafter("zlab"), "q4_0", false),
+        ];
+        let fresh = vec![
+            cand(Source::Baseline, "q4_0", true),
+            cand(Source::Mtp, "q4_0", true),
+            cand(drafter("orca"), "q4_0", true),
+            cand(drafter("orca"), "q8_0", false),
+            cand(drafter("zlab"), "q4_0", true),
+            cand(drafter("zlab"), "q8_0", false),
+        ];
+        let on: Vec<bool> = keep_ticks(&old, fresh).iter().map(|c| c.on).collect();
+        assert_eq!(on, [true, false, true, false, false, false]);
     }
 
     #[test]

@@ -207,3 +207,72 @@ fn every_screen_draws_at_every_size() {
         }
     }
 }
+
+/// The whole screen as text, rows joined by newlines.
+fn screen_text(app: &App, w: u16, h: u16) -> String {
+    let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.draw(f)).unwrap();
+    let buf = term.backend().buffer();
+    (0..h)
+        .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn a_running_speed_bench_lists_only_ticked_candidates() {
+    use crate::bench::{Candidate, Source};
+    let mut app = App::new(None);
+    app.open_bench();
+    let drafter = |label: &str| Source::Drafter {
+        path: format!("/m/{label}").into(),
+        label: label.into(),
+        kind: "dflash2",
+        max_depth: 7,
+    };
+    let b = app.bench.as_mut().unwrap();
+    b.measure = Measure::Speed;
+    b.cands = vec![
+        Candidate {
+            source: Source::Baseline,
+            quant: "q4_0",
+            on: true,
+        },
+        Candidate {
+            source: drafter("Skipped-Drafter"),
+            quant: "q4_0",
+            on: false,
+        },
+        Candidate {
+            source: drafter("Ticked-Drafter"),
+            quant: "q4_0",
+            on: true,
+        },
+    ];
+    // The run measured the ticked drafter; its rows name its queue index.
+    b.rows = vec![
+        row(0, "no drafter", None, 8.0, None),
+        row(2, "Ticked-Drafter", Some(2), 19.0, Some(Match::Exact)),
+    ];
+    for phase in [BenchPhase::Setup, BenchPhase::Running, BenchPhase::Results] {
+        app.bench.as_mut().unwrap().phase = phase;
+        let text = screen_text(&app, 240, 60);
+        assert!(text.contains("Ticked-Drafter"), "{phase:?}");
+        assert_eq!(
+            text.contains("Skipped-Drafter"),
+            phase == BenchPhase::Setup,
+            "{phase:?}: an unticked drafter shows only in the setup list"
+        );
+    }
+    // Progress lands on the ticked drafter: 1 of its depths measured.
+    app.bench.as_mut().unwrap().phase = BenchPhase::Running;
+    let text = screen_text(&app, 240, 60);
+    let queue: Vec<&str> = text
+        .lines()
+        .filter(|l| l.contains("Ticked-Drafter"))
+        .collect();
+    assert!(
+        queue.iter().any(|l| l.contains(" 1/3")),
+        "no 1/3 progress on the ticked drafter: {queue:?}"
+    );
+}
