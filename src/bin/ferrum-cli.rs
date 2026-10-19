@@ -5,7 +5,7 @@
 //!            [--presence-penalty X] [--repetition-penalty X] [--seed N]
 //!            [--max-tokens N] [--no-think] [--reasoning-effort LEVEL]
 //!            [--reasoning-budget N] [--hide-thinking]
-//!            [--draft mtp|DIR] [--draft-max N] [--draft-quant q8_0|q4_0]
+//!            [--draft mtp|DIR|FILE.gguf] [--draft-max N] [--draft-quant q8_0|q4_0]
 //!            [--draft-context N] [--draft-p-min P]
 //!            [--mmproj FILE|auto|none] [--image-tokens N] [--image-min-tokens N]
 //!
