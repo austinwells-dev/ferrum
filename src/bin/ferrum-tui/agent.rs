@@ -226,6 +226,11 @@ pub struct Sandbox {
     pub workspace: PathBuf,
     /// Scratch home, temp and attachment folders; outside the project for agents.
     pub state: PathBuf,
+    /// Seatbelt confinement is applied (`sandbox-exec -p PROFILE`) when on. When
+    /// off the sandbox runs commands with the same scrubbed environment and
+    /// workspace cwd but no Seatbelt — an unrestricted shell (network only if
+    /// `network` is on). Off is deliberate; the default is on.
+    pub confined: bool,
     pub network: bool,
     pub search: crate::search::Config,
     /// Command output longer than this is clipped (agents offload it instead).
@@ -256,6 +261,7 @@ impl Sandbox {
         Ok(Self {
             workspace,
             state,
+            confined: true,
             network,
             search: Default::default(),
             output_limit: MAX_OUTPUT,
@@ -366,23 +372,37 @@ impl Sandbox {
             .unwrap_or_else(|_| path.display().to_string())
     }
 
-    /// `program args…` wrapped in `sandbox-exec` with a scrubbed environment.
+    /// `program args…` confined in `sandbox-exec` with a scrubbed environment and
+    /// the workspace as cwd, or unconfined when `confined` is off: the same
+    /// command, environment and cwd but no Seatbelt, so it is an unrestricted
+    /// shell (network only when `network` is on). `argv` is never empty at a
+    /// call site, matching the pre-existing assumption here.
     pub fn command(&self, argv: &[&str]) -> Command {
-        let mut c = Command::new("/usr/bin/sandbox-exec");
-        c.arg("-p")
-            .arg(PROFILE)
-            .arg("-D")
-            .arg(format!("WORKSPACE={}", self.workspace.display()))
-            .arg("-D")
-            .arg(format!("STATE={}", self.state.display()))
-            .arg("-D")
-            .arg(format!("HOME={}", home().display()))
-            .arg("-D")
-            .arg(format!(
-                "NETWORK={}",
-                if self.network { "on" } else { "off" }
-            ))
-            .args(argv)
+        let program = if self.confined {
+            "/usr/bin/sandbox-exec"
+        } else {
+            argv[0]
+        };
+        // Confined, `argv` follows the `-D` directives; unconfined, it is the
+        // whole command, so skip the leading program token to avoid doubling it.
+        let tail = if self.confined { argv } else { &argv[1..] };
+        let mut c = Command::new(program);
+        if self.confined {
+            c.arg("-p")
+                .arg(PROFILE)
+                .arg("-D")
+                .arg(format!("WORKSPACE={}", self.workspace.display()))
+                .arg("-D")
+                .arg(format!("STATE={}", self.state.display()))
+                .arg("-D")
+                .arg(format!("HOME={}", home().display()))
+                .arg("-D")
+                .arg(format!(
+                    "NETWORK={}",
+                    if self.network { "on" } else { "off" }
+                ));
+        }
+        c.args(tail)
             .current_dir(&self.workspace)
             .env_clear()
             .env(
@@ -863,6 +883,35 @@ mod tests {
             json!({"command": format!("echo no > {}", outside.display())}),
         );
         assert!(!ok && !outside.exists(), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sandbox_off_disables_the_confinement() {
+        // On by default, then turned off flips every restriction back on.
+        let (mut sb, dir) = sandbox("off", false);
+        assert!(sb.confined, "the sandbox is confined by default");
+        sb.confined = false;
+        // With Seatbelt off, a command can write outside the workspace and read
+        // a system file the confined sandbox would block.
+        let outside = home().join("ferrum-sandbox-off-test.txt");
+        let _ = fs::remove_file(&outside);
+        let (ok, out) = call(
+            &sb,
+            "bash",
+            json!({"command": format!(
+                "echo yes > {} && cat {}",
+                outside.display(),
+                outside.display()
+            )}),
+        );
+        assert!(
+            ok && out.contains("yes"),
+            "writing outside the workspace: {out}"
+        );
+        let (ok, out) = call(&sb, "bash", json!({"command": "cat /etc/hosts"}));
+        assert!(ok, "/etc/hosts should be readable when unconfined: {out}");
+        let _ = fs::remove_file(&outside);
         let _ = fs::remove_dir_all(dir);
     }
 

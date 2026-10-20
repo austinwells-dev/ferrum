@@ -35,6 +35,9 @@ pub struct ChatOpts {
     pub tools: ToolMode,
     pub workspace: String,
     pub network: bool,
+    /// Seatbelt confinement of the agent's commands. Default on; toggled in
+    /// session with `/sandbox on|off`.
+    pub sandbox_confined: bool,
     pub search: crate::search::Config,
     pub agent: Option<AgentOpts>,
 }
@@ -156,6 +159,7 @@ impl ChatOpts {
             },
             workspace: app.value("workspace").to_string(),
             network: app.value("network") != "off",
+            sandbox_confined: app.value("sandbox") != "off",
             search: app.search.clone(),
             agent: if app.mode == Mode::Agent {
                 let project = match app.value("project") {
@@ -466,6 +470,11 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/tools off", "no tools"),
     ("/tools ask", "approve writes, commands and downloads"),
     ("/tools auto", "run tools without asking"),
+    ("/sandbox on", "confine commands in the Seatbelt sandbox"),
+    (
+        "/sandbox off",
+        "run commands WITHOUT the Seatbelt sandbox (unrestricted)",
+    ),
     ("/attach ", "attach a file by path"),
     ("/paste", "attach the clipboard (image, files or text)"),
     ("/screenshot", "drag out a screen region to attach"),
@@ -559,6 +568,11 @@ pub const AGENT_COMMANDS: &[(&str, &str)] = &[
     ),
     ("/tools ask", "confirm every change"),
     ("/tools auto", "never ask"),
+    ("/sandbox on", "confine commands in the Seatbelt sandbox"),
+    (
+        "/sandbox off",
+        "run commands WITHOUT the Seatbelt sandbox (unrestricted)",
+    ),
     ("/new", "start a new session (this one stays in /resume)"),
     ("/resume", "pick up a past session"),
     ("/think on", "turn reasoning on"),
@@ -610,6 +624,10 @@ pub struct Chat {
     pub tools: ToolMode,
     workspace: String,
     network: bool,
+    /// Seatbelt confinement is on. Off (`/sandbox off`) lets the agent run
+    /// commands with no Seatbelt — an unrestricted shell — so it stays on by
+    /// default and is only turned off deliberately, per session.
+    sandbox_confined: bool,
     search: crate::search::Config,
     sandbox: Option<Sandbox>,
     pub attachments: Vec<Attachment>,
@@ -725,6 +743,7 @@ impl Chat {
                 let mut sb =
                     Sandbox::with_state(a.project.clone(), agent_state_dir(&a.project), network)?;
                 sb.output_limit = coding::AGENT_OUTPUT_LIMIT;
+                sb.confined = opts.sandbox_confined;
                 sb.search = search.clone();
                 let mut agent = Agent {
                     project: a.project.clone(),
@@ -758,6 +777,7 @@ impl Chat {
             None => label,
         };
         let flag = cancel.clone();
+        let sandbox_confined = opts.sandbox_confined;
         let handle = std::thread::Builder::new()
             .name("ferrum-chat".into())
             .spawn(move || worker(opts, wrx, wtx, flag))
@@ -794,6 +814,7 @@ impl Chat {
             tools,
             workspace,
             network,
+            sandbox_confined,
             search,
             sandbox,
             attachments: Vec::new(),
@@ -1000,6 +1021,7 @@ impl Chat {
     pub fn sandbox(&mut self) -> Result<Sandbox, String> {
         if self.sandbox.is_none() {
             let mut sb = Sandbox::new(&self.workspace, self.network)?;
+            sb.confined = self.sandbox_confined;
             sb.search = self.search.clone();
             self.sandbox = Some(sb);
         }
@@ -1798,6 +1820,16 @@ impl Chat {
                     }
                     ToolMode::Edits => "tools on: file edits run freely, commands ask".to_string(),
                     ToolMode::Auto => "tools on: they run without asking".to_string(),
+                });
+            }
+            "/sandbox on" | "/sandbox off" => {
+                self.sandbox_confined = line.trim().ends_with("on");
+                if let Some(sb) = self.sandbox.as_mut() {
+                    sb.confined = self.sandbox_confined;
+                }
+                self.note(match self.sandbox_confined {
+                    true => "sandbox on: commands run in the Seatbelt sandbox".to_string(),
+                    false => "sandbox off: commands run WITHOUT the Seatbelt sandbox (unrestricted shell; network on unless /network off)".to_string(),
                 });
             }
             "/workspace" => match self.sandbox() {
