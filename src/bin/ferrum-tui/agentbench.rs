@@ -34,6 +34,9 @@ const REPLY_TOKENS: usize = 4096;
 /// Context the run asks for, and the fallback when that does not fit.
 pub const CONTEXT: usize = 65_536;
 const CONTEXT_FALLBACK: usize = 32_768;
+/// Assistant replies, counted from the newest, whose thinking stays in the
+/// prompt (see `prompt_messages`).
+const KEEP_REASONING: usize = 1;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Task {
@@ -493,11 +496,78 @@ fn run(plan: AgentPlan, tasks: Vec<Task>, tx: Sender<AgentEvent>, stop: Arc<Atom
 /// The first user message: the bug, where the code is, how to test.
 fn task_message(task: &Task) -> String {
     format!(
-        "{}\n\nThe repository is your project folder. Fix the bug there. The tests run with:\n\n    {}\n\nThe network is off.",
+        "{}\n\nThe repository is your project folder. Fix the bug there. The tests run with:\n\n    {}\n\nOnly that command decides whether the bug is fixed: other tests may fail for reasons unrelated to it, such as a missing optional dependency. The network is off.",
         task.issue,
         task.hint()
     )
 }
+
+/// The conversation as sent to the model: thinking is kept only on the newest
+/// `KEEP_REASONING` assistant replies. Qwen-style templates render the
+/// thinking of every assistant turn after the last user message, and in a
+/// task that is all of them (there is one user message); some also default
+/// `preserve_thinking` to true, which keeps it everywhere. With a 4K
+/// thinking budget, ten replies of thinking fill the context before the agent
+/// edits anything. A template variable cannot fix this (Qwen templates have
+/// none for turns after the user message), so the thinking is dropped from
+/// the messages. What the model did and saw stays: its replies, tool calls
+/// and their output, and the plan of its latest reply, which it is acting on.
+/// That is also what these models see between user turns in training.
+fn prompt_messages(messages: &[Json]) -> Vec<Json> {
+    let mut kept = 0;
+    let mut out: Vec<Json> = messages
+        .iter()
+        .rev()
+        .map(|m| {
+            let mut m = m.clone();
+            if m["role"] == "assistant" && m.get("reasoning_content").is_some() {
+                if kept < KEEP_REASONING {
+                    kept += 1;
+                } else if let Some(o) = m.as_object_mut() {
+                    o.remove("reasoning_content");
+                }
+            }
+            m
+        })
+        .collect();
+    out.reverse();
+    out
+}
+
+/// Python packages find their plugins through entry points, which exist only
+/// once the package is installed, and the task checkouts are not: without
+/// them Python-Markdown's suite fails about 390 tests (every extension by
+/// name), and agents spend their replies proving those errors are not theirs.
+/// Writes the `[project.entry-points]` of `pyproject.toml` into a
+/// `.dist-info` folder at the top of the checkout, where `importlib.metadata`
+/// finds it (the tests run from there), and hides it from git. Best effort:
+/// without it, only the full suite is affected.
+fn add_entry_points(work: &Path) {
+    if !work.join("pyproject.toml").exists() {
+        return;
+    }
+    let _ = Command::new("python3")
+        .args(["-I", "-c", ENTRY_POINTS])
+        .current_dir(work)
+        .output();
+}
+
+const ENTRY_POINTS: &str = r#"
+import pathlib, re, tomllib
+p = tomllib.load(open("pyproject.toml", "rb")).get("project", {})
+groups = p.get("entry-points", {})
+if p.get("name") and groups:
+    name = re.sub(r"[-_.]+", "_", p["name"])
+    d = pathlib.Path(name + "-0.dist-info")
+    d.mkdir(exist_ok=True)
+    (d / "METADATA").write_text("Metadata-Version: 2.1\nName: %s\nVersion: 0\n" % p["name"])
+    (d / "entry_points.txt").write_text("".join(
+        "[%s]\n%s\n" % (g, "".join("%s = %s\n" % kv for kv in eps.items()))
+        for g, eps in groups.items()))
+    pathlib.Path(".git/info").mkdir(parents=True, exist_ok=True)
+    with open(".git/info/exclude", "a") as f:
+        f.write("/%s/\n" % d)
+"#;
 
 /// Copy `from` into a new folder `to`.
 fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
@@ -531,6 +601,9 @@ fn attempt(
     let work = tmp.join("work");
     copy_tree(&source.join("repo"), &work)?;
     let work = fs::canonicalize(&work).map_err(|e| e.to_string())?;
+    if task.lang == "python" {
+        add_entry_points(&work);
+    }
     let sb = Sandbox::with_state(work.clone(), tmp.join("state"), false)?;
     let shared = coding::new_shared();
     let tools: Vec<Json> = coding::tool_defs(false, false)
@@ -555,7 +628,8 @@ fn attempt(
     );
     while turns < MAX_TURNS {
         let request = ChatRequest {
-            messages: messages.clone(),
+            // `messages` keeps all the thinking, for the saved transcript.
+            messages: prompt_messages(&messages),
             tools: tools.clone(),
             max_tokens: REPLY_TOKENS + plan.thinking.unwrap_or(0),
             sampling: ferrum::hybrid::session::SamplingParams::default(),
@@ -969,6 +1043,9 @@ mod tests {
                     git(&["checkout", "-q", "FETCH_HEAD", "--", "."], &work).unwrap();
                 }
                 let work = fs::canonicalize(&work).unwrap();
+                if t.lang == "python" {
+                    add_entry_points(&work);
+                }
                 let sb = Sandbox::with_state(work, dir.join("state"), false).unwrap();
                 let (got, _) = grade(&t, &src, &sb, &AtomicBool::new(false));
                 eprintln!("{} fixed={fixed}: {got}", t.id);
@@ -976,6 +1053,60 @@ mod tests {
             }
         }
         fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn thinking_stays_only_on_the_newest_reply() {
+        let messages = vec![
+            json!({"role": "system", "content": "s"}),
+            json!({"role": "user", "content": "u"}),
+            json!({"role": "assistant", "content": "", "reasoning_content": "one", "tool_calls": []}),
+            json!({"role": "tool", "content": "out"}),
+            json!({"role": "assistant", "content": "", "reasoning_content": "two"}),
+            json!({"role": "tool", "content": "out"}),
+            json!({"role": "assistant", "content": "", "reasoning_content": "three"}),
+            json!({"role": "tool", "content": "out"}),
+        ];
+        let sent = prompt_messages(&messages);
+        assert_eq!(sent.len(), messages.len());
+        let thoughts: Vec<_> = sent
+            .iter()
+            .filter_map(|m| m["reasoning_content"].as_str())
+            .collect();
+        assert_eq!(thoughts, ["three"]);
+        assert!(sent[2].get("tool_calls").is_some(), "only thinking dropped");
+        // The transcript keeps everything.
+        assert_eq!(messages[2]["reasoning_content"], "one");
+    }
+
+    #[test]
+    fn python_checkouts_get_their_entry_points() {
+        let dir = std::env::temp_dir().join(format!("ferrum-agent-ep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("pkg")).unwrap();
+        git(&["init", "-q"], &dir).unwrap();
+        fs::write(
+            dir.join("pyproject.toml"),
+            "[project]\nname = 'My-Pkg'\n\n[project.entry-points.'my.plugins']\nfoo = 'pkg.foo:Foo'\n",
+        )
+        .unwrap();
+        fs::write(dir.join("pkg/__init__.py"), "").unwrap();
+        fs::write(dir.join("pkg/foo.py"), "class Foo: pass\n").unwrap();
+        add_entry_points(&dir);
+        let out = Command::new("python3")
+            .args([
+                "-c",
+                "from importlib.metadata import entry_points as e; print(e(group='my.plugins')['foo'].load().__name__)",
+            ])
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "Foo");
+        // Hidden from the agent's `git status` and from the saved diff.
+        let status =
+            String::from_utf8_lossy(&git(&["status", "--porcelain"], &dir).unwrap()).into_owned();
+        assert!(!status.contains("dist-info"), "{status}");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
