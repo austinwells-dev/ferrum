@@ -1406,34 +1406,15 @@ impl Chat {
         self.start_turn();
     }
 
-    /// Free context before a turn when it is filling up. Old tool output is
-    /// elided in one batch (so the model's cache is rebuilt once, not every
-    /// turn); when that is not enough the session is snapshotted.
+    /// Snapshot the session before a turn once the context is nearly full.
     fn maybe_compact(&mut self) {
         let Some((used, cap)) = self.ctx else { return };
         let Some(a) = &self.agent else { return };
         if !a.compact || cap == 0 {
             return;
         }
-        let ratio = used as f64 / cap as f64;
-        if ratio >= 0.80 {
-            self.compact_now("context is 80% full");
-        } else if ratio >= 0.55 {
-            let Some(a) = &self.agent else { return };
-            let Ok(mut g) = a.shared.lock() else { return };
-            let (n, saved) = brain::evict_old(&mut self.history, &mut g.store, 6);
-            if n > 0 {
-                g.evicted += n;
-                g.evicted_bytes += saved;
-                g.forget_reads();
-                drop(g);
-                self.ctx = None;
-                self.note(format!(
-                    "context {:.0}% full: elided {n} old tool outputs ({} KB); ctx_read brings any back",
-                    ratio * 100.0,
-                    saved / 1024
-                ));
-            }
+        if used as f64 / cap as f64 >= 0.85 {
+            self.compact_now("context is 85% full");
         }
     }
 

@@ -363,7 +363,7 @@ pub fn fields() -> Vec<Field> {
             Agent,
             Kind::Cycle(&["on", "off"]),
             "on",
-            "Elide old tool output and snapshot the session as the context fills.",
+            "Snapshot the session when the context is 85% full.",
         ),
         field(
             "host",
