@@ -718,9 +718,6 @@ fn turn_key(chat: &Chat, turn: &Turn, prev: Option<Role>, width: usize) -> Optio
     Some(h.finish())
 }
 
-/// Most tool rounds the model may chain after one message.
-const MAX_ROUNDS: usize = 24;
-
 impl Chat {
     pub fn start(app: &App) -> Result<Chat, String> {
         let opts = ChatOpts::from_app(app)?;
@@ -1134,13 +1131,6 @@ impl Chat {
         self.ctx = Some((d.ctx_used, d.ctx_cap));
         self.last_stats = stats;
         if !d.tool_calls.is_empty() && self.tools != ToolMode::Off && !cancelled {
-            if self.rounds >= MAX_ROUNDS {
-                self.history.push(reply);
-                self.note(format!("stopped after {MAX_ROUNDS} rounds of tool calls"));
-                self.rounds = 0;
-                self.end_generation();
-                return;
-            }
             let mut calls = Vec::new();
             for (name, args) in d.tool_calls {
                 self.call_seq += 1;
