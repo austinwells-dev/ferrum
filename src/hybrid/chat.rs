@@ -11,6 +11,8 @@ pub struct ChatTemplate {
     source: String,
     bos_token: String,
     eos_token: String,
+    /// See `opens_thinking`.
+    opens_thinking: bool,
 }
 
 /// Python `json.dumps(value, ensure_ascii=False)`: insertion order, `", "`
@@ -130,18 +132,25 @@ impl ChatTemplate {
             source: source.to_owned(),
             bos_token: bos_token.to_owned(),
             eos_token: eos_token.to_owned(),
+            opens_thinking: false,
         })
+    }
+
+    /// Mark the template as one whose prompt must open or close the think
+    /// block itself (Flint's template has no thinking switch).
+    pub fn with_opens_thinking(mut self, on: bool) -> Self {
+        self.opens_thinking = on;
+        self
     }
 
     pub fn source(&self) -> &str {
         &self.source
     }
 
-    /// Whether the template reads a thinking variable (Qwen3.5 does; Flint's
-    /// template does not, so its reasoning must be opened or closed by the
-    /// prompt itself).
-    pub fn has_thinking_switch(&self) -> bool {
-        self.source.contains("enable_thinking") || self.source.contains("thinking")
+    /// Whether the generation prompt needs `<think>` (or an empty think block)
+    /// appended, because the template does not write one (Flint).
+    pub fn opens_thinking(&self) -> bool {
+        self.opens_thinking
     }
 
     /// Render `messages` (OpenAI-style JSON objects). `extra` carries template
@@ -291,12 +300,19 @@ fn parse_tool_call(body: &str, tools: &[Json]) -> Option<ToolCall> {
     }
 }
 
+/// The function object of tool `name` in the OpenAI tool list.
+fn tool_function<'a>(tools: &'a [Json], name: &str) -> Option<&'a Json> {
+    tools
+        .iter()
+        .map(|t| t.get("function").unwrap_or(t))
+        .find(|f| f.get("name").and_then(Json::as_str) == Some(name))
+}
+
 /// The declared parameter schema of tool `name` in the OpenAI tool list.
 fn tool_schema(tools: &[Json], name: &str) -> Option<Json> {
-    tools.iter().find_map(|t| {
-        let f = t.get("function").unwrap_or(t);
-        (f.get("name")?.as_str()? == name).then(|| f.pointer("/parameters/properties").cloned())?
-    })
+    tool_function(tools, name)?
+        .pointer("/parameters/properties")
+        .cloned()
 }
 
 /// A parameter value typed by its declared schema: strings stay as written,
@@ -341,15 +357,14 @@ fn parse_qwen_tool_call(body: &str, tools: &[Json]) -> Option<ToolCall> {
 
 /// Flint: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`,
 /// with no separators between the pairs (the template writes them back to back).
+/// The bare name carries no marker of its own, so it must name a declared tool.
 fn parse_flint_tool_call(body: &str, tools: &[Json]) -> Option<ToolCall> {
     let (name, mut rest) = match body.find("<arg_key>") {
         Some(p) => (&body[..p], &body[p..]),
         None => (body, ""),
     };
     let name = name.trim();
-    if name.is_empty() || name.contains(char::is_whitespace) || name.contains('<') {
-        return None;
-    }
+    tool_function(tools, name)?;
     let schema = tool_schema(tools, name);
     let mut arguments = Map::new();
     while !rest.trim().is_empty() {
@@ -437,6 +452,12 @@ mod tests {
         assert!(parsed.tool_calls.is_empty());
         assert!(parsed.content.contains("not a call"));
         assert!(parsed.content.contains("<arg_value>1"));
+        // A bare word that names no declared tool is text, with or without tools.
+        for tools in [&tools[..], &[]] {
+            let parsed = parse_output("<tool_call>later</tool_call>", false, tools);
+            assert!(parsed.tool_calls.is_empty());
+            assert_eq!(parsed.content, "<tool_call>later</tool_call>");
+        }
     }
 
     /// Every case in tests/fixtures/flint/render_cases.json renders byte for

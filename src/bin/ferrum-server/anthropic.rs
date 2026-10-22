@@ -8,8 +8,10 @@ use crate::{
     warn,
     worker::{Event, Work},
 };
-use ferrum::hybrid::runtime::{ChatRequest, ChatResult, Delta};
-use serde_json::{Map, Value as Json, json};
+use ferrum::hybrid::runtime::{
+    ChatRequest, ChatResult, Delta, generation_prefix, normalize_thinking,
+};
+use serde_json::{Value as Json, json};
 use std::{
     net::TcpStream,
     sync::atomic::Ordering,
@@ -209,15 +211,21 @@ pub fn count_tokens(
     keep_alive: bool,
 ) -> std::io::Result<()> {
     let result = convert(body, id).and_then(|(messages, tools)| {
+        // Count the prompt `messages` would feed the model, thinking switch included.
+        let mut vars = openai::thinking(body, server).vars;
+        normalize_thinking(server.template.source(), &mut vars);
         server
             .template
             .render(
                 &messages,
                 (!tools.is_empty()).then_some(&tools[..]),
                 true,
-                &Map::new(),
+                &vars,
             )
-            .and_then(|text| server.tokenizer.encode(&text))
+            .and_then(|mut text| {
+                text.push_str(generation_prefix(&server.template, &vars));
+                server.tokenizer.encode(&text)
+            })
             .map_err(|e| e.to_string())
     });
     match result {

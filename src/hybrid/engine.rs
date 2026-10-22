@@ -3175,7 +3175,6 @@ mod tests {
                         "{name} m {m} pos {pos} window {window:?} sinks {sinks} gated {gated} splits {splits}: max error {worst}"
                     );
                 };
-                let _ = span;
                 if m == 1 {
                     for splits_wanted in [1usize, 5] {
                         let kps = span.div_ceil(splits_wanted).next_multiple_of(32);
@@ -3211,7 +3210,8 @@ mod tests {
                             [row_blocks, kv_heads, splits],
                             128,
                             if q8 {
-                                (64 * 128 * 2usize).max(32 * 64 * 4) + 32 * 64 * 2 + 3 * 32 * 4
+                                // The K/V staging tile outgrows the 32-row score tile.
+                                64 * 128 * 2 + 32 * 64 * 2 + 3 * 32 * 4
                             } else {
                                 32 * 64 * 4 + 32 * 64 * 2 + 3 * 32 * 4
                             },

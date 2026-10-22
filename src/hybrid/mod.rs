@@ -118,10 +118,13 @@ pub fn load_with(
 pub fn load_chat_template(path: impl AsRef<Path>) -> Result<Option<chat::ChatTemplate>> {
     let file = GgufFile::open(path)?;
     let (bos, eos) = special_tokens(file.metadata());
+    let flint = matches!(
+        file.metadata_value("general.architecture"),
+        Some(MetadataValue::String(a)) if a == "flint"
+    );
     match file.metadata_value("tokenizer.chat_template") {
-        Some(MetadataValue::String(t)) => {
-            chat::ChatTemplate::with_special_tokens(t, &bos, &eos).map(Some)
-        }
+        Some(MetadataValue::String(t)) => chat::ChatTemplate::with_special_tokens(t, &bos, &eos)
+            .map(|t| Some(t.with_opens_thinking(flint))),
         _ => Ok(None),
     }
 }

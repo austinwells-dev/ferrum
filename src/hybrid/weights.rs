@@ -379,41 +379,38 @@ pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Resu
                 down: l.matrix(&n("ffn_down.weight"), c.hidden, c.ffn)?,
             })
         } else {
-            {
-                let moe = c.moe.expect("expert layer carries expert geometry");
-                Ffn::Moe(MoeFfn {
-                    // TODO: `ffn_exp_probs.bias` (a selection bias on the scores) is
-                    // absent from the Flint GGUF; load it when a checkpoint carries it.
-                    router: l.router(&n("ffn_gate_inp.weight"), moe.experts, c.hidden)?,
-                    gate_exps: l.stacked(
-                        &n("ffn_gate_exps.weight"),
-                        moe.experts,
-                        moe.expert_ffn,
-                        c.hidden,
-                    )?,
-                    up_exps: l.stacked(
-                        &n("ffn_up_exps.weight"),
-                        moe.experts,
-                        moe.expert_ffn,
-                        c.hidden,
-                    )?,
-                    down_exps: l.stacked(
-                        &n("ffn_down_exps.weight"),
-                        moe.experts,
-                        c.hidden,
-                        moe.expert_ffn,
-                    )?,
-                    shared_gate_inp: match moe.shared_gate {
-                        true => Some(l.vector(&n("ffn_gate_inp_shexp.weight"), c.hidden)?),
-                        false => None,
-                    },
-                    shared: DenseFfn {
-                        gate: l.matrix(&n("ffn_gate_shexp.weight"), moe.shared_ffn, c.hidden)?,
-                        up: l.matrix(&n("ffn_up_shexp.weight"), moe.shared_ffn, c.hidden)?,
-                        down: l.matrix(&n("ffn_down_shexp.weight"), c.hidden, moe.shared_ffn)?,
-                    },
-                })
-            }
+            let moe = c.moe.expect("expert layer carries expert geometry");
+            Ffn::Moe(MoeFfn {
+                // `HybridConfig::from_gguf` refuses a selection bias (`exp_probs_b`).
+                router: l.router(&n("ffn_gate_inp.weight"), moe.experts, c.hidden)?,
+                gate_exps: l.stacked(
+                    &n("ffn_gate_exps.weight"),
+                    moe.experts,
+                    moe.expert_ffn,
+                    c.hidden,
+                )?,
+                up_exps: l.stacked(
+                    &n("ffn_up_exps.weight"),
+                    moe.experts,
+                    moe.expert_ffn,
+                    c.hidden,
+                )?,
+                down_exps: l.stacked(
+                    &n("ffn_down_exps.weight"),
+                    moe.experts,
+                    c.hidden,
+                    moe.expert_ffn,
+                )?,
+                shared_gate_inp: match moe.shared_gate {
+                    true => Some(l.vector(&n("ffn_gate_inp_shexp.weight"), c.hidden)?),
+                    false => None,
+                },
+                shared: DenseFfn {
+                    gate: l.matrix(&n("ffn_gate_shexp.weight"), moe.shared_ffn, c.hidden)?,
+                    up: l.matrix(&n("ffn_up_shexp.weight"), moe.shared_ffn, c.hidden)?,
+                    down: l.matrix(&n("ffn_down_shexp.weight"), c.hidden, moe.shared_ffn)?,
+                },
+            })
         };
         layers.push(Layer {
             attn_norm,

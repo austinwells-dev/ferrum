@@ -5,7 +5,10 @@ use super::{
     config::HybridConfig,
     engine::{kv_bytes, page, recurrent_bytes, scratch_bytes},
 };
-use crate::{Error, Result, loader::gguf::GgufFile};
+use crate::{
+    Error, Result,
+    loader::gguf::{GgufFile, TensorInfo},
+};
 
 /// Planning inputs. `context: None` fits the largest context automatically.
 #[derive(Debug, Clone, Copy)]
@@ -110,6 +113,16 @@ impl MemoryPlan {
     }
 }
 
+/// Bytes `weights::load` allocates for one tensor: its stored size, except BF16
+/// routers, which are widened to F32 (`Loader::router`).
+fn loaded_bytes(t: &TensorInfo) -> usize {
+    if t.type_id == 30 && t.name.ends_with("ffn_gate_inp.weight") {
+        t.byte_len * 2
+    } else {
+        t.byte_len
+    }
+}
+
 /// Weight bytes the loader will allocate: every trunk tensor, page-rounded,
 /// plus a second embedding copy when the output projection is tied.
 pub fn weight_bytes(file: &GgufFile, c: &HybridConfig) -> usize {
@@ -125,7 +138,7 @@ pub fn weight_bytes(file: &GgufFile, c: &HybridConfig) -> usize {
         .tensors()
         .values()
         .filter(|t| trunk(&t.name))
-        .map(|t| page(t.byte_len))
+        .map(|t| page(loaded_bytes(t)))
         .sum();
     if !file.tensors().contains_key("output.weight")
         && let Ok(embedding) = file.tensor("token_embd.weight")

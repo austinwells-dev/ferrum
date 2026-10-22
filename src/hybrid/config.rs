@@ -235,6 +235,25 @@ impl HybridConfig {
                         "expert gating function {gating} is not sigmoid"
                     )));
                 }
+                // Neither a weight scale nor a selection bias on the scores is
+                // implemented; refuse checkpoints that carry one rather than
+                // route their experts wrongly.
+                let scale_key = key("expert_weights_scale");
+                if md.contains_key(&scale_key) && float(md, &scale_key)? != 1.0 {
+                    return Err(Error::Config(format!(
+                        "{scale_key} {} is unsupported (only 1.0)",
+                        float(md, &scale_key)?
+                    )));
+                }
+                if let Some(bias) = file
+                    .tensors()
+                    .keys()
+                    .find(|n| n.ends_with(".exp_probs_b.bias"))
+                {
+                    return Err(Error::Config(format!(
+                        "expert selection bias {bias} is unsupported"
+                    )));
+                }
                 Some(MoeConfig {
                     experts: uint(md, &key("expert_count"))?,
                     experts_used: uint(md, &key("expert_used_count"))?,

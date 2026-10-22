@@ -1203,12 +1203,12 @@ fn dequant_iq3_s(x: &[u8], out: &mut [f32]) {
         let d = f16_at(b, 0);
         let (qs, qh, signs, scales) = (&b[2..66], &b[66..74], &b[74..106], &b[106..110]);
         let y = &mut out[i * 256..][..256];
-        for pair in 0..4 {
+        for (pair, &scale) in scales.iter().enumerate() {
             let db = [
-                d * (1 + 2 * (scales[pair] & 0xf) as u32) as f32,
-                d * (1 + 2 * (scales[pair] >> 4) as u32) as f32,
+                d * (1 + 2 * (scale & 0xf) as u32) as f32,
+                d * (1 + 2 * (scale >> 4) as u32) as f32,
             ];
-            for half in 0..2 {
+            for (half, &dh) in db.iter().enumerate() {
                 let ib32 = 2 * pair + half;
                 let h = qh[ib32] as usize;
                 for l in 0..4 {
@@ -1219,8 +1219,8 @@ fn dequant_iq3_s(x: &[u8], out: &mut [f32]) {
                     let (g1, g2) = (g1.to_le_bytes(), g2.to_le_bytes());
                     let o = 32 * ib32 + 8 * l;
                     for j in 0..4 {
-                        y[o + j] = db[half] * g1[j] as f32 * sign(signs[k], j);
-                        y[o + j + 4] = db[half] * g2[j] as f32 * sign(signs[k], j + 4);
+                        y[o + j] = dh * g1[j] as f32 * sign(signs[k], j);
+                        y[o + j + 4] = dh * g2[j] as f32 * sign(signs[k], j + 4);
                     }
                 }
             }
