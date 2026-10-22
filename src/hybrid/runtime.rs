@@ -9,6 +9,7 @@ use super::{
     draft::{DraftModel, DraftOptions, DraftQuant, check_drafter_tokenizer},
     engine::ImageSpan,
     engine::{SpecGeometry, spec_bytes},
+    lookup::Lookup,
     mtp::{Mtp, mtp_state_bytes, mtp_weight_bytes},
     plan::{DraftMemory, PlanOptions},
     session::{Completion, Flow, GenerationHooks, SamplingParams, Session, StopReason},
@@ -47,18 +48,25 @@ pub enum DraftSource {
     /// A DFlash / DFlash2 / DSpark checkpoint directory (or HF cache entry),
     /// or a DFlash / DFlash2 GGUF from llama.cpp's converter.
     Checkpoint(PathBuf),
+    /// Prompt lookup (`lookup::Lookup`): drafts copied from the context.
+    Lookup,
 }
 
 impl DraftSource {
-    /// `mtp` or a path.
+    /// `mtp`, `lookup` or a path.
     pub fn parse(value: &str) -> Self {
         if value.eq_ignore_ascii_case("mtp") {
             Self::Mtp
+        } else if value.eq_ignore_ascii_case("lookup") {
+            Self::Lookup
         } else {
             Self::Checkpoint(value.into())
         }
     }
 }
+
+/// Default prompt-lookup drafts per step (`--draft-max` overrides).
+const LOOKUP_DRAFTS: usize = 3;
 
 /// Speculative decoding setup for `Runtime::load_speculative`.
 #[derive(Debug, Clone)]
@@ -123,6 +131,7 @@ impl SpecOptions {
         self.max_drafts
             .unwrap_or(match (&self.source, target.variant) {
                 (DraftSource::Mtp, _) => 3,
+                (DraftSource::Lookup, _) => LOOKUP_DRAFTS,
                 (_, Variant::Moe | Variant::Flint) => trained.min(2),
                 _ => trained,
             })
@@ -150,6 +159,18 @@ impl SpecOptions {
                     fixed: mtp_state_bytes(target, 0, chunk, k)
                         + spec_bytes(target, chunk, &geometry),
                     per_token,
+                })
+            }
+            DraftSource::Lookup => {
+                let geometry = SpecGeometry {
+                    rows: self.drafts(target, LOOKUP_DRAFTS) + 1,
+                    aux_layers: Vec::new(),
+                    final_hidden: false,
+                };
+                Ok(DraftMemory {
+                    weights: 0,
+                    fixed: spec_bytes(target, chunk, &geometry),
+                    per_token: 0.,
                 })
             }
             DraftSource::Checkpoint(dir) => {
@@ -191,6 +212,7 @@ impl SpecOptions {
                     self.draft.vocab,
                 )?)
             }
+            DraftSource::Lookup => Box::new(Lookup::new(self.drafts(&model.config, LOOKUP_DRAFTS))),
             DraftSource::Checkpoint(dir) => {
                 let header = std::fs::File::open(target_path)
                     .map_err(|e| Error::Gguf(format!("{}: {e}", target_path.display())))?;

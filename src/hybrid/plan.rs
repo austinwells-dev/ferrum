@@ -3,12 +3,9 @@
 #![forbid(unsafe_code)]
 use super::{
     config::HybridConfig,
-    engine::{kv_bytes, page, recurrent_bytes, scratch_bytes},
+    engine::{kv_bytes, kv_ring_bytes, max_forward_rows, page, recurrent_bytes, scratch_bytes},
 };
-use crate::{
-    Error, Result,
-    loader::gguf::{GgufFile, TensorInfo},
-};
+use crate::{Error, Result, loader::gguf::GgufFile};
 
 /// Planning inputs. `context: None` fits the largest context automatically.
 #[derive(Debug, Clone, Copy)]
@@ -67,8 +64,10 @@ pub struct MemoryPlan {
     /// Fixed recurrent state (conv windows and delta-rule matrices).
     pub recurrent: usize,
     pub snapshots: usize,
-    /// Allocation-rounded K+V bytes per cached position.
+    /// Allocation-rounded K+V bytes per cached position (full-attention layers).
     pub kv_per_token: f64,
+    /// K+V rings of sliding-window layers: fixed, whatever the context.
+    pub kv_ring: usize,
     /// Driver, pipeline and small runtime allocations (measured estimate).
     pub overhead: usize,
     pub budget: usize,
@@ -97,9 +96,12 @@ impl MemoryPlan {
     fn draft_kv(&self, context: usize) -> usize {
         (self.draft.per_token * context.next_multiple_of(32) as f64).ceil() as usize
     }
-    /// K+V bytes at `context` (upper bound; allocation pads to 32 positions).
+    /// K+V bytes at `context` (upper bound; allocation pads to 32 positions,
+    /// and contexts shorter than a ring keep linear caches no larger than it).
     pub fn kv(&self, context: usize) -> usize {
-        (self.kv_per_token * context.next_multiple_of(32) as f64).ceil() as usize + (1 << 20)
+        (self.kv_per_token * context.next_multiple_of(32) as f64).ceil() as usize
+            + self.kv_ring
+            + (1 << 20)
     }
     fn fixed(&self) -> usize {
         self.weights
@@ -110,16 +112,6 @@ impl MemoryPlan {
             + self.draft.weights
             + self.draft.fixed
             + self.vision
-    }
-}
-
-/// Bytes `weights::load` allocates for one tensor: its stored size, except BF16
-/// routers, which are widened to F32 (`Loader::router`).
-fn loaded_bytes(t: &TensorInfo) -> usize {
-    if t.type_id == 30 && t.name.ends_with("ffn_gate_inp.weight") {
-        t.byte_len * 2
-    } else {
-        t.byte_len
     }
 }
 
@@ -138,7 +130,7 @@ pub fn weight_bytes(file: &GgufFile, c: &HybridConfig) -> usize {
         .tensors()
         .values()
         .filter(|t| trunk(&t.name))
-        .map(|t| page(loaded_bytes(t)))
+        .map(|t| page(t.byte_len))
         .sum();
     if !file.tensors().contains_key("output.weight")
         && let Ok(embedding) = file.tensor("token_embd.weight")
@@ -160,13 +152,16 @@ pub fn plan(
     let recurrent = recurrent_bytes(c);
     // Per-position K+V bytes over a large capacity, so page rounding amortizes.
     let probe = 1 << 16;
-    let kv_per_token = kv_bytes(c, probe) as f64 / probe as f64;
+    let max_rows = max_forward_rows(options.chunk.max(1));
+    let kv_ring = kv_ring_bytes(c, max_rows);
+    let kv_per_token = (kv_bytes(c, probe, max_rows) - kv_ring) as f64 / probe as f64;
     let mut plan = MemoryPlan {
         weights: weight_bytes(file, c),
         scratch: scratch_bytes(c, options.chunk, options.logit_rows),
         recurrent,
         snapshots: options.snapshots * recurrent,
         kv_per_token,
+        kv_ring,
         overhead: RUNTIME_OVERHEAD,
         budget,
         max_context: 0,
@@ -175,7 +170,7 @@ pub fn plan(
         draft: options.draft,
         vision: options.vision,
     };
-    let free = budget.saturating_sub(plan.fixed());
+    let free = budget.saturating_sub(plan.fixed() + kv_ring);
     let per_token = kv_per_token + options.draft.per_token;
     let fits = ((free as f64 / per_token) as usize / 256 * 256).min(c.trained_context);
     plan.max_context = fits;

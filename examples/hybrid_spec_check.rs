@@ -37,7 +37,7 @@ fn main() -> Result<()> {
     let capacity = prompt.len() + n_new + block + 64;
 
     // Reference: plain greedy decode, keeping each step's top-2 margin.
-    let mut state = HybridState::new(&d, &model.config, capacity)?;
+    let mut state = HybridState::new(&d, &model.config, capacity, model.max_forward_rows())?;
     let Produced::Logits(mut logits) = model.forward(&d, &mut state, &prompt, Output::Logits)?
     else {
         unreachable!()
@@ -63,7 +63,7 @@ fn main() -> Result<()> {
             final_hidden: true,
         },
     )?;
-    let mut state = HybridState::new(&d, &model.config, capacity)?;
+    let mut state = HybridState::new(&d, &model.config, capacity, model.max_forward_rows())?;
     let Produced::Token(mut anchor) = model.forward(&d, &mut state, &prompt, Output::Argmax)?
     else {
         unreachable!()
@@ -119,14 +119,14 @@ fn main() -> Result<()> {
     // same positions (reference prefix, one full-width verify).
     {
         let rows = block + 1;
-        let mut a = HybridState::new(&d, &model.config, capacity)?;
+        let mut a = HybridState::new(&d, &model.config, capacity, model.max_forward_rows())?;
         model.forward(&d, &mut a, &prompt, Output::None)?;
         let RowsProduced::Logits(wide) =
             model.verify(&d, &mut a, &reference[..rows], RowOutput::Logits)?
         else {
             unreachable!()
         };
-        let mut b = HybridState::new(&d, &model.config, capacity)?;
+        let mut b = HybridState::new(&d, &model.config, capacity, model.max_forward_rows())?;
         model.forward(&d, &mut b, &prompt, Output::None)?;
         let (mut worst, mut kl_max) = (0f32, 0f64);
         for (i, row) in wide.iter().enumerate() {
@@ -150,14 +150,14 @@ fn main() -> Result<()> {
     // Replay check: commit(n) versus plain forwards of the same n tokens.
     let n = block / 2 + 1;
     let tail = &reference[..n];
-    let mut a = HybridState::new(&d, &model.config, capacity)?;
+    let mut a = HybridState::new(&d, &model.config, capacity, model.max_forward_rows())?;
     model.forward(&d, &mut a, &prompt, Output::None)?;
     model.verify(&d, &mut a, &reference[..block + 1], RowOutput::Argmax)?;
     model.commit(&d, &mut a, n)?;
     let Produced::Logits(la) = model.forward(&d, &mut a, &[reference[n]], Output::Logits)? else {
         unreachable!()
     };
-    let mut b = HybridState::new(&d, &model.config, capacity)?;
+    let mut b = HybridState::new(&d, &model.config, capacity, model.max_forward_rows())?;
     model.forward(&d, &mut b, &prompt, Output::None)?;
     model.forward(&d, &mut b, tail, Output::None)?;
     let Produced::Logits(lb) = model.forward(&d, &mut b, &[reference[n]], Output::Logits)? else {

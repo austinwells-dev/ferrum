@@ -191,7 +191,21 @@ impl HybridModel {
             let e = d.execution_with_shared_encoder(true)?;
             let start = std::time::Instant::now();
             for _ in 0..n {
-                self.flash_attention(d, &s, kv, &q, &kc, &vc, &qg, &att, m, keys - m, spec, None)?;
+                self.flash_attention(
+                    d,
+                    &s,
+                    kv,
+                    &q,
+                    &kc,
+                    &vc,
+                    &qg,
+                    &att,
+                    m,
+                    keys - m,
+                    spec,
+                    None,
+                    0,
+                )?;
             }
             e.finish()?;
             Ok(start.elapsed().as_secs_f64())
@@ -234,7 +248,21 @@ impl HybridModel {
             let e = d.execution_with_shared_encoder(true)?;
             let start = std::time::Instant::now();
             for _ in 0..n {
-                self.flash_attention(d, &s, kv, &q, &kc, &vc, &qg, &att, m, keys - m, spec, None)?;
+                self.flash_attention(
+                    d,
+                    &s,
+                    kv,
+                    &q,
+                    &kc,
+                    &vc,
+                    &qg,
+                    &att,
+                    m,
+                    keys - m,
+                    spec,
+                    None,
+                    0,
+                )?;
             }
             e.finish()?;
             Ok(start.elapsed().as_secs_f64())
@@ -265,7 +293,12 @@ impl HybridModel {
     ) -> Result<Vec<(usize, f64)>> {
         use super::engine::{HybridState, Output};
         let widest = widths.iter().copied().max().unwrap_or(1);
-        let mut state = HybridState::new(d, &self.config, context + widest + 1)?;
+        let mut state = HybridState::new(
+            d,
+            &self.config,
+            context + widest + 1,
+            self.max_forward_rows(),
+        )?;
         let tokens: Vec<u32> = (0..(context + widest) as u32)
             .map(|i| 1000 + (i * 7919) % 20000)
             .collect();

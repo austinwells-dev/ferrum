@@ -37,6 +37,11 @@ pub trait Drafter {
     ) -> Result<Vec<u32>>;
     /// The target sequence now ends at `len` (prefix reuse or reset).
     fn rewind(&mut self, d: &MetalDevice, target: &HybridModel, len: usize) -> Result<()>;
+    /// Whether `rewind` accepts any length, not only snapshot positions, so an
+    /// attention-only target can resume exactly where a prompt diverges.
+    fn rewinds_anywhere(&self) -> bool {
+        false
+    }
     /// The session saved a recurrent snapshot at `pos`.
     fn snapshot(&mut self, _d: &MetalDevice, _pos: usize) -> Result<()> {
         Ok(())

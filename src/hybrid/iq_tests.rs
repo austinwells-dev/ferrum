@@ -1331,6 +1331,39 @@ fn iq_projections_match_the_cpu_dequant() {
     }
 }
 
+/// BF16 routers on every dense path: the kernels widen BF16 exactly, so they
+/// match F32 rows holding the same values.
+#[test]
+fn bf16_projections_match_widened_rows() {
+    let d = MetalDevice::new().unwrap();
+    let (rows, cols) = (256, 2048);
+    let bits: Vec<u16> = random(rows * cols, 7)
+        .iter()
+        .map(|v| (v.to_bits() >> 16) as u16)
+        .collect();
+    let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+    let dense: Vec<f32> = bits
+        .iter()
+        .map(|&b| f32::from_bits(u32::from(b) << 16))
+        .collect();
+    let w = Matrix::from_packed(&d, rows, cols, 1, Format::Bf16, &bytes).unwrap();
+    for m in [1, 3, 16, 64] {
+        let x = random(m * cols, 100 + m as u64);
+        let xt = Tensor::from_f32(&d, [m * cols], DType::F32, &x).unwrap();
+        let yt = Tensor::zeros(&d, [m * rows], DType::F32).unwrap();
+        HybridModel::project(&d, &w, &xt, m, &yt).unwrap();
+        let want: Vec<f32> = (0..m * rows)
+            .map(|i| {
+                let (mi, r) = (i / rows, i % rows);
+                (0..cols)
+                    .map(|c| x[mi * cols + c] as f64 * dense[r * cols + c] as f64)
+                    .sum::<f64>() as f32
+            })
+            .collect();
+        assert_close(&yt.to_f32(), &want, &format!("bf16 m={m}"));
+    }
+}
+
 /// Expert projections: each route multiplies its own expert's slice.
 #[test]
 fn iq_expert_projections_match_the_cpu_dequant() {

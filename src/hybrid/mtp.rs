@@ -153,6 +153,7 @@ impl Mtp {
             &w.attention,
             &self.k,
             &self.v,
+            0,
             c.layers,
             &xn,
             &mix,

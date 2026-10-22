@@ -145,7 +145,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
     };
     let prompt = loaded.tokenizer.encode(&text)?;
     let before_state = d.allocated_bytes();
-    let mut state = HybridState::new(d, c, plan.context)?;
+    let mut state = HybridState::new(d, c, plan.context, model.max_forward_rows())?;
     let state_measured = d.allocated_bytes() - before_state;
     eprintln!(
         "measured: weights+scratch {:.0} MiB (predicted {:.0}), state {:.0} MiB (predicted {:.0})",
@@ -184,6 +184,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         {
             print!("{piece}");
         }
+        let gpu_before = d.counters().gpu;
         while generated.len() < o.max_new && !loaded.eos_ids.contains(&token) {
             let t = Instant::now();
             let Produced::Token(next) = model.forward(d, &mut state, &[token], Output::Argmax)?
@@ -208,10 +209,12 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             print_profile(&format!("decode ({} steps)", steps.len()), d.take_profile());
         }
         let decode: Duration = steps.iter().sum();
+        // Command-buffer GPU time: free of CPU scheduling noise.
+        let gpu = d.counters().gpu.saturating_sub(gpu_before);
         let mut sorted = steps.clone();
         sorted.sort();
         eprintln!(
-            "round {round}: prefill {} tok in {:.1} ms ({:.1} tok/s); decode {} tok in {:.1} ms ({:.2} tok/s, median {:.1} ms)",
+            "round {round}: prefill {} tok in {:.1} ms ({:.1} tok/s); decode {} tok in {:.1} ms ({:.2} tok/s, median {:.1} ms, GPU {:.2} ms/tok)",
             prompt.len(),
             ms(prefill),
             prompt.len() as f64 / prefill.as_secs_f64(),
@@ -219,6 +222,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             ms(decode),
             steps.len() as f64 / decode.as_secs_f64().max(1e-9),
             sorted.get(sorted.len() / 2).map_or(0., |&d| ms(d)),
+            ms(gpu) / steps.len().max(1) as f64,
         );
         if round == 0 {
             eprintln!("generated IDs: {generated:?}");

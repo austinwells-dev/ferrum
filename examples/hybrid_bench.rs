@@ -47,7 +47,12 @@ fn main() -> Result<()> {
         .max()
         .unwrap_or(0);
     let max_depth = depths.iter().copied().max().unwrap_or(0).max(pp_depth_max);
-    let mut state = HybridState::new(&d, &model.config, max_pp.max(tg).max(max_depth + 32) + 1)?;
+    let mut state = HybridState::new(
+        &d,
+        &model.config,
+        max_pp.max(tg).max(max_depth + 32) + 1,
+        model.max_forward_rows(),
+    )?;
     // Deterministic pseudo-text tokens in the ordinary-word ID range.
     let tokens: Vec<u32> = (0..max_pp.max(max_depth) as u32)
         .map(|i| 1000 + (i * 7919) % 20000)

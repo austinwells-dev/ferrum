@@ -628,7 +628,7 @@ pub fn check(path: &Path) -> Checked {
     // Tensors of the trailing NextN/MTP block are only read for `--draft mtp`.
     let (mut trunk, mut head): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     for t in file.tensors().values() {
-        // BF16 routers are widened to F32 when the weights load.
+        // BF16 routers load as BF16 (the hybrid engine has kernels for them).
         let bf16_router = t.type_id == 30 && t.name.ends_with("ffn_gate_inp.weight");
         let supported = if t.dimensions.len() <= 1 {
             t.type_id == 0

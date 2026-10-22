@@ -9,6 +9,7 @@ pub mod draft;
 pub mod engine;
 #[cfg(test)]
 mod iq_tests;
+pub mod lookup;
 pub mod mtp;
 pub mod plan;
 pub mod runtime;

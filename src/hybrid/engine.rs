@@ -101,11 +101,51 @@ pub struct HybridState {
     v: Vec<Option<Tensor>>,
     conv: Vec<Option<Tensor>>,
     ssm: Vec<Option<Tensor>>,
+    /// Per layer: rows of its K/V ring (`ring_rows`), or 0 for one row per position.
+    ring: Vec<usize>,
+    /// Per layer: its sliding window (0 = full attention).
+    window: Vec<usize>,
+    /// Most positions one forward may add (`HybridModel::max_forward_rows`).
+    max_rows: usize,
+    /// One past the highest position whose K/V was ever written: ring rows of
+    /// positions below `written - ring` have been overwritten.
+    written: usize,
+}
+
+/// Rows of the K/V ring of sliding-window `layer` when a forward adds at most
+/// `max_rows` positions, or 0 when a linear cache of `capacity` positions is
+/// no larger (or the layer attends to everything). A forward at `pos` reads
+/// keys from its first query's window start aligned down to 64 (at most
+/// `window + 62` back) through its own rows, so that span must fit without
+/// wrapping onto itself. Multiples of 64 keep aligned 64-key tiles contiguous.
+pub fn ring_rows(c: &HybridConfig, layer: usize, capacity: usize, max_rows: usize) -> usize {
+    let Some(window) = attn_spec(c, layer).window else {
+        return 0;
+    };
+    let ring = (window + 62 + max_rows).next_multiple_of(64);
+    if ring >= capacity.next_multiple_of(32) {
+        0
+    } else {
+        ring
+    }
+}
+
+/// Most positions one forward adds for prompt chunks of `chunk` rows: the
+/// chunk itself, or the widest speculative verify.
+pub fn max_forward_rows(chunk: usize) -> usize {
+    chunk.max(MMS_MAX_ROWS)
 }
 
 impl HybridState {
-    pub fn new(d: &MetalDevice, c: &HybridConfig, capacity: usize) -> Result<Self> {
-        if capacity == 0 {
+    /// A state of `capacity` positions whose forwards add at most `max_rows`
+    /// positions each (sliding-window layers size their K/V rings from it).
+    pub fn new(
+        d: &MetalDevice,
+        c: &HybridConfig,
+        capacity: usize,
+        max_rows: usize,
+    ) -> Result<Self> {
+        if capacity == 0 || max_rows == 0 {
             return Err(Error::Cache("context capacity must be positive".into()));
         }
         let kv_row = c.kv_heads * c.head_dim;
@@ -121,11 +161,23 @@ impl HybridState {
             v: Vec::new(),
             conv: Vec::new(),
             ssm: Vec::new(),
+            ring: Vec::new(),
+            window: Vec::new(),
+            max_rows,
+            written: 0,
         };
         for layer in 0..c.layers {
+            let ring = if c.is_attention(layer) {
+                ring_rows(c, layer, capacity, max_rows)
+            } else {
+                0
+            };
+            state.ring.push(ring);
+            state.window.push(attn_spec(c, layer).window.unwrap_or(0));
             if c.is_attention(layer) {
-                state.k.push(Some(c.kv_cache.alloc(d, kv_rows, kv_row)?));
-                state.v.push(Some(c.kv_cache.alloc(d, kv_rows, kv_row)?));
+                let rows = if ring > 0 { ring } else { kv_rows };
+                state.k.push(Some(c.kv_cache.alloc(d, rows, kv_row)?));
+                state.v.push(Some(c.kv_cache.alloc(d, rows, kv_row)?));
                 state.conv.push(None);
                 state.ssm.push(None);
             } else {
@@ -166,7 +218,17 @@ impl HybridState {
         self.len = 0;
         self.valid = true;
         self.verified = 0;
+        self.written = 0;
         self.media.clear();
+    }
+    /// Whether every K/V row a forward at `position` reads is still intact:
+    /// a ring layer must not have overwritten the start of that window.
+    pub(crate) fn can_resume(&self, position: usize) -> bool {
+        self.ring.iter().zip(&self.window).all(|(&ring, &window)| {
+            ring == 0
+                || (position + 1).saturating_sub(window) / 64 * 64
+                    >= self.written.saturating_sub(ring)
+        })
     }
     /// The images of the sequence being processed. Spans past `len` are the
     /// ones about to be prefilled; their embeddings replace the token rows.
@@ -222,6 +284,11 @@ impl HybridState {
     pub(crate) fn recurrent(&self) -> impl Iterator<Item = &Tensor> {
         self.conv.iter().flatten().chain(self.ssm.iter().flatten())
     }
+    /// Whether the model has recurrent state (only attention-only models, such
+    /// as Flint, have none: their append-only K/V cache can resume anywhere).
+    pub(crate) fn has_recurrent(&self) -> bool {
+        self.recurrent().next().is_some()
+    }
     /// Copy the recurrent state into `dst` (same order and shapes).
     pub(crate) fn save_recurrent(&self, d: &MetalDevice, dst: &[Tensor]) -> Result<()> {
         let e = d.execution_with_shared_encoder(true)?;
@@ -241,6 +308,11 @@ impl HybridState {
         if position > self.len && self.valid {
             return Err(Error::Cache(
                 "snapshot lies beyond the cached sequence".into(),
+            ));
+        }
+        if !self.can_resume(position) {
+            return Err(Error::Cache(
+                "the sliding-window K/V ring no longer holds that position's window".into(),
             ));
         }
         self.valid = false;
@@ -490,15 +562,33 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
 }
 
 /// Bytes of a `HybridState` for `capacity` positions, page-rounded.
-pub fn state_bytes(c: &HybridConfig, capacity: usize) -> usize {
-    kv_bytes(c, capacity) + recurrent_bytes(c)
+pub fn state_bytes(c: &HybridConfig, capacity: usize, max_rows: usize) -> usize {
+    kv_bytes(c, capacity, max_rows) + recurrent_bytes(c)
 }
 
-/// K and V caches of every attention layer for `capacity` positions.
-pub fn kv_bytes(c: &HybridConfig, capacity: usize) -> usize {
-    let per_tensor =
-        page(capacity.next_multiple_of(32) * c.kv_cache.row_bytes(c.kv_heads * c.head_dim));
-    c.attention_layer_count() * 2 * per_tensor
+/// K and V caches of every attention layer for `capacity` positions (ring
+/// layers hold `ring_rows` rows whatever the capacity).
+pub fn kv_bytes(c: &HybridConfig, capacity: usize, max_rows: usize) -> usize {
+    let row = c.kv_cache.row_bytes(c.kv_heads * c.head_dim);
+    (0..c.layers)
+        .filter(|&l| c.is_attention(l))
+        .map(|l| match ring_rows(c, l, capacity, max_rows) {
+            0 => 2 * page(capacity.next_multiple_of(32) * row),
+            ring => 2 * page(ring * row),
+        })
+        .sum()
+}
+
+/// The part of `kv_bytes` held by sliding-window rings, which does not grow
+/// with the context once it exceeds the ring.
+pub fn kv_ring_bytes(c: &HybridConfig, max_rows: usize) -> usize {
+    let row = c.kv_cache.row_bytes(c.kv_heads * c.head_dim);
+    (0..c.layers)
+        .filter(|&l| c.is_attention(l))
+        .map(|l| ring_rows(c, l, usize::MAX / 2, max_rows))
+        .filter(|&ring| ring > 0)
+        .map(|ring| 2 * page(ring * row))
+        .sum()
 }
 
 /// Convolution windows and delta-rule matrices of every recurrent layer.
@@ -768,6 +858,10 @@ impl HybridModel {
     }
     pub fn chunk(&self) -> usize {
         self.scratch.borrow().chunk
+    }
+    /// Most positions one forward adds (sizes `HybridState` K/V rings).
+    pub fn max_forward_rows(&self) -> usize {
+        max_forward_rows(self.chunk())
     }
 
     /// Append `tokens` to `state` and produce `output` for the last token.
@@ -1094,6 +1188,13 @@ impl HybridModel {
         let m = tokens.len();
         let pos = state.len;
         let h = c.hidden;
+        if m > state.max_rows && state.ring.iter().any(|&r| r > 0) {
+            return Err(Error::Cache(format!(
+                "a forward of {m} rows exceeds the {} the K/V rings were sized for",
+                state.max_rows
+            )));
+        }
+        state.written = state.written.max(pos + m);
         let execution = d.execution_with_shared_encoder(true)?;
         if pos == 0 {
             for t in state.conv.iter().chain(&state.ssm).flatten() {
@@ -1308,10 +1409,24 @@ impl HybridModel {
         let vc = state.v[layer]
             .as_ref()
             .expect("attention layer has V cache");
-        self.attention_with(d, s, a, kc, vc, layer, xn, out, m, pos, rope)
+        self.attention_with(
+            d,
+            s,
+            a,
+            kc,
+            vc,
+            state.ring[layer],
+            layer,
+            xn,
+            out,
+            m,
+            pos,
+            rope,
+        )
     }
 
-    /// Attention of `m` rows at `pos..` against explicit K/V caches.
+    /// Attention of `m` rows at `pos..` against explicit K/V caches, which
+    /// are rings of `ring` rows (see `ring_rows`) or linear (`ring` = 0).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_with(
         &self,
@@ -1320,6 +1435,7 @@ impl HybridModel {
         a: &AttentionWeights,
         kc: &Tensor,
         vc: &Tensor,
+        ring: usize,
         layer: usize,
         xn: &Tensor,
         out: &Tensor,
@@ -1355,7 +1471,8 @@ impl HybridModel {
             .u(c.rope_sections[1])?
             .u(c.rope_sections[2])?
             .u(kc.shape().dimensions()[0])?
-            .u(usize::from(spec.gated))?;
+            .u(usize::from(spec.gated))?
+            .u(ring)?;
         let q8 = c.kv_cache == KvCache::Q8;
         d.dispatch_hybrid(
             if q8 { "h_attn_prep_q8" } else { "h_attn_prep" },
@@ -1399,6 +1516,7 @@ impl HybridModel {
             pos,
             spec,
             a.sinks.as_ref(),
+            ring,
         )?;
         self.dump(d, "attn_gated", layer, &att)?;
         Self::project(d, &a.o, &att, m, out)?;
@@ -1424,13 +1542,20 @@ impl HybridModel {
         pos: usize,
         spec: AttnSpec,
         sinks: Option<&Tensor>,
+        ring: usize,
     ) -> Result<()> {
         let c = &self.config;
         let group = c.heads / c.kv_heads;
         let rows = m * group;
         let window = spec.window.unwrap_or(0);
-        // No query reads keys before the window of the first query.
+        // No query reads keys before the window of the first query. A ring
+        // starts at a multiple of 64 so tensor-op tiles never wrap.
         let first_key = spec.window.map_or(0, |w| (pos + 1).saturating_sub(w));
+        let first_key = if ring > 0 {
+            first_key / 64 * 64
+        } else {
+            first_key
+        };
         let keys = pos + m - first_key;
         let kv_rows = kc.shape().dimensions()[0];
         let q8 = kv == KvCache::Q8;
@@ -1441,7 +1566,7 @@ impl HybridModel {
                 "the reference and legacy attention kernels read only an F16 K/V cache".into(),
             ));
         }
-        if legacy && (!wide || !spec.gated || window != 0 || sinks.is_some()) {
+        if legacy && (!wide || !spec.gated || window != 0 || sinks.is_some() || ring != 0) {
             return Err(Error::Config(
                 "the legacy attention kernels cover gated, full-window, sink-free 256-wide heads"
                     .into(),
@@ -1461,7 +1586,8 @@ impl HybridModel {
                 .f(1.)
                 .u(window)?
                 .u(usize::from(spec.gated))?
-                .u(sinks_on)?;
+                .u(sinks_on)?
+                .u(ring)?;
             return d.dispatch_hybrid(
                 "h_attention",
                 &[
@@ -1494,6 +1620,7 @@ impl HybridModel {
                 .u(window)?
                 .u(usize::from(spec.gated))?
                 .u(sinks_on)?
+                .u(ring)?
                 .0)
         };
         // Sinks ride as the fifth input; the legacy kernels predate them.
@@ -2014,7 +2141,12 @@ impl HybridModel {
             Format::Iq3S => "h_mm_id_iq3_s",
             Format::Iq3Xxs => "h_mm_id_iq3_xxs",
             Format::Iq2S => "h_mm_id_iq2_s",
-            Format::F32 => return Err(Error::Gguf("F32 experts are unsupported".into())),
+            Format::F32 | Format::Bf16 => {
+                return Err(Error::Gguf(format!(
+                    "{} experts are unsupported",
+                    w.format.name()
+                )));
+            }
         };
         d.dispatch_hybrid(
             name,
@@ -2213,6 +2345,7 @@ impl HybridModel {
                 Format::Q4_0 => "h_mm_q4_0",
                 Format::Iq4Xs => "h_mm_iq4_xs",
                 Format::F32 => "h_mm_f32",
+                Format::Bf16 => "h_mm_bf16",
                 Format::Iq3S => "h_mm_iq3_s",
                 Format::Iq3Xxs => "h_mm_iq3_xxs",
                 Format::Iq2S => "h_mm_iq2_s",
@@ -2310,6 +2443,7 @@ fn mvb_kernel(format: Format) -> &'static str {
         Format::Iq3Xxs => "h_mvb_iq3_xxs",
         Format::Iq2S => "h_mvb_iq2_s",
         Format::F32 => "h_mvb_f32",
+        Format::Bf16 => "h_mvb_bf16",
     }
 }
 
@@ -2326,6 +2460,7 @@ fn mms_kernel(format: Format) -> &'static str {
         Format::Iq3Xxs => "h_mms_iq3_xxs",
         Format::Iq2S => "h_mms_iq2_s",
         Format::F32 => "h_mms_f32",
+        Format::Bf16 => "h_mms_bf16",
     }
 }
 
@@ -2338,6 +2473,7 @@ fn mv_kernel(format: Format, expert: bool) -> (&'static str, usize, usize, usize
         Format::Q6K => (pick("h_mv_q6_k", "h_mv_id_q6_k"), 4, 2, 0),
         Format::Q4_0 => (pick("h_mv_q4_0", "h_mv_id_q4_0"), 8, 2, 0),
         Format::F32 => ("h_mv_f32", 8, 2, 0),
+        Format::Bf16 => ("h_mv_bf16", 8, 2, 0),
         Format::Q8_0 => (pick("h_mv_q8_0", "h_mv_id_q8_0"), 2, 4, 32 * 2 * 4),
         Format::Iq4Xs => (pick("h_mv_iq4_xs", "h_mv_id_iq4_xs"), 4, 2, 32 * 4),
         Format::Iq3S => (pick("h_mv_iq3_s", "h_mv_id_iq3_s"), 8, 2, 512 * 4),
@@ -2392,6 +2528,10 @@ mod tests {
             v: Vec::new(),
             conv: Vec::new(),
             ssm: Vec::new(),
+            ring: Vec::new(),
+            window: Vec::new(),
+            max_rows: 1,
+            written: 0,
         };
         // Text only: a plain offset.
         let plan = state.rope_plan(&d, 17, 4).unwrap();
@@ -2475,7 +2615,9 @@ mod tests {
                 .u(rows + 2)
                 .unwrap()
                 .u(1)
-                .unwrap();
+                .unwrap()
+                .u(0)
+                .unwrap(); // ring
             let e = d.execution_with_shared_encoder(true).unwrap();
             d.dispatch_hybrid(
                 "h_attn_prep",
@@ -2620,7 +2762,9 @@ mod tests {
                 .u(1)
                 .unwrap()
                 .u(0)
-                .unwrap();
+                .unwrap()
+                .u(0)
+                .unwrap(); // ring
             {
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
@@ -2678,7 +2822,9 @@ mod tests {
                         .u(1)
                         .unwrap()
                         .u(0)
-                        .unwrap();
+                        .unwrap()
+                        .u(0)
+                        .unwrap(); // ring
                     let e = d.execution_with_shared_encoder(true).unwrap();
                     d.dispatch_hybrid(
                         if simds == 1 {
@@ -2755,7 +2901,9 @@ mod tests {
                         .u(1)
                         .unwrap()
                         .u(0)
-                        .unwrap();
+                        .unwrap()
+                        .u(0)
+                        .unwrap(); // ring
                     let e = d.execution_with_shared_encoder(true).unwrap();
                     d.dispatch_hybrid(
                         "h_attn_decode",
@@ -2828,7 +2976,9 @@ mod tests {
                 .u(1)
                 .unwrap()
                 .u(0)
-                .unwrap();
+                .unwrap()
+                .u(0)
+                .unwrap(); // ring
             let e = d.execution_with_shared_encoder(true).unwrap();
             d.dispatch_hybrid(
                 "h_flash_attn_mpp",
@@ -2876,6 +3026,40 @@ mod tests {
         (values, deq)
     }
 
+    /// A ring layer can resume at a position only while its ring still holds
+    /// that position's window (from its start aligned down to 64); linear
+    /// layers can always resume.
+    #[test]
+    fn ring_states_resume_only_inside_the_ring() {
+        let state = |written: usize| HybridState {
+            capacity: 1 << 16,
+            len: written,
+            valid: true,
+            verified: 0,
+            media: Vec::new(),
+            k: Vec::new(),
+            v: Vec::new(),
+            conv: Vec::new(),
+            ssm: Vec::new(),
+            ring: vec![0, 1088],
+            window: vec![0, 513],
+            max_rows: 512,
+            written,
+        };
+        // Nothing overwritten yet: any position resumes.
+        assert!(state(1000).can_resume(10));
+        // 3000 written: rows of positions below 3000 - 1088 = 1912 are gone.
+        let s = state(3000);
+        assert!(s.can_resume(3000));
+        // Window of 2500 starts at 1988, aligned down to 1984 >= 1912.
+        assert!(s.can_resume(2500));
+        // Window of 2432 starts at 1920, already a multiple of 64.
+        assert!(s.can_resume(2432));
+        // Window of 2431 starts at 1919, aligned to 1856 < 1912.
+        assert!(!s.can_resume(2431));
+        assert!(!s.can_resume(100));
+    }
+
     /// Ungated queries (Flint) read one head-width row per head, and with RoPE
     /// off the prep is the RMS-normalized query times the scale alone.
     #[test]
@@ -2917,7 +3101,9 @@ mod tests {
             .u(rows + 2)
             .unwrap()
             .u(0)
-            .unwrap(); // gated: qg rows hold queries only
+            .unwrap() // gated: qg rows hold queries only
+            .u(0)
+            .unwrap(); // ring
         let (qg_t, k_t, zeros) = (t(&qg, qg.len()), t(&kk, kk.len()), t(&[0.], 1));
         let (qn, kn) = (t(&norm, head_dim), t(&norm, head_dim));
         let e = d.execution_with_shared_encoder(true).unwrap();
@@ -3050,7 +3236,9 @@ mod tests {
                     .u(gated_on)
                     .unwrap()
                     .u(sinks_on)
-                    .unwrap();
+                    .unwrap()
+                    .u(0)
+                    .unwrap(); // ring
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
                     "h_attention",
@@ -3070,170 +3258,211 @@ mod tests {
                 .unwrap();
                 e.finish().unwrap();
                 let expected = reference.to_f32();
-                // Keys the kernels split: everything from the first visible key.
-                let span = keys - first_key;
-                let fa = |keys_per_split: usize, splits: usize| {
-                    let mut p = Params::default();
-                    for x in [
-                        m,
-                        heads,
-                        kv_heads,
-                        group,
-                        pos,
-                        stride,
-                        keys_per_split,
-                        splits,
-                        cap,
-                        dim,
-                        first_key,
-                        window_arg,
-                        gated_on,
-                        sinks_on,
-                    ] {
-                        p = p.u(x).unwrap();
-                    }
-                    p.0
-                };
-                let check = |name: &'static str,
-                             inputs_extra: bool,
-                             groups: [usize; 3],
-                             threads: usize,
-                             shared: usize,
-                             kps: usize,
-                             splits: usize| {
-                    let out = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
-                    let partial =
-                        Tensor::zeros(&d, [splits * m * heads * dim], DType::F32).unwrap();
-                    let ml = Tensor::zeros(&d, [splits * m * heads * 2], DType::F32).unwrap();
-                    let args = fa(kps, splits);
-                    let qk = Tensor::zeros(&d, [m, heads * dim], DType::F16).unwrap();
-                    let verify = name.starts_with("h_attn_verify");
-                    let mpp = name.starts_with("h_flash_attn_mpp");
-                    let e = d.execution_with_shared_encoder(true).unwrap();
-                    if verify {
-                        d.dispatch_hybrid(
-                            "h_q_by_kv_head",
-                            &[q.binding()],
-                            &[qk.binding()],
-                            &args,
-                            [(m * heads * dim).div_ceil(256), 1, 1],
-                            [256, 1, 1],
-                            0,
-                        )
-                        .unwrap();
-                    }
-                    let outputs = if mpp {
-                        vec![out.binding()]
-                    } else {
-                        vec![out.binding(), partial.binding(), ml.binding()]
+                // Each kernel runs on the linear cache and, for windowed
+                // cases whose keys wrap it, on a ring of `ring_rows` rows
+                // holding key j in row j % ring (as `h_attn_prep` stores it).
+                let ring = window.map_or(0, |w| (w + 62 + m).next_multiple_of(64));
+                let mut layouts = vec![(0, kc, vc, cap, first_key)];
+                if ring > 0 && ring < keys {
+                    let wrap = |raw: &[f32]| {
+                        let mut out = random(ring * stride, 9);
+                        for j in 0..keys {
+                            out[(j % ring) * stride..][..stride]
+                                .copy_from_slice(&raw[j * stride..][..stride]);
+                        }
+                        out
                     };
-                    let mut inputs = vec![
-                        if verify { qk.binding() } else { q.binding() },
-                        kc.binding(),
-                        vc.binding(),
-                        qg.binding(),
-                    ];
-                    if inputs_extra {
-                        inputs.push(sink_arg.binding());
-                    }
-                    d.dispatch_hybrid(
-                        name,
-                        &inputs,
-                        &outputs,
-                        &args,
-                        groups,
-                        [threads, 1, 1],
-                        shared,
-                    )
-                    .unwrap();
-                    if splits > 1 {
+                    let (kw, vw) = (wrap(&k_raw), wrap(&v_raw));
+                    let (kc, vc) = match kv {
+                        KvCache::F16 => {
+                            let t = |x: &[f32]| {
+                                Tensor::from_f32(&d, [ring, stride], DType::F16, x).unwrap()
+                            };
+                            (t(&kw), t(&vw))
+                        }
+                        KvCache::Q8 => {
+                            let t = |x: &[f32]| {
+                                let (b, _) = quantize_q8(x, stride);
+                                Tensor::from_le_bytes(
+                                    &d,
+                                    [ring, kv.row_bytes(stride) / 2],
+                                    DType::F16,
+                                    &b,
+                                )
+                                .unwrap()
+                            };
+                            (t(&kw), t(&vw))
+                        }
+                    };
+                    layouts.push((ring, kc, vc, ring, first_key / 64 * 64));
+                }
+                for (ring, kc, vc, kv_rows, first_key) in layouts {
+                    // Keys the kernels split: everything from the first visible key.
+                    let span = keys - first_key;
+                    let fa = |keys_per_split: usize, splits: usize| {
+                        let mut p = Params::default();
+                        for x in [
+                            m,
+                            heads,
+                            kv_heads,
+                            group,
+                            pos,
+                            stride,
+                            keys_per_split,
+                            splits,
+                            kv_rows,
+                            dim,
+                            first_key,
+                            window_arg,
+                            gated_on,
+                            sinks_on,
+                            ring,
+                        ] {
+                            p = p.u(x).unwrap();
+                        }
+                        p.0
+                    };
+                    let check = |name: &'static str,
+                                 inputs_extra: bool,
+                                 groups: [usize; 3],
+                                 threads: usize,
+                                 shared: usize,
+                                 kps: usize,
+                                 splits: usize| {
+                        let out = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
+                        let partial =
+                            Tensor::zeros(&d, [splits * m * heads * dim], DType::F32).unwrap();
+                        let ml = Tensor::zeros(&d, [splits * m * heads * 2], DType::F32).unwrap();
+                        let args = fa(kps, splits);
+                        let qk = Tensor::zeros(&d, [m, heads * dim], DType::F16).unwrap();
+                        let verify = name.starts_with("h_attn_verify");
+                        let mpp = name.starts_with("h_flash_attn_mpp");
+                        let e = d.execution_with_shared_encoder(true).unwrap();
+                        if verify {
+                            d.dispatch_hybrid(
+                                "h_q_by_kv_head",
+                                &[q.binding()],
+                                &[qk.binding()],
+                                &args,
+                                [(m * heads * dim).div_ceil(256), 1, 1],
+                                [256, 1, 1],
+                                0,
+                            )
+                            .unwrap();
+                        }
+                        let outputs = if mpp {
+                            vec![out.binding()]
+                        } else {
+                            vec![out.binding(), partial.binding(), ml.binding()]
+                        };
+                        let mut inputs = vec![
+                            if verify { qk.binding() } else { q.binding() },
+                            kc.binding(),
+                            vc.binding(),
+                            qg.binding(),
+                        ];
+                        if inputs_extra {
+                            inputs.push(sink_arg.binding());
+                        }
                         d.dispatch_hybrid(
-                            "h_flash_reduce_d128",
-                            &[
-                                partial.binding(),
-                                ml.binding(),
-                                qg.binding(),
-                                sink_arg.binding(),
-                            ],
-                            &[out.binding()],
+                            name,
+                            &inputs,
+                            &outputs,
                             &args,
-                            [m * heads, 1, 1],
-                            [dim, 1, 1],
-                            0,
+                            groups,
+                            [threads, 1, 1],
+                            shared,
                         )
                         .unwrap();
+                        if splits > 1 {
+                            d.dispatch_hybrid(
+                                "h_flash_reduce_d128",
+                                &[
+                                    partial.binding(),
+                                    ml.binding(),
+                                    qg.binding(),
+                                    sink_arg.binding(),
+                                ],
+                                &[out.binding()],
+                                &args,
+                                [m * heads, 1, 1],
+                                [dim, 1, 1],
+                                0,
+                            )
+                            .unwrap();
+                        }
+                        e.finish().unwrap();
+                        let worst = out
+                            .to_f32()
+                            .iter()
+                            .zip(&expected)
+                            .map(|(a, b)| (a - b).abs())
+                            .fold(0f32, f32::max);
+                        assert!(
+                            worst < 2e-3,
+                            "{name} m {m} pos {pos} window {window:?} sinks {sinks} gated {gated} ring {ring} splits {splits}: max error {worst}"
+                        );
+                    };
+                    if m == 1 {
+                        for splits_wanted in [1usize, 5] {
+                            let kps = span.div_ceil(splits_wanted).next_multiple_of(32);
+                            let splits = span.div_ceil(kps);
+                            check(
+                                if q8 {
+                                    "h_attn_decode_q8_d128"
+                                } else {
+                                    "h_attn_decode_d128"
+                                },
+                                true,
+                                [kv_heads, splits, 1],
+                                128,
+                                8 * dim * 2 + 4 * 8 * 2 * 4 + 2 * 8 * dim * 4,
+                                kps,
+                                splits,
+                            );
+                        }
                     }
-                    e.finish().unwrap();
-                    let worst = out
-                        .to_f32()
-                        .iter()
-                        .zip(&expected)
-                        .map(|(a, b)| (a - b).abs())
-                        .fold(0f32, f32::max);
-                    assert!(
-                        worst < 2e-3,
-                        "{name} m {m} pos {pos} window {window:?} sinks {sinks} gated {gated} splits {splits}: max error {worst}"
-                    );
-                };
-                if m == 1 {
-                    for splits_wanted in [1usize, 5] {
-                        let kps = span.div_ceil(splits_wanted).next_multiple_of(32);
-                        let splits = span.div_ceil(kps);
+                    if m > 1 && m < 16 {
+                        for splits_wanted in [1usize, 3] {
+                            let rows = m * group;
+                            let row_blocks = rows.div_ceil(32);
+                            let kps = span.div_ceil(splits_wanted).next_multiple_of(64);
+                            let splits = span.div_ceil(kps);
+                            check(
+                                if q8 {
+                                    "h_attn_verify_mpp_32_q8_d128"
+                                } else {
+                                    "h_attn_verify_mpp_32_d128"
+                                },
+                                true,
+                                [row_blocks, kv_heads, splits],
+                                128,
+                                if q8 {
+                                    // The K/V staging tile outgrows the 32-row score tile.
+                                    64 * 128 * 2 + 32 * 64 * 2 + 3 * 32 * 4
+                                } else {
+                                    32 * 64 * 4 + 32 * 64 * 2 + 3 * 32 * 4
+                                },
+                                kps,
+                                splits,
+                            );
+                        }
+                    }
+                    if m >= 16 {
                         check(
                             if q8 {
-                                "h_attn_decode_q8_d128"
+                                "h_flash_attn_mpp_q8_d128"
                             } else {
-                                "h_attn_decode_d128"
+                                "h_flash_attn_mpp_staged_d128"
                             },
                             true,
-                            [kv_heads, splits, 1],
+                            [m.div_ceil(64), heads, 1],
                             128,
-                            8 * dim * 2 + 4 * 8 * 2 * 4 + 2 * 8 * dim * 4,
-                            kps,
-                            splits,
+                            64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
+                            0,
+                            1,
                         );
                     }
-                }
-                if m > 1 && m < 16 {
-                    for splits_wanted in [1usize, 3] {
-                        let rows = m * group;
-                        let row_blocks = rows.div_ceil(32);
-                        let kps = span.div_ceil(splits_wanted).next_multiple_of(64);
-                        let splits = span.div_ceil(kps);
-                        check(
-                            if q8 {
-                                "h_attn_verify_mpp_32_q8_d128"
-                            } else {
-                                "h_attn_verify_mpp_32_d128"
-                            },
-                            true,
-                            [row_blocks, kv_heads, splits],
-                            128,
-                            if q8 {
-                                // The K/V staging tile outgrows the 32-row score tile.
-                                64 * 128 * 2 + 32 * 64 * 2 + 3 * 32 * 4
-                            } else {
-                                32 * 64 * 4 + 32 * 64 * 2 + 3 * 32 * 4
-                            },
-                            kps,
-                            splits,
-                        );
-                    }
-                }
-                if m >= 16 {
-                    check(
-                        if q8 {
-                            "h_flash_attn_mpp_q8_d128"
-                        } else {
-                            "h_flash_attn_mpp_staged_d128"
-                        },
-                        true,
-                        [m.div_ceil(64), heads, 1],
-                        128,
-                        64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
-                        0,
-                        1,
-                    );
                 }
             }
         }
@@ -3364,7 +3593,9 @@ mod tests {
             .u(cap)
             .unwrap()
             .u(1)
-            .unwrap();
+            .unwrap()
+            .u(0)
+            .unwrap(); // ring
         let e = d.execution_with_shared_encoder(true).unwrap();
         d.dispatch_hybrid(
             "h_store_v_q8",
@@ -3461,7 +3692,16 @@ mod tests {
                 for x in [m, heads, kv_heads, dim, pos, stride] {
                     args = args.u(x).unwrap();
                 }
-                let args = args.f(1.).u(0).unwrap().u(1).unwrap().u(0).unwrap();
+                let args = args
+                    .f(1.)
+                    .u(0)
+                    .unwrap()
+                    .u(1)
+                    .unwrap()
+                    .u(0)
+                    .unwrap()
+                    .u(0)
+                    .unwrap(); // ring
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
                     "h_attention",
@@ -3496,7 +3736,7 @@ mod tests {
                     for x in [m, heads, kv_heads, group, pos, stride, kps, splits, cap] {
                         fa = fa.u(x).unwrap();
                     }
-                    for x in [dim, 0, 0, 1, 0] {
+                    for x in [dim, 0, 0, 1, 0, 0] {
                         fa = fa.u(x).unwrap();
                     }
                     let mpp = name.starts_with("h_flash_attn_mpp");

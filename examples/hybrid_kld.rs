@@ -57,7 +57,7 @@ fn main() -> Result<()> {
         model.config.vocab, n_vocab,
         "vocabulary differs from base file"
     );
-    let mut state = HybridState::new(&device, &model.config, n_ctx)?;
+    let mut state = HybridState::new(&device, &model.config, n_ctx, model.max_forward_rows())?;
 
     let (mut nll, mut nll_base, mut kld_sum, mut same_top, mut count) =
         (0f64, 0f64, 0f64, 0usize, 0usize);

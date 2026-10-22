@@ -24,6 +24,8 @@ struct block_iq4_xs { half d; ushort scales_h; uchar scales_l[4]; uchar qs[128];
 struct block_iq3_s { half d; uchar qs[64]; uchar qh[8]; uchar signs[32]; uchar scales[4]; };
 struct block_iq3_xxs { half d; uchar qs[96]; };
 struct block_iq2_s { half d; uchar qs[64]; uchar qh[8]; uchar scales[8]; };
+// 16 BF16 values (the top half of an F32), the unit the F32 kernels read as float4x4.
+struct block_bf16 { ushort v[16]; };
 
 constexpr constant static float kvalues_iq4nl_f[16] = {
     -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
@@ -600,6 +602,11 @@ void dequantize_f32(device const float4x4 * src, short il, thread type4x4 & reg)
     reg = (type4x4)(*src);
 }
 
+template <typename type4x4>
+void dequantize_bf16(device const block_bf16 * src, short il, thread type4x4 & reg) {
+    for (short i = 0; i < 16; i++) reg[i/4][i%4] = as_type<float>(uint(src->v[i]) << 16);
+}
+
 // ---------------------------------------------------------------- projections
 
 // y[m][n] = sum_k x[m][k] * W[n][k]; W rows are `row_bytes` apart.
@@ -1150,6 +1157,31 @@ void mv_f32(constant ProjArgs & a, device const char * w, device const float * x
     }
 }
 
+// Dense BF16 weights (MoE routers), widened to F32 in registers: the same
+// values the F32 kernel reads, at half the bytes.
+template<short NR0, short NSG>
+void mv_bf16(constant ProjArgs & a, device const char * w, device const float * x, device float * y,
+             uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
+    const uint r1 = tgpig.y;
+    device const float4 * yv = (device const float4 *)(x + (ulong)r1*a.x_stride);
+    const int nrows = min(int(NR0), int(a.n) - first_row);
+    float sumf[NR0] = {0.f};
+    for (uint i = tiisg; i < a.k/4; i += 32) {
+        float4 xv = yv[i];
+        for (short row = 0; row < NR0; row++) {
+            if (row >= nrows) break;
+            device const ushort4 * wr = (device const ushort4 *)(w + (ulong)(first_row + row)*a.row_bytes);
+            sumf[row] += dot(xv, as_type<float4>(uint4(wr[i]) << 16));
+        }
+    }
+    device float * out = y + (ulong)r1*a.y_stride;
+    for (int row = 0; row < nrows; ++row) {
+        float t = simd_sum(sumf[row]);
+        if (tiisg == 0) out[first_row + row] = t;
+    }
+}
+
 #define MV_KERNEL(NAME, IMPL, NR0, NSG) \
 kernel void NAME(constant ProjArgs & a [[buffer(3)]], device const char * w [[buffer(0)]], \
                  device const float * x [[buffer(1)]], device float * y [[buffer(2)]], \
@@ -1162,6 +1194,7 @@ MV_KERNEL(h_mv_q5_k, mv_q5_K, 1, 2)
 MV_KERNEL(h_mv_q6_k, mv_q6_K, 2, 2)
 MV_KERNEL(h_mv_q4_0, mv_q4_0, 4, 2)
 MV_KERNEL(h_mv_f32, mv_f32, 4, 2)
+MV_KERNEL(h_mv_bf16, mv_bf16, 4, 2)
 
 kernel void h_mv_q8_0(constant ProjArgs & a [[buffer(3)]], device const char * w [[buffer(0)]],
                       device const float * x [[buffer(1)]], device float * y [[buffer(2)]],
@@ -1259,6 +1292,7 @@ MVB_FORMAT(iq3_s, block_iq3_s, 16, dequantize_iq3_s)
 MVB_FORMAT(iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MVB_FORMAT(iq2_s, block_iq2_s, 16, dequantize_iq2_s)
 MVB_FORMAT(f32, float4x4, 1, dequantize_f32)
+MVB_FORMAT(bf16, block_bf16, 1, dequantize_bf16)
 
 // TensorOps GEMM after llama.cpp's kernel_mul_mm (tensor path): a 64-row
 // weight tile is dequantized to F16 in threadgroup memory; 128 activation
@@ -1340,6 +1374,7 @@ MMS_FORMAT(iq3_s, block_iq3_s, 16, dequantize_iq3_s)
 MMS_FORMAT(iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MMS_FORMAT(iq2_s, block_iq2_s, 16, dequantize_iq2_s)
 MMS_FORMAT(f32, float4x4, 1, dequantize_f32)
+MMS_FORMAT(bf16, block_bf16, 1, dequantize_bf16)
 MM_KERNEL(h_mm_q4_k, block_q4_K, 16, dequantize_q4_K)
 MM_KERNEL(h_mm_q5_k, block_q5_K, 16, dequantize_q5_K)
 MM_KERNEL(h_mm_q6_k, block_q6_K, 16, dequantize_q6_K)
@@ -1350,6 +1385,7 @@ MM_KERNEL(h_mm_iq3_s, block_iq3_s, 16, dequantize_iq3_s)
 MM_KERNEL(h_mm_iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MM_KERNEL(h_mm_iq2_s, block_iq2_s, 16, dequantize_iq2_s)
 MM_KERNEL(h_mm_f32, float4x4, 1, dequantize_f32)
+MM_KERNEL(h_mm_bf16, block_bf16, 1, dequantize_bf16)
 
 // ---------------------------------------------------------------- embedding
 
@@ -1607,7 +1643,15 @@ struct AttnPrepArgs {
     uint sections_w;
     uint kv_rows;      // rows the cache buffer holds (locates Q8 scales)
     uint gated;        // qg rows hold [q | gate] (2 * head_dim per head) instead of q alone
+    uint ring;         // 0: position p lives in row p; else in row p % ring (see kv_row)
 };
+
+// Cache row of key position `key`. Sliding-window layers keep a ring of `ring`
+// rows (a multiple of 64, so 64-key tiles starting at a multiple of 64 never
+// wrap); full-attention layers keep one row per position (ring = 0).
+inline uint kv_row(uint key, uint ring) {
+    return ring != 0 ? key % ring : key;
+}
 
 // Q8 K/V cache: the buffer holds kv_rows * stride int8 values, then one half
 // scale per 32 values (same element order). F16 caches have no scales.
@@ -1694,7 +1738,7 @@ void attn_prep_impl(constant AttnPrepArgs & p, device const float * qg, device c
     if (is_q) {
         q_out[((ulong)t * p.heads + head) * p.head_dim + tid] = half(outv * p.q_scale);
     } else {
-        const ulong e = (ulong)(p.position + t) * p.cache_stride + kvh * p.head_dim + tid;
+        const ulong e = (ulong)kv_row(p.position + t, p.ring) * p.cache_stride + kvh * p.head_dim + tid;
         kv_store<Q8>(kv, p.kv_rows, p.cache_stride, e, outv);
     }
 }
@@ -1721,7 +1765,7 @@ void store_v_impl(constant AttnPrepArgs & p, device const float * v, device half
     const uint row = p.kv_heads * p.head_dim;
     if (i >= p.tokens * row) return;
     const uint t = i / row, r = i % row;
-    kv_store<Q8>(vc, p.kv_rows, p.cache_stride, (ulong)(p.position + t) * p.cache_stride + r, v[i]);
+    kv_store<Q8>(vc, p.kv_rows, p.cache_stride, (ulong)kv_row(p.position + t, p.ring) * p.cache_stride + r, v[i]);
 }
 kernel void h_store_v(constant AttnPrepArgs & p [[buffer(2)]], device const float * v [[buffer(0)]],
                       device half * vc [[buffer(1)]], uint i [[thread_position_in_grid]]) {
@@ -1743,6 +1787,7 @@ struct AttnArgs {
     uint window;       // 0 = full attention (see FaArgs)
     uint gated;
     uint sinks;
+    uint ring;         // see kv_row
 };
 
 // Reference-grade attention: one threadgroup (head_dim threads) per (query, head),
@@ -1765,7 +1810,7 @@ kernel void h_attention(constant AttnArgs & p [[buffer(6)]],
         l = 1.f;
     }
     for (uint j = lo; j < keys; j++) {
-        const ulong base = (ulong)j * p.cache_stride + kvh * p.head_dim + tid;
+        const ulong base = (ulong)kv_row(j, p.ring) * p.cache_stride + kvh * p.head_dim + tid;
         const float s = block_sum(qv * float(kc[base]), scratch, tid, p.head_dim);
         const float m_new = max(m, s);
         const float corr = exp(m - m_new);
@@ -2083,6 +2128,7 @@ struct FaArgs {
     uint window;         // 0 = full attention; else key k is seen from q iff q - k < window
     uint gated;          // multiply the output by sigmoid(gate) from qg
     uint sinks;          // sink logits (sinks buffer) join the softmax denominator
+    uint ring;           // see kv_row; ring layers align first_key to 64
 };
 
 // Causal attention over the F16 cache for query rows r = t*group + g of one
@@ -2418,7 +2464,7 @@ kernel void h_flash_attn_mpp(constant FaArgs & p [[buffer(5)]],
 // or Q8 cache into Hs [BC][128] as F16, zeros at and past `total`.
 template <bool Q8, int BC, int NT>
 inline void stage_kv_half(threadgroup half * Hs, device const half * cache, device const half * scales,
-                          uint j0, uint total, uint stride, ulong head_off, uint d0, uint tid) {
+                          uint j0, uint total, uint stride, ulong head_off, uint d0, uint tid, uint ring) {
     constexpr int W = 128, E = Q8 ? 16 : 8;   // one 16-byte load per thread step
     for (uint i = tid; i < BC * W / E; i += NT) {
         const uint kr = i / (W / E), dd = (i % (W / E)) * E;
@@ -2428,7 +2474,7 @@ inline void stage_kv_half(threadgroup half * Hs, device const half * cache, devi
             for (int j = 0; j < E / 4; j++) dst[j] = 0.h;
             continue;
         }
-        const ulong e = (ulong)key * stride + head_off + d0 + dd;
+        const ulong e = (ulong)kv_row(key, ring) * stride + head_off + d0 + dd;
         if (Q8) {
             const uint4 raw = *(device const uint4 *)((device const char *)cache + e);
             const half sc = scales[e / 32];
@@ -2505,12 +2551,12 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
     const uint row_last_key = p.position + uint(t0 + my_row);
     for (uint j0 = lo / BC * BC; j0 < total_keys && j0 <= last_key; j0 += BC) {
         for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
-        stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, total_keys, p.cache_stride, head_off, 0, tid);
+        stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, total_keys, p.cache_stride, head_off, 0, tid, p.ring);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mm_s.run(tQ0, tH, cS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (NH == 2) {
-            stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, total_keys, p.cache_stride, head_off, W, tid);
+            stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, total_keys, p.cache_stride, head_off, W, tid, p.ring);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             mm_s.run(tQ1, tH, cS);
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2555,12 +2601,12 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
                 }
             }
         }
-        stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, total_keys, p.cache_stride, head_off, 0, tid);
+        stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, total_keys, p.cache_stride, head_off, 0, tid, p.ring);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mm_o.run(tP, tH, cO0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (NH == 2) {
-            stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, total_keys, p.cache_stride, head_off, W, tid);
+            stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, total_keys, p.cache_stride, head_off, W, tid, p.ring);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             mm_o.run(tP, tH, cO1);
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2726,8 +2772,10 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
     const int kv_stride = int(p.cache_stride);
 
     auto tQ = tensor(qk + ((ulong)kvh * rows_total + r0) * D, dextents<int32_t, 2>(D, rows), array<int, 2>({1, D}));
-    auto tK = tensor(kc + kvh * D, dextents<int32_t, 2>(D, int(total_keys)), array<int, 2>({1, kv_stride}));
-    auto tV = tensor(vc + kvh * D, dextents<int32_t, 2>(D, int(total_keys)), array<int, 2>({1, kv_stride}));
+    // A ring cache spans its `ring` rows; its tiles start at multiples of 64.
+    const int key_rows = p.ring != 0 ? int(p.ring) : int(total_keys);
+    auto tK = tensor(kc + kvh * D, dextents<int32_t, 2>(D, key_rows), array<int, 2>({1, kv_stride}));
+    auto tV = tensor(vc + kvh * D, dextents<int32_t, 2>(D, key_rows), array<int, 2>({1, kv_stride}));
     auto tS = tensor(Ss, dextents<int32_t, 2>(BC, BR));
     auto tP = tensor(Ps, dextents<int32_t, 2>(BC, BR));
     mpp::tensor_ops::matmul2d<
@@ -2746,7 +2794,7 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
 
     const uint row_last_key = p.position + uint(r0 + int(tid / (128 / BR))) / p.group;
     for (uint j0 = j_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
-        auto mK = tK.slice(0, int(j0));
+        auto mK = tK.slice(0, int(kv_row(j0, p.ring)));
         mm_s.run(tQ, mK, cS);
         cS.store(tS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2759,7 +2807,7 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
                 }
             }
         }
-        auto mV = tV.slice(0, int(j0));
+        auto mV = tV.slice(0, int(kv_row(j0, p.ring)));
         mm_o.run(tP, mV, cO);
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -2834,12 +2882,12 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
     const uint row_last_key = p.position + uint(r0 + int(tid / (128 / BR))) / p.group;
     for (uint j0 = j_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
         for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
-        stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, key_end, p.cache_stride, head_off, 0, tid);
+        stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, key_end, p.cache_stride, head_off, 0, tid, p.ring);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mm_s.run(tQ0, tH, cS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (NH == 2) {
-            stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, key_end, p.cache_stride, head_off, W, tid);
+            stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, key_end, p.cache_stride, head_off, W, tid, p.ring);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             mm_s.run(tQ1, tH, cS);
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2856,12 +2904,12 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
                 }
             }
         }
-        stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, key_end, p.cache_stride, head_off, 0, tid);
+        stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, key_end, p.cache_stride, head_off, 0, tid, p.ring);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         mm_o.run(tP, tH, cO0);
         threadgroup_barrier(mem_flags::mem_threadgroup);
         if (NH == 2) {
-            stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, key_end, p.cache_stride, head_off, W, tid);
+            stage_kv_half<Q8, BC, 128>(Hs, vc, vs, j0, key_end, p.cache_stride, head_off, W, tid, p.ring);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             mm_o.run(tP, tH, cO1);
             threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2955,11 +3003,12 @@ void attn_decode_impl(constant FaArgs & p, device const half * q, device const h
     }
     for (uint j0 = begin + sg * 32; j0 < end; j0 += NSG * 32) {
         const uint key = j0 + lane;
-        const bool ok = key < end;
+        // Ring layers start at first_key aligned down to 64: mask what precedes the window.
+        const bool ok = key < end && (p.window == 0 || key + p.window > p.position);
         float s[G];
         for (int g = 0; g < G; g++) s[g] = 0.f;
         if (ok && !Q8) {
-            device const half4 * kr = (device const half4 *)(kc + (ulong)key * p.cache_stride + head);
+            device const half4 * kr = (device const half4 *)(kc + (ulong)kv_row(key, p.ring) * p.cache_stride + head);
             for (int d4 = 0; d4 < D / 4; d4++) {
                 const float4 kv = float4(kr[d4]);
                 for (int g = 0; g < G; g++) {
@@ -2969,7 +3018,7 @@ void attn_decode_impl(constant FaArgs & p, device const half * q, device const h
             }
         } else if (ok) {
             // Q8: dot each 32-element block unscaled, then apply its scale.
-            const ulong kr = (ulong)key * p.cache_stride + head;
+            const ulong kr = (ulong)kv_row(key, p.ring) * p.cache_stride + head;
             for (int b = 0; b < D / 32; b++) {
                 float sb[G];
                 for (int g = 0; g < G; g++) sb[g] = 0.f;
@@ -2999,7 +3048,7 @@ void attn_decode_impl(constant FaArgs & p, device const half * q, device const h
         }
         const uint count = min(32u, end - j0);
         for (uint k = 0; k < count; k++) {
-            const ulong ve = (ulong)(j0 + k) * p.cache_stride + head + lane * VPL;
+            const ulong ve = (ulong)kv_row(j0 + k, p.ring) * p.cache_stride + head + lane * VPL;
             float4 v0, v1;
             kv_load_n<Q8, VPL>(vc, ve, v0, v1);
             if (Q8) {

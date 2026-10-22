@@ -13,6 +13,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     F32,
+    /// Only MoE routers load as BF16 (see `Loader::router`).
+    Bf16,
     Q4_0,
     Q8_0,
     Q4K,
@@ -43,6 +45,7 @@ impl Format {
     pub fn name(self) -> &'static str {
         match self {
             Self::F32 => "f32",
+            Self::Bf16 => "bf16",
             Self::Q4_0 => "q4_0",
             Self::Q8_0 => "q8_0",
             Self::Q4K => "q4_k",
@@ -216,26 +219,34 @@ impl Loader<'_> {
         gguf_matrix(self.device, self.file, name, experts, rows, cols)
     }
 
-    /// `[experts, hidden]` router. BF16 routers are widened to F32 once here so
-    /// the F32 GEMV reads them; other encodings load as-is.
+    /// `[experts, hidden]` router. BF16 routers keep their encoding; the BF16
+    /// kernels widen each value to F32 as they read it. Other encodings load
+    /// as any matrix does.
     fn router(&mut self, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
         let info = self.file.tensor(name)?.clone();
         if info.type_id != 30 {
             return self.matrix(name, rows, cols);
         }
-        if info.dimensions != [cols, rows] || info.byte_len != rows * cols * 2 {
+        if info.dimensions != [cols, rows]
+            || info.byte_len != rows * cols * 2
+            || !cols.is_multiple_of(256)
+        {
             return Err(Error::Weight {
                 name: name.into(),
                 message: format!("expected a BF16 [{rows}, {cols}] router"),
             });
         }
-        let mut raw = vec![0u8; info.byte_len];
-        self.file.read_tensor_into(name, &mut raw)?;
-        Matrix::from_rows(self.device, rows, cols, Format::F32, |r, out| {
-            let row = &raw[r * cols * 2..][..cols * 2];
-            for (o, b) in out.iter_mut().zip(row.chunks_exact(2)) {
-                *o = f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
-            }
+        let file = &mut *self.file;
+        let storage = PackedStorage::from_reader(self.device, info.byte_len, |dst| {
+            file.read_tensor_into(name, dst)
+        })?;
+        Ok(Matrix {
+            rows,
+            cols,
+            experts: 1,
+            format: Format::Bf16,
+            row_bytes: cols * 2,
+            storage,
         })
     }
 
@@ -602,6 +613,7 @@ impl Matrix {
             Format::Iq3Xxs => 18,
             Format::Iq3S => 21,
             Format::Iq2S => 22,
+            Format::Bf16 => 30,
             f => {
                 return Err(Error::Parameter(format!(
                     "no raw test path for {}",

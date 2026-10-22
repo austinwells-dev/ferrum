@@ -28,7 +28,7 @@ Ferrum sits closer to llama.cpp's Metal output than llama.cpp's own CPU backend 
 
 - One quant (`UD-Q3_K_XL`) is validated. Other Flint files may use quant types the kernels do not cover; the TUI lists the supported set when it refuses a file.
 - Flint's template has no thinking switch, so the prompt itself ends in `<think>` (thinking on) or `<think></think>` (off), written the way the template writes past reasoning so later turns reuse the cached prefix. A budget-cut reasoning closes with a bare `</think>`.
-- No ring buffer for sliding-window KV. Every layer keeps a full-length cache (about 98 KiB per token), so long contexts cost more memory than they need.
+- Sliding-window layers keep their K/V in a ring of 1,088 rows (window 513 plus one prompt chunk), so only the 13 full-attention layers grow with the context: about 26 KiB per token plus 76 MiB of rings, against 98 KiB per token before. A session can rewind only while the rings still hold the rewind point's window; further back it recomputes from the start.
 - The legacy attention kernels (`FERRUM_LEGACY_ATTENTION`, `FERRUM_SIMD_ATTENTION`) reject Flint's geometry.
 - Drafters (MTP, DFlash) are not available for Flint.
 - Expert routing implements neither a selection bias on the scores (`exp_probs_b.bias`) nor an `expert_weights_scale` other than 1.0; this GGUF has neither, and a file that does is refused at load.

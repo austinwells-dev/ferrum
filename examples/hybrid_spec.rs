@@ -208,7 +208,12 @@ fn main() -> Result<()> {
 /// Target top-2 logit margin after `prompt` + `prefix`.
 fn margin(rt: &Runtime, prompt: &[u32], prefix: &[u32]) -> Result<f32> {
     let model = &rt.loaded.model;
-    let mut state = HybridState::new(&rt.device, &model.config, prompt.len() + prefix.len() + 1)?;
+    let mut state = HybridState::new(
+        &rt.device,
+        &model.config,
+        prompt.len() + prefix.len() + 1,
+        model.max_forward_rows(),
+    )?;
     let mut all = prompt.to_vec();
     all.extend_from_slice(prefix);
     let Produced::Logits(logits) = model.forward(&rt.device, &mut state, &all, Output::Logits)?

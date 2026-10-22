@@ -192,7 +192,7 @@ impl Session {
         capacity: usize,
         snapshots: usize,
     ) -> Result<Self> {
-        let state = HybridState::new(d, &model.config, capacity)?;
+        let state = HybridState::new(d, &model.config, capacity, model.max_forward_rows())?;
         let mut slots = Vec::with_capacity(snapshots);
         for _ in 0..snapshots {
             let tensors = state
@@ -346,12 +346,34 @@ impl Session {
         if common == self.tokens.len() {
             return Ok(common);
         }
+        // Without recurrent state the K/V cache is valid at every prefix its
+        // rings still hold, so resume exactly at the divergence. Most drafters
+        // rewind only to their own snapshots, so they take the snapshot path.
+        if common > 0
+            && !self.state.has_recurrent()
+            && self.drafter.as_ref().is_none_or(|t| t.rewinds_anywhere())
+            && self.state.can_resume(common)
+        {
+            self.state.restore_recurrent(d, &[], common)?;
+            self.tokens.truncate(common);
+            if self.drafter.is_some() {
+                self.drafter_rewind = Some(common);
+            }
+            for s in &mut self.snapshots {
+                if s.position > common {
+                    s.position = 0;
+                    s.stamp = 0;
+                }
+            }
+            return Ok(common);
+        }
         // Diverged inside the cached sequence: resume from the deepest
         // snapshot at or before the divergence point.
+        let state = &self.state;
         let best = self
             .snapshots
             .iter_mut()
-            .filter(|s| s.position > 0 && s.position <= common)
+            .filter(|s| s.position > 0 && s.position <= common && state.can_resume(s.position))
             .max_by_key(|s| s.position);
         match best {
             Some(snapshot) => {

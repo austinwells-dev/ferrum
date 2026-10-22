@@ -1,5 +1,6 @@
 //! Prefix reuse must not change results: greedy generations from a session
-//! that extends or rewinds (restoring a recurrent snapshot) a cached
+//! that extends or rewinds (restoring a recurrent snapshot, or for
+//! attention-only models resuming at the divergence point) a cached
 //! conversation are compared with a fresh session that computes the same
 //! prefix/suffix split from scratch.
 //!
@@ -73,6 +74,12 @@ fn main() -> Result<()> {
         // Reference: a fresh session split at the same point, so both sides run
         // identical kernels (single-row and chunk kernels round differently).
         fresh.reset();
+        if name == "rewind" {
+            // The cached session computed p1's body as a chunk and its final
+            // token alone; attention-only models (no snapshots needed) resume
+            // past that boundary, so the reference splits there too.
+            fresh.prefill(&d, model, &p1[..p1.len() - 1])?;
+        }
         if a.reused_tokens > 0 {
             fresh.prefill(&d, model, &prompt[..a.reused_tokens])?;
         }
