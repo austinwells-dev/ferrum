@@ -537,12 +537,14 @@ impl Runtime {
     fn render_messages(&self, messages: &[Json], request: &ChatRequest) -> Result<String> {
         let mut vars = request.template_vars.clone();
         normalize_thinking(self.template.source(), &mut vars);
-        self.template.render(
+        let mut prompt = self.template.render(
             messages,
             (!request.tools.is_empty()).then_some(&request.tools[..]),
             true,
             &vars,
-        )
+        )?;
+        prompt.push_str(generation_prefix(&self.template, &vars));
+        Ok(prompt)
     }
 
     /// Run one chat turn, reusing whatever prefix the session already holds.
@@ -751,6 +753,21 @@ impl StopReason {
             StopReason::Eos | StopReason::Stopped | StopReason::Cancelled => "stop",
             StopReason::Length | StopReason::ContextFull => "length",
         }
+    }
+}
+
+/// Text the generation prompt needs when the template has no thinking switch.
+/// Thinking is on unless the request turns it off. On: open a think block, so
+/// the reasoning is split from the answer (the budget applies as for Qwen). Off:
+/// an empty think block, which is how Flint's template writes an empty
+/// reasoning. Templates with a switch handle this themselves.
+pub fn generation_prefix(template: &ChatTemplate, vars: &Map<String, Json>) -> &'static str {
+    if template.has_thinking_switch() {
+        return "";
+    }
+    match vars.get("enable_thinking") {
+        Some(Json::Bool(false)) => "<think></think>",
+        _ => "<think>\n",
     }
 }
 
@@ -1042,6 +1059,29 @@ mod tests {
 #[cfg(test)]
 mod thinking_tests {
     use super::*;
+
+    /// Flint's template has no thinking switch, so the prompt opens or closes
+    /// the think block; Qwen's template switches itself and needs nothing.
+    #[test]
+    fn templates_without_a_switch_open_or_close_thinking() {
+        let flint = ChatTemplate::new(include_str!(
+            "../../tests/fixtures/flint/chat_template.jinja"
+        ))
+        .unwrap();
+        let qwen = ChatTemplate::new(
+            "{%- if enable_thinking is not defined or enable_thinking %}think{% endif %}",
+        )
+        .unwrap();
+        let mut off = Map::new();
+        off.insert("enable_thinking".into(), Json::Bool(false));
+        let mut on = Map::new();
+        on.insert("enable_thinking".into(), Json::Bool(true));
+        assert_eq!(generation_prefix(&flint, &off), "<think></think>");
+        assert_eq!(generation_prefix(&flint, &on), "<think>\n");
+        assert_eq!(generation_prefix(&flint, &Map::new()), "<think>\n");
+        assert_eq!(generation_prefix(&qwen, &off), "");
+        assert_eq!(generation_prefix(&qwen, &Map::new()), "");
+    }
 
     #[test]
     fn effort_snaps_to_template_levels() {

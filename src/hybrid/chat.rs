@@ -137,6 +137,13 @@ impl ChatTemplate {
         &self.source
     }
 
+    /// Whether the template reads a thinking variable (Qwen3.5 does; Flint's
+    /// template does not, so its reasoning must be opened or closed by the
+    /// prompt itself).
+    pub fn has_thinking_switch(&self) -> bool {
+        self.source.contains("enable_thinking") || self.source.contains("thinking")
+    }
+
     /// Render `messages` (OpenAI-style JSON objects). `extra` carries template
     /// variables such as `enable_thinking` or `reasoning_effort`.
     pub fn render(
