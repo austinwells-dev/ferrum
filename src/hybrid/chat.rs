@@ -9,6 +9,8 @@ use serde_json::{Map, Value as Json};
 pub struct ChatTemplate {
     env: Environment<'static>,
     source: String,
+    bos_token: String,
+    eos_token: String,
 }
 
 /// Python `json.dumps(value, ensure_ascii=False)`: insertion order, `", "`
@@ -81,7 +83,13 @@ fn python_json(value: &Json, indent: Option<usize>, depth: usize, out: &mut Stri
 }
 
 impl ChatTemplate {
+    /// A template for a model whose chat turns end with `<|im_end|>` (Qwen3.5).
     pub fn new(source: &str) -> Result<Self> {
+        Self::with_special_tokens(source, "", "<|im_end|>")
+    }
+
+    /// A template with the model's `bos_token` and `eos_token` strings.
+    pub fn with_special_tokens(source: &str, bos_token: &str, eos_token: &str) -> Result<Self> {
         let mut env = Environment::new();
         env.set_trim_blocks(true);
         env.set_lstrip_blocks(true);
@@ -98,12 +106,20 @@ impl ChatTemplate {
              kwargs: minijinja::value::Kwargs|
              -> std::result::Result<Value, minijinja::Error> {
                 let indent: Option<usize> = kwargs.get("indent")?;
+                // Hugging Face's default is ensure_ascii=False.
+                let ensure_ascii: bool =
+                    kwargs.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false);
                 kwargs.assert_all_used()?;
                 let json: Json = serde_json::to_value(&value).map_err(|e| {
                     minijinja::Error::new(ErrorKind::InvalidOperation, e.to_string())
                 })?;
                 let mut out = String::new();
                 python_json(&json, indent, 0, &mut out);
+                if ensure_ascii {
+                    // Non-ASCII only occurs inside JSON strings, so escaping the
+                    // output is the same as escaping the strings.
+                    out = ascii_escape(&out);
+                }
                 Ok(Value::from_safe_string(out))
             },
         );
@@ -112,6 +128,8 @@ impl ChatTemplate {
         Ok(Self {
             env,
             source: source.to_owned(),
+            bos_token: bos_token.to_owned(),
+            eos_token: eos_token.to_owned(),
         })
     }
 
@@ -140,8 +158,8 @@ impl ChatTemplate {
             "add_generation_prompt".into(),
             Json::Bool(add_generation_prompt),
         );
-        context.insert("bos_token".into(), Json::String(String::new()));
-        context.insert("eos_token".into(), Json::String("<|im_end|>".into()));
+        context.insert("bos_token".into(), Json::String(self.bos_token.clone()));
+        context.insert("eos_token".into(), Json::String(self.eos_token.clone()));
         for (k, v) in extra {
             context.insert(k.clone(), v.clone());
         }
@@ -153,6 +171,22 @@ impl ChatTemplate {
             .render(Value::from_serialize(&context))
             .map_err(|e| Error::Tokenizer(format!("chat template: {e:#}")))
     }
+}
+
+/// Python `json.dumps(ensure_ascii=True)` escaping of every non-ASCII character.
+fn ascii_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_ascii() {
+            out.push(c);
+        } else {
+            let mut units = [0u16; 2];
+            for unit in c.encode_utf16(&mut units) {
+                out.push_str(&format!("\\u{unit:04x}"));
+            }
+        }
+    }
+    out
 }
 
 /// OpenAI tool-call arguments arrive as a JSON string; templates iterate them
@@ -239,14 +273,43 @@ pub fn parse_output(text: &str, starts_in_reasoning: bool, tools: &[Json]) -> Pa
     }
 }
 
+/// One `<tool_call>` body in either format: Qwen3.5's `<function=…>` with
+/// `<parameter=…>` blocks, or Flint's `name<arg_key>…</arg_key><arg_value>…`
+/// pairs. `None` leaves the text in the content.
 fn parse_tool_call(body: &str, tools: &[Json]) -> Option<ToolCall> {
+    if body.contains("<function=") {
+        parse_qwen_tool_call(body, tools)
+    } else {
+        parse_flint_tool_call(body, tools)
+    }
+}
+
+/// The declared parameter schema of tool `name` in the OpenAI tool list.
+fn tool_schema(tools: &[Json], name: &str) -> Option<Json> {
+    tools.iter().find_map(|t| {
+        let f = t.get("function").unwrap_or(t);
+        (f.get("name")?.as_str()? == name).then(|| f.pointer("/parameters/properties").cloned())?
+    })
+}
+
+/// A parameter value typed by its declared schema: strings stay as written,
+/// anything else is read as JSON and kept as text when that fails.
+fn typed_value(schema: Option<&Json>, key: &str, raw: &str) -> Json {
+    let declared = schema
+        .and_then(|s| s.get(key))
+        .and_then(|p| p.get("type"))
+        .and_then(Json::as_str);
+    match declared {
+        Some("string") => Json::String(raw.to_owned()),
+        _ => serde_json::from_str(raw.trim()).unwrap_or_else(|_| Json::String(raw.to_owned())),
+    }
+}
+
+fn parse_qwen_tool_call(body: &str, tools: &[Json]) -> Option<ToolCall> {
     let start = body.find("<function=")? + "<function=".len();
     let name_end = start + body[start..].find('>')?;
     let name = body[start..name_end].trim().to_owned();
-    let schema = tools.iter().find_map(|t| {
-        let f = t.get("function").unwrap_or(t);
-        (f.get("name")?.as_str()? == name).then(|| f.pointer("/parameters/properties").cloned())?
-    });
+    let schema = tool_schema(tools, &name);
     let mut arguments = Map::new();
     let mut cursor = &body[name_end + 1..];
     while let Some(p) = cursor.find("<parameter=") {
@@ -263,19 +326,44 @@ fn parse_tool_call(body: &str, tools: &[Json]) -> Option<ToolCall> {
             .strip_prefix('\n')
             .unwrap_or(&value_start[..value_end]);
         let raw = raw.strip_suffix('\n').unwrap_or(raw);
-        let declared = schema
-            .as_ref()
-            .and_then(|s| s.get(&key))
-            .and_then(|p| p.get("type"))
-            .and_then(Json::as_str);
-        let value = match declared {
-            Some("string") => Json::String(raw.to_owned()),
-            _ => serde_json::from_str(raw.trim()).unwrap_or_else(|_| Json::String(raw.to_owned())),
-        };
-        arguments.insert(key, value);
+        arguments.insert(key.clone(), typed_value(schema.as_ref(), &key, raw));
         cursor = &value_start[value_end..];
     }
     Some(ToolCall { name, arguments })
+}
+
+/// Flint: `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…</tool_call>`,
+/// with no separators between the pairs (the template writes them back to back).
+fn parse_flint_tool_call(body: &str, tools: &[Json]) -> Option<ToolCall> {
+    let (name, mut rest) = match body.find("<arg_key>") {
+        Some(p) => (&body[..p], &body[p..]),
+        None => (body, ""),
+    };
+    let name = name.trim();
+    if name.is_empty() || name.contains(char::is_whitespace) || name.contains('<') {
+        return None;
+    }
+    let schema = tool_schema(tools, name);
+    let mut arguments = Map::new();
+    while !rest.trim().is_empty() {
+        let after = rest.trim_start().strip_prefix("<arg_key>")?;
+        let key_end = after.find("</arg_key>")?;
+        let key = after[..key_end].trim();
+        if key.is_empty() {
+            return None;
+        }
+        let after = after[key_end + "</arg_key>".len()..]
+            .trim_start()
+            .strip_prefix("<arg_value>")?;
+        let value_end = after.find("</arg_value>")?;
+        let raw = &after[..value_end];
+        arguments.insert(key.to_owned(), typed_value(schema.as_ref(), key, raw));
+        rest = &after[value_end + "</arg_value>".len()..];
+    }
+    Some(ToolCall {
+        name: name.to_owned(),
+        arguments,
+    })
 }
 
 #[cfg(test)]
@@ -307,6 +395,70 @@ mod tests {
             Json::String("42".into())
         );
         assert_eq!(parsed.tool_calls[0].arguments["lines"], Json::from(10));
+    }
+
+    #[test]
+    fn parses_flint_tool_calls_typed_by_schema() {
+        let tools: Vec<Json> = vec![serde_json::json!({"type": "function", "function": {
+        "name": "get_weather",
+        "parameters": {"properties": {
+            "city": {"type": "string"}, "days": {"type": "integer"}, "metric": {"type": "boolean"}
+        }}}})];
+        let text = "Let me check.\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>10</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>metric</arg_key><arg_value>true</arg_value></tool_call>";
+        let parsed = parse_output(text, false, &tools);
+        assert_eq!(parsed.content, "Let me check.");
+        assert_eq!(parsed.tool_calls.len(), 1);
+        let call = &parsed.tool_calls[0];
+        assert_eq!(call.name, "get_weather");
+        // "city" is a string in the schema, so "10" stays text.
+        assert_eq!(call.arguments["city"], Json::String("10".into()));
+        assert_eq!(call.arguments["days"], Json::from(3));
+        assert_eq!(call.arguments["metric"], Json::Bool(true));
+    }
+
+    #[test]
+    fn flint_calls_without_arguments_and_malformed_blocks() {
+        let tools = vec![serde_json::json!({"name": "now"})];
+        let parsed = parse_output("<tool_call>now</tool_call>", false, &tools);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].name, "now");
+        assert!(parsed.tool_calls[0].arguments.is_empty());
+        // A block that is not a call stays visible; a truncated pair is not
+        // half-parsed.
+        let text = "See <tool_call>not a call</tool_call> then <tool_call>now<arg_key>x</arg_key><arg_value>1</tool_call>";
+        let parsed = parse_output(text, false, &tools);
+        assert!(parsed.tool_calls.is_empty());
+        assert!(parsed.content.contains("not a call"));
+        assert!(parsed.content.contains("<arg_value>1"));
+    }
+
+    /// Every case in tests/fixtures/flint/render_cases.json renders byte for
+    /// byte as Jinja2 renders the Flint template (see render_cases.py).
+    #[test]
+    fn renders_flint_template_like_jinja2() {
+        let template = ChatTemplate::with_special_tokens(
+            include_str!("../../tests/fixtures/flint/chat_template.jinja"),
+            "<|begin_of_text|>",
+            "<|end_of_text|>",
+        )
+        .unwrap();
+        let cases: Vec<Json> =
+            serde_json::from_str(include_str!("../../tests/fixtures/flint/render_cases.json"))
+                .unwrap();
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let messages = case["messages"].as_array().unwrap();
+            let tools = case["tools"].as_array().map(Vec::as_slice);
+            let out = template
+                .render(
+                    messages,
+                    tools,
+                    case["add_generation_prompt"].as_bool().unwrap(),
+                    &Map::new(),
+                )
+                .unwrap();
+            assert_eq!(out, case["expect"].as_str().unwrap(), "case {name}");
+        }
     }
 
     #[test]

@@ -8,6 +8,7 @@
 | [tui.md](tui.md) | The full-screen launcher: chat, the sandboxed coding agent, the speed and intelligence benchmarks |
 | [development.md](development.md) | Building, testing, profiling and using the crate as a library |
 | [architecture.md](architecture.md) | How the system fits together, and the runtime's safety argument |
+| [experimental.md](experimental.md) | **Experimental** Flint support: status, validation numbers, known gaps (`experimental` branch) |
 | [vision.md](vision.md) | The image encoder and how image tokens are positioned |
 
 ## Engineering journals

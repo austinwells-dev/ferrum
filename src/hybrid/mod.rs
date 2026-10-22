@@ -7,6 +7,8 @@ pub mod chat;
 pub mod config;
 pub mod draft;
 pub mod engine;
+#[cfg(test)]
+mod iq_tests;
 pub mod mtp;
 pub mod plan;
 pub mod runtime;
@@ -14,7 +16,7 @@ pub mod session;
 pub mod speculative;
 pub mod weights;
 
-pub use config::{HybridConfig, KvCache, Variant};
+pub use config::{AttnSpec, HybridConfig, KvCache, Variant};
 pub use engine::{
     HybridModel, HybridState, Output, Penalties, Produced, RowOutput, RowsProduced, SpecGeometry,
 };
@@ -29,11 +31,22 @@ use std::path::Path;
 /// Qwen3.5 pre-tokenizer split (tokenizer.json of the Qwen3.5/3.6 family).
 const QWEN35_PATTERN: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// Flint pre-tokenizer (llama.cpp `LLAMA_VOCAB_PRE_TYPE_FLINT`): digit runs of
+/// up to three, then CJK runs, then words, punctuation and whitespace. The
+/// patterns apply in that order, each to the pieces the previous one made.
+const FLINT_PATTERNS: [&str; 3] = [
+    r"\p{N}{1,3}",
+    r"[一-龥぀-ゟ゠-ヿ]+",
+    r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
+];
+
 pub struct LoadedHybrid {
     pub model: HybridModel,
     pub tokenizer: Tokenizer,
     pub eos_ids: Vec<u32>,
     pub chat_template: Option<String>,
+    /// The chat template's `bos_token` and `eos_token` strings.
+    pub chat_special_tokens: (String, String),
     pub load_time: std::time::Duration,
     /// Memory plan computed from metadata before any weight was read.
     pub plan: plan::MemoryPlan,
@@ -85,6 +98,7 @@ pub fn load_with(
         Some(MetadataValue::String(t)) => Some(t.clone()),
         _ => None,
     };
+    let chat_special_tokens = special_tokens(file.metadata());
     let before = device.allocated_bytes();
     let weights = weights::load(device, &mut file, &config)?;
     let model = HybridModel::new(device, config, weights, options.chunk, options.logit_rows)?;
@@ -93,6 +107,7 @@ pub fn load_with(
         tokenizer,
         eos_ids,
         chat_template,
+        chat_special_tokens,
         load_time: start.elapsed(),
         plan,
         loaded_bytes: device.allocated_bytes().saturating_sub(before),
@@ -102,10 +117,39 @@ pub fn load_with(
 /// The chat template embedded in a GGUF (no weights are read).
 pub fn load_chat_template(path: impl AsRef<Path>) -> Result<Option<chat::ChatTemplate>> {
     let file = GgufFile::open(path)?;
+    let (bos, eos) = special_tokens(file.metadata());
     match file.metadata_value("tokenizer.chat_template") {
-        Some(MetadataValue::String(t)) => chat::ChatTemplate::new(t).map(Some),
+        Some(MetadataValue::String(t)) => {
+            chat::ChatTemplate::with_special_tokens(t, &bos, &eos).map(Some)
+        }
         _ => Ok(None),
     }
+}
+
+/// The vocabulary strings of `tokenizer.ggml.bos_token_id` and
+/// `tokenizer.ggml.eos_token_id` (empty when absent): what a chat template
+/// sees as `bos_token` and `eos_token`.
+fn special_tokens(md: &std::collections::BTreeMap<String, MetadataValue>) -> (String, String) {
+    let tokens: Vec<&str> = match md.get("tokenizer.ggml.tokens") {
+        Some(MetadataValue::Array { values, .. }) => values
+            .iter()
+            .filter_map(|v| match v {
+                MetadataValue::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let named = |key: &str| {
+        config::uint(md, key)
+            .ok()
+            .and_then(|id| tokens.get(id).map(|t| (*t).to_owned()))
+            .unwrap_or_default()
+    };
+    (
+        named("tokenizer.ggml.bos_token_id"),
+        named("tokenizer.ggml.eos_token_id"),
+    )
 }
 
 /// Build only the tokenizer of a hybrid GGUF (no weights are read).
@@ -121,11 +165,22 @@ fn tokenizer(file: &GgufFile, vocab: usize) -> Result<(Tokenizer, Vec<u32>)> {
         Some(MetadataValue::String(s)) => Ok(s.as_str()),
         _ => Err(Error::Tokenizer(format!("missing GGUF metadata {key}"))),
     };
-    if text("tokenizer.ggml.model")? != "gpt2" || text("tokenizer.ggml.pre")? != "qwen35" {
+    if text("tokenizer.ggml.model")? != "gpt2" {
         return Err(Error::Tokenizer(
-            "hybrid GGUF must use the gpt2 model with the qwen35 pre-tokenizer".into(),
+            "hybrid GGUF must use the gpt2 model".into(),
         ));
     }
+    // Qwen3.5 text is NFC-normalized before splitting; llama.cpp's Flint
+    // tokenizer is not, so combining marks stay separate tokens.
+    let (patterns, nfc): (&[&str], bool) = match text("tokenizer.ggml.pre")? {
+        "qwen35" => (&[QWEN35_PATTERN], true),
+        "flint" => (&FLINT_PATTERNS, false),
+        other => {
+            return Err(Error::Tokenizer(format!(
+                "hybrid GGUF pre-tokenizer {other:?} is not supported (qwen35, flint)"
+            )));
+        }
+    };
     let strings = |key: &str| -> Result<Vec<String>> {
         match md.get(key) {
             Some(MetadataValue::Array {
@@ -159,9 +214,23 @@ fn tokenizer(file: &GgufFile, vocab: usize) -> Result<(Tokenizer, Vec<u32>)> {
         ));
     }
     let tokenizer =
-        Tokenizer::from_gguf_bpe_with_pattern(&tokens, &merges, &types, QWEN35_PATTERN)?;
+        Tokenizer::from_gguf_bpe_with_patterns(&tokens, &merges, &types, patterns, nfc)?;
     let eos = config::uint(md, "tokenizer.ggml.eos_token_id")? as u32;
     let mut eos_ids = vec![eos];
+    // Architectures that list their end-of-generation tokens use that list.
+    if let Some(MetadataValue::Array { values, .. }) = md.get("tokenizer.ggml.eog_token_ids") {
+        for v in values {
+            // Stored as i32 (GGUF array element type 5).
+            let id = match v {
+                MetadataValue::Int32(id) if *id >= 0 => *id as u32,
+                MetadataValue::Uint32(id) => *id,
+                _ => continue,
+            };
+            if !eos_ids.contains(&id) {
+                eos_ids.push(id);
+            }
+        }
+    }
     // Chat turns end with <|im_end|>; raw completions may emit <|endoftext|>.
     for special in ["<|im_end|>", "<|endoftext|>"] {
         if let Some(id) = tokens.iter().position(|t| t == special)

@@ -42,11 +42,11 @@ impl HybridModel {
         let batched = Tensor::zeros(d, [m, w.rows], DType::F32)?;
         let single = Tensor::zeros(d, [m, w.rows], DType::F32)?;
         let e = d.execution_with_shared_encoder(true)?;
-        self.project(d, w, &x, m, &batched)?;
+        Self::project(d, w, &x, m, &batched)?;
         for r in 0..m {
             let xr = x.view(r * w.cols, [1, w.cols])?;
             let yr = single.view(r * w.rows, [1, w.rows])?;
-            self.project(d, w, &xr, 1, &yr)?;
+            Self::project(d, w, &xr, 1, &yr)?;
         }
         e.finish()?;
         let (b, s) = (batched.to_f32(), single.to_f32());
@@ -114,7 +114,7 @@ impl HybridModel {
                 let e = d.execution_with_shared_encoder(true)?;
                 let start = std::time::Instant::now();
                 for _ in 0..n {
-                    self.project(d, w, &x, m, &y)?;
+                    Self::project(d, w, &x, m, &y)?;
                 }
                 e.finish()?;
                 Ok(start.elapsed().as_secs_f64())
@@ -186,11 +186,12 @@ impl HybridModel {
         let qg = Tensor::zeros(d, [m, 2 * c.heads * c.head_dim], DType::F32)?;
         let att = Tensor::zeros(d, [m, c.heads * c.head_dim], DType::F32)?;
         let s = self.scratch.borrow();
+        let spec = super::engine::attn_spec(&self.config, 0);
         let run = |n: usize| -> Result<f64> {
             let e = d.execution_with_shared_encoder(true)?;
             let start = std::time::Instant::now();
             for _ in 0..n {
-                self.flash_attention(d, &s, kv, &q, &kc, &vc, &qg, &att, m, keys - m)?;
+                self.flash_attention(d, &s, kv, &q, &kc, &vc, &qg, &att, m, keys - m, spec, None)?;
             }
             e.finish()?;
             Ok(start.elapsed().as_secs_f64())
@@ -228,11 +229,12 @@ impl HybridModel {
         let qg = Tensor::zeros(d, [m, 2 * c.heads * c.head_dim], DType::F32)?;
         let att = Tensor::zeros(d, [m, c.heads * c.head_dim], DType::F32)?;
         let s = self.scratch.borrow();
+        let spec = super::engine::attn_spec(&self.config, 0);
         let run = |n: usize| -> Result<f64> {
             let e = d.execution_with_shared_encoder(true)?;
             let start = std::time::Instant::now();
             for _ in 0..n {
-                self.flash_attention(d, &s, kv, &q, &kc, &vc, &qg, &att, m, keys - m)?;
+                self.flash_attention(d, &s, kv, &q, &kc, &vc, &qg, &att, m, keys - m, spec, None)?;
             }
             e.finish()?;
             Ok(start.elapsed().as_secs_f64())

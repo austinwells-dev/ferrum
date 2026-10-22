@@ -123,7 +123,7 @@ impl SpecOptions {
         self.max_drafts
             .unwrap_or(match (&self.source, target.variant) {
                 (DraftSource::Mtp, _) => 3,
-                (_, Variant::Moe) => trained.min(2),
+                (_, Variant::Moe | Variant::Flint) => trained.min(2),
                 _ => trained,
             })
     }
@@ -362,11 +362,14 @@ impl Runtime {
         }
         drop(file);
         let loaded = super::load_with(&device, path, options)?;
-        let template = ChatTemplate::new(
+        let (bos, eos) = &loaded.chat_special_tokens;
+        let template = ChatTemplate::with_special_tokens(
             loaded
                 .chat_template
                 .as_deref()
                 .ok_or_else(|| Error::Tokenizer("GGUF has no chat template".into()))?,
+            bos,
+            eos,
         )?;
         let mut session = Session::new(
             &device,

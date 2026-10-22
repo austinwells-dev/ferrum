@@ -507,7 +507,7 @@ pub fn type_name(id: u32) -> String {
 }
 
 /// Weight types the hybrid engine has kernels for (see `hybrid::weights`).
-pub const SUPPORTED: [u32; 8] = [0, 2, 8, 12, 13, 14, 21, 23];
+pub const SUPPORTED: [u32; 10] = [0, 2, 8, 12, 13, 14, 18, 21, 22, 23];
 
 /// Mirrors what `Runtime::load` requires, without reading any weights.
 pub fn check(path: &Path) -> Checked {
@@ -603,14 +603,19 @@ pub fn check(path: &Path) -> Checked {
         result.problem = Some("a DFlash drafter, not a chat model".into());
         return result;
     }
-    if !matches!(arch.as_str(), "qwen35" | "qwen35moe") {
-        result.problem = Some(format!("architecture {arch}: needs qwen35 or qwen35moe"));
+    if !matches!(arch.as_str(), "qwen35" | "qwen35moe" | "flint") {
+        result.problem = Some(format!(
+            "architecture {arch}: needs qwen35, qwen35moe or flint"
+        ));
         return result;
     }
-    if text("tokenizer.ggml.model").as_deref() != Some("gpt2")
-        || text("tokenizer.ggml.pre").as_deref() != Some("qwen35")
-    {
-        result.problem = Some("tokenizer is not the qwen35 gpt2 tokenizer".into());
+    let pre = text("tokenizer.ggml.pre");
+    let pre_ok = match arch.as_str() {
+        "flint" => pre.as_deref() == Some("flint"),
+        _ => pre.as_deref() == Some("qwen35"),
+    };
+    if text("tokenizer.ggml.model").as_deref() != Some("gpt2") || !pre_ok {
+        result.problem = Some(format!("tokenizer is not the {arch} gpt2 tokenizer"));
         return result;
     }
     let config = match HybridConfig::from_gguf(&file) {
@@ -623,10 +628,12 @@ pub fn check(path: &Path) -> Checked {
     // Tensors of the trailing NextN/MTP block are only read for `--draft mtp`.
     let (mut trunk, mut head): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     for t in file.tensors().values() {
+        // BF16 routers are widened to F32 when the weights load.
+        let bf16_router = t.type_id == 30 && t.name.ends_with("ffn_gate_inp.weight");
         let supported = if t.dimensions.len() <= 1 {
             t.type_id == 0
         } else {
-            SUPPORTED.contains(&t.type_id)
+            SUPPORTED.contains(&t.type_id) || bf16_router
         };
         if supported {
             continue;
@@ -652,7 +659,7 @@ pub fn check(path: &Path) -> Checked {
     };
     if !trunk.is_empty() {
         result.problem = Some(format!(
-            "unsupported quant {} (runs Q4_0 Q8_0 Q4_K Q5_K Q6_K IQ3_S IQ4_XS)",
+            "unsupported quant {} (runs Q4_0 Q8_0 Q4_K Q5_K Q6_K IQ3_XXS IQ3_S IQ2_S IQ4_XS)",
             names(trunk)
         ));
         return result;
@@ -664,4 +671,29 @@ pub fn check(path: &Path) -> Checked {
     }
     result.hybrid = Some(config);
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The Flint GGUF from the Hugging Face cache, when it is present (it is
+    /// 18.5 GB, so CI skips this). Its BF16 routers once made it "unsupported".
+    #[test]
+    fn cached_flint_gguf_passes_the_quant_check() {
+        let cache = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".cache/huggingface/hub/models--unsloth--flint-GGUF/snapshots");
+        let Some(path) = std::fs::read_dir(&cache).ok().and_then(|dirs| {
+            dirs.flatten()
+                .map(|d| d.path().join("flint-UD-Q3_K_XL.gguf"))
+                .find(|p| p.exists())
+        }) else {
+            return;
+        };
+        let checked = check(&path);
+        assert_eq!(checked.problem, None);
+        assert!(checked.hybrid.is_some());
+    }
 }

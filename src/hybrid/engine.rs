@@ -1,7 +1,7 @@
 //! Forward pass for Qwen3.5-family hybrid models on fixed, preallocated storage.
 #![forbid(unsafe_code)]
 use super::{
-    config::{HybridConfig, KvCache},
+    config::{AttnSpec, HybridConfig, KvCache},
     weights::{
         AttentionWeights, DeltaWeights, DenseFfn, Ffn, Format, Matrix, Mixer, MoeFfn, Weights,
     },
@@ -409,14 +409,30 @@ fn copy(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
     )
 }
 
+/// Attention options of `layer`. Layers past the trunk (the MTP block) use the
+/// Qwen3.5 layout: full window, RoPE, gated, no sinks.
+pub(crate) fn attn_spec(c: &HybridConfig, layer: usize) -> AttnSpec {
+    c.attn.get(layer).copied().unwrap_or(AttnSpec {
+        window: None,
+        rope: true,
+        sinks: false,
+        gated: true,
+    })
+}
+
+/// Widest feed-forward activation of any layer: dense, expert or shared.
+fn scratch_ffn(c: &HybridConfig) -> usize {
+    match c.moe {
+        Some(moe) => c.ffn.max(moe.shared_ffn).max(moe.expert_ffn),
+        None => c.ffn,
+    }
+}
+
 /// Bytes of every scratch allocation `Scratch::new` makes, page-rounded.
 pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize {
     let chunk = chunk.max(1);
     let logit_rows = logit_rows.clamp(1, chunk);
-    let ffn = match c.moe {
-        Some(moe) => moe.shared_ffn.max(moe.expert_ffn),
-        None => c.ffn,
-    };
+    let ffn = scratch_ffn(c);
     let f32s = |n: usize| page(n * 4);
     let mut total = 0;
     for n in [
@@ -424,7 +440,7 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
         chunk * c.hidden,
         chunk * c.hidden,
         chunk * c.hidden,
-        chunk * 2 * c.heads * c.head_dim,
+        chunk * c.query_width(),
         chunk * c.kv_heads * c.head_dim,
         chunk * c.kv_heads * c.head_dim,
         chunk * c.heads * c.head_dim,
@@ -500,16 +516,13 @@ pub(crate) fn page(bytes: usize) -> usize {
 impl Scratch {
     fn new(d: &MetalDevice, c: &HybridConfig, chunk: usize, logit_rows: usize) -> Result<Self> {
         let f = |dims: &[usize]| Tensor::zeros_resident(d, dims, DType::F32);
-        let ffn = match c.moe {
-            Some(moe) => moe.shared_ffn.max(moe.expert_ffn),
-            None => c.ffn,
-        };
+        let ffn = scratch_ffn(c);
         Ok(Self {
             chunk,
             x: [f(&[chunk, c.hidden])?, f(&[chunk, c.hidden])?],
             xn: f(&[chunk, c.hidden])?,
             mix: f(&[chunk, c.hidden])?,
-            qg: f(&[chunk, 2 * c.heads * c.head_dim])?,
+            qg: f(&[chunk, c.query_width()])?,
             k: f(&[chunk, c.kv_heads * c.head_dim])?,
             v: f(&[chunk, c.kv_heads * c.head_dim])?,
             q: Tensor::zeros_resident(d, [chunk, c.heads * c.head_dim], DType::F16)?,
@@ -943,7 +956,7 @@ impl HybridModel {
         let xn = rows(&s.xn, 0, m, c.hidden)?;
         let logits = rows(&spec.logits, 0, m, c.vocab)?;
         let e = d.execution_with_shared_encoder(true)?;
-        self.project(d, &self.weights.output, &xn, m, &logits)?;
+        Self::project(d, &self.weights.output, &xn, m, &logits)?;
         match output {
             RowOutput::Logits => {
                 e.finish()?;
@@ -1179,7 +1192,7 @@ impl HybridModel {
         // xn now holds output_norm(final hidden) for every position.
         let produced = if let Some(all) = all_logits {
             let logits = rows(&s.logits, 0, m, c.vocab)?;
-            self.project(d, &self.weights.output, &xn, m, &logits)?;
+            Self::project(d, &self.weights.output, &xn, m, &logits)?;
             execution.finish()?;
             *all = logits.to_f32();
             Produced::None
@@ -1192,7 +1205,7 @@ impl HybridModel {
                 Output::Candidates(penalties) => {
                     let last = rows(&xn, m - 1, 1, h)?;
                     let logits = rows(&s.logits, 0, 1, c.vocab)?;
-                    self.project(d, &self.weights.output, &last, 1, &logits)?;
+                    Self::project(d, &self.weights.output, &last, 1, &logits)?;
                     if penalties.active() {
                         let ids = Tensor::from_le_bytes(
                             d,
@@ -1252,7 +1265,7 @@ impl HybridModel {
                 Output::Argmax | Output::Logits => {
                     let last = rows(&xn, m - 1, 1, h)?;
                     let logits = rows(&s.logits, 0, 1, c.vocab)?;
-                    self.project(d, &self.weights.output, &last, 1, &logits)?;
+                    Self::project(d, &self.weights.output, &last, 1, &logits)?;
                     if matches!(output, Output::Argmax) {
                         d.dispatch_hybrid(
                             "h_argmax",
@@ -1298,7 +1311,7 @@ impl HybridModel {
         self.attention_with(d, s, a, kc, vc, layer, xn, out, m, pos, rope)
     }
 
-    /// Gated attention of `m` rows at `pos..` against explicit K/V caches.
+    /// Attention of `m` rows at `pos..` against explicit K/V caches.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn attention_with(
         &self,
@@ -1315,22 +1328,23 @@ impl HybridModel {
         rope: &RopePlan,
     ) -> Result<()> {
         let c = &self.config;
+        let spec = attn_spec(c, layer);
         let q_width = c.heads * c.head_dim;
         let kv_width = c.kv_heads * c.head_dim;
-        let qg = rows(&s.qg, 0, m, 2 * q_width)?;
+        let qg = rows(&s.qg, 0, m, if spec.gated { 2 * q_width } else { q_width })?;
         let k = rows(&s.k, 0, m, kv_width)?;
         let v = rows(&s.v, 0, m, kv_width)?;
         let q = s.q.view(0, [m, q_width])?;
         let att = rows(&s.att, 0, m, q_width)?;
-        self.project(d, &a.q, xn, m, &qg)?;
-        self.project(d, &a.k, xn, m, &k)?;
-        self.project(d, &a.v, xn, m, &v)?;
+        Self::project(d, &a.q, xn, m, &qg)?;
+        Self::project(d, &a.k, xn, m, &k)?;
+        Self::project(d, &a.v, xn, m, &v)?;
         let prep = Params::default()
             .u(m)?
             .u(c.heads)?
             .u(c.kv_heads)?
             .u(c.head_dim)?
-            .u(c.rope_dims)?
+            .u(if spec.rope { c.rope_dims } else { 0 })?
             .u(pos)?
             .f(c.rope_theta)
             .f(c.eps)
@@ -1340,7 +1354,8 @@ impl HybridModel {
             .u(usize::from(rope.table.is_some()))?
             .u(c.rope_sections[1])?
             .u(c.rope_sections[2])?
-            .u(kc.shape().dimensions()[0])?;
+            .u(kc.shape().dimensions()[0])?
+            .u(usize::from(spec.gated))?;
         let q8 = c.kv_cache == KvCache::Q8;
         d.dispatch_hybrid(
             if q8 { "h_attn_prep_q8" } else { "h_attn_prep" },
@@ -1371,14 +1386,29 @@ impl HybridModel {
         self.dump(d, "Qcur_full", layer, &qg)?;
         self.dump(d, "Kcur", layer, &k)?;
         self.dump(d, "Vcur", layer, &v)?;
-        self.flash_attention(d, s, c.kv_cache, &q, kc, vc, &qg, &att, m, pos)?;
+        self.flash_attention(
+            d,
+            s,
+            c.kv_cache,
+            &q,
+            kc,
+            vc,
+            &qg,
+            &att,
+            m,
+            pos,
+            spec,
+            a.sinks.as_ref(),
+        )?;
         self.dump(d, "attn_gated", layer, &att)?;
-        self.project(d, &a.o, &att, m, out)?;
+        Self::project(d, &a.o, &att, m, out)?;
         self.dump(d, "attn_output", layer, out)
     }
 
     /// Causal attention of `m` new queries against the cache (format `kv`),
-    /// gated by sigmoid(gate) from `qg`, written to `att`.
+    /// written to `att`. With `spec.gated` the output is multiplied by
+    /// sigmoid(gate) from `qg`; `spec.window` masks keys out of range, and
+    /// `sinks` (per-head logits) join the softmax denominator.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn flash_attention(
         &self,
@@ -1392,19 +1422,34 @@ impl HybridModel {
         att: &Tensor,
         m: usize,
         pos: usize,
+        spec: AttnSpec,
+        sinks: Option<&Tensor>,
     ) -> Result<()> {
         let c = &self.config;
         let group = c.heads / c.kv_heads;
         let rows = m * group;
-        let keys = pos + m;
+        let window = spec.window.unwrap_or(0);
+        // No query reads keys before the window of the first query.
+        let first_key = spec.window.map_or(0, |w| (pos + 1).saturating_sub(w));
+        let keys = pos + m - first_key;
         let kv_rows = kc.shape().dimensions()[0];
         let q8 = kv == KvCache::Q8;
+        let wide = c.head_dim == 256;
         let legacy = flags().legacy_attention || flags().simd_attention;
         if q8 && (flags().reference_attention || legacy) {
             return Err(Error::Config(
                 "the reference and legacy attention kernels read only an F16 K/V cache".into(),
             ));
         }
+        if legacy && (!wide || !spec.gated || window != 0 || sinks.is_some()) {
+            return Err(Error::Config(
+                "the legacy attention kernels cover gated, full-window, sink-free 256-wide heads"
+                    .into(),
+            ));
+        }
+        let sinks_on = usize::from(sinks.is_some());
+        // Bound (and ignored) when the layer has no sinks.
+        let sinks_t = sinks.unwrap_or(qg);
         if flags().reference_attention {
             let args = Params::default()
                 .u(m)?
@@ -1413,10 +1458,19 @@ impl HybridModel {
                 .u(c.head_dim)?
                 .u(pos)?
                 .u(c.kv_heads * c.head_dim)?
-                .f(1.);
+                .f(1.)
+                .u(window)?
+                .u(usize::from(spec.gated))?
+                .u(sinks_on)?;
             return d.dispatch_hybrid(
                 "h_attention",
-                &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                &[
+                    q.binding(),
+                    kc.binding(),
+                    vc.binding(),
+                    qg.binding(),
+                    sinks_t.binding(),
+                ],
                 &[att.binding()],
                 &args.0,
                 [c.heads, m, 1],
@@ -1435,19 +1489,30 @@ impl HybridModel {
                 .u(keys_per_split)?
                 .u(splits)?
                 .u(kv_rows)?
+                .u(c.head_dim)?
+                .u(first_key)?
+                .u(window)?
+                .u(usize::from(spec.gated))?
+                .u(sinks_on)?
                 .0)
         };
+        // Sinks ride as the fifth input; the legacy kernels predate them.
+        let base = [q.binding(), kc.binding(), vc.binding(), qg.binding()];
+        let sink_inputs = [base[0], base[1], base[2], base[3], sinks_t.binding()];
         if m >= MPP_ATTENTION_MIN_TOKENS && !flags().simd_attention {
             let args = fa(0, 1)?;
+            let name = match (q8, legacy, wide) {
+                (true, _, true) => "h_flash_attn_mpp_q8",
+                (true, _, false) => "h_flash_attn_mpp_q8_d128",
+                (false, false, true) => "h_flash_attn_mpp_staged",
+                (false, false, false) => "h_flash_attn_mpp_staged_d128",
+                (false, true, _) => "h_flash_attn_mpp",
+            };
+            // K/V staged through threadgroup memory measured 15-20% faster
+            // than reading the cache as a device tensor.
             return d.dispatch_hybrid(
-                // K/V staged through threadgroup memory measured 15-20%
-                // faster than reading the cache as a device tensor.
-                match (q8, legacy) {
-                    (true, _) => "h_flash_attn_mpp_q8",
-                    (false, false) => "h_flash_attn_mpp_staged",
-                    (false, true) => "h_flash_attn_mpp",
-                },
-                &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                name,
+                if legacy { &base } else { &sink_inputs },
                 &[att.binding()],
                 &args,
                 [m.div_ceil(64), c.heads, 1],
@@ -1457,8 +1522,17 @@ impl HybridModel {
         }
         let reduce = |args: &[u8]| {
             d.dispatch_hybrid(
-                "h_flash_reduce",
-                &[s.attn_partial.binding(), s.attn_ml.binding(), qg.binding()],
+                if wide {
+                    "h_flash_reduce"
+                } else {
+                    "h_flash_reduce_d128"
+                },
+                &[
+                    s.attn_partial.binding(),
+                    s.attn_ml.binding(),
+                    qg.binding(),
+                    sinks_t.binding(),
+                ],
                 &[att.binding()],
                 args,
                 [m * c.heads, 1, 1],
@@ -1476,18 +1550,20 @@ impl HybridModel {
             let keys_per_split = keys.div_ceil(splits).next_multiple_of(32);
             let splits = keys.div_ceil(keys_per_split);
             let args = fa(keys_per_split, splits)?;
+            let name = match (q8, wide) {
+                (false, true) => "h_attn_decode",
+                (true, true) => "h_attn_decode_q8",
+                (false, false) => "h_attn_decode_d128",
+                (true, false) => "h_attn_decode_q8_d128",
+            };
             d.dispatch_hybrid(
-                if q8 {
-                    "h_attn_decode_q8"
-                } else {
-                    "h_attn_decode"
-                },
-                &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                name,
+                &sink_inputs,
                 &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
                 &args,
                 [c.kv_heads, splits, 1],
                 [128, 1, 1],
-                8 * 256 * 2 + 4 * 8 * 2 * 4 + 2 * 8 * 256 * 4,
+                8 * c.head_dim * 2 + 4 * 8 * 2 * 4 + 2 * 8 * c.head_dim * 4,
             )?;
             if splits > 1 {
                 reduce(&args)?;
@@ -1525,15 +1601,23 @@ impl HybridModel {
             } else {
                 br * 64 * 4 + br * 64 * 2 + 3 * br * 4
             };
+            let name = match (q8, wide) {
+                (false, true) => "h_attn_verify_mpp_32",
+                (true, true) => "h_attn_verify_mpp_32_q8",
+                (false, false) => "h_attn_verify_mpp_32_d128",
+                (true, false) => "h_attn_verify_mpp_32_q8_d128",
+            };
             d.dispatch_hybrid(
                 // F16 reads K/V directly: staging only pays off for prompt
                 // chunks. Q8 must stage to dequantize.
-                if q8 {
-                    "h_attn_verify_mpp_32_q8"
-                } else {
-                    "h_attn_verify_mpp_32"
-                },
-                &[qk.binding(), kc.binding(), vc.binding(), qg.binding()],
+                name,
+                &[
+                    qk.binding(),
+                    kc.binding(),
+                    vc.binding(),
+                    qg.binding(),
+                    sinks_t.binding(),
+                ],
                 &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
                 &args,
                 [row_blocks, c.kv_heads, splits],
@@ -1565,7 +1649,7 @@ impl HybridModel {
             } else {
                 "h_flash_attn_4"
             },
-            &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+            &base,
             &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
             &args,
             [row_blocks, c.kv_heads, splits],
@@ -1618,10 +1702,10 @@ impl HybridModel {
         let delta = rows(&s.delta, 0, m, vd)?;
         let gated = rows(&s.gated, 0, m, vd)?;
         self.dump(d, "attn_norm", layer, xn)?;
-        self.project(d, &w.qkv, xn, m, &qkv)?;
-        self.project(d, &w.z, xn, m, &z)?;
-        self.project(d, &w.alpha, xn, m, &alpha)?;
-        self.project(d, &w.beta, xn, m, &beta)?;
+        Self::project(d, &w.qkv, xn, m, &qkv)?;
+        Self::project(d, &w.z, xn, m, &z)?;
+        Self::project(d, &w.alpha, xn, m, &alpha)?;
+        Self::project(d, &w.beta, xn, m, &beta)?;
         self.dump(d, "linear_attn_qkv_mixed", layer, &qkv)?;
         self.dump(d, "z", layer, &z)?;
         self.dump(d, "alpha", layer, &alpha)?;
@@ -1653,7 +1737,7 @@ impl HybridModel {
             0,
         )?;
         self.dump(d, "final_output", layer, &gated)?;
-        self.project(d, &w.out, &gated, m, out)?;
+        Self::project(d, &w.out, &gated, m, out)?;
         self.dump(d, "linear_attn_out", layer, out)
     }
 
@@ -1750,17 +1834,27 @@ impl HybridModel {
         let ids = ms.ids.view(0, [routes])?;
         let weights = ms.weights.view(0, [routes])?;
         let shared_gate = ms.shared_gate.view(0, [m])?;
+        // Without a shared-expert gate tensor the kernel never reads this buffer.
+        let shared_w = f.shared_gate_inp.as_ref().unwrap_or(xn);
         let shared = rows(&ms.shared, 0, m, hidden)?;
         let gate = rows(&ms.gate, 0, routes, ef)?;
         let up = rows(&ms.up, 0, routes, ef)?;
         let act = rows(&ms.act, 0, routes, ef)?;
         let down = rows(&ms.down, 0, routes, hidden)?;
-        self.project(d, &f.router, xn, m, &logits)?;
+        Self::project(d, &f.router, xn, m, &logits)?;
         d.dispatch_hybrid(
             "h_moe_route",
-            &[logits.binding(), xn.binding(), f.shared_gate_inp.binding()],
+            &[logits.binding(), xn.binding(), shared_w.binding()],
             &[ids.binding(), weights.binding(), shared_gate.binding()],
-            &Params::default().u(experts)?.u(used)?.u(hidden)?.u(m)?.0,
+            &Params::default()
+                .u(experts)?
+                .u(used)?
+                .u(hidden)?
+                .u(m)?
+                .u(usize::from(moe.sigmoid))?
+                .u(usize::from(moe.norm_weights))?
+                .u(usize::from(moe.shared_gate))?
+                .0,
             [m, 1, 1],
             [experts, 1, 1],
             0,
@@ -1781,10 +1875,10 @@ impl HybridModel {
         self.dump(d, "shared_expert_gate_sigmoid", 0, &shared_gate)?;
         let identity = routes <= MV_ID_MAX_ROUTES || exact_math();
         if identity {
-            self.project_id(d, &f.gate_exps, xn, &ids, routes, used, &gate)?;
-            self.project_id(d, &f.up_exps, xn, &ids, routes, used, &up)?;
+            Self::project_id(d, &f.gate_exps, xn, &ids, routes, used, &gate)?;
+            Self::project_id(d, &f.up_exps, xn, &ids, routes, used, &up)?;
             self.swiglu(d, &gate, &up, &act)?;
-            self.project_id(d, &f.down_exps, &act, &ids, routes, 1, &down)?;
+            Self::project_id(d, &f.down_exps, &act, &ids, routes, 1, &down)?;
         } else {
             let offsets = ms.offsets.view(0, [experts + 1])?;
             let sorted = ms.sorted.view(0, [routes])?;
@@ -1855,8 +1949,7 @@ impl HybridModel {
 
     /// Expert GEMV: route r multiplies activation row r / x_div by expert ids[r].
     #[allow(clippy::too_many_arguments)]
-    fn project_id(
-        &self,
+    pub(crate) fn project_id(
         d: &MetalDevice,
         w: &Matrix,
         x: &Tensor,
@@ -1919,6 +2012,8 @@ impl HybridModel {
             Format::Q4_0 => "h_mm_id_q4_0",
             Format::Iq4Xs => "h_mm_id_iq4_xs",
             Format::Iq3S => "h_mm_id_iq3_s",
+            Format::Iq3Xxs => "h_mm_id_iq3_xxs",
+            Format::Iq2S => "h_mm_id_iq2_s",
             Format::F32 => return Err(Error::Gguf("F32 experts are unsupported".into())),
         };
         d.dispatch_hybrid(
@@ -1945,8 +2040,8 @@ impl HybridModel {
         let gate = rows(&s.ffn_gate, 0, m, width)?;
         let up = rows(&s.ffn_up, 0, m, width)?;
         let act = rows(&s.ffn_act, 0, m, width)?;
-        self.project(d, &f.gate, xn, m, &gate)?;
-        self.project(d, &f.up, xn, m, &up)?;
+        Self::project(d, &f.gate, xn, m, &gate)?;
+        Self::project(d, &f.up, xn, m, &up)?;
         d.dispatch_hybrid(
             "h_swiglu",
             &[gate.binding(), up.binding()],
@@ -1956,7 +2051,7 @@ impl HybridModel {
             [256, 1, 1],
             0,
         )?;
-        self.project(d, &f.down, &act, m, out)
+        Self::project(d, &f.down, &act, m, out)
     }
 
     /// Debug aid (`FERRUM_HYBRID_DUMP=1`): complete queued work and print the
@@ -2061,7 +2156,6 @@ impl HybridModel {
 
     /// y[m][rows] = x[m][cols] · Wᵀ.
     pub(crate) fn project(
-        &self,
         d: &MetalDevice,
         w: &Matrix,
         x: &Tensor,
@@ -2120,6 +2214,8 @@ impl HybridModel {
                 Format::Iq4Xs => "h_mm_iq4_xs",
                 Format::F32 => "h_mm_f32",
                 Format::Iq3S => "h_mm_iq3_s",
+                Format::Iq3Xxs => "h_mm_iq3_xxs",
+                Format::Iq2S => "h_mm_iq2_s",
             };
             return d.dispatch_hybrid(
                 name,
@@ -2211,6 +2307,8 @@ fn mvb_kernel(format: Format) -> &'static str {
         Format::Q4_0 => "h_mvb_q4_0",
         Format::Iq4Xs => "h_mvb_iq4_xs",
         Format::Iq3S => "h_mvb_iq3_s",
+        Format::Iq3Xxs => "h_mvb_iq3_xxs",
+        Format::Iq2S => "h_mvb_iq2_s",
         Format::F32 => "h_mvb_f32",
     }
 }
@@ -2225,6 +2323,8 @@ fn mms_kernel(format: Format) -> &'static str {
         Format::Q4_0 => "h_mms_q4_0",
         Format::Iq4Xs => "h_mms_iq4_xs",
         Format::Iq3S => "h_mms_iq3_s",
+        Format::Iq3Xxs => "h_mms_iq3_xxs",
+        Format::Iq2S => "h_mms_iq2_s",
         Format::F32 => "h_mms_f32",
     }
 }
@@ -2241,6 +2341,8 @@ fn mv_kernel(format: Format, expert: bool) -> (&'static str, usize, usize, usize
         Format::Q8_0 => (pick("h_mv_q8_0", "h_mv_id_q8_0"), 2, 4, 32 * 2 * 4),
         Format::Iq4Xs => (pick("h_mv_iq4_xs", "h_mv_id_iq4_xs"), 4, 2, 32 * 4),
         Format::Iq3S => (pick("h_mv_iq3_s", "h_mv_id_iq3_s"), 8, 2, 512 * 4),
+        Format::Iq3Xxs => (pick("h_mv_iq3_xxs", "h_mv_id_iq3_xxs"), 8, 2, 256 * 4 + 128),
+        Format::Iq2S => (pick("h_mv_iq2_s", "h_mv_id_iq2_s"), 8, 2, 0),
     }
 }
 
@@ -2371,6 +2473,8 @@ mod tests {
                 .u(sec_w)
                 .unwrap()
                 .u(rows + 2)
+                .unwrap()
+                .u(1)
                 .unwrap();
             let e = d.execution_with_shared_encoder(true).unwrap();
             d.dispatch_hybrid(
@@ -2510,12 +2614,24 @@ mod tests {
                 .unwrap()
                 .u(stride)
                 .unwrap()
-                .f(1.);
+                .f(1.)
+                .u(0)
+                .unwrap()
+                .u(1)
+                .unwrap()
+                .u(0)
+                .unwrap();
             {
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
                     "h_attention",
-                    &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                    &[
+                        q.binding(),
+                        kc.binding(),
+                        vc.binding(),
+                        qg.binding(),
+                        qg.binding(),
+                    ],
                     &[reference.binding()],
                     &args.0,
                     [heads, m, 1],
@@ -2552,6 +2668,16 @@ mod tests {
                         .u(splits)
                         .unwrap()
                         .u(cap)
+                        .unwrap()
+                        .u(dim)
+                        .unwrap()
+                        .u(0)
+                        .unwrap()
+                        .u(0)
+                        .unwrap()
+                        .u(1)
+                        .unwrap()
+                        .u(0)
                         .unwrap();
                     let e = d.execution_with_shared_encoder(true).unwrap();
                     d.dispatch_hybrid(
@@ -2571,7 +2697,7 @@ mod tests {
                     if splits > 1 {
                         d.dispatch_hybrid(
                             "h_flash_reduce",
-                            &[partial.binding(), ml.binding(), qg.binding()],
+                            &[partial.binding(), ml.binding(), qg.binding(), qg.binding()],
                             &[out.binding()],
                             &fa.0,
                             [m * heads, 1, 1],
@@ -2619,11 +2745,27 @@ mod tests {
                         .u(splits)
                         .unwrap()
                         .u(cap)
+                        .unwrap()
+                        .u(dim)
+                        .unwrap()
+                        .u(0)
+                        .unwrap()
+                        .u(0)
+                        .unwrap()
+                        .u(1)
+                        .unwrap()
+                        .u(0)
                         .unwrap();
                     let e = d.execution_with_shared_encoder(true).unwrap();
                     d.dispatch_hybrid(
                         "h_attn_decode",
-                        &[q.binding(), kc.binding(), vc.binding(), qg.binding()],
+                        &[
+                            q.binding(),
+                            kc.binding(),
+                            vc.binding(),
+                            qg.binding(),
+                            qg.binding(),
+                        ],
                         &[out.binding(), partial.binding(), ml.binding()],
                         &fa.0,
                         [kv_heads, splits, 1],
@@ -2634,7 +2776,7 @@ mod tests {
                     if splits > 1 {
                         d.dispatch_hybrid(
                             "h_flash_reduce",
-                            &[partial.binding(), ml.binding(), qg.binding()],
+                            &[partial.binding(), ml.binding(), qg.binding(), qg.binding()],
                             &[out.binding()],
                             &fa.0,
                             [heads, 1, 1],
@@ -2676,6 +2818,16 @@ mod tests {
                 .u(1)
                 .unwrap()
                 .u(cap)
+                .unwrap()
+                .u(dim)
+                .unwrap()
+                .u(0)
+                .unwrap()
+                .u(0)
+                .unwrap()
+                .u(1)
+                .unwrap()
+                .u(0)
                 .unwrap();
             let e = d.execution_with_shared_encoder(true).unwrap();
             d.dispatch_hybrid(
@@ -2724,6 +2876,465 @@ mod tests {
         (values, deq)
     }
 
+    /// Ungated queries (Flint) read one head-width row per head, and with RoPE
+    /// off the prep is the RMS-normalized query times the scale alone.
+    #[test]
+    fn ungated_prep_without_rope_is_the_normalized_query() {
+        let d = MetalDevice::new().unwrap();
+        let (heads, kv_heads, head_dim, rows) = (4usize, 1usize, 128usize, 3usize);
+        let (eps, scale) = (1e-6f32, 1. / (head_dim as f32).sqrt());
+        let qg = random(rows * heads * head_dim, 31);
+        let kk = random(rows * kv_heads * head_dim, 32);
+        let norm: Vec<f32> = random(head_dim, 33).iter().map(|v| 1. + v / 4.).collect();
+        let t = |data: &[f32], n: usize| Tensor::from_f32(&d, [n], DType::F32, data).unwrap();
+        let q_out = Tensor::zeros(&d, [rows * heads * head_dim], DType::F16).unwrap();
+        let cache = Tensor::zeros(&d, [(rows + 2) * kv_heads * head_dim], DType::F16).unwrap();
+        let params = Params::default()
+            .u(rows)
+            .unwrap()
+            .u(heads)
+            .unwrap()
+            .u(kv_heads)
+            .unwrap()
+            .u(head_dim)
+            .unwrap()
+            .u(0)
+            .unwrap() // rope_dims: no rotation
+            .u(0)
+            .unwrap()
+            .f(1e7)
+            .f(eps)
+            .u(kv_heads * head_dim)
+            .unwrap()
+            .f(scale)
+            .i(0)
+            .u(0)
+            .unwrap()
+            .u(0)
+            .unwrap()
+            .u(0)
+            .unwrap()
+            .u(rows + 2)
+            .unwrap()
+            .u(0)
+            .unwrap(); // gated: qg rows hold queries only
+        let (qg_t, k_t, zeros) = (t(&qg, qg.len()), t(&kk, kk.len()), t(&[0.], 1));
+        let (qn, kn) = (t(&norm, head_dim), t(&norm, head_dim));
+        let e = d.execution_with_shared_encoder(true).unwrap();
+        d.dispatch_hybrid(
+            "h_attn_prep",
+            &[
+                qg_t.binding(),
+                k_t.binding(),
+                k_t.binding(),
+                qn.binding(),
+                kn.binding(),
+                zeros.binding(),
+            ],
+            &[q_out.binding(), cache.binding()],
+            &params.0,
+            [heads + kv_heads, rows, 1],
+            [head_dim, 1, 1],
+            0,
+        )
+        .unwrap();
+        e.finish().unwrap();
+        let got = q_out.to_f32();
+        for r in 0..rows {
+            for h in 0..heads {
+                let row = &qg[(r * heads + h) * head_dim..][..head_dim];
+                let ss: f32 = row.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
+                let inv = 1. / (ss + eps).sqrt();
+                for dd in 0..head_dim {
+                    let want = row[dd] * inv * norm[dd] * scale;
+                    let g = got[(r * heads + h) * head_dim + dd];
+                    assert!(
+                        (g - want).abs() <= 2e-3 * want.abs().max(1e-2),
+                        "row {r} head {h} dim {dd}: {g} vs {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Head width 128 (Flint: GQA 32/4, learned sinks, sliding windows, ungated
+    /// output) on every attention path against the reference kernel.
+    #[test]
+    fn narrow_heads_with_sinks_and_windows_match_reference() {
+        let d = MetalDevice::new().unwrap();
+        let (heads, kv_heads, dim) = (32usize, 4usize, 128usize);
+        let group = heads / kv_heads;
+        let stride = kv_heads * dim;
+        // (m, pos, window, sinks, gated): decode, short and long prompt
+        // chunks, and verify widths, with and without each feature.
+        let cases: [(usize, usize, Option<usize>, bool, bool); 9] = [
+            (1, 600, Some(513), true, false),
+            (1, 40, None, true, false),
+            (1, 1200, Some(513), false, true),
+            (5, 300, Some(513), true, false),
+            (9, 600, Some(513), true, false),
+            (12, 1500, Some(513), false, true),
+            (37, 700, Some(513), true, false),
+            (37, 90, None, false, true),
+            (64, 1000, Some(513), true, false),
+        ];
+        for (m, pos, window, sinks, gated) in cases {
+            let keys = pos + m;
+            let cap = keys.next_multiple_of(32);
+            let first_key = window.map_or(0, |w| (pos + 1).saturating_sub(w));
+            let window_arg = window.unwrap_or(0);
+            let (sinks_on, gated_on) = (usize::from(sinks), usize::from(gated));
+            let q = Tensor::from_f32(
+                &d,
+                [m, heads * dim],
+                DType::F16,
+                &random(m * heads * dim, 1)
+                    .iter()
+                    .map(|v| v / 16.)
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap();
+            let (k_raw, v_raw) = (random(cap * stride, 2), random(cap * stride, 3));
+            let qg = Tensor::from_f32(
+                &d,
+                [m, 2 * heads * dim],
+                DType::F32,
+                &random(m * 2 * heads * dim, 4),
+            )
+            .unwrap();
+            let sink_logits = Tensor::from_f32(&d, [heads], DType::F32, &random(heads, 5)).unwrap();
+            // The attention layer's sinks are real logits; the reference reads them too.
+            let sink_arg = if sinks { &sink_logits } else { &qg };
+            for kv in [KvCache::F16, KvCache::Q8] {
+                let q8 = kv == KvCache::Q8;
+                let (kc, vc, k_ref, v_ref) = match kv {
+                    KvCache::F16 => {
+                        let t =
+                            |x: &[f32]| Tensor::from_f32(&d, [cap, stride], DType::F16, x).unwrap();
+                        (t(&k_raw), t(&v_raw), k_raw.clone(), v_raw.clone())
+                    }
+                    KvCache::Q8 => {
+                        let (kb, kd) = quantize_q8(&k_raw, stride);
+                        let (vb, vd) = quantize_q8(&v_raw, stride);
+                        let t = |b: &[u8]| {
+                            Tensor::from_le_bytes(
+                                &d,
+                                [cap, kv.row_bytes(stride) / 2],
+                                DType::F16,
+                                b,
+                            )
+                            .unwrap()
+                        };
+                        (t(&kb), t(&vb), kd, vd)
+                    }
+                };
+                let kr = Tensor::from_f32(&d, [cap, stride], DType::F16, &k_ref).unwrap();
+                let vr = Tensor::from_f32(&d, [cap, stride], DType::F16, &v_ref).unwrap();
+                let reference = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
+                let args = Params::default()
+                    .u(m)
+                    .unwrap()
+                    .u(heads)
+                    .unwrap()
+                    .u(kv_heads)
+                    .unwrap()
+                    .u(dim)
+                    .unwrap()
+                    .u(pos)
+                    .unwrap()
+                    .u(stride)
+                    .unwrap()
+                    .f(1.)
+                    .u(window_arg)
+                    .unwrap()
+                    .u(gated_on)
+                    .unwrap()
+                    .u(sinks_on)
+                    .unwrap();
+                let e = d.execution_with_shared_encoder(true).unwrap();
+                d.dispatch_hybrid(
+                    "h_attention",
+                    &[
+                        q.binding(),
+                        kr.binding(),
+                        vr.binding(),
+                        qg.binding(),
+                        sink_arg.binding(),
+                    ],
+                    &[reference.binding()],
+                    &args.0,
+                    [heads, m, 1],
+                    [dim, 1, 1],
+                    0,
+                )
+                .unwrap();
+                e.finish().unwrap();
+                let expected = reference.to_f32();
+                // Keys the kernels split: everything from the first visible key.
+                let span = keys - first_key;
+                let fa = |keys_per_split: usize, splits: usize| {
+                    let mut p = Params::default();
+                    for x in [
+                        m,
+                        heads,
+                        kv_heads,
+                        group,
+                        pos,
+                        stride,
+                        keys_per_split,
+                        splits,
+                        cap,
+                        dim,
+                        first_key,
+                        window_arg,
+                        gated_on,
+                        sinks_on,
+                    ] {
+                        p = p.u(x).unwrap();
+                    }
+                    p.0
+                };
+                let check = |name: &'static str,
+                             inputs_extra: bool,
+                             groups: [usize; 3],
+                             threads: usize,
+                             shared: usize,
+                             kps: usize,
+                             splits: usize| {
+                    let out = Tensor::zeros(&d, [m, heads * dim], DType::F32).unwrap();
+                    let partial =
+                        Tensor::zeros(&d, [splits * m * heads * dim], DType::F32).unwrap();
+                    let ml = Tensor::zeros(&d, [splits * m * heads * 2], DType::F32).unwrap();
+                    let args = fa(kps, splits);
+                    let qk = Tensor::zeros(&d, [m, heads * dim], DType::F16).unwrap();
+                    let verify = name.starts_with("h_attn_verify");
+                    let mpp = name.starts_with("h_flash_attn_mpp");
+                    let e = d.execution_with_shared_encoder(true).unwrap();
+                    if verify {
+                        d.dispatch_hybrid(
+                            "h_q_by_kv_head",
+                            &[q.binding()],
+                            &[qk.binding()],
+                            &args,
+                            [(m * heads * dim).div_ceil(256), 1, 1],
+                            [256, 1, 1],
+                            0,
+                        )
+                        .unwrap();
+                    }
+                    let outputs = if mpp {
+                        vec![out.binding()]
+                    } else {
+                        vec![out.binding(), partial.binding(), ml.binding()]
+                    };
+                    let mut inputs = vec![
+                        if verify { qk.binding() } else { q.binding() },
+                        kc.binding(),
+                        vc.binding(),
+                        qg.binding(),
+                    ];
+                    if inputs_extra {
+                        inputs.push(sink_arg.binding());
+                    }
+                    d.dispatch_hybrid(
+                        name,
+                        &inputs,
+                        &outputs,
+                        &args,
+                        groups,
+                        [threads, 1, 1],
+                        shared,
+                    )
+                    .unwrap();
+                    if splits > 1 {
+                        d.dispatch_hybrid(
+                            "h_flash_reduce_d128",
+                            &[
+                                partial.binding(),
+                                ml.binding(),
+                                qg.binding(),
+                                sink_arg.binding(),
+                            ],
+                            &[out.binding()],
+                            &args,
+                            [m * heads, 1, 1],
+                            [dim, 1, 1],
+                            0,
+                        )
+                        .unwrap();
+                    }
+                    e.finish().unwrap();
+                    let worst = out
+                        .to_f32()
+                        .iter()
+                        .zip(&expected)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0f32, f32::max);
+                    assert!(
+                        worst < 2e-3,
+                        "{name} m {m} pos {pos} window {window:?} sinks {sinks} gated {gated} splits {splits}: max error {worst}"
+                    );
+                };
+                let _ = span;
+                if m == 1 {
+                    for splits_wanted in [1usize, 5] {
+                        let kps = span.div_ceil(splits_wanted).next_multiple_of(32);
+                        let splits = span.div_ceil(kps);
+                        check(
+                            if q8 {
+                                "h_attn_decode_q8_d128"
+                            } else {
+                                "h_attn_decode_d128"
+                            },
+                            true,
+                            [kv_heads, splits, 1],
+                            128,
+                            8 * dim * 2 + 4 * 8 * 2 * 4 + 2 * 8 * dim * 4,
+                            kps,
+                            splits,
+                        );
+                    }
+                }
+                if m > 1 && m < 16 {
+                    for splits_wanted in [1usize, 3] {
+                        let rows = m * group;
+                        let row_blocks = rows.div_ceil(32);
+                        let kps = span.div_ceil(splits_wanted).next_multiple_of(64);
+                        let splits = span.div_ceil(kps);
+                        check(
+                            if q8 {
+                                "h_attn_verify_mpp_32_q8_d128"
+                            } else {
+                                "h_attn_verify_mpp_32_d128"
+                            },
+                            true,
+                            [row_blocks, kv_heads, splits],
+                            128,
+                            if q8 {
+                                (64 * 128 * 2usize).max(32 * 64 * 4) + 32 * 64 * 2 + 3 * 32 * 4
+                            } else {
+                                32 * 64 * 4 + 32 * 64 * 2 + 3 * 32 * 4
+                            },
+                            kps,
+                            splits,
+                        );
+                    }
+                }
+                if m >= 16 {
+                    check(
+                        if q8 {
+                            "h_flash_attn_mpp_q8_d128"
+                        } else {
+                            "h_flash_attn_mpp_staged_d128"
+                        },
+                        true,
+                        [m.div_ceil(64), heads, 1],
+                        128,
+                        64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
+                        0,
+                        1,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Expert routing: softmax or sigmoid scores, top-k with ties to the lower
+    /// index, optional renormalization, and the shared-expert gate (or 1).
+    #[test]
+    fn moe_routing_matches_the_reference_selection() {
+        let d = MetalDevice::new().unwrap();
+        let (experts, used, hidden, m) = (256usize, 6usize, 2048usize, 3usize);
+        let logits = random(m * experts, 21)
+            .iter()
+            .map(|v| v * 3.)
+            .collect::<Vec<_>>();
+        let x = random(m * hidden, 22);
+        let shared_w = random(hidden, 23);
+        // (sigmoid, norm, shared_gate): Flint, Qwen3.5-MoE, and sigmoid-only routing.
+        for (sigmoid, norm, shared_gate) in [
+            (true, true, false),
+            (false, true, true),
+            (true, false, true),
+        ] {
+            let lt = Tensor::from_f32(&d, [m, experts], DType::F32, &logits).unwrap();
+            let xt = Tensor::from_f32(&d, [m, hidden], DType::F32, &x).unwrap();
+            let wt = Tensor::from_f32(&d, [hidden], DType::F32, &shared_w).unwrap();
+            let ids = Tensor::zeros(&d, [m * used], DType::F32).unwrap();
+            let weights = Tensor::zeros(&d, [m * used], DType::F32).unwrap();
+            let gate = Tensor::zeros(&d, [m], DType::F32).unwrap();
+            let args = Params::default()
+                .u(experts)
+                .unwrap()
+                .u(used)
+                .unwrap()
+                .u(hidden)
+                .unwrap()
+                .u(m)
+                .unwrap()
+                .u(usize::from(sigmoid))
+                .unwrap()
+                .u(usize::from(norm))
+                .unwrap()
+                .u(usize::from(shared_gate))
+                .unwrap();
+            let e = d.execution_with_shared_encoder(true).unwrap();
+            d.dispatch_hybrid(
+                "h_moe_route",
+                &[lt.binding(), xt.binding(), wt.binding()],
+                &[ids.binding(), weights.binding(), gate.binding()],
+                &args.0,
+                [m, 1, 1],
+                [experts, 1, 1],
+                0,
+            )
+            .unwrap();
+            e.finish().unwrap();
+            let got_ids: Vec<u32> = ids.to_f32().iter().map(|v| v.to_bits()).collect();
+            let got_w = weights.to_f32();
+            let got_gate = gate.to_f32();
+            for t in 0..m {
+                let row = &logits[t * experts..][..experts];
+                let scores: Vec<f32> = if sigmoid {
+                    row.iter().map(|l| 1. / (1. + (-l).exp())).collect()
+                } else {
+                    let mx = row.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                    let e: Vec<f32> = row.iter().map(|l| (l - mx).exp()).collect();
+                    let total: f32 = e.iter().sum();
+                    e.iter().map(|v| v / total).collect()
+                };
+                let mut order: Vec<usize> = (0..experts).collect();
+                order.sort_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
+                let picked = &order[..used];
+                let sum: f32 = picked.iter().map(|&i| scores[i]).sum();
+                for (k, &i) in picked.iter().enumerate() {
+                    assert_eq!(got_ids[t * used + k] as usize, i, "route {k} of token {t}");
+                    let want = if norm { scores[i] / sum } else { scores[i] };
+                    let got = got_w[t * used + k];
+                    assert!(
+                        (got - want).abs() < 1e-5,
+                        "weight {k} of token {t}: {got} vs {want}"
+                    );
+                }
+                let want_gate = if shared_gate {
+                    let dot: f32 = x[t * hidden..][..hidden]
+                        .iter()
+                        .zip(&shared_w)
+                        .map(|(a, b)| a * b)
+                        .sum();
+                    1. / (1. + (-dot).exp())
+                } else {
+                    1.
+                };
+                assert!(
+                    (got_gate[t] - want_gate).abs() < 1e-4,
+                    "shared gate of token {t}: {} vs {want_gate}",
+                    got_gate[t]
+                );
+            }
+        }
+    }
+
     #[test]
     fn q8_cache_stores_match_cpu_quantization() {
         let d = MetalDevice::new().unwrap();
@@ -2751,6 +3362,8 @@ mod tests {
             .u(0)
             .unwrap()
             .u(cap)
+            .unwrap()
+            .u(1)
             .unwrap();
         let e = d.execution_with_shared_encoder(true).unwrap();
         d.dispatch_hybrid(
@@ -2848,11 +3461,17 @@ mod tests {
                 for x in [m, heads, kv_heads, dim, pos, stride] {
                     args = args.u(x).unwrap();
                 }
-                let args = args.f(1.);
+                let args = args.f(1.).u(0).unwrap().u(1).unwrap().u(0).unwrap();
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
                     "h_attention",
-                    &[q.binding(), kr.binding(), vr.binding(), qg.binding()],
+                    &[
+                        q.binding(),
+                        kr.binding(),
+                        vr.binding(),
+                        qg.binding(),
+                        qg.binding(),
+                    ],
                     &[reference.binding()],
                     &args.0,
                     [heads, m, 1],
@@ -2877,6 +3496,9 @@ mod tests {
                     for x in [m, heads, kv_heads, group, pos, stride, kps, splits, cap] {
                         fa = fa.u(x).unwrap();
                     }
+                    for x in [dim, 0, 0, 1, 0] {
+                        fa = fa.u(x).unwrap();
+                    }
                     let mpp = name.starts_with("h_flash_attn_mpp");
                     let verify = name.starts_with("h_attn_verify_mpp");
                     let qk = Tensor::zeros(&d, [m, heads * dim], DType::F16).unwrap();
@@ -2898,14 +3520,19 @@ mod tests {
                     } else {
                         vec![out.binding(), partial.binding(), ml.binding()]
                     };
+                    let mut inputs = vec![
+                        if verify { qk.binding() } else { q.binding() },
+                        kc.binding(),
+                        vc.binding(),
+                        qg.binding(),
+                    ];
+                    // The legacy non-staged prefill kernel predates sinks.
+                    if name != "h_flash_attn_mpp" {
+                        inputs.push(qg.binding());
+                    }
                     d.dispatch_hybrid(
                         name,
-                        &[
-                            if verify { qk.binding() } else { q.binding() },
-                            kc.binding(),
-                            vc.binding(),
-                            qg.binding(),
-                        ],
+                        &inputs,
                         &outputs,
                         &fa.0,
                         groups,
@@ -2916,7 +3543,7 @@ mod tests {
                     if splits > 1 {
                         d.dispatch_hybrid(
                             "h_flash_reduce",
-                            &[partial.binding(), ml.binding(), qg.binding()],
+                            &[partial.binding(), ml.binding(), qg.binding(), qg.binding()],
                             &[out.binding()],
                             &fa.0,
                             [m * heads, 1, 1],

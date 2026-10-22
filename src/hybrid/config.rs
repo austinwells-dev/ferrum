@@ -12,6 +12,24 @@ pub enum Variant {
     Dense,
     /// `qwen35moe`: routed experts plus a sigmoid-gated shared expert.
     Moe,
+    /// `flint`: full attention on every layer (some sliding-window), learned
+    /// sinks, dense feed-forward for the leading layers, then sigmoid-routed
+    /// experts with an ungated shared expert.
+    Flint,
+}
+
+/// How one attention layer masks, rotates and gates its keys and queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttnSpec {
+    /// Sliding window in tokens: a key at `pos - key >= window` is masked.
+    /// `None` attends to the whole context.
+    pub window: Option<usize>,
+    /// Rotary embedding on Q and K.
+    pub rope: bool,
+    /// Learned per-head sink logits (`attn_sinks`) join the softmax denominator.
+    pub sinks: bool,
+    /// Sigmoid output gate fused into `attn_q` (Qwen3.5 gated attention).
+    pub gated: bool,
 }
 
 /// Storage format of the attention K/V cache.
@@ -83,6 +101,12 @@ pub struct MoeConfig {
     pub experts_used: usize,
     pub expert_ffn: usize,
     pub shared_ffn: usize,
+    /// Scores are sigmoid(logit) rather than softmax over all experts.
+    pub sigmoid: bool,
+    /// Selected weights are divided by their sum.
+    pub norm_weights: bool,
+    /// The shared expert has a sigmoid gate (`ffn_gate_inp_shexp`).
+    pub shared_gate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -95,6 +119,11 @@ pub struct HybridConfig {
     pub layers: usize,
     /// Layers with full attention (the rest are Gated DeltaNet).
     pub attention_layers: Vec<bool>,
+    /// Per-layer attention options, one entry per trunk layer.
+    pub attn: Vec<AttnSpec>,
+    /// Leading layers with a dense feed-forward block (all of them for
+    /// `qwen35`, none for `qwen35moe`).
+    pub leading_dense: usize,
     pub heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
@@ -124,9 +153,10 @@ impl HybridConfig {
         let variant = match arch {
             "qwen35" => Variant::Dense,
             "qwen35moe" => Variant::Moe,
+            "flint" => Variant::Flint,
             other => {
                 return Err(Error::Config(format!(
-                    "GGUF architecture {other:?} is not a Qwen3.5 hybrid"
+                    "GGUF architecture {other:?} is not a supported hybrid"
                 )));
             }
         };
@@ -140,22 +170,25 @@ impl HybridConfig {
             .checked_sub(nextn)
             .filter(|&l| l > 0)
             .ok_or_else(|| Error::Config("no trunk layers".into()))?;
-        let attention_layers = match md.get(&key("attention.recurrent_layers")) {
-            Some(MetadataValue::Array { values, .. }) => values
-                .iter()
-                .take(layers)
-                .map(|v| match v {
-                    MetadataValue::Bool(recurrent) => Ok(!recurrent),
-                    _ => Err(Error::Config("recurrent_layers must be booleans".into())),
-                })
-                .collect::<Result<Vec<_>>>()?,
-            _ => {
-                let interval = match md.get(&key("full_attention_interval")) {
-                    Some(_) => uint(md, &key("full_attention_interval"))?,
-                    None => 4,
-                };
-                (0..layers).map(|i| (i + 1) % interval == 0).collect()
-            }
+        let attention_layers = match variant {
+            Variant::Flint => vec![true; layers],
+            _ => match md.get(&key("attention.recurrent_layers")) {
+                Some(MetadataValue::Array { values, .. }) => values
+                    .iter()
+                    .take(layers)
+                    .map(|v| match v {
+                        MetadataValue::Bool(recurrent) => Ok(!recurrent),
+                        _ => Err(Error::Config("recurrent_layers must be booleans".into())),
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                _ => {
+                    let interval = match md.get(&key("full_attention_interval")) {
+                        Some(_) => uint(md, &key("full_attention_interval"))?,
+                        None => 4,
+                    };
+                    (0..layers).map(|i| (i + 1) % interval == 0).collect()
+                }
+            },
         };
         if attention_layers.len() != layers {
             return Err(Error::Config("recurrent layer mask is too short".into()));
@@ -164,14 +197,26 @@ impl HybridConfig {
         if uint(md, &key("attention.value_length"))? != head_dim {
             return Err(Error::Config("K/V head dimensions differ".into()));
         }
-        let ssm_head_dim = uint(md, &key("ssm.state_size"))?;
-        let ssm_v_heads = uint(md, &key("ssm.time_step_rank"))?;
-        let ssm_k_heads = uint(md, &key("ssm.group_count"))?;
-        if uint(md, &key("ssm.inner_size"))? != ssm_v_heads * ssm_head_dim {
-            return Err(Error::Config(
-                "ssm.inner_size must equal time_step_rank * state_size".into(),
-            ));
-        }
+        // Flint has no recurrent layers, so its SSM keys are absent and unused.
+        let (ssm_head_dim, ssm_v_heads, ssm_k_heads, conv_kernel) = match variant {
+            Variant::Flint => (0, 0, 0, 4),
+            _ => {
+                let ssm_head_dim = uint(md, &key("ssm.state_size"))?;
+                let ssm_v_heads = uint(md, &key("ssm.time_step_rank"))?;
+                let ssm_k_heads = uint(md, &key("ssm.group_count"))?;
+                if uint(md, &key("ssm.inner_size"))? != ssm_v_heads * ssm_head_dim {
+                    return Err(Error::Config(
+                        "ssm.inner_size must equal time_step_rank * state_size".into(),
+                    ));
+                }
+                (
+                    ssm_head_dim,
+                    ssm_v_heads,
+                    ssm_k_heads,
+                    uint(md, &key("ssm.conv_kernel"))?,
+                )
+            }
+        };
         let moe = match variant {
             Variant::Dense => None,
             Variant::Moe => Some(MoeConfig {
@@ -179,8 +224,34 @@ impl HybridConfig {
                 experts_used: uint(md, &key("expert_used_count"))?,
                 expert_ffn: uint(md, &key("expert_feed_forward_length"))?,
                 shared_ffn: uint(md, &key("expert_shared_feed_forward_length"))?,
+                sigmoid: false,
+                norm_weights: true,
+                shared_gate: true,
             }),
+            Variant::Flint => {
+                let gating = uint(md, &key("expert_gating_func"))?;
+                if gating != 2 {
+                    return Err(Error::Config(format!(
+                        "expert gating function {gating} is not sigmoid"
+                    )));
+                }
+                Some(MoeConfig {
+                    experts: uint(md, &key("expert_count"))?,
+                    experts_used: uint(md, &key("expert_used_count"))?,
+                    expert_ffn: uint(md, &key("expert_feed_forward_length"))?,
+                    shared_ffn: uint(md, &key("expert_shared_feed_forward_length"))?,
+                    sigmoid: true,
+                    norm_weights: flag(md, &key("expert_weights_norm"), false),
+                    shared_gate: false,
+                })
+            }
         };
+        let leading_dense = match variant {
+            Variant::Dense => layers,
+            Variant::Moe => 0,
+            Variant::Flint => uint_or(md, &key("leading_dense_block_count"), 0)?,
+        };
+        let attn = attention_specs(md, &key, variant, layers)?;
         let embedding = file.tensor("token_embd.weight")?.logical_matrix_shape()?;
         let config = Self {
             variant,
@@ -195,18 +266,23 @@ impl HybridConfig {
             hidden: uint(md, &key("embedding_length"))?,
             layers,
             attention_layers,
+            attn,
+            leading_dense,
             heads: uint(md, &key("attention.head_count"))?,
             kv_heads: uint(md, &key("attention.head_count_kv"))?,
             head_dim,
-            rope_dims: uint(md, &key("rope.dimension_count"))?,
+            rope_dims: match variant {
+                Variant::Flint => uint_or(md, &key("rope.dimension_count"), head_dim)?,
+                Variant::Dense | Variant::Moe => uint(md, &key("rope.dimension_count"))?,
+            },
             rope_theta: float(md, &key("rope.freq_base"))?,
             rope_sections: rope_sections(md, &key("rope.dimension_sections")),
             eps: float(md, &key("attention.layer_norm_rms_epsilon"))?,
             ffn: match variant {
-                Variant::Dense => uint(md, &key("feed_forward_length"))?,
                 Variant::Moe => 0,
+                Variant::Dense | Variant::Flint => uint(md, &key("feed_forward_length"))?,
             },
-            conv_kernel: uint(md, &key("ssm.conv_kernel"))?,
+            conv_kernel,
             ssm_head_dim,
             ssm_k_heads,
             ssm_v_heads,
@@ -223,26 +299,32 @@ impl HybridConfig {
         if embedding_mismatch(self) {
             return bad("embedding width");
         }
-        if self.head_dim != 256
-            || self.rope_dims > self.head_dim
-            || !self.rope_dims.is_multiple_of(2)
-        {
-            return bad("attention head dimension must be 256 with even RoPE width");
+        let head_dim_ok = match self.variant {
+            Variant::Flint => matches!(self.head_dim, 128 | 256),
+            Variant::Dense | Variant::Moe => self.head_dim == 256,
+        };
+        if !head_dim_ok || self.rope_dims > self.head_dim || !self.rope_dims.is_multiple_of(2) {
+            return bad("attention head dimension with even RoPE width");
         }
         if self.kv_heads == 0 || !self.heads.is_multiple_of(self.kv_heads) {
             return bad("grouped-query head ratio");
         }
-        if self.conv_kernel != 4 {
-            return bad("convolution kernel must be 4");
+        if self.recurrent_layer_count() > 0 {
+            if self.conv_kernel != 4 {
+                return bad("convolution kernel must be 4");
+            }
+            if self.ssm_head_dim != 128
+                || self.ssm_k_heads == 0
+                || !self.ssm_v_heads.is_multiple_of(self.ssm_k_heads)
+            {
+                return bad("delta-rule heads must be 128 wide with V heads a multiple of K heads");
+            }
         }
-        if self.ssm_head_dim != 128
-            || self.ssm_k_heads == 0
-            || !self.ssm_v_heads.is_multiple_of(self.ssm_k_heads)
-        {
-            return bad("delta-rule heads must be 128 wide with V heads a multiple of K heads");
+        if self.attn.len() != self.layers || self.leading_dense > self.layers {
+            return bad("per-layer attention options and dense layer count");
         }
         if !self.hidden.is_multiple_of(256)
-            || (self.variant == Variant::Dense && !self.ffn.is_multiple_of(256))
+            || (self.variant != Variant::Moe && !self.ffn.is_multiple_of(256))
         {
             return bad("projection widths must be multiples of 256");
         }
@@ -260,6 +342,16 @@ impl HybridConfig {
 
     pub fn is_attention(&self, layer: usize) -> bool {
         self.attention_layers[layer]
+    }
+    /// Whether `layer` runs the dense feed-forward (rather than experts).
+    pub fn dense_ffn(&self, layer: usize) -> bool {
+        layer < self.leading_dense
+    }
+    /// Query rows of `attn_q` per token: heads * head_dim, doubled when the
+    /// output gate is fused into the projection.
+    pub fn query_width(&self) -> usize {
+        let gated = self.attn.iter().any(|a| a.gated);
+        self.heads * self.head_dim * if gated { 2 } else { 1 }
     }
     pub fn attention_layer_count(&self) -> usize {
         self.attention_layers.iter().filter(|&&a| a).count()
@@ -286,6 +378,75 @@ impl HybridConfig {
         let conv = (self.conv_kernel - 1) * self.conv_channels() * 4;
         let ssm = self.ssm_v_heads * self.ssm_head_dim * self.ssm_head_dim * 4;
         self.recurrent_layer_count() * (conv + ssm)
+    }
+}
+
+/// Per-layer attention options. Flint masks layers flagged in
+/// `sliding_window_pattern` to `sliding_window` and skips RoPE where
+/// `rope_pattern` is false; Qwen3.5 has neither pattern and always gates Q.
+fn attention_specs(
+    md: &BTreeMap<String, MetadataValue>,
+    key: &dyn Fn(&str) -> String,
+    variant: Variant,
+    layers: usize,
+) -> Result<Vec<AttnSpec>> {
+    let sliding = bool_array(md, &key("attention.sliding_window_pattern"), layers)?;
+    let window = match sliding {
+        Some(_) => Some(uint(md, &key("attention.sliding_window"))?),
+        None => None,
+    };
+    let rope = bool_array(md, &key("attention.rope_pattern"), layers)?;
+    Ok((0..layers)
+        .map(|i| AttnSpec {
+            window: sliding.as_ref().filter(|p| p[i]).and(window),
+            rope: rope.as_ref().is_none_or(|p| p[i]),
+            sinks: variant == Variant::Flint,
+            gated: variant != Variant::Flint,
+        })
+        .collect())
+}
+
+fn bool_array(
+    md: &BTreeMap<String, MetadataValue>,
+    key: &str,
+    layers: usize,
+) -> Result<Option<Vec<bool>>> {
+    match md.get(key) {
+        None => Ok(None),
+        Some(MetadataValue::Array { values, .. }) => {
+            let flags = values
+                .iter()
+                .map(|v| match v {
+                    MetadataValue::Bool(b) => Ok(*b),
+                    _ => Err(Error::Config(format!("{key} must hold booleans"))),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if flags.len() != layers {
+                return Err(Error::Config(format!(
+                    "{key} has {} entries for {layers} layers",
+                    flags.len()
+                )));
+            }
+            Ok(Some(flags))
+        }
+        Some(_) => Err(Error::Config(format!("{key} must be an array"))),
+    }
+}
+
+/// A boolean metadata value, or `default` when the key is absent.
+fn flag(md: &BTreeMap<String, MetadataValue>, key: &str, default: bool) -> bool {
+    match md.get(key) {
+        Some(MetadataValue::Bool(b)) => *b,
+        _ => default,
+    }
+}
+
+/// An unsigned metadata value, or `default` when the key is absent.
+fn uint_or(md: &BTreeMap<String, MetadataValue>, key: &str, default: usize) -> Result<usize> {
+    if md.contains_key(key) {
+        uint(md, key)
+    } else {
+        Ok(default)
     }
 }
 

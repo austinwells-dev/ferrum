@@ -1,7 +1,7 @@
 //! A tiny random DFlash2 drafter written both as an HF checkpoint and as a
 //! llama.cpp-style GGUF must load to the same config and the same weights.
 use super::*;
-use crate::hybrid::{KvCache, Variant};
+use crate::hybrid::{AttnSpec, KvCache, Variant};
 
 const VOCAB: usize = 512;
 const TARGET_HIDDEN: usize = 256;
@@ -387,6 +387,16 @@ fn target() -> HybridConfig {
         hidden: TARGET_HIDDEN,
         layers: 4,
         attention_layers: vec![false, false, false, true],
+        attn: vec![
+            AttnSpec {
+                window: None,
+                rope: true,
+                sinks: false,
+                gated: true,
+            };
+            4
+        ],
+        leading_dense: 4,
         heads: 2,
         kv_heads: 1,
         head_dim: 256,

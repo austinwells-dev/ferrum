@@ -1049,15 +1049,15 @@ impl DraftModel {
             let input = match &layer.attn_conv {
                 Some(conv) => {
                     let dyn_ = b.dyn_.view(0, [m, conv.proj.rows])?;
-                    t.project(d, &conv.proj, &hn, m, &dyn_)?;
+                    HybridModel::project(d, &conv.proj, &hn, m, &dyn_)?;
                     self.conv(d, conv, &hn, &hc, m, 0)?;
                     &hc
                 }
                 None => &hn,
             };
-            t.project(d, &layer.q, input, m, &q32)?;
-            t.project(d, &layer.k, input, m, &k32)?;
-            t.project(d, &layer.v, input, m, &v32)?;
+            HybridModel::project(d, &layer.q, input, m, &q32)?;
+            HybridModel::project(d, &layer.k, input, m, &k32)?;
+            HybridModel::project(d, &layer.v, input, m, &v32)?;
             let q_scale = c.rope_scale / (hd as f32).sqrt();
             self.prep(d, &q32, &layer.q_norm, &b.qh, c.heads, m, pos, 0, q_scale)?;
             self.prep(
@@ -1096,7 +1096,7 @@ impl DraftModel {
                 [128, 1, 1],
                 0,
             )?;
-            t.project(d, &layer.o, &att, m, &tmp)?;
+            HybridModel::project(d, &layer.o, &att, m, &tmp)?;
             if let Some(conv) = &layer.attn_conv {
                 self.conv(d, conv, &tmp, &hc, m, 1)?;
                 self.add(d, &x, &hc, m * h)?;
@@ -1107,14 +1107,14 @@ impl DraftModel {
             let input = match &layer.mlp_conv {
                 Some(conv) => {
                     let dyn_ = b.dyn_.view(0, [m, conv.proj.rows])?;
-                    t.project(d, &conv.proj, &hn, m, &dyn_)?;
+                    HybridModel::project(d, &conv.proj, &hn, m, &dyn_)?;
                     self.conv(d, conv, &hn, &hc, m, 0)?;
                     &hc
                 }
                 None => &hn,
             };
-            t.project(d, &layer.gate, input, m, &gate)?;
-            t.project(d, &layer.up, input, m, &up)?;
+            HybridModel::project(d, &layer.gate, input, m, &gate)?;
+            HybridModel::project(d, &layer.up, input, m, &up)?;
             d.dispatch_hybrid(
                 "h_swiglu",
                 &[gate.binding(), up.binding()],
@@ -1124,7 +1124,7 @@ impl DraftModel {
                 [256, 1, 1],
                 0,
             )?;
-            t.project(d, &layer.down, &act, m, &tmp)?;
+            HybridModel::project(d, &layer.down, &act, m, &tmp)?;
             if let Some(conv) = &layer.mlp_conv {
                 self.conv(d, conv, &tmp, &hc, m, 1)?;
                 self.add(d, &x, &hc, m * h)?;
@@ -1135,7 +1135,7 @@ impl DraftModel {
         self.rmsnorm(d, &x, &self.norm, &hn, m)?;
         let n = m - from;
         let out = hn.view(from * h, [n, h])?;
-        t.project(d, &self.head, &out, n, &b.logits.view(0, [n, self.vocab])?)
+        HybridModel::project(d, &self.head, &out, n, &b.logits.view(0, [n, self.vocab])?)
     }
 
     /// Greedy DFlash2 path through each row's top-k candidates.
@@ -1407,11 +1407,11 @@ impl Drafter for DraftModel {
         let gn = self.b.gn.view(0, [r, h])?;
         let kx = self.b.kx.view(0, [r, kvw])?;
         let vx = self.b.vx.view(0, [r, kvw])?;
-        t.project(d, &self.fc, &f, r, &g)?;
+        HybridModel::project(d, &self.fc, &f, r, &g)?;
         self.rmsnorm(d, &g, &self.hidden_norm, &gn, r)?;
         for (i, layer) in self.layers.iter().enumerate() {
-            t.project(d, &layer.k, &gn, r, &kx)?;
-            t.project(d, &layer.v, &gn, r, &vx)?;
+            HybridModel::project(d, &layer.k, &gn, r, &kx)?;
+            HybridModel::project(d, &layer.v, &gn, r, &vx)?;
             self.prep(
                 d,
                 &kx,
@@ -1461,7 +1461,13 @@ impl Drafter for DraftModel {
                     };
                     let w1p = b.w1p.view(i * rank, [1, rank])?;
                     t.get_rows(d, &markov.w1, &prev, &w1p)?;
-                    t.project(d, &markov.w2_head, &w1p, 1, &b.bias.view(0, [1, vocab])?)?;
+                    HybridModel::project(
+                        d,
+                        &markov.w2_head,
+                        &w1p,
+                        1,
+                        &b.bias.view(0, [1, vocab])?,
+                    )?;
                     let row = b.logits.view(i * vocab, [1, vocab])?;
                     d.dispatch_hybrid(
                         "h_accumulate",
@@ -1547,7 +1553,7 @@ impl Drafter for DraftModel {
                     0,
                 )?;
                 let out = b.hn.view(c.hidden, [max, c.hidden])?;
-                t.project(d, &sel.hidden, &out, max, &b.sel_gate.view(0, [max, rank])?)?;
+                HybridModel::project(d, &sel.hidden, &out, max, &b.sel_gate.view(0, [max, rank])?)?;
                 e.finish()?;
                 let raw = b.candidates.to_f32();
                 let candidates: Vec<Vec<(u32, f32)>> = raw

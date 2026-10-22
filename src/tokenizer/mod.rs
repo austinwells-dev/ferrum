@@ -29,6 +29,19 @@ impl Tokenizer {
         token_types: &[i32],
         pattern: &str,
     ) -> Result<Self> {
+        Self::from_gguf_bpe_with_patterns(tokens, merges, token_types, &[pattern], true)
+    }
+
+    /// GPT-2 byte-level BPE whose split patterns apply in order, each to the
+    /// pieces the previous one produced (llama.cpp's `regex_exprs`). `nfc`
+    /// normalizes the text first; llama.cpp leaves some families unnormalized.
+    pub(crate) fn from_gguf_bpe_with_patterns(
+        tokens: &[String],
+        merges: &[String],
+        token_types: &[i32],
+        patterns: &[&str],
+        nfc: bool,
+    ) -> Result<Self> {
         if tokens.is_empty() || tokens.len() != token_types.len() {
             return Err(Error::Tokenizer(
                 "GGUF Qwen token/type arrays are empty or differ in length".into(),
@@ -88,23 +101,24 @@ impl Tokenizer {
             "truncation": null,
             "padding": null,
             "added_tokens": special_tokens,
-            "normalizer": {"type": "NFC"},
+            "normalizer": if nfc { serde_json::json!({"type": "NFC"}) } else { serde_json::Value::Null },
             "pre_tokenizer": {
                 "type": "Sequence",
-                "pretokenizers": [
-                    {
+                "pretokenizers": patterns
+                    .iter()
+                    .map(|pattern| serde_json::json!({
                         "type": "Split",
                         "pattern": {"Regex": pattern},
                         "behavior": "Isolated",
                         "invert": false
-                    },
-                    {
+                    }))
+                    .chain(std::iter::once(serde_json::json!({
                         "type": "ByteLevel",
                         "add_prefix_space": false,
                         "trim_offsets": true,
                         "use_regex": false
-                    }
-                ]
+                    })))
+                    .collect::<Vec<_>>()
             },
             "post_processor": null,
             "decoder": {

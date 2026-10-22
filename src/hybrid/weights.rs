@@ -18,7 +18,9 @@ pub enum Format {
     Q4K,
     Q5K,
     Q6K,
+    Iq3Xxs,
     Iq3S,
+    Iq2S,
     Iq4Xs,
 }
 
@@ -31,7 +33,9 @@ impl Format {
             12 => Self::Q4K,
             13 => Self::Q5K,
             14 => Self::Q6K,
+            18 => Self::Iq3Xxs,
             21 => Self::Iq3S,
+            22 => Self::Iq2S,
             23 => Self::Iq4Xs,
             _ => return None,
         })
@@ -44,7 +48,9 @@ impl Format {
             Self::Q4K => "q4_k",
             Self::Q5K => "q5_k",
             Self::Q6K => "q6_k",
+            Self::Iq3Xxs => "iq3_xxs",
             Self::Iq3S => "iq3_s",
+            Self::Iq2S => "iq2_s",
             Self::Iq4Xs => "iq4_xs",
         }
     }
@@ -93,6 +99,8 @@ pub struct AttentionWeights {
     pub o: Matrix,
     pub q_norm: Tensor,
     pub k_norm: Tensor,
+    /// Per-head sink logits, for layers whose `AttnSpec::sinks` is set.
+    pub sinks: Option<Tensor>,
 }
 
 pub struct DeltaWeights {
@@ -124,7 +132,8 @@ pub struct MoeFfn {
     pub gate_exps: Matrix,
     pub up_exps: Matrix,
     pub down_exps: Matrix,
-    pub shared_gate_inp: Tensor,
+    /// Sigmoid gate of the shared expert (absent when `MoeConfig::shared_gate` is off).
+    pub shared_gate_inp: Option<Tensor>,
     pub shared: DenseFfn,
 }
 
@@ -163,6 +172,7 @@ impl Weights {
                         + m(&a.o)
                         + a.q_norm.byte_size()
                         + a.k_norm.byte_size()
+                        + a.sinks.as_ref().map_or(0, Tensor::byte_size)
                 }
                 Mixer::Delta(d) => {
                     m(&d.qkv)
@@ -183,7 +193,7 @@ impl Weights {
                         + m(&f.gate_exps)
                         + m(&f.up_exps)
                         + m(&f.down_exps)
-                        + f.shared_gate_inp.byte_size()
+                        + f.shared_gate_inp.as_ref().map_or(0, Tensor::byte_size)
                         + dense(&f.shared)
                 }
             };
@@ -204,6 +214,29 @@ impl Loader<'_> {
 
     fn stacked(&mut self, name: &str, experts: usize, rows: usize, cols: usize) -> Result<Matrix> {
         gguf_matrix(self.device, self.file, name, experts, rows, cols)
+    }
+
+    /// `[experts, hidden]` router. BF16 routers are widened to F32 once here so
+    /// the F32 GEMV reads them; other encodings load as-is.
+    fn router(&mut self, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
+        let info = self.file.tensor(name)?.clone();
+        if info.type_id != 30 {
+            return self.matrix(name, rows, cols);
+        }
+        if info.dimensions != [cols, rows] || info.byte_len != rows * cols * 2 {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: format!("expected a BF16 [{rows}, {cols}] router"),
+            });
+        }
+        let mut raw = vec![0u8; info.byte_len];
+        self.file.read_tensor_into(name, &mut raw)?;
+        Matrix::from_rows(self.device, rows, cols, Format::F32, |r, out| {
+            let row = &raw[r * cols * 2..][..cols * 2];
+            for (o, b) in out.iter_mut().zip(row.chunks_exact(2)) {
+                *o = f32::from_bits(u32::from(u16::from_le_bytes([b[0], b[1]])) << 16);
+            }
+        })
     }
 
     fn vector(&mut self, name: &str, len: usize) -> Result<Tensor> {
@@ -298,17 +331,32 @@ pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Resu
     for i in 0..c.layers {
         let n = |s: &str| format!("blk.{i}.{s}");
         let attn_norm = l.vector(&n("attn_norm.weight"), c.hidden)?;
-        let post_norm = l.vector(&n("post_attention_norm.weight"), c.hidden)?;
+        // Flint has no separate post-attention norm: `ffn_norm` sits there.
+        let post_norm = match c.variant {
+            Variant::Flint => l.vector(&n("ffn_norm.weight"), c.hidden)?,
+            Variant::Dense | Variant::Moe => {
+                l.vector(&n("post_attention_norm.weight"), c.hidden)?
+            }
+        };
         let mixer = if c.is_attention(i) {
             let q = c.heads * c.head_dim;
             let kv = c.kv_heads * c.head_dim;
+            let spec = c.attn[i];
             Mixer::Attention(AttentionWeights {
-                q: l.matrix(&n("attn_q.weight"), 2 * q, c.hidden)?,
+                q: l.matrix(
+                    &n("attn_q.weight"),
+                    if spec.gated { 2 * q } else { q },
+                    c.hidden,
+                )?,
                 k: l.matrix(&n("attn_k.weight"), kv, c.hidden)?,
                 v: l.matrix(&n("attn_v.weight"), kv, c.hidden)?,
                 o: l.matrix(&n("attn_output.weight"), c.hidden, q)?,
                 q_norm: l.vector(&n("attn_q_norm.weight"), c.head_dim)?,
                 k_norm: l.vector(&n("attn_k_norm.weight"), c.head_dim)?,
+                sinks: match spec.sinks {
+                    true => Some(l.vector(&n("attn_sinks.weight"), c.heads)?),
+                    false => None,
+                },
             })
         } else {
             let v_heads = c.ssm_v_heads;
@@ -324,16 +372,19 @@ pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Resu
                 norm: l.vector(&n("ssm_norm.weight"), c.ssm_head_dim)?,
             })
         };
-        let ffn = match c.variant {
-            Variant::Dense => Ffn::Dense(DenseFfn {
+        let ffn = if c.dense_ffn(i) {
+            Ffn::Dense(DenseFfn {
                 gate: l.matrix(&n("ffn_gate.weight"), c.ffn, c.hidden)?,
                 up: l.matrix(&n("ffn_up.weight"), c.ffn, c.hidden)?,
                 down: l.matrix(&n("ffn_down.weight"), c.hidden, c.ffn)?,
-            }),
-            Variant::Moe => {
-                let moe = c.moe.expect("MoE variant carries expert geometry");
+            })
+        } else {
+            {
+                let moe = c.moe.expect("expert layer carries expert geometry");
                 Ffn::Moe(MoeFfn {
-                    router: l.matrix(&n("ffn_gate_inp.weight"), moe.experts, c.hidden)?,
+                    // TODO: `ffn_exp_probs.bias` (a selection bias on the scores) is
+                    // absent from the Flint GGUF; load it when a checkpoint carries it.
+                    router: l.router(&n("ffn_gate_inp.weight"), moe.experts, c.hidden)?,
                     gate_exps: l.stacked(
                         &n("ffn_gate_exps.weight"),
                         moe.experts,
@@ -352,7 +403,10 @@ pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Resu
                         c.hidden,
                         moe.expert_ffn,
                     )?,
-                    shared_gate_inp: l.vector(&n("ffn_gate_inp_shexp.weight"), c.hidden)?,
+                    shared_gate_inp: match moe.shared_gate {
+                        true => Some(l.vector(&n("ffn_gate_inp_shexp.weight"), c.hidden)?),
+                        false => None,
+                    },
                     shared: DenseFfn {
                         gate: l.matrix(&n("ffn_gate_shexp.weight"), moe.shared_ffn, c.hidden)?,
                         up: l.matrix(&n("ffn_up_shexp.weight"), moe.shared_ffn, c.hidden)?,
@@ -452,6 +506,7 @@ pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> 
             o: l.matrix(&n("attn_output.weight"), c.hidden, q)?,
             q_norm: l.vector(&n("attn_q_norm.weight"), c.head_dim)?,
             k_norm: l.vector(&n("attn_k_norm.weight"), c.head_dim)?,
+            sinks: None,
         },
         ffn: DenseFfn {
             gate: l.matrix(&n("ffn_gate.weight"), ffn_width, c.hidden)?,
@@ -529,6 +584,50 @@ impl Matrix {
             rows,
             cols,
             experts: 1,
+            format,
+            row_bytes,
+            storage,
+        })
+    }
+
+    /// `experts` stacked slices of `rows` rows each, from raw packed bytes in
+    /// `format`, for kernel tests.
+    #[cfg(test)]
+    pub(crate) fn from_packed(
+        device: &MetalDevice,
+        rows: usize,
+        cols: usize,
+        experts: usize,
+        format: Format,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let type_id = match format {
+            Format::Iq3Xxs => 18,
+            Format::Iq3S => 21,
+            Format::Iq2S => 22,
+            f => {
+                return Err(Error::Parameter(format!(
+                    "no raw test path for {}",
+                    f.name()
+                )));
+            }
+        };
+        let layout = block_layout(type_id)?;
+        let row_bytes = cols / layout.elements * layout.bytes;
+        if row_bytes * rows * experts != bytes.len() {
+            return Err(Error::Shape(format!(
+                "{rows} x {experts} rows of {row_bytes} bytes against {} bytes",
+                bytes.len()
+            )));
+        }
+        let storage = PackedStorage::from_reader(device, bytes.len(), |dst| {
+            dst.copy_from_slice(bytes);
+            Ok(())
+        })?;
+        Ok(Matrix {
+            rows: rows * experts,
+            cols,
+            experts,
             format,
             row_bytes,
             storage,

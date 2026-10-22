@@ -13,6 +13,8 @@ Ferrum runs 27B–35B language models on a 32 GB Mac, faster than llama.cpp on t
 
 You give it a model file and then either chat in the terminal, use the full-screen TUI (chat, a sandboxed coding agent, and a benchmarking tool), or run a local server that speaks the **OpenAI** and **Anthropic** APIs, so existing clients and coding agents work with it unchanged.
 
+> **Experimental.** This branch adds Flint (unsloth's `flint-GGUF`) support. It is not production-ready: it is checked against llama.cpp on one quant only, its tool-call parsing is new, and the API it sits behind may change. Everything on `main` is unaffected. Details and known gaps: [docs/experimental.md](docs/experimental.md).
+
 ## Highlights
 
 - **Faster than llama.cpp on the same files.** Measured on an M5: 15% faster prefill and 11% faster decode on a dense 27B model, 8–18% faster on a 35B mixture-of-experts. [Numbers below](#performance).
@@ -56,6 +58,16 @@ Ferrum never downloads anything, so you provide the model files. The main engine
 # Needs the Hugging Face CLI (pip install -U huggingface_hub)
 hf download peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP \
   Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf --local-dir ~/models
+```
+
+**Experimental:** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks), in the `experimental` branch only. One quant is validated:
+
+| Model | Hugging Face repo | File | Size |
+|---|---|---|---|
+| Flint Preview (MoE, experimental) | [`unsloth/flint-GGUF`](https://huggingface.co/unsloth/flint-GGUF) | `flint-UD-Q3_K_XL.gguf` | 18.5 GB |
+
+```sh
+hf download unsloth/flint-GGUF flint-UD-Q3_K_XL.gguf --local-dir ~/models
 ```
 
 The MoE model is the better place to start because it decodes at about 40 tok/s. The TUI finds models on its own in `~/models`, `~/Downloads`, the Hugging Face cache and LM Studio's folder, and greys out any file Ferrum can't run, with the reason.
@@ -166,7 +178,7 @@ ferrum run --model ~/.cache/huggingface/hub/models--Qwen--Qwen3-0.6B/snapshots/<
   --prompt 'Hello!' --max-new-tokens 32 --temperature 0
 ```
 
-Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants and IQ4_XS/IQ3_S, and MLX affine Q4.
+Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants and IQ4_XS/IQ3_XXS/IQ3_S/IQ2_S, and MLX affine Q4.
 
 ## Documentation
 
@@ -177,13 +189,14 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | [Development](docs/development.md) | Building, testing (including Metal validation layers), profiling, using Ferrum as a library |
 | [Architecture](docs/architecture.md) | Tensor and storage model, Metal backend, safety argument, the hybrid engine |
 | [Vision](docs/vision.md) | How image input is encoded and positioned |
+| [Experimental](docs/experimental.md) | Flint support: status, validation numbers, known gaps |
 | [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
 
 ## Limitations
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - One request at a time (batch size 1).
-- The server and TUI run Qwen3.5-family hybrids only. Other architectures go through the developer runner.
+- The server and TUI run Qwen3.5-family hybrids and, experimentally, Flint. Other architectures go through the developer runner.
 - Vision supports the Qwen3-VL projector only (no video).
 - No training and no language bindings.
 

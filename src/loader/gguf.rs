@@ -103,7 +103,9 @@ pub fn block_layout(type_id: u32) -> Result<BlockLayout> {
         13 => (256, 176),
         14 => (256, 210),
         15 => (256, 292),
+        18 => (256, 98),  // IQ3_XXS
         21 => (256, 110), // IQ3_S
+        22 => (256, 82),  // IQ2_S
         23 => (256, 136), // IQ4_XS
         30 => (1, 2),     // BF16
         _ => {
@@ -911,5 +913,21 @@ mod tests {
                 bytes: 144
             }
         );
+    }
+
+    #[test]
+    fn iq_block_sizes_match_the_ggml_layouts() {
+        // block_iq3_xxs: f16 scale + 3 * QK_K/8 bytes; block_iq2_s: f16 scale +
+        // QK_K/4 quants + QK_K/16 bytes of high bits and scales.
+        for (type_id, bytes) in [(18, 98), (21, 110), (22, 82)] {
+            assert_eq!(
+                block_layout(type_id).unwrap(),
+                BlockLayout {
+                    elements: 256,
+                    bytes
+                },
+                "type {type_id}"
+            );
+        }
     }
 }

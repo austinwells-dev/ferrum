@@ -145,7 +145,7 @@ impl Mtp {
         t.capture(d, &xn, &self.cat, 0, m)?;
         t.rmsnorm(d, h, &w.hnorm, &xn, m)?;
         t.capture(d, &xn, &self.cat, 1, m)?;
-        t.project(d, &w.eh_proj, &cat, m, &x1)?;
+        HybridModel::project(d, &w.eh_proj, &cat, m, &x1)?;
         t.rmsnorm(d, &x1, &w.attn_norm, &xn, m)?;
         t.attention_with(
             d,
@@ -165,7 +165,7 @@ impl Mtp {
         t.add_rmsnorm(d, &x0, &mix, &w.head_norm, &x1, &xn, m)?;
         if let Some((token, h_out)) = out {
             let last = xn.view((m - 1) * hd, [1, hd])?;
-            t.project(d, &self.head, &last, 1, &self.logits)?;
+            HybridModel::project(d, &self.head, &last, 1, &self.logits)?;
             d.dispatch_hybrid(
                 "h_argmax",
                 &[self.logits.binding()],
