@@ -26,6 +26,12 @@ impl App {
             Some(m) => opt("mtp", "MTP", &m.mtp_why, Fit::Blocked),
             None => opt("mtp", "MTP", "no model selected", Fit::Blocked),
         });
+        options.push(opt(
+            "lookup",
+            "Prompt lookup",
+            "copies spans from the context · no drafter model",
+            Fit::Plain,
+        ));
         let (mut fits, mut blocked) = (Vec::new(), Vec::new());
         for d in self.drafters_for(model) {
             let why = match model {

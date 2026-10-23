@@ -1104,7 +1104,7 @@ pub struct EvalPlan {
 impl EvalPlan {
     pub fn draft_label(&self) -> String {
         match &self.draft {
-            Some((c, d)) => format!("{} · depth {d} · {}", c.label(), c.quant),
+            Some((c, d)) => format!("{} · depth {d} · {}", c.label(), c.quant_label()),
             None => "plain decoding".into(),
         }
     }

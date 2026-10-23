@@ -1,6 +1,6 @@
-# Experimental: Flint
+# Experimental: Flint and Spark
 
-> **Experimental.** This page covers Flint support, which lives on the `experimental` branch only. It is not production-ready. Expect rough edges, and expect the behaviour and the parsing to change.
+> **Experimental.** This page covers Flint and Spark support, which lives on the `experimental` branch only. It is not production-ready. Expect rough edges, and expect the behaviour and the parsing to change.
 
 ## What works
 
@@ -42,3 +42,26 @@ cargo run --release --bin ferrum-tui
 ```
 
 Pick the model in the Models tab. It shows as runnable once the quant check passes.
+
+# Spark-X2.6-4B
+
+XHToken's `spark2_5` architecture: a 4.4B dense model with attention on all 36 layers (three 512-token sliding-window layers to each global one), fused QKV, a per-head sigmoid output gate, no QK norm, a GEGLU feed-forward, and separate RoPE on sliding-window layers (256 dims at a 10k base, against 64 dims at 5M on global layers). It runs on the Flint path of the hybrid engine (`Variant::Spark`), with the same K/V rings.
+
+## Validation
+
+`XHToken/Spark-X2.6-4B-GGUF`, file `Spark-X2.6-4B-Q4_K_M.gguf` (3.5 GB), against llama.cpp build 11669 on a 32 GB M-series Mac.
+
+| Check | Result |
+|---|---|
+| Tokenizer ids vs `llama-tokenize` (mixed-script stress file, README, architecture.md; 13.4K tokens) | identical |
+| Greedy continuation, "The capital of France is" | identical to `llama-simple` |
+| KLD vs llama.cpp Metal, 5,115 positions | mean 0.0012, median 0.00008, top-1 99.35%; PPL 13.303 vs 13.298 |
+| llama.cpp CPU vs its own Metal (same file) | mean 0.0040, median 0.0010, top-1 97.9% |
+| Speed (`hybrid_bench` vs `llama-bench`, interleaved) | pp512 1161 vs 1110-1165 tok/s; pp2048 1094 vs 1066-1121; tg128 35-38 vs 36-39 |
+
+## Known gaps
+
+- One quant (`Q4_K_M`) is validated. Its embedding and head gates are BF16. `Q8_0` should load but is untested; the all-BF16 file (`Spark-X2.6-4B.gguf`) is refused, since only embeddings, LM heads, routers, head gates and the fused QKV accept BF16.
+- Tool calls use Flint's `<arg_key>`/`<arg_value>` format and go through the same parser, untested against this model.
+- `reasoning_effort` (`low`/`high`) is passed through to the template; the 1M trained context is capped by the memory plan.
+- No trained drafter (MTP, DFlash, DSpark) exists for Spark. Prompt lookup (`--draft lookup`, "Prompt lookup" in the TUI) works and is lossless: 1.13× on the `hybrid_spec` chat prompts (35.8 → 40.4 tok/s). Plain decode already reads weights at about 81% of the M5's measured bandwidth ceiling.

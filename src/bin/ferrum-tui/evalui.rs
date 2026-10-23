@@ -285,6 +285,7 @@ impl App {
         let source = match text("draft")? {
             "off" => return None,
             "mtp" => Source::Mtp,
+            "lookup" => Source::Lookup,
             path => {
                 let path = PathBuf::from(path);
                 if !path.exists() {

@@ -16,6 +16,10 @@ pub enum Variant {
     /// sinks, dense feed-forward for the leading layers, then sigmoid-routed
     /// experts with an ungated shared expert.
     Flint,
+    /// `spark2_5`: full attention on every layer (sliding-window except every
+    /// fourth), fused QKV, a per-head sigmoid output gate, no QK norm, its own
+    /// RoPE width and base on sliding-window layers, and a GEGLU feed-forward.
+    Spark,
 }
 
 /// How one attention layer masks, rotates and gates its keys and queries.
@@ -129,12 +133,17 @@ pub struct HybridConfig {
     pub head_dim: usize,
     pub rope_dims: usize,
     pub rope_theta: f32,
+    /// RoPE width and base of sliding-window layers, when the GGUF gives them
+    /// their own (`spark2_5`: 256 dims at a 10k base against 64 at 5M).
+    pub swa_rope: Option<(usize, f32)>,
     /// Interleaved multi-axis RoPE sections (time, height, width, extra) used
     /// to position image tokens; zeros when the GGUF declares none.
     pub rope_sections: [usize; 4],
     pub eps: f32,
     /// Dense FFN width (unused by MoE layers).
     pub ffn: usize,
+    /// Dense FFN activation is GELU (tanh) rather than SiLU: `gelu(gate) * up`.
+    pub gelu_ffn: bool,
     pub conv_kernel: usize,
     /// Per-head state width of the delta rule (both K and V head dims).
     pub ssm_head_dim: usize,
@@ -154,6 +163,7 @@ impl HybridConfig {
             "qwen35" => Variant::Dense,
             "qwen35moe" => Variant::Moe,
             "flint" => Variant::Flint,
+            "spark2_5" => Variant::Spark,
             other => {
                 return Err(Error::Config(format!(
                     "GGUF architecture {other:?} is not a supported hybrid"
@@ -171,7 +181,7 @@ impl HybridConfig {
             .filter(|&l| l > 0)
             .ok_or_else(|| Error::Config("no trunk layers".into()))?;
         let attention_layers = match variant {
-            Variant::Flint => vec![true; layers],
+            Variant::Flint | Variant::Spark => vec![true; layers],
             _ => match md.get(&key("attention.recurrent_layers")) {
                 Some(MetadataValue::Array { values, .. }) => values
                     .iter()
@@ -197,9 +207,10 @@ impl HybridConfig {
         if uint(md, &key("attention.value_length"))? != head_dim {
             return Err(Error::Config("K/V head dimensions differ".into()));
         }
-        // Flint has no recurrent layers, so its SSM keys are absent and unused.
+        // Flint and Spark have no recurrent layers, so their SSM keys are
+        // absent and unused.
         let (ssm_head_dim, ssm_v_heads, ssm_k_heads, conv_kernel) = match variant {
-            Variant::Flint => (0, 0, 0, 4),
+            Variant::Flint | Variant::Spark => (0, 0, 0, 4),
             _ => {
                 let ssm_head_dim = uint(md, &key("ssm.state_size"))?;
                 let ssm_v_heads = uint(md, &key("ssm.time_step_rank"))?;
@@ -218,7 +229,7 @@ impl HybridConfig {
             }
         };
         let moe = match variant {
-            Variant::Dense => None,
+            Variant::Dense | Variant::Spark => None,
             Variant::Moe => Some(MoeConfig {
                 experts: uint(md, &key("expert_count"))?,
                 experts_used: uint(md, &key("expert_used_count"))?,
@@ -266,12 +277,28 @@ impl HybridConfig {
             }
         };
         let leading_dense = match variant {
-            Variant::Dense => layers,
+            Variant::Dense | Variant::Spark => layers,
             Variant::Moe => 0,
             Variant::Flint => uint_or(md, &key("leading_dense_block_count"), 0)?,
         };
         let attn = attention_specs(md, &key, variant, layers)?;
         let embedding = file.tensor("token_embd.weight")?.logical_matrix_shape()?;
+        let rope_dims = match variant {
+            Variant::Flint | Variant::Spark => uint_or(md, &key("rope.dimension_count"), head_dim)?,
+            Variant::Dense | Variant::Moe => uint(md, &key("rope.dimension_count"))?,
+        };
+        let rope_theta = float(md, &key("rope.freq_base"))?;
+        // llama.cpp falls back to the global width and base for either key.
+        let swa_rope = match variant {
+            Variant::Spark => Some((
+                uint_or(md, &key("rope.dimension_count_swa"), rope_dims)?,
+                match md.get(&key("rope.freq_base_swa")) {
+                    Some(_) => float(md, &key("rope.freq_base_swa"))?,
+                    None => rope_theta,
+                },
+            )),
+            _ => None,
+        };
         let config = Self {
             variant,
             name: md
@@ -290,17 +317,18 @@ impl HybridConfig {
             heads: uint(md, &key("attention.head_count"))?,
             kv_heads: uint(md, &key("attention.head_count_kv"))?,
             head_dim,
-            rope_dims: match variant {
-                Variant::Flint => uint_or(md, &key("rope.dimension_count"), head_dim)?,
-                Variant::Dense | Variant::Moe => uint(md, &key("rope.dimension_count"))?,
-            },
-            rope_theta: float(md, &key("rope.freq_base"))?,
+            rope_dims,
+            rope_theta,
+            swa_rope,
             rope_sections: rope_sections(md, &key("rope.dimension_sections")),
             eps: float(md, &key("attention.layer_norm_rms_epsilon"))?,
             ffn: match variant {
                 Variant::Moe => 0,
-                Variant::Dense | Variant::Flint => uint(md, &key("feed_forward_length"))?,
+                Variant::Dense | Variant::Flint | Variant::Spark => {
+                    uint(md, &key("feed_forward_length"))?
+                }
             },
+            gelu_ffn: variant == Variant::Spark,
             conv_kernel,
             ssm_head_dim,
             ssm_k_heads,
@@ -319,10 +347,14 @@ impl HybridConfig {
             return bad("embedding width");
         }
         let head_dim_ok = match self.variant {
-            Variant::Flint => matches!(self.head_dim, 128 | 256),
+            Variant::Flint | Variant::Spark => matches!(self.head_dim, 128 | 256),
             Variant::Dense | Variant::Moe => self.head_dim == 256,
         };
-        if !head_dim_ok || self.rope_dims > self.head_dim || !self.rope_dims.is_multiple_of(2) {
+        let rope_ok = |dims: usize| dims <= self.head_dim && dims.is_multiple_of(2);
+        if !head_dim_ok
+            || !rope_ok(self.rope_dims)
+            || self.swa_rope.is_some_and(|(dims, _)| !rope_ok(dims))
+        {
             return bad("attention head dimension with even RoPE width");
         }
         if self.kv_heads == 0 || !self.heads.is_multiple_of(self.kv_heads) {
@@ -400,9 +432,10 @@ impl HybridConfig {
     }
 }
 
-/// Per-layer attention options. Flint masks layers flagged in
-/// `sliding_window_pattern` to `sliding_window` and skips RoPE where
+/// Per-layer attention options. Flint and Spark mask layers flagged in
+/// `sliding_window_pattern` to `sliding_window`, and Flint skips RoPE where
 /// `rope_pattern` is false; Qwen3.5 has neither pattern and always gates Q.
+/// (Spark's per-head gate is a separate weight, not the fused Q gate.)
 fn attention_specs(
     md: &BTreeMap<String, MetadataValue>,
     key: &dyn Fn(&str) -> String,
@@ -420,7 +453,7 @@ fn attention_specs(
             window: sliding.as_ref().filter(|p| p[i]).and(window),
             rope: rope.as_ref().is_none_or(|p| p[i]),
             sinks: variant == Variant::Flint,
-            gated: variant != Variant::Flint,
+            gated: matches!(variant, Variant::Dense | Variant::Moe),
         })
         .collect())
 }

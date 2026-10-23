@@ -603,15 +603,15 @@ pub fn check(path: &Path) -> Checked {
         result.problem = Some("a DFlash drafter, not a chat model".into());
         return result;
     }
-    if !matches!(arch.as_str(), "qwen35" | "qwen35moe" | "flint") {
+    if !matches!(arch.as_str(), "qwen35" | "qwen35moe" | "flint" | "spark2_5") {
         result.problem = Some(format!(
-            "architecture {arch}: needs qwen35, qwen35moe or flint"
+            "architecture {arch}: needs qwen35, qwen35moe, flint or spark2_5"
         ));
         return result;
     }
     let pre = text("tokenizer.ggml.pre");
     let pre_ok = match arch.as_str() {
-        "flint" => pre.as_deref() == Some("flint"),
+        "flint" | "spark2_5" => pre.as_deref() == Some(arch.as_str()),
         _ => pre.as_deref() == Some("qwen35"),
     };
     if text("tokenizer.ggml.model").as_deref() != Some("gpt2") || !pre_ok {
@@ -628,12 +628,19 @@ pub fn check(path: &Path) -> Checked {
     // Tensors of the trailing NextN/MTP block are only read for `--draft mtp`.
     let (mut trunk, mut head): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     for t in file.tensors().values() {
-        // BF16 routers load as BF16 (the hybrid engine has kernels for them).
-        let bf16_router = t.type_id == 30 && t.name.ends_with("ffn_gate_inp.weight");
+        // BF16 routers, embeddings and LM heads load as BF16 (the hybrid
+        // engine has kernels for them), and so do Spark's head gates and
+        // fused QKV; see `Loader::matrix_or_bf16` and `Loader::split`.
+        let bf16_ok = t.type_id == 30
+            && (t.name.ends_with("ffn_gate_inp.weight")
+                || matches!(t.name.as_str(), "token_embd.weight" | "output.weight")
+                || (arch == "spark2_5"
+                    && (t.name.ends_with("attn_gate.weight")
+                        || t.name.ends_with("attn_qkv.weight"))));
         let supported = if t.dimensions.len() <= 1 {
             t.type_id == 0
         } else {
-            SUPPORTED.contains(&t.type_id) || bf16_router
+            SUPPORTED.contains(&t.type_id) || bf16_ok
         };
         if supported {
             continue;
@@ -695,5 +702,26 @@ mod tests {
         let checked = check(&path);
         assert_eq!(checked.problem, None);
         assert!(checked.hybrid.is_some());
+    }
+
+    /// The Spark Q4_K_M GGUF from the Hugging Face cache, when present. Its
+    /// BF16 embedding and head gates must not make it "unsupported".
+    #[test]
+    fn cached_spark_gguf_passes_the_quant_check() {
+        let cache = std::env::var_os("HOME")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_default()
+            .join(".cache/huggingface/hub/models--XHToken--Spark-X2.6-4B-GGUF/snapshots");
+        let Some(path) = std::fs::read_dir(&cache).ok().and_then(|dirs| {
+            dirs.flatten()
+                .map(|d| d.path().join("Spark-X2.6-4B-Q4_K_M.gguf"))
+                .find(|p| p.exists())
+        }) else {
+            return;
+        };
+        let checked = check(&path);
+        assert_eq!(checked.problem, None);
+        assert!(checked.hybrid.is_some());
+        assert!(!checked.mtp);
     }
 }

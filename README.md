@@ -60,11 +60,12 @@ hf download peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP \
   Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf --local-dir ~/models
 ```
 
-**Experimental:** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks), in the `experimental` branch only. One quant is validated:
+**Experimental:** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks) and Spark-X2.6-4B (XHToken, dense, sliding windows and per-head gates), in the `experimental` branch only. One quant of each is validated:
 
 | Model | Hugging Face repo | File | Size |
 |---|---|---|---|
 | Flint Preview (MoE, experimental) | [`unsloth/flint-GGUF`](https://huggingface.co/unsloth/flint-GGUF) | `flint-UD-Q3_K_XL.gguf` | 18.5 GB |
+| Spark-X2.6-4B (dense, experimental) | [`XHToken/Spark-X2.6-4B-GGUF`](https://huggingface.co/XHToken/Spark-X2.6-4B-GGUF) | `Spark-X2.6-4B-Q4_K_M.gguf` | 3.5 GB |
 
 ```sh
 hf download unsloth/flint-GGUF flint-UD-Q3_K_XL.gguf --local-dir ~/models
@@ -189,7 +190,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | [Development](docs/development.md) | Building, testing (including Metal validation layers), profiling, using Ferrum as a library |
 | [Architecture](docs/architecture.md) | Tensor and storage model, Metal backend, safety argument, the hybrid engine |
 | [Vision](docs/vision.md) | How image input is encoded and positioned |
-| [Experimental](docs/experimental.md) | Flint support: status, validation numbers, known gaps |
+| [Experimental](docs/experimental.md) | Flint and Spark support: status, validation numbers, known gaps |
 | [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
 
 ## Limitations

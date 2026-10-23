@@ -13,7 +13,8 @@ use crate::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Format {
     F32,
-    /// Only MoE routers load as BF16 (see `Loader::router`).
+    /// Only MoE routers, embeddings, LM heads and Spark's head gates load as
+    /// BF16 (see `Loader::matrix_or_bf16`).
     Bf16,
     Q4_0,
     Q8_0,
@@ -100,10 +101,14 @@ pub struct AttentionWeights {
     pub k: Matrix,
     pub v: Matrix,
     pub o: Matrix,
-    pub q_norm: Tensor,
-    pub k_norm: Tensor,
+    /// Per-head RMS norms of Q and K (absent for Spark, which has none).
+    pub q_norm: Option<Tensor>,
+    pub k_norm: Option<Tensor>,
     /// Per-head sink logits, for layers whose `AttnSpec::sinks` is set.
     pub sinks: Option<Tensor>,
+    /// Spark's `[heads, hidden]` output gate: each head's attention output is
+    /// scaled by sigmoid(gate · attn_norm(x)).
+    pub head_gate: Option<Matrix>,
 }
 
 pub struct DeltaWeights {
@@ -173,9 +178,13 @@ impl Weights {
                         + m(&a.k)
                         + m(&a.v)
                         + m(&a.o)
-                        + a.q_norm.byte_size()
-                        + a.k_norm.byte_size()
-                        + a.sinks.as_ref().map_or(0, Tensor::byte_size)
+                        + a.q_norm
+                            .iter()
+                            .chain(&a.k_norm)
+                            .chain(&a.sinks)
+                            .map(Tensor::byte_size)
+                            .sum::<usize>()
+                        + a.head_gate.as_ref().map_or(0, Matrix::byte_size)
                 }
                 Mixer::Delta(d) => {
                     m(&d.qkv)
@@ -219,10 +228,10 @@ impl Loader<'_> {
         gguf_matrix(self.device, self.file, name, experts, rows, cols)
     }
 
-    /// `[experts, hidden]` router. BF16 routers keep their encoding; the BF16
-    /// kernels widen each value to F32 as they read it. Other encodings load
-    /// as any matrix does.
-    fn router(&mut self, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
+    /// A plain matrix (router, embedding, LM head, head gate) that may be
+    /// BF16. BF16 keeps its encoding; the BF16 kernels widen each value to F32
+    /// as they read it. Other encodings load as any matrix does.
+    fn matrix_or_bf16(&mut self, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
         let info = self.file.tensor(name)?.clone();
         if info.type_id != 30 {
             return self.matrix(name, rows, cols);
@@ -233,7 +242,7 @@ impl Loader<'_> {
         {
             return Err(Error::Weight {
                 name: name.into(),
-                message: format!("expected a BF16 [{rows}, {cols}] router"),
+                message: format!("expected a BF16 [{rows}, {cols}] matrix"),
             });
         }
         let file = &mut *self.file;
@@ -248,6 +257,57 @@ impl Loader<'_> {
             row_bytes: cols * 2,
             storage,
         })
+    }
+
+    /// A row-stacked matrix (Spark's fused `attn_qkv`) split into consecutive
+    /// blocks of `parts` rows, each copied into its own storage.
+    fn split(&mut self, name: &str, parts: &[usize], cols: usize) -> Result<Vec<Matrix>> {
+        let info = self.file.tensor(name)?.clone();
+        let rows: usize = parts.iter().sum();
+        let bad = |message: String| Error::Weight {
+            name: name.into(),
+            message,
+        };
+        let (format, row_bytes) = match info.type_id {
+            30 => (Format::Bf16, cols * 2),
+            t => {
+                let format = Format::from_type(t)
+                    .ok_or_else(|| bad(format!("GGML type {t} has no hybrid kernel")))?;
+                let layout = block_layout(t)?;
+                (format, cols / layout.elements * layout.bytes)
+            }
+        };
+        if info.dimensions != [cols, rows] {
+            return Err(bad(format!(
+                "expected GGUF dims {:?}, found {:?}",
+                [cols, rows],
+                info.dimensions
+            )));
+        }
+        if !cols.is_multiple_of(256) || row_bytes * rows != info.byte_len {
+            return Err(bad("byte length differs from geometry".into()));
+        }
+        let mut bytes = vec![0; info.byte_len];
+        self.file.read_tensor_into(name, &mut bytes)?;
+        let mut start = 0;
+        parts
+            .iter()
+            .map(|&n| {
+                let block = &bytes[start * row_bytes..(start + n) * row_bytes];
+                start += n;
+                Ok(Matrix {
+                    rows: n,
+                    cols,
+                    experts: 1,
+                    format,
+                    row_bytes,
+                    storage: PackedStorage::from_reader(self.device, block.len(), |dst| {
+                        dst.copy_from_slice(block);
+                        Ok(())
+                    })?,
+                })
+            })
+            .collect()
     }
 
     fn vector(&mut self, name: &str, len: usize) -> Result<Tensor> {
@@ -331,20 +391,20 @@ pub(crate) fn gguf_matrix(
 
 pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Result<Weights> {
     let mut l = Loader { device, file };
-    let embedding = l.matrix("token_embd.weight", c.vocab, c.hidden)?;
+    let embedding = l.matrix_or_bf16("token_embd.weight", c.vocab, c.hidden)?;
     let output_norm = l.vector("output_norm.weight", c.hidden)?;
     let output = if l.file.tensors().contains_key("output.weight") {
-        l.matrix("output.weight", c.vocab, c.hidden)?
+        l.matrix_or_bf16("output.weight", c.vocab, c.hidden)?
     } else {
-        l.matrix("token_embd.weight", c.vocab, c.hidden)?
+        l.matrix_or_bf16("token_embd.weight", c.vocab, c.hidden)?
     };
     let mut layers = Vec::with_capacity(c.layers);
     for i in 0..c.layers {
         let n = |s: &str| format!("blk.{i}.{s}");
         let attn_norm = l.vector(&n("attn_norm.weight"), c.hidden)?;
-        // Flint has no separate post-attention norm: `ffn_norm` sits there.
+        // Flint and Spark have no separate post-attention norm: `ffn_norm` sits there.
         let post_norm = match c.variant {
-            Variant::Flint => l.vector(&n("ffn_norm.weight"), c.hidden)?,
+            Variant::Flint | Variant::Spark => l.vector(&n("ffn_norm.weight"), c.hidden)?,
             Variant::Dense | Variant::Moe => {
                 l.vector(&n("post_attention_norm.weight"), c.hidden)?
             }
@@ -353,19 +413,42 @@ pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Resu
             let q = c.heads * c.head_dim;
             let kv = c.kv_heads * c.head_dim;
             let spec = c.attn[i];
+            let spark = c.variant == Variant::Spark;
+            let (wq, wk, wv) = if spark {
+                let mut qkv = l.split(&n("attn_qkv.weight"), &[q, kv, kv], c.hidden)?;
+                let wv = qkv.pop().expect("three parts");
+                let wk = qkv.pop().expect("three parts");
+                (qkv.pop().expect("three parts"), wk, wv)
+            } else {
+                (
+                    l.matrix(
+                        &n("attn_q.weight"),
+                        if spec.gated { 2 * q } else { q },
+                        c.hidden,
+                    )?,
+                    l.matrix(&n("attn_k.weight"), kv, c.hidden)?,
+                    l.matrix(&n("attn_v.weight"), kv, c.hidden)?,
+                )
+            };
             Mixer::Attention(AttentionWeights {
-                q: l.matrix(
-                    &n("attn_q.weight"),
-                    if spec.gated { 2 * q } else { q },
-                    c.hidden,
-                )?,
-                k: l.matrix(&n("attn_k.weight"), kv, c.hidden)?,
-                v: l.matrix(&n("attn_v.weight"), kv, c.hidden)?,
+                q: wq,
+                k: wk,
+                v: wv,
                 o: l.matrix(&n("attn_output.weight"), c.hidden, q)?,
-                q_norm: l.vector(&n("attn_q_norm.weight"), c.head_dim)?,
-                k_norm: l.vector(&n("attn_k_norm.weight"), c.head_dim)?,
+                q_norm: match spark {
+                    true => None,
+                    false => Some(l.vector(&n("attn_q_norm.weight"), c.head_dim)?),
+                },
+                k_norm: match spark {
+                    true => None,
+                    false => Some(l.vector(&n("attn_k_norm.weight"), c.head_dim)?),
+                },
                 sinks: match spec.sinks {
                     true => Some(l.vector(&n("attn_sinks.weight"), c.heads)?),
+                    false => None,
+                },
+                head_gate: match spark {
+                    true => Some(l.matrix_or_bf16(&n("attn_gate.weight"), c.heads, c.hidden)?),
                     false => None,
                 },
             })
@@ -393,7 +476,7 @@ pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Resu
             let moe = c.moe.expect("expert layer carries expert geometry");
             Ffn::Moe(MoeFfn {
                 // `HybridConfig::from_gguf` refuses a selection bias (`exp_probs_b`).
-                router: l.router(&n("ffn_gate_inp.weight"), moe.experts, c.hidden)?,
+                router: l.matrix_or_bf16(&n("ffn_gate_inp.weight"), moe.experts, c.hidden)?,
                 gate_exps: l.stacked(
                     &n("ffn_gate_exps.weight"),
                     moe.experts,
@@ -475,10 +558,10 @@ impl MtpWeights {
                 &self.head_norm,
                 &self.attn_norm,
                 &self.post_norm,
-                &a.q_norm,
-                &a.k_norm,
             ]
-            .iter()
+            .into_iter()
+            .chain(&a.q_norm)
+            .chain(&a.k_norm)
             .map(|t| t.byte_size())
             .sum::<usize>()
     }
@@ -512,9 +595,10 @@ pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> 
             k: l.matrix(&n("attn_k.weight"), kv, c.hidden)?,
             v: l.matrix(&n("attn_v.weight"), kv, c.hidden)?,
             o: l.matrix(&n("attn_output.weight"), c.hidden, q)?,
-            q_norm: l.vector(&n("attn_q_norm.weight"), c.head_dim)?,
-            k_norm: l.vector(&n("attn_k_norm.weight"), c.head_dim)?,
+            q_norm: Some(l.vector(&n("attn_q_norm.weight"), c.head_dim)?),
+            k_norm: Some(l.vector(&n("attn_k_norm.weight"), c.head_dim)?),
             sinks: None,
+            head_gate: None,
         },
         ffn: DenseFfn {
             gate: l.matrix(&n("ffn_gate.weight"), ffn_width, c.hidden)?,

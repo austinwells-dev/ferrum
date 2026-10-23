@@ -344,6 +344,8 @@ pub(crate) struct Scratch {
     /// Verify-width queries regrouped by KV head (`h_q_by_kv_head`).
     pub(crate) q_grouped: Tensor,
     pub(crate) att: Tensor,
+    /// `[chunk, heads]` per-head output gate logits (Spark).
+    pub(crate) head_gate: Tensor,
     pub(crate) attn_partial: Tensor,
     pub(crate) attn_ml: Tensor,
     pub(crate) qkv: Tensor,
@@ -492,6 +494,16 @@ pub(crate) fn attn_spec(c: &HybridConfig, layer: usize) -> AttnSpec {
     })
 }
 
+/// RoPE width (0 = none) and base of a layer with options `spec`:
+/// sliding-window layers take `swa_rope` when the model has one.
+pub(crate) fn rope_of(c: &HybridConfig, spec: AttnSpec) -> (usize, f32) {
+    match (spec.rope, spec.window.and(c.swa_rope)) {
+        (false, _) => (0, c.rope_theta),
+        (true, Some(swa)) => swa,
+        (true, None) => (c.rope_dims, c.rope_theta),
+    }
+}
+
 /// Widest feed-forward activation of any layer: dense, expert or shared.
 fn scratch_ffn(c: &HybridConfig) -> usize {
     match c.moe {
@@ -516,6 +528,7 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
         chunk * c.kv_heads * c.head_dim,
         chunk * c.kv_heads * c.head_dim,
         chunk * c.heads * c.head_dim,
+        chunk * c.heads,
         MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim,
         MAX_SPLITS * MAX_SPLIT_ROWS * 2,
         chunk * c.conv_channels(),
@@ -622,6 +635,7 @@ impl Scratch {
                 DType::F16,
             )?,
             att: f(&[chunk, c.heads * c.head_dim])?,
+            head_gate: f(&[chunk, c.heads])?,
             attn_partial: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim])?,
             attn_ml: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * 2])?,
             qkv: f(&[chunk, c.conv_channels()])?,
@@ -674,6 +688,7 @@ impl Scratch {
             &self.q,
             &self.q_grouped,
             &self.att,
+            &self.head_gate,
             &self.attn_partial,
             &self.attn_ml,
             &self.qkv,
@@ -1455,14 +1470,15 @@ impl HybridModel {
         Self::project(d, &a.q, xn, m, &qg)?;
         Self::project(d, &a.k, xn, m, &k)?;
         Self::project(d, &a.v, xn, m, &v)?;
+        let (rope_dims, rope_theta) = rope_of(c, spec);
         let prep = Params::default()
             .u(m)?
             .u(c.heads)?
             .u(c.kv_heads)?
             .u(c.head_dim)?
-            .u(if spec.rope { c.rope_dims } else { 0 })?
+            .u(rope_dims)?
             .u(pos)?
-            .f(c.rope_theta)
+            .f(rope_theta)
             .f(c.eps)
             .u(kv_width)?
             .f(1. / (c.head_dim as f32).sqrt())
@@ -1472,7 +1488,8 @@ impl HybridModel {
             .u(c.rope_sections[2])?
             .u(kc.shape().dimensions()[0])?
             .u(usize::from(spec.gated))?
-            .u(ring)?;
+            .u(ring)?
+            .u(usize::from(a.q_norm.is_some()))?;
         let q8 = c.kv_cache == KvCache::Q8;
         d.dispatch_hybrid(
             if q8 { "h_attn_prep_q8" } else { "h_attn_prep" },
@@ -1480,8 +1497,9 @@ impl HybridModel {
                 qg.binding(),
                 k.binding(),
                 v.binding(),
-                a.q_norm.binding(),
-                a.k_norm.binding(),
+                // Unread without QK norms.
+                a.q_norm.as_ref().unwrap_or(&qg).binding(),
+                a.k_norm.as_ref().unwrap_or(&qg).binding(),
                 // Unread unless the plan carries a position table.
                 rope.table.as_ref().unwrap_or(&qg).binding(),
             ],
@@ -1518,6 +1536,19 @@ impl HybridModel {
             a.sinks.as_ref(),
             ring,
         )?;
+        if let Some(gate) = &a.head_gate {
+            let logits = rows(&s.head_gate, 0, m, c.heads)?;
+            Self::project(d, gate, xn, m, &logits)?;
+            d.dispatch_hybrid(
+                "h_head_gate",
+                &[logits.binding()],
+                &[att.binding()],
+                &Params::default().u(m * q_width)?.u(c.head_dim)?.0,
+                [(m * q_width).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )?;
+        }
         self.dump(d, "attn_gated", layer, &att)?;
         Self::project(d, &a.o, &att, m, out)?;
         self.dump(d, "attn_output", layer, out)
@@ -2175,7 +2206,7 @@ impl HybridModel {
         Self::project(d, &f.gate, xn, m, &gate)?;
         Self::project(d, &f.up, xn, m, &up)?;
         d.dispatch_hybrid(
-            "h_swiglu",
+            if self.config.gelu_ffn { "h_geglu" } else { "h_swiglu" },
             &[gate.binding(), up.binding()],
             &[act.binding()],
             &Params::default().u(m * width)?.0,
@@ -2230,6 +2261,7 @@ impl HybridModel {
             Format::Q8_0 => "h_get_rows_q8_0",
             Format::Q4_0 => "h_get_rows_q4_0",
             Format::Iq4Xs => "h_get_rows_iq4_xs",
+            Format::Bf16 => "h_get_rows_bf16",
             f => return Err(Error::Gguf(format!("no embedding lookup for {}", f.name()))),
         };
         d.dispatch_hybrid(
@@ -2617,7 +2649,9 @@ mod tests {
                 .u(1)
                 .unwrap()
                 .u(0)
-                .unwrap(); // ring
+                .unwrap() // ring
+                .u(1)
+                .unwrap(); // qk_norm
             let e = d.execution_with_shared_encoder(true).unwrap();
             d.dispatch_hybrid(
                 "h_attn_prep",
@@ -3103,7 +3137,9 @@ mod tests {
             .u(0)
             .unwrap() // gated: qg rows hold queries only
             .u(0)
-            .unwrap(); // ring
+            .unwrap() // ring
+            .u(1)
+            .unwrap(); // qk_norm
         let (qg_t, k_t, zeros) = (t(&qg, qg.len()), t(&kk, kk.len()), t(&[0.], 1));
         let (qn, kn) = (t(&norm, head_dim), t(&norm, head_dim));
         let e = d.execution_with_shared_encoder(true).unwrap();
@@ -3595,7 +3631,9 @@ mod tests {
             .u(1)
             .unwrap()
             .u(0)
-            .unwrap(); // ring
+            .unwrap() // ring
+            .u(1)
+            .unwrap(); // qk_norm
         let e = d.execution_with_shared_encoder(true).unwrap();
         d.dispatch_hybrid(
             "h_store_v_q8",

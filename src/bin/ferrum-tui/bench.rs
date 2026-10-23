@@ -40,11 +40,15 @@ When free frames run low the kernel evicts pages that were not used recently, wr
 
 /// Most MTP drafts worth trying.
 const MTP_MAX_DEPTH: usize = 6;
+/// Most prompt-lookup drafts worth trying.
+const LOOKUP_MAX_DEPTH: usize = 6;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
     Baseline,
     Mtp,
+    /// Prompt lookup: drafts copied from the context, no drafter model.
+    Lookup,
     Drafter {
         path: PathBuf,
         label: String,
@@ -66,7 +70,16 @@ impl Candidate {
         match &self.source {
             Source::Baseline => "no drafter".into(),
             Source::Mtp => "MTP head".into(),
+            Source::Lookup => "prompt lookup".into(),
             Source::Drafter { label, kind, .. } => format!("{label} ({kind})"),
+        }
+    }
+
+    /// The drafter precision as shown, or "–" for prompt lookup (no weights).
+    pub fn quant_label(&self) -> &'static str {
+        match self.source {
+            Source::Lookup => "–",
+            _ => self.quant,
         }
     }
 
@@ -75,6 +88,7 @@ impl Candidate {
         match &self.source {
             Source::Baseline => 0,
             Source::Mtp => MTP_MAX_DEPTH,
+            Source::Lookup => LOOKUP_MAX_DEPTH,
             Source::Drafter { max_depth, .. } => *max_depth,
         }
     }
@@ -84,6 +98,7 @@ impl Candidate {
         match &self.source {
             Source::Baseline => "off".into(),
             Source::Mtp => "mtp".into(),
+            Source::Lookup => "lookup".into(),
             Source::Drafter { path, .. } => path.display().to_string(),
         }
     }
@@ -92,6 +107,7 @@ impl Candidate {
         let source = match &self.source {
             Source::Baseline => return None,
             Source::Mtp => DraftSource::Mtp,
+            Source::Lookup => DraftSource::Lookup,
             Source::Drafter { path, .. } => DraftSource::Checkpoint(path.clone()),
         };
         let mut spec = SpecOptions::new(source);
@@ -440,7 +456,7 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
                 cand: ci,
                 label: cand.label(),
                 draft_value: cand.draft_value(),
-                quant: if depth.is_some() {
+                quant: if depth.is_some() && cand.source != Source::Lookup {
                     cand.quant.into()
                 } else {
                     String::new()
@@ -567,7 +583,7 @@ pub fn answer_check(
     stop: &AtomicBool,
 ) -> Result<Vec<eval::Graded>, String> {
     let label = match depth {
-        Some(d) => format!("{} · depth {d} · {}", cand.label(), cand.quant),
+        Some(d) => format!("{} · depth {d} · {}", cand.label(), cand.quant_label()),
         None => cand.label(),
     };
     send(Event::Stage(format!("answer check · loading {label}")));
@@ -916,6 +932,23 @@ mod tests {
         let v = settings_for(&row("none", None, 40.0), None);
         assert_eq!(v["draft"], "off");
         assert!(!v.contains_key("draft_max"));
+    }
+
+    /// Prompt lookup selects `--draft lookup`, sweeps its own depths and
+    /// carries no drafter precision into the saved settings.
+    #[test]
+    fn lookup_candidates_map_to_the_lookup_drafter() {
+        let c = Candidate {
+            source: Source::Lookup,
+            quant: "q4_0",
+            on: true,
+        };
+        assert_eq!(c.draft_value(), "lookup");
+        assert_eq!(c.quant_label(), "–");
+        assert_eq!(c.max_depth(), LOOKUP_MAX_DEPTH);
+        let spec = c.spec(Some(3)).expect("lookup speculates");
+        assert!(matches!(spec.source, DraftSource::Lookup));
+        assert_eq!(spec.max_drafts, Some(3));
     }
 
     #[test]

@@ -41,6 +41,16 @@ const FLINT_PATTERNS: [&str; 3] = [
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ];
 
+/// Spark pre-tokenizer (llama.cpp `LLAMA_VOCAB_PRE_TYPE_SPARK2_5`): digit runs
+/// of up to three, CJK runs, words, punctuation and whitespace, then single
+/// digits, applied in that order like `FLINT_PATTERNS`.
+const SPARK_PATTERNS: [&str; 4] = [
+    r"\p{N}{1,3}",
+    r"[一-龥぀-ゟ゠-ヿ]+",
+    r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+|[\r\n]|\s+(?!\S)|\s+"##,
+    r"\p{N}",
+];
+
 pub struct LoadedHybrid {
     pub model: HybridModel,
     pub tokenizer: Tokenizer,
@@ -179,9 +189,10 @@ fn tokenizer(file: &GgufFile, vocab: usize) -> Result<(Tokenizer, Vec<u32>)> {
     let (patterns, nfc): (&[&str], bool) = match text("tokenizer.ggml.pre")? {
         "qwen35" => (&[QWEN35_PATTERN], true),
         "flint" => (&FLINT_PATTERNS, false),
+        "spark2_5" => (&SPARK_PATTERNS, false),
         other => {
             return Err(Error::Tokenizer(format!(
-                "hybrid GGUF pre-tokenizer {other:?} is not supported (qwen35, flint)"
+                "hybrid GGUF pre-tokenizer {other:?} is not supported (qwen35, flint, spark2_5)"
             )));
         }
     };

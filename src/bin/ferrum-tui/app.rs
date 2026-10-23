@@ -156,6 +156,7 @@ impl App {
         let reason = match current.as_str() {
             "" | "off" => None,
             "mtp" => (!m.mtp).then(|| m.mtp_why.clone()),
+            "lookup" => None,
             path => self
                 .drafters
                 .iter()
@@ -279,6 +280,7 @@ impl App {
         if model.is_some_and(|m| m.mtp) {
             v.push("mtp".to_string());
         }
+        v.push("lookup".to_string());
         v.extend(
             self.drafters_for(model)
                 .into_iter()
@@ -289,6 +291,9 @@ impl App {
     }
 
     pub fn draft_label(&self, value: &str) -> String {
+        if value == "lookup" {
+            return "Prompt lookup".into();
+        }
         match self
             .drafters
             .iter()

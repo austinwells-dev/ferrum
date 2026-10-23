@@ -105,7 +105,9 @@ impl App {
             .collect()
     }
 
-    /// Baseline, MTP (when the GGUF has a working head) and every drafter that fits.
+    /// Baseline, MTP (when the GGUF has a working head), prompt lookup (left
+    /// unticked: it needs no drafter, but pays off only on repetitive output)
+    /// and every drafter that fits.
     fn bench_candidates(&self, model: &Model, q8: bool) -> Vec<Candidate> {
         let mut out = vec![Candidate {
             source: Source::Baseline,
@@ -119,6 +121,11 @@ impl App {
                 on: true,
             });
         }
+        out.push(Candidate {
+            source: Source::Lookup,
+            quant: "q4_0",
+            on: false,
+        });
         for d in &self.drafters {
             let Some(config) = &d.config else { continue };
             if drafter_problem(d, model).is_some() {
@@ -316,7 +323,7 @@ impl App {
             .map(|m| m.path.display().to_string())
             .unwrap_or_default();
         let best_label = match best.depth {
-            Some(d) => format!("{} · depth {d} · {}", best.label, best.quant),
+            Some(d) => format!("{} · depth {d} · {}", best.label, shown_quant(&best.quant)),
             None => "no drafter".to_string(),
         };
         bench::record(
@@ -822,7 +829,7 @@ impl App {
                     Some(d) => format!(
                         "★ {} · depth {d} · {} → {:.2}× plain decoding",
                         short_drafter(&best.label),
-                        best.quant,
+                        shown_quant(&best.quant),
                         best.tps / base.max(1e-9)
                     ),
                     None => "No drafter beats plain decoding here".to_string(),
@@ -877,7 +884,11 @@ impl App {
                             },
                             16
                         ),
-                        if depths.is_empty() { "–" } else { c.quant }
+                        if depths.is_empty() {
+                            "–"
+                        } else {
+                            c.quant_label()
+                        }
                     ),
                     Style::new().fg(TEXT),
                 ));
@@ -982,7 +993,7 @@ impl App {
         };
         let right = match b.phase {
             BenchPhase::Setup if c.source == Source::Baseline => "baseline".to_string(),
-            BenchPhase::Setup => format!("≤{} · {}", c.max_depth(), c.quant),
+            BenchPhase::Setup => format!("≤{} · {}", c.max_depth(), c.quant_label()),
             _ => format!("{}/{planned}", measured.len()),
         };
         let best = measured.iter().map(|r| r.tps).fold(0.0, f64::max);
@@ -1219,6 +1230,11 @@ impl BenchState {
             Measure::Agent => self.ag.loaded.map(|(_, w)| w),
         }
     }
+}
+
+/// A result row's drafter precision, or "–" when it has none (prompt lookup).
+fn shown_quant(quant: &str) -> &str {
+    if quant.is_empty() { "–" } else { quant }
 }
 
 #[cfg(test)]

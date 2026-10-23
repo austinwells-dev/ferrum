@@ -1417,6 +1417,7 @@ GET_ROWS_KERNEL(h_get_rows_q6_k, block_q6_K, 16, dequantize_q6_K)
 GET_ROWS_KERNEL(h_get_rows_q8_0, block_q8_0, 2, dequantize_q8_0)
 GET_ROWS_KERNEL(h_get_rows_q4_0, block_q4_0, 2, dequantize_q4_0)
 GET_ROWS_KERNEL(h_get_rows_iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
+GET_ROWS_KERNEL(h_get_rows_bf16, block_bf16, 1, dequantize_bf16)
 
 // ---------------------------------------------------------------- norms and elementwise
 
@@ -1483,6 +1484,25 @@ kernel void h_swiglu(constant EltArgs & a [[buffer(3)]], device const float * g 
         float x = g[i];
         y[i] = x / (1.f + exp(-x)) * u[i];
     }
+}
+
+// out = gelu(gate) * up, with ggml's tanh approximation (GEGLU).
+kernel void h_geglu(constant EltArgs & a [[buffer(3)]], device const float * g [[buffer(0)]],
+                    device const float * u [[buffer(1)]], device float * y [[buffer(2)]],
+                    uint i [[thread_position_in_grid]]) {
+    if (i < a.n) {
+        const float x = g[i];
+        const float t = precise::tanh(0.7978845608028654f * x * (1.f + 0.044715f * x * x));
+        y[i] = 0.5f * x * (1.f + t) * u[i];
+    }
+}
+
+struct HeadGateArgs { uint n; uint head_dim; };
+
+// att [tokens][heads][head_dim] *= sigmoid(gate [tokens][heads]) (Spark).
+kernel void h_head_gate(constant HeadGateArgs & a [[buffer(2)]], device const float * gate [[buffer(0)]],
+                        device float * att [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i < a.n) att[i] *= 1.f / (1.f + exp(-gate[i / a.head_dim]));
 }
 
 // ---------------------------------------------------------------- Gated DeltaNet
@@ -1644,6 +1664,7 @@ struct AttnPrepArgs {
     uint kv_rows;      // rows the cache buffer holds (locates Q8 scales)
     uint gated;        // qg rows hold [q | gate] (2 * head_dim per head) instead of q alone
     uint ring;         // 0: position p lives in row p; else in row p % ring (see kv_row)
+    uint qk_norm;      // 0: q and k skip the per-head RMS norm (Spark)
 };
 
 // Cache row of key position `key`. Sliding-window layers keep a ring of `ring`
@@ -1696,7 +1717,7 @@ inline float kv_scale(device const half * scales, ulong e) {
     return Q8 ? float(scales[e / 32]) : 1.f;
 }
 
-// Query heads: rmsnorm + partial NEOX RoPE of q (first half of each [q|gate]
+// Query heads: rmsnorm (unless qk_norm is 0) + partial NEOX RoPE of q (first half of each [q|gate]
 // pair in qg) into q_out [tokens][heads][head_dim]. KV heads: rmsnorm + RoPE of
 // k and a copy of v into the F16 cache at `position + token`.
 // grid (heads + kv_heads, tokens); threads head_dim.
@@ -1714,7 +1735,7 @@ void attn_prep_impl(constant AttnPrepArgs & p, device const float * qg, device c
                          : k[((ulong)t * p.kv_heads + kvh) * p.head_dim + tid];
     const float ss = block_sum(x * x, scratch, tid, p.head_dim);
     const float scale = rsqrt(ss / float(p.head_dim) + p.eps);
-    const float nv = x * scale * (is_q ? q_norm[tid] : k_norm[tid]);
+    const float nv = p.qk_norm != 0 ? x * scale * (is_q ? q_norm[tid] : k_norm[tid]) : x;
     normed[tid] = nv;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     float outv = nv;
