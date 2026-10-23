@@ -1,0 +1,76 @@
+== bench-swift-llama-1
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |           pp512 |        145.92 ± 7.75 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |          pp8192 |        147.18 ± 1.75 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |           tg128 |          6.86 ± 0.12 |
+== bench-swift-llama-2
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |           pp512 |        159.74 ± 0.51 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |          pp8192 |        148.32 ± 2.06 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |           tg128 |          7.03 ± 0.09 |
+== bench-swift-llama-depth-1
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |            tg16 |          7.09 ± 0.01 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |   tg16 @ d32768 |          5.85 ± 0.18 |
+== bench-swift-llama-depth-2
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |            tg16 |          6.61 ± 0.30 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |   tg16 @ d32768 |          6.02 ± 0.02 |
+== bench-tiel-llama-1
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |           pp512 |        918.85 ± 6.94 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |         pp16384 |        729.55 ± 1.73 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |           tg128 |         40.62 ± 0.04 |
+== bench-tiel-llama-2
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |           pp512 |       941.20 ± 52.36 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |         pp16384 |        730.18 ± 3.94 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |           tg128 |         39.10 ± 2.28 |
+== bench-tiel-llama-depth-1
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |            tg16 |         40.52 ± 0.05 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |   tg16 @ d32768 |         26.86 ± 6.51 |
+== bench-tiel-llama-depth-2
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |            tg16 |         40.55 ± 0.48 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |   tg16 @ d32768 |         29.67 ± 0.32 |
+== bench-spark-llama-1
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| spark2_5 ?B Q4_K - Medium      |   3.30 GiB |     4.45 B | BLAS,MTL   |       4 |           pp512 |      1207.41 ± 31.07 |
+| spark2_5 ?B Q4_K - Medium      |   3.30 GiB |     4.45 B | BLAS,MTL   |       4 |          pp2048 |      1115.09 ± 46.83 |
+| spark2_5 ?B Q4_K - Medium      |   3.30 GiB |     4.45 B | BLAS,MTL   |       4 |           tg128 |         39.86 ± 0.30 |
+== bench-spark-llama-2
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| spark2_5 ?B Q4_K - Medium      |   3.30 GiB |     4.45 B | BLAS,MTL   |       4 |           pp512 |      1182.31 ± 32.49 |
+| spark2_5 ?B Q4_K - Medium      |   3.30 GiB |     4.45 B | BLAS,MTL   |       4 |          pp2048 |      1140.08 ± 14.11 |
+| spark2_5 ?B Q4_K - Medium      |   3.30 GiB |     4.45 B | BLAS,MTL   |       4 |           tg128 |         39.30 ± 1.58 |
+== verify-swift-llama
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |     pp2 @ d1024 |         10.98 ± 3.33 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |     pp4 @ d1024 |         23.74 ± 0.11 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |     pp8 @ d1024 |         46.67 ± 1.30 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |     pp9 @ d1024 |         34.18 ± 0.31 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |    pp16 @ d1024 |         55.09 ± 0.20 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |    pp17 @ d1024 |         31.91 ± 0.40 |
+| qwen35 27B Q4_K - Medium       |  16.23 GiB |    27.32 B | BLAS,MTL   |       4 |    tg16 @ d1024 |          6.93 ± 0.06 |
+== verify-tiel-llama
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |     pp2 @ d1024 |        49.48 ± 29.16 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |     pp4 @ d1024 |        103.16 ± 3.25 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |     pp8 @ d1024 |        149.04 ± 2.50 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |     pp9 @ d1024 |        151.83 ± 3.21 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |    pp16 @ d1024 |        188.86 ± 5.50 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |    pp17 @ d1024 |        159.32 ± 0.74 |
+| qwen35moe 35B.A3B IQ4_XS - 4.25 bpw |  16.87 GiB |    35.51 B | BLAS,MTL   |       4 |    tg16 @ d1024 |         39.14 ± 1.59 |

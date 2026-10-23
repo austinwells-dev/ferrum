@@ -1,6 +1,7 @@
 //! LLM inference on Apple Silicon: a Metal tensor runtime with its own kernels,
 //! safetensors/GGUF loaders, a general transformer engine (`model`) and a
-//! Qwen3.5-family hybrid engine (`hybrid`) with speculative decoding.
+//! Qwen3.5-family hybrid engine (`hybrid`, which also runs Flint and Spark)
+//! with speculative decoding.
 #![deny(unsafe_op_in_unsafe_fn)]
 #![deny(unsafe_code)]
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]

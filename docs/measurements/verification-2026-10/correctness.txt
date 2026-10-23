@@ -1,0 +1,112 @@
+== tok-swift-ferrum (09:56:37)
+   exit 0, 1 s
+== tok-swift-llama (09:56:38)
+   exit 0, 0 s
+   TOKENIZER swift: identical (12522 ids)
+== tok-tiel-ferrum (09:56:38)
+   exit 0, 0 s
+== tok-tiel-llama (09:56:38)
+   exit 0, 1 s
+   TOKENIZER tiel: identical (12522 ids)
+== tok-flint-ferrum (09:56:39)
+   exit 0, 0 s
+== tok-flint-llama (09:56:39)
+   exit 1, 0 s
+   TOKENIZER flint: DIFFERENT
+== tok-spark-ferrum (09:56:39)
+   exit 0, 0 s
+== tok-spark-llama (09:56:39)
+   exit 0, 0 s
+   TOKENIZER spark: identical (13319 ids)
+== greedy-swift-ferrum (09:56:39)
+   exit 0, 10 s
+   memory plan: budget 23552 MiB = weights 16400 + scratch 282 + recurrent 150 + snapshots 300 + overhead 96 + KV 257 (64.0 KiB/token x 4096); max context 101120 (trained 262144)
+   measured: weights+scratch 16679 MiB (predicted 16682), state 406 MiB (predicted 407)
+== greedy-swift-llama (09:56:49)
+   exit 0, 5 s
+== greedy-tiel-ferrum (09:56:54)
+   exit 0, 6 s
+   memory plan: budget 23552 MiB = weights 16901 + scratch 215 + recurrent 63 + snapshots 126 + overhead 96 + KV 81 (20.0 KiB/token x 4096); max context 262144 (trained 262144)
+   measured: weights+scratch 17114 MiB (predicted 17116), state 143 MiB (predicted 144)
+== greedy-tiel-llama (09:57:00)
+   exit 0, 5 s
+== greedy-flint-ferrum (09:57:05)
+   exit 0, 6 s
+   memory plan: budget 23552 MiB = weights 17636 + scratch 154 + recurrent 0 + snapshots 0 + overhead 96 + KV 187 (28.0 KiB/token x 4096); max context 204288 (trained 262144)
+   measured: weights+scratch 17786 MiB (predicted 17790), state 186 MiB (predicted 187)
+== greedy-flint-llama (09:57:11)
+   exit 1, 0 s
+== greedy-spark-ferrum (09:57:11)
+   exit 0, 2 s
+   memory plan: budget 23552 MiB = weights 3375 + scratch 121 + recurrent 0 + snapshots 0 + overhead 96 + KV 260 (36.0 KiB/token x 4096); max context 564480 (trained 1048576)
+   measured: weights+scratch 3496 MiB (predicted 3496), state 259 MiB (predicted 260)
+== greedy-spark-llama (09:57:13)
+   exit 0, 1 s
+== kldbase-swift (09:57:14)
+   exit 0, 33 s
+   [1]4.4798,[2]4.5996,[3]6.7713,[4]7.7740,[5]8.7640,[6]10.0821,[7]9.5434,[8]10.5470,
+   0.33.153.829 I Final estimate: PPL = 10.5470 +/- 0.64861
+   
+== kld-swift (09:57:47)
+   exit 0, 49 s
+   positions 2040; Ferrum PPL 10.5492; llama.cpp PPL 10.5470; mean KLD 0.000117; median 0.000073; p99 0.000668; max 0.008073; same top-1 99.51%; 44.2 s
+== kldbase-tiel (09:58:36)
+   exit 0, 13 s
+   [1]6.2018,[2]7.4609,[3]11.5229,[4]13.8181,[5]15.0062,[6]17.1107,[7]15.8894,[8]17.5205,
+   0.13.109.530 I Final estimate: PPL = 17.5205 +/- 1.20023
+   
+== kld-tiel (09:58:49)
+   exit 0, 22 s
+   positions 2040; Ferrum PPL 17.5253; llama.cpp PPL 17.5205; mean KLD 0.006826; median 0.003642; p99 0.043010; max 0.189655; same top-1 95.98%; 16.4 s
+== kld-tiel-exact-write (09:59:11)
+   exit 101, 0 s
+   note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+== kld-tiel-vs-exact (09:59:11)
+   exit 101, 0 s
+   note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+== kld-tiel-llama-vs-exact (09:59:11)
+   exit 0, 6 s
+== kld-tiel-q8 (09:59:17)
+   exit 0, 19 s
+   positions 2040; Ferrum PPL 17.5212; llama.cpp PPL 17.5205; mean KLD 0.009892; median 0.004716; p99 0.074898; max 1.130591; same top-1 95.78%; 14.8 s
+== kldbase-flint (09:59:36)
+   exit 1, 0 s
+   0.00.292.578 E llama_model_load_from_file_impl: failed to load model
+   0.00.292.579 E cmn  common_init_: failed to load model '~/.cache/huggingface/hub/models--unsloth--flint-GGUF/snapshots/20468edfc38ab43d6914cc88b08cbecb05d0fc62/flint-UD-Q3_K_XL.gguf'
+   0.00.292.580 E llama_perplexity: unable to load model
+== kld-flint (09:59:36)
+   exit 101, 0 s
+   note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+== kldbase-spark (09:59:36)
+   exit 0, 15 s
+   [1]22.7843,[2]23.1645,[3]18.3883,[4]21.3873,[5]20.1523,
+   0.14.375.053 I Final estimate: PPL = 20.1523 +/- 0.92761
+   
+== kld-spark (09:59:51)
+   exit 0, 23 s
+   positions 5115; Ferrum PPL 20.1438; llama.cpp PPL 20.1334; mean KLD 0.000279; median 0.000088; p99 0.001741; max 0.332624; same top-1 99.55%; 22.3 s
+== kld-flint-llamacpu (10:00:14)
+   exit 1, 1 s
+== kld-spark-llamacpu (10:00:15)
+   exit 0, 287 s
+   chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+   Mean PPL(Q)                   :  20.200353 ±   0.929489
+   Mean PPL(base)                :  20.133387 ±   0.925620
+   Mean PPL(Q)/PPL(base)         :   1.003326 ±   0.003068
+   Mean PPL(Q)-PPL(base)         :   0.066966 ±   0.061776
+   Mean    KLD:   0.005981 ±   0.001955
+   Median  KLD:   0.001229
+   Same top p: 97.595 ± 0.214 %
+== plan (10:05:02)
+   exit 0, 0 s
+   | model | K/V | KiB/token | auto context | K/V at auto context |
+   |---|---|---|---|---|
+   | Miroslav 1.0 | f16 | 64.0 | 101120 | 6.17 GiB |
+   | Miroslav 1.0 | q8 | 34.0 | 190208 | 6.17 GiB |
+   | Ornith-1.5-35B | f16 | 20.0 | 262144 | 5.00 GiB |
+   | Ornith-1.5-35B | q8 | 10.6 | 262144 | 2.66 GiB |
+   | Flint Preview | f16 | 28.0 | 204288 | 5.53 GiB |
+   | Flint Preview | q8 | 14.9 | 262144 | 3.76 GiB |
+   | Dense F32 | f16 | 36.0 | 564480 | 19.49 GiB |
+   | Dense F32 | q8 | 19.1 | 1048576 | 19.19 GiB |
+DONE

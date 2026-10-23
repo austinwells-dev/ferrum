@@ -1,11 +1,12 @@
-//! Interactive terminal chat with a Qwen3.5-family GGUF.
+//! Interactive terminal chat with a Qwen3.5-family GGUF (or, experimentally,
+//! Flint or Spark).
 //!
 //! ferrum-cli --model FILE.gguf [--context N|auto] [--kv-cache f16|q8] [--system TEXT]
 //!            [--temperature T] [--top-p P] [--top-k K] [--min-p P]
 //!            [--presence-penalty X] [--repetition-penalty X] [--seed N]
 //!            [--max-tokens N] [--no-think] [--reasoning-effort LEVEL]
 //!            [--reasoning-budget N] [--hide-thinking]
-//!            [--draft mtp|DIR|FILE.gguf] [--draft-max N] [--draft-quant q8_0|q4_0]
+//!            [--draft mtp|lookup|DIR|FILE.gguf] [--draft-max N] [--draft-quant q8_0|q4_0]
 //!            [--draft-context N] [--draft-p-min P]
 //!            [--mmproj FILE|auto|none] [--image-tokens N] [--image-min-tokens N]
 //!

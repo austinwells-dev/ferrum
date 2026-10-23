@@ -509,6 +509,9 @@ pub fn type_name(id: u32) -> String {
 /// Weight types the hybrid engine has kernels for (see `hybrid::weights`).
 pub const SUPPORTED: [u32; 10] = [0, 2, 8, 12, 13, 14, 18, 21, 22, 23];
 
+/// Types the token-embedding lookup reads (`HybridModel::get_rows`).
+const EMBEDDING: [u32; 7] = [2, 8, 12, 13, 14, 23, 30];
+
 /// Mirrors what `Runtime::load` requires, without reading any weights.
 pub fn check(path: &Path) -> Checked {
     let blocked = |problem: String| Checked {
@@ -625,6 +628,15 @@ pub fn check(path: &Path) -> Checked {
             return result;
         }
     };
+    if let Some(t) = file.tensors().get("token_embd.weight")
+        && !EMBEDDING.contains(&t.type_id)
+    {
+        result.problem = Some(format!(
+            "embedding quant {} has no lookup kernel (needs Q4_0 Q8_0 Q4_K Q5_K Q6_K IQ4_XS BF16)",
+            type_name(t.type_id)
+        ));
+        return result;
+    }
     // Tensors of the trailing NextN/MTP block are only read for `--draft mtp`.
     let (mut trunk, mut head): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
     for t in file.tensors().values() {
@@ -704,21 +716,13 @@ mod tests {
         assert!(checked.hybrid.is_some());
     }
 
-    /// The Spark Q4_K_M GGUF from the Hugging Face cache, when present. Its
-    /// BF16 embedding and head gates must not make it "unsupported".
+    /// The Spark Q4_K_M GGUF: its BF16 embedding and head gates must not make
+    /// it "unsupported".
+    /// `FERRUM_SPARK_GGUF=Spark-X2.6-4B-Q4_K_M.gguf cargo test --bin ferrum-tui -- --ignored spark_gguf`
     #[test]
-    fn cached_spark_gguf_passes_the_quant_check() {
-        let cache = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_default()
-            .join(".cache/huggingface/hub/models--XHToken--Spark-X2.6-4B-GGUF/snapshots");
-        let Some(path) = std::fs::read_dir(&cache).ok().and_then(|dirs| {
-            dirs.flatten()
-                .map(|d| d.path().join("Spark-X2.6-4B-Q4_K_M.gguf"))
-                .find(|p| p.exists())
-        }) else {
-            return;
-        };
+    #[ignore = "needs the Spark GGUF on disk"]
+    fn spark_gguf_passes_the_quant_check() {
+        let path = PathBuf::from(std::env::var("FERRUM_SPARK_GGUF").expect("FERRUM_SPARK_GGUF"));
         let checked = check(&path);
         assert_eq!(checked.problem, None);
         assert!(checked.hybrid.is_some());

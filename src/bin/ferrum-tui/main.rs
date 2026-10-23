@@ -1,7 +1,6 @@
 //! Interactive launcher: home screen, setups, chat and serve in one TUI.
 //!
 //! ferrum-tui [MODEL.gguf]   (aliased to `ferrum`)
-#![allow(unused_imports)]
 
 mod agent;
 mod agentbench;

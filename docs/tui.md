@@ -110,7 +110,7 @@ Local models have small contexts, so the agent works to keep its context useful:
 
 - Long tool output is stored and searchable with BM25. The model gets a short excerpt and a handle it can follow up with (`ctx_search`, `ctx_read`). `bash` takes an `intent` and returns only the lines relevant to it.
 - Re-reading a file that hasn't changed returns a short notice instead of the contents.
-- At 55% context, old tool output is elided in one batch, so the prompt cache is rebuilt once instead of every turn. At 80% the session is snapshotted.
+- At 85% context the session is snapshotted once (as `/compact` does), so the prompt cache is rebuilt once instead of every turn. Tool output stays in full until then.
 - Repeated identical tool calls are stopped.
 - The system prompt includes a repo map, the commands available on the machine, and your `AGENTS.md` / `CLAUDE.md`.
 

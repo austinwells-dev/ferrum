@@ -1,6 +1,6 @@
 # Experimental: Flint and Spark
 
-> **Experimental.** This page covers Flint and Spark support, which lives on the `experimental` branch only. It is not production-ready. Expect rough edges, and expect the behaviour and the parsing to change.
+> **Experimental.** This page covers Flint and Spark support. It is not production-ready. Expect rough edges, and expect the behaviour and the parsing to change.
 
 ## What works
 
@@ -28,9 +28,9 @@ Ferrum sits closer to llama.cpp's Metal output than llama.cpp's own CPU backend 
 
 - One quant (`UD-Q3_K_XL`) is validated. Other Flint files may use quant types the kernels do not cover; the TUI lists the supported set when it refuses a file.
 - Flint's template has no thinking switch, so the prompt itself ends in `<think>` (thinking on) or `<think></think>` (off), written the way the template writes past reasoning so later turns reuse the cached prefix. A budget-cut reasoning closes with a bare `</think>`.
-- Sliding-window layers keep their K/V in a ring of 1,088 rows (window 513 plus one prompt chunk), so only the 13 full-attention layers grow with the context: about 26 KiB per token plus 76 MiB of rings, against 98 KiB per token before. A session can rewind only while the rings still hold the rewind point's window; further back it recomputes from the start.
-- The legacy attention kernels (`FERRUM_LEGACY_ATTENTION`, `FERRUM_SIMD_ATTENTION`) reject Flint's geometry.
-- Drafters (MTP, DFlash) are not available for Flint.
+- Sliding-window layers keep their K/V in a ring of 1,088 rows (window 513 plus one prompt chunk), so only the 14 full-attention layers grow with the context: 28 KiB per token plus 76 MiB of rings, against 98 KiB per token before. A session can rewind only while the rings still hold the rewind point's window; further back it recomputes from the start.
+- The legacy attention kernels (`FERRUM_HYBRID_LEGACY_ATTENTION`, `FERRUM_HYBRID_SIMD_ATTENTION`) reject Flint's and Spark's geometry.
+- No trained drafter (MTP, DFlash) exists for Flint. Prompt lookup (`--draft lookup`) works (1.12× on the `hybrid_spec` chat prompts) but is less exact than on the Qwen3.5 models: verifying 4 or more rows goes through F16 TensorOps tiles, and Flint's expert routing amplifies that rounding, so 4 of 8 greedy prompts drifted from plain decoding (one at a top-2 margin of 0.32). With `FERRUM_HYBRID_EXACT=1` only one near-tie flip (margin 0.035) remains, so this is rounding, not a verify error. The TUI's speed benchmark marks such rows `≈` and checks their answers before recommending them.
 - Expert routing implements neither a selection bias on the scores (`exp_probs_b.bias`) nor an `expert_weights_scale` other than 1.0; this GGUF has neither, and a file that does is refused at load.
 - Chat `bos_token` and `eos_token` strings come from the vocabulary, but Flint's template does not use them.
 
@@ -55,6 +55,7 @@ XHToken's `spark2_5` architecture: a 4.4B dense model with attention on all 36 l
 |---|---|
 | Tokenizer ids vs `llama-tokenize` (mixed-script stress file, README, architecture.md; 13.4K tokens) | identical |
 | Greedy continuation, "The capital of France is" | identical to `llama-simple` |
+| Chat template vs Jinja2 (`tests/fixtures/spark/render_cases.json`: tools, tool history, thinking on/off, low effort) | identical |
 | KLD vs llama.cpp Metal, 5,115 positions | mean 0.0012, median 0.00008, top-1 99.35%; PPL 13.303 vs 13.298 |
 | llama.cpp CPU vs its own Metal (same file) | mean 0.0040, median 0.0010, top-1 97.9% |
 | Speed (`hybrid_bench` vs `llama-bench`, interleaved) | pp512 1161 vs 1110-1165 tok/s; pp2048 1094 vs 1066-1121; tg128 35-38 vs 36-39 |
@@ -62,6 +63,6 @@ XHToken's `spark2_5` architecture: a 4.4B dense model with attention on all 36 l
 ## Known gaps
 
 - One quant (`Q4_K_M`) is validated. Its embedding and head gates are BF16. `Q8_0` should load but is untested; the all-BF16 file (`Spark-X2.6-4B.gguf`) is refused, since only embeddings, LM heads, routers, head gates and the fused QKV accept BF16.
-- Tool calls use Flint's `<arg_key>`/`<arg_value>` format and go through the same parser, untested against this model.
+- Tool calls use Flint's `<arg_key>`/`<arg_value>` format and go through the same parser. A weather-tool request through `ferrum-server` returns a call with schema-typed arguments; broader tool use is untested.
 - `reasoning_effort` (`low`/`high`) is passed through to the template; the 1M trained context is capped by the memory plan.
 - No trained drafter (MTP, DFlash, DSpark) exists for Spark. Prompt lookup (`--draft lookup`, "Prompt lookup" in the TUI) works and is lossless: 1.13× on the `hybrid_spec` chat prompts (35.8 → 40.4 tok/s). Plain decode already reads weights at about 81% of the M5's measured bandwidth ceiling.

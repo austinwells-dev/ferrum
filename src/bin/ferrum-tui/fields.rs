@@ -1,5 +1,3 @@
-use crate::*;
-
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mode {
     Chat,

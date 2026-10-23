@@ -1,6 +1,6 @@
 # Server and CLI guide
 
-`ferrum-server` and `ferrum-cli` run Qwen3.5-family GGUF models (`qwen35` dense and `qwen35moe` hybrids) on the hybrid engine. Both of them:
+`ferrum-server` and `ferrum-cli` run Qwen3.5-family GGUF models (`qwen35` dense and `qwen35moe` hybrids) on the hybrid engine, and, experimentally, Flint and Spark ([experimental.md](experimental.md)). Both of them:
 
 - render the chat template embedded in the GGUF, the same way Hugging Face's `apply_chat_template` does,
 - stream the model's reasoning separately from its answer (as `reasoning_content`),
@@ -95,13 +95,14 @@ Commands: `/reset`, `/think on|off`, `/image PATH`, `/stats`, `/exit`. To contin
 
 Speculative decoding speeds up generation without changing the output. A small, fast drafter guesses the next few tokens, and the main model checks all of the guesses in one forward pass. With greedy decoding the output is exactly the same as without speculation. With sampling, the output distribution is unchanged.
 
-Ferrum supports three kinds of drafter:
+Ferrum supports four kinds of drafter:
 
-- **MTP.** The multi-token-prediction head built into the model's own GGUF. Nothing extra to download.
+- **MTP.** The multi-token-prediction head built into the model's own GGUF. Nothing extra to download. Dense models only: an MTP block with routed experts (as in the 35B MoE GGUFs) is refused.
 - **DFlash / DFlash2.** Separate block-diffusion drafters that propose a whole block of tokens at once.
 - **DSpark.** DFlash plus a low-rank Markov bias and a confidence head that predicts which guesses will be accepted.
+- **Prompt lookup.** No model: it proposes the tokens that followed the latest earlier occurrence of the last few tokens. It pays off when output repeats its context (code edits, quoted text) and costs nothing when it misses.
 
-Drafters are loaded from Hugging Face checkpoints and quantized to Q4_0 when they load, with no measurable loss in accuracy. The memory planner budgets for the drafter up front and shrinks the automatic context to make room.
+Drafters are loaded from Hugging Face checkpoints (or DFlash GGUF files) and quantized to Q4_0 when they load, with no measurable loss in accuracy. The memory planner budgets for the drafter up front and shrinks the automatic context to make room.
 
 ```sh
 # The model's built-in MTP head
@@ -117,8 +118,8 @@ ferrum-cli --model tiel.gguf \
 
 | Flag | Meaning |
 |---|---|
-| `--draft mtp\|DIR` | Drafter to use (off by default) |
-| `--draft-max N` | Most tokens drafted per step (default: 3 for MTP, the trained block size for dense targets, 2 for MoE targets) |
+| `--draft mtp\|lookup\|DIR\|FILE` | Drafter to use (off by default): the MTP head, prompt lookup, a checkpoint directory or its Hugging Face cache entry, or a DFlash GGUF |
+| `--draft-max N` | Most tokens drafted per step (default: 3 for MTP and lookup, the trained block size for dense targets, 2 for MoE targets) |
 | `--draft-quant q4_0\|q8_0` | Drafter weight precision (default `q4_0`) |
 | `--draft-context N` | Context slots for drafters without a sliding window (default 8192) |
 | `--draft-p-min P` | DSpark: stop drafting below this confidence |

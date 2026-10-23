@@ -140,7 +140,7 @@ impl Mtp {
         let xn = rows(&s.xn, m, hd)?;
         let mix = rows(&s.mix, m, hd)?;
         let cat = rows(&self.cat, m, 2 * hd)?;
-        t.get_rows(d, &t.weights.embedding, ids, &x0)?;
+        HybridModel::get_rows(d, &t.weights.embedding, ids, &x0)?;
         t.rmsnorm(d, &x0, &w.enorm, &xn, m)?;
         t.capture(d, &xn, &self.cat, 0, m)?;
         t.rmsnorm(d, h, &w.hnorm, &xn, m)?;

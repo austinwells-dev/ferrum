@@ -1,4 +1,4 @@
-//! Qwen3.5-family hybrid geometry read from GGUF metadata.
+//! Hybrid-engine geometry read from GGUF metadata (Qwen3.5 family, Flint, Spark).
 #![forbid(unsafe_code)]
 use crate::{
     Error, Result,

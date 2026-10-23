@@ -1,0 +1,256 @@
+[
+ {
+  "name": "system_user_thinking_by_default",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hi there"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expect": "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.\n`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low` and `high`.\nNow the system is invoked with `thinking_effort=high`.\n\nYou are terse.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Hi there<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>"
+ },
+ {
+  "name": "thinking_off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": false
+  },
+  "expect": "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Hi<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|></think>"
+ },
+ {
+  "name": "low_reasoning_effort",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": true,
+   "reasoning_effort": "low"
+  },
+  "expect": "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.\n`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low` and `high`.\nNow the system is invoked with `thinking_effort=low`.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Hi<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>"
+ },
+ {
+  "name": "tools_in_the_system_block",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expect": "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.\n`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low` and `high`.\nNow the system is invoked with `thinking_effort=high`.\n\n## Tools\nYou have access to the following functions:\n<tools>\n{\"name\":\"get_weather\",\"description\":\"Current weather for a city\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"metric\":{\"type\":\"boolean\"}},\"required\":[\"city\"]}}\n</tools><｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Weather in Paris?<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>"
+ },
+ {
+  "name": "tool_call_reasoning_and_tool_responses",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris and Oslo, 3 days, metric?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Two cities, two calls.",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris",
+        "days": 3,
+        "metric": true,
+        "tags": [
+         "a",
+         "b"
+        ]
+       }
+      }
+     },
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Oslo"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "18C and sunny"
+   },
+   {
+    "role": "tool",
+    "content": "4C and rain"
+   },
+   {
+    "role": "assistant",
+    "content": "Paris 18C sunny, Oslo 4C rain."
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       },
+       "metric": {
+        "type": "boolean"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expect": "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.\n`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low` and `high`.\nNow the system is invoked with `thinking_effort=high`.\n\n## Tools\nYou have access to the following functions:\n<tools>\n{\"name\":\"get_weather\",\"description\":\"Current weather for a city\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"type\":\"integer\"},\"metric\":{\"type\":\"boolean\"}},\"required\":[\"city\"]}}\n</tools><｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Weather in Paris and Oslo, 3 days, metric?<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>Two cities, two calls.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value><arg_key>metric</arg_key><arg_value>true</arg_value><arg_key>tags</arg_key><arg_value>[\"a\", \"b\"]</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call><｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Tool|><tool_response>18C and sunny</tool_response><tool_response>4C and rain</tool_response><｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|></think>Paris 18C sunny, Oslo 4C rain.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Thanks<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>"
+ },
+ {
+  "name": "unicode_and_text_blocks",
+  "messages": [
+   {
+    "role": "system",
+    "content": [
+     {
+      "type": "text",
+      "text": "Réponds en français."
+     }
+    ]
+   },
+   {
+    "role": "user",
+    "content": [
+     {
+      "type": "text",
+      "text": "¿Qué tiempo hace? 天気は？"
+     }
+    ]
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "tiempo",
+     "description": "Clima en ciudades: Málaga, 東京",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {},
+  "expect": "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.\n`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low` and `high`.\nNow the system is invoked with `thinking_effort=high`.\n\n## Tools\nYou have access to the following functions:\n<tools>\n{\"name\":\"tiempo\",\"description\":\"Clima en ciudades: Málaga, 東京\",\"parameters\":{\"type\":\"object\",\"properties\":{}}}\n</tools>\n\nRéponds en français.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>¿Qué tiempo hace? 天気は？<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|><think>"
+ },
+ {
+  "name": "later_system_message",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Count"
+   },
+   {
+    "role": "assistant",
+    "content": "1, 2, 3"
+   },
+   {
+    "role": "system",
+    "content": "Now count backwards."
+   },
+   {
+    "role": "user",
+    "content": "Go"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": false
+  },
+  "expect": "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Count<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|></think>1, 2, 3<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|System|>\nNow count backwards.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Go<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|></think>"
+ },
+ {
+  "name": "assistant_history_without_generation_prompt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Count"
+   },
+   {
+    "role": "assistant",
+    "content": "1, 2, 3"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expect": "<｜start▁of▁sentence｜><|System|>\nyou are a helpful assistant.\n`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low` and `high`.\nNow the system is invoked with `thinking_effort=high`.<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|User|>Count<｜end▁of▁sentence｜><｜start▁of▁sentence｜><|Bot|></think>1, 2, 3<｜end▁of▁sentence｜>"
+ }
+]

@@ -90,7 +90,7 @@ impl SpecOptions {
 
     /// Apply one command-line flag shared by `ferrum-cli` and
     /// `ferrum-server`; returns false when `key` is not a draft flag.
-    /// `--draft mtp|DIR|FILE.gguf` enables speculation; the others tune it:
+    /// `--draft mtp|lookup|DIR|FILE.gguf` enables speculation; the others tune it:
     /// `--draft-max N`, `--draft-quant q8_0|q4_0`, `--draft-context N`
     /// (context slots for drafts without a sliding window) and
     /// `--draft-p-min P` (DSpark confidence cut-off).
@@ -659,7 +659,7 @@ impl Runtime {
     ) -> Result<((Completion, bool, usize, bool, String), String)> {
         let (prompt, spans) = self.expand_images(prompt_text, images)?;
         self.session.set_media(spans);
-        let close_text = reasoning_close(&self.template);
+        let close_text = reasoning_close(self.loaded.model.config.variant);
         let close_reasoning = self.loaded.tokenizer.encode(close_text)?;
         let tokenizer = &self.loaded.tokenizer;
         struct Driver<'a, H: ChatHooks> {
@@ -802,12 +802,11 @@ pub fn generation_prefix(template: &ChatTemplate, vars: &Map<String, Json>) -> &
 }
 
 /// What closes reasoning cut off by the budget: Qwen's template spacing, or
-/// Flint's bare `</think>` (as its template writes past reasoning).
-fn reasoning_close(template: &ChatTemplate) -> &'static str {
-    if template.opens_thinking() {
-        "</think>"
-    } else {
-        "\n</think>\n\n"
+/// the bare `</think>` Flint's and Spark's templates write after past reasoning.
+fn reasoning_close(variant: Variant) -> &'static str {
+    match variant {
+        Variant::Flint | Variant::Spark => "</think>",
+        Variant::Dense | Variant::Moe => "\n</think>\n\n",
     }
 }
 
@@ -1125,8 +1124,9 @@ mod thinking_tests {
         assert_eq!(generation_prefix(&qwen, &Map::new()), "");
         let plain = ChatTemplate::new("{{ messages[0].content }}").unwrap();
         assert_eq!(generation_prefix(&plain, &Map::new()), "");
-        assert_eq!(reasoning_close(&flint), "</think>");
-        assert_eq!(reasoning_close(&qwen), "\n</think>\n\n");
+        assert_eq!(reasoning_close(Variant::Flint), "</think>");
+        assert_eq!(reasoning_close(Variant::Spark), "</think>");
+        assert_eq!(reasoning_close(Variant::Dense), "\n</think>\n\n");
     }
 
     #[test]

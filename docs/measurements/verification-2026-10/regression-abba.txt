@@ -1,0 +1,17 @@
+SWIFT 1 main  6.72 ± 0.19 
+SWIFT 2 branch  6.83 ± 0.12 
+SWIFT 3 branch  7.30 ± 0.09 
+SWIFT 4 main  7.32 ± 0.10 
+SWIFT 5 main  7.24 ± 0.13 
+SWIFT 6 branch  7.27 ± 0.08 
+SWIFT 7 branch  7.33 ± 0.10 
+SWIFT 8 main  7.30 ± 0.09 
+TIEL 1 main  42.78 ± 1.62 
+TIEL 2 branch  44.31 ± 0.21 
+TIEL 3 branch  44.49 ± 0.04 
+TIEL 4 main  43.43 ± 2.18 
+TIEL 5 main  44.14 ± 1.08 
+TIEL 6 branch  44.44 ± 0.05 
+TIEL 7 branch  44.38 ± 0.02 
+TIEL 8 main  42.41 ± 1.10 
+DONE

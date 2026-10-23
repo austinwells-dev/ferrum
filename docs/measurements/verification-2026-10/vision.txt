@@ -1,0 +1,21 @@
+PASS  /props reports vision  -- {'vision': True, 'audio': False}
+PASS  test.png decodes and is described  -- 2.0 s, prompt 505: 'The picture contains a red rectangle in the top-left and a blue square in the bottom-right, both on a white background.'
+PASS  test.jpg decodes and is described  -- 2.0 s, prompt 505: 'The picture contains a red rectangle in the top-left corner and a blue square in the bottom-right corner, both on a white background.'
+PASS  test.gif decodes and is described  -- 2.1 s, prompt 505: 'The picture contains a red rectangle in the top-left corner and a blue square in the bottom-right corner, both on a white background.'
+PASS  test.webp decodes and is described  -- 2.2 s, prompt 505: 'The picture contains a red rectangle in the top-left corner and a blue square in the bottom-right corner, both on a white background.'
+PASS  test.bmp decodes and is described  -- 2.1 s, prompt 505: 'The picture contains a red rectangle in the top-left and a blue square in the bottom-right, both on a white background.'
+PASS  a 1024x1024 image is encoded (see the server log for its encode time)  -- 6.6 s, prompt 1229
+PASS  Anthropic base64 image block  -- There are two rectangles in the image: a red rectangle in the top-left corner and a blue rectangle in the bottom-right corner.
+PASS  a remote image URL is refused, not fetched  -- 400: {'error': {'message': 'invalid operation parameter: images must be sent inline as data: URLs or base64; remote and file URLs are not fetched', 'type': 'invalid_
+PASS  a second turn with the image in history reuses the cache  -- prompt 554, cached 530, 0.2 s
+PASS  text after the image answers correctly (red is top-left)  -- The red rectangle.
+
+11/11 passed
+10:30:07.400 INF vision: ~/Models/hub/models--peculiar-ragdoll--Tiel-Coder-35B-A3B-GGUF-MTP/snapshots/bbe9e566f39e4fc9652ac66b71968289a03c520a/mmproj-BF16.gguf (0.83 GiB; images take 64..1024 tokens each)
+10:30:09.875 INF [req 1] encoded images in 0.79 s
+10:30:11.885 INF [req 2] encoded images in 0.80 s
+10:30:13.946 INF [req 3] encoded images in 0.80 s
+10:30:16.176 INF [req 4] encoded images in 0.85 s
+10:30:18.245 INF [req 5] encoded images in 0.84 s
+10:30:24.852 INF [req 6] encoded images in 4.37 s
+10:30:26.067 WRN [req 8] rejected: invalid operation parameter: images must be sent inline as data: URLs or base64; remote and file URLs are not fetched

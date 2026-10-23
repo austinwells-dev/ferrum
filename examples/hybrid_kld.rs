@@ -21,11 +21,13 @@ use std::io::Read;
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: hybrid_kld MODEL.gguf BASE.kld [max_chunks]");
+        eprintln!("usage: hybrid_kld MODEL.gguf BASE.kld [max_chunks] [--write OUT.kld]");
         std::process::exit(2);
     }
+    // The optional chunk count is the third positional, before any --write.
     let max_chunks: usize = args
         .get(3)
+        .filter(|v| !v.starts_with("--"))
         .map_or(usize::MAX, |v| v.parse().expect("chunk count"));
     let write_path = args
         .iter()

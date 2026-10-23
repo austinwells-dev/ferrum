@@ -1,4 +1,5 @@
-//! `ferrum hybrid`: load a Qwen3.5-family GGUF and generate.
+//! `ferrum hybrid`: load a hybrid-engine GGUF (Qwen3.5 family, or experimentally
+//! Flint and Spark) and generate.
 use ferrum::{
     Error, MetalDevice, Result,
     hybrid::{self, HybridState, Output, Produced},
@@ -135,13 +136,17 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         model.scratch_bytes() as f64 / (1u64 << 20) as f64,
         loaded.load_time.as_secs_f64()
     );
+    // One user turn through the GGUF's own chat template, with its default
+    // thinking setting, unless --raw asks for plain completion.
     let text = if o.raw {
         o.prompt.clone()
     } else {
-        format!(
-            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-            o.prompt
-        )
+        let template = hybrid::load_chat_template(&o.model)?
+            .ok_or_else(|| Error::Parameter("the GGUF has no chat template; pass --raw".into()))?;
+        let vars = serde_json::Map::new();
+        let message = serde_json::json!({"role": "user", "content": o.prompt});
+        template.render(&[message], None, true, &vars)?
+            + hybrid::runtime::generation_prefix(&template, &vars)
     };
     let prompt = loaded.tokenizer.encode(&text)?;
     let before_state = d.allocated_bytes();

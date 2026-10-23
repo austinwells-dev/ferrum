@@ -8,7 +8,7 @@ use crate::*;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{BufRead, BufReader};
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 
 /// The agent's sandbox keeps command output whole; the store decides what the model sees.

@@ -1364,6 +1364,35 @@ fn bf16_projections_match_widened_rows() {
     }
 }
 
+/// BF16 embeddings (Spark): a looked-up row is the exact widened BF16 row.
+#[test]
+fn bf16_embedding_rows_are_widened_exactly() {
+    let d = MetalDevice::new().unwrap();
+    let (rows, cols) = (37, 2560);
+    let bits: Vec<u16> = random(rows * cols, 11)
+        .iter()
+        .map(|v| (v.to_bits() >> 16) as u16)
+        .collect();
+    let bytes: Vec<u8> = bits.iter().flat_map(|b| b.to_le_bytes()).collect();
+    let w = Matrix::from_packed(&d, rows, cols, 1, Format::Bf16, &bytes).unwrap();
+    let ids: [u32; 4] = [36, 0, 17, 17];
+    let ids_t = Tensor::from_le_bytes(
+        &d,
+        [ids.len()],
+        DType::F32,
+        &ids.iter().flat_map(|i| i.to_le_bytes()).collect::<Vec<_>>(),
+    )
+    .unwrap();
+    let y = Tensor::zeros(&d, [ids.len() * cols], DType::F32).unwrap();
+    HybridModel::get_rows(&d, &w, &ids_t, &y).unwrap();
+    let want: Vec<f32> = ids
+        .iter()
+        .flat_map(|&r| &bits[r as usize * cols..(r as usize + 1) * cols])
+        .map(|&b| f32::from_bits(u32::from(b) << 16))
+        .collect();
+    assert_eq!(y.to_f32(), want);
+}
+
 /// Expert projections: each route multiplies its own expert's slice.
 #[test]
 fn iq_expert_projections_match_the_cpu_dequant() {

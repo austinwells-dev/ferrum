@@ -1043,7 +1043,7 @@ impl DraftModel {
         let gate = rows(&b.gate, c.ffn)?;
         let up = rows(&b.up, c.ffn)?;
         let act = rows(&b.act, c.ffn)?;
-        t.get_rows(d, &t.weights.embedding, &ids, &x)?;
+        HybridModel::get_rows(d, &t.weights.embedding, &ids, &x)?;
         for (li, layer) in self.layers.iter().enumerate() {
             self.rmsnorm(d, &x, &layer.in_norm, &hn, m)?;
             let input = match &layer.attn_conv {
@@ -1460,7 +1460,7 @@ impl Drafter for DraftModel {
                         b.ids.view(i - 1, [1])?
                     };
                     let w1p = b.w1p.view(i * rank, [1, rank])?;
-                    t.get_rows(d, &markov.w1, &prev, &w1p)?;
+                    HybridModel::get_rows(d, &markov.w1, &prev, &w1p)?;
                     HybridModel::project(
                         d,
                         &markov.w2_head,

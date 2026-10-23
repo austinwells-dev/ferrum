@@ -1,0 +1,53 @@
+PASS  GET /health answers 200  -- {'status': 'ok'}
+PASS  GET /props answers 200  -- {'model_path': '~/.cache/huggingface/hub/models--XHToken--Spark
+PASS  GET /slots answers 200  -- [{'id': 0, 'n_ctx': 16384, 'is_processing': False, 'id_task': None, 'phase': 'id
+PASS  GET /metrics answers 200  -- # TYPE ferrum_requests_total counter
+ferrum_requests_total 0
+# TYPE ferrum_reque
+PASS  GET /v1/models answers 200  -- {'object': 'list', 'data': [{'id': 'Spark-X2.6-4B-Q4_K_M', 'object': 'model', 'c
+PASS  /tokenize returns ids  -- {'tokens': [26240, 3179]}
+PASS  /detokenize round-trips  -- {'content': 'Hello world'}
+PASS  /apply-template renders the prompt
+PASS  /v1/completions  -- {'id': 'cmpl-4', 'object': 'text_completion', 'created': 1792747748, 'model': 'Spark-X2.6-4B-Q4_K_M', 'choices': [{'inde
+PASS  /v1/chat/completions  -- {'id': 'chatcmpl-5', 'object': 'chat.completion', 'created': 1792747749, 'model': 'Spark-X2.6-4B-Q4_K_M', 'choices': [{'index': 0, 'message': {'role': 'assistan
+PASS  /v1/messages (Anthropic)  -- {'id': 'msg_6', 'type': 'message', 'role': 'assistant', 'model': 'Spark-X2.6-4B-Q4_K_M', 'content': [{'type': 'thinking', 'thinking': 'We need answer user asks 
+PASS  /v1/messages/count_tokens  -- {'input_tokens': 72}
+PASS  Anthropic streaming emits message_stop
+PASS  /props reports modalities  -- {'vision': False, 'audio': False}
+PASS  identical retry reuses all but the last token  -- prompt 868, cached 867
+PASS  identical greedy retry gives identical text
+PASS  an extended conversation reuses the cached prefix  -- prompt 906, cached 891
+PASS  extended answer equals a from-scratch server's  -- 
+   cached: {'role': 'assistant', 'content': '', 'reasoning_content': 'We need answer. Need count even items in list item 0..149 inclusive. Need determine number even.'}
+   fresh:  {'role': 'assistant', 'content': '', 'reasoning_content': 'We need answer. Need count even items in list item 0..149 inclusive. Need determine number even.'}
+PASS  late divergence past the ring matches a fresh server  -- prompt 4981, cached 4969
+PASS  late divergence resumes from the cache  -- cached 4969
+PASS  early divergence past the ring matches a fresh server  -- prompt 4989, cached 0
+PASS  early divergence recomputes  -- cached 0
+PASS  enable_thinking=false turns reasoning off  -- {'role': 'assistant', 'content': 'The three primary colours are **red, blue, and yellow**. \n\nThese are the primary col
+PASS  chat_template_kwargs turns reasoning off  -- {'role': 'assistant', 'content': 'The three primary colours are **red, blue, and yellow**. \n\nThese are the primary col
+PASS  think=false turns reasoning off  -- {'role': 'assistant', 'content': 'The three primary colours are **red, blue, and yellow**. \n\nThese are the primary col
+PASS  reasoning_effort=none turns reasoning off  -- {'role': 'assistant', 'content': 'The three primary colours are **red, blue, and yellow**. \n\nThese are the primary col
+PASS  thinking on by default yields reasoning_content  -- {'role': 'assistant', 'content': '', 'reasoning_content': 'We need answer user asks "Name three primary colours." Need l
+PASS  reasoning_budget=8 cuts reasoning short  -- reasoning tokens None; {'role': 'assistant', 'content': 'Three primary colours are red, blue, and yellow.', 'reasoning_content': 'We need answer user asks "Name three'}
+PASS  reasoning_format=none keeps <think> inline  -- {'role': 'assistant', 'content': '<think>\nWe need answer user asks "Name three primary colours." Need likely RGB or CMY
+PASS  reasoning_effort=low reaches the template  -- <｜start▁of▁sentence｜><|System|>
+you are a helpful assistant.
+`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`
+PASS  reasoning_effort=medium snaps to a level the template knows  -- {'id': 'chatcmpl-24', 'object': 'chat.completion', 'created': 1792747788, 'model': 'Spark-X2.6-4B-Q4_K_M', 'choices': [{'index': 0, 'message': {'role': 'assista
+PASS  Anthropic thinking returns a thinking block  -- {'id': 'msg_25', 'type': 'message', 'role': 'assistant', 'model': 'Spark-X2.6-4B-Q4_K_M', 'content': [{'type': 'thinking', 'thinking': 'We need answer user asks "Name three primary colours." Need like
+PASS  include_usage adds a final usage chunk  -- {'id': 'chatcmpl-26', 'object': 'chat.completion.chunk', 'created': 1792747790, 'model': 'Spark-X2.6-4B-Q4_K_M', 'choices': [], 'usage': {'prompt_tokens': 72, '
+PASS  return_progress streams prompt progress  -- [{'id': 'chatcmpl-27', 'object': 'chat.completion.chunk', 'created': 1792747790, 'model': 'Spark-X2.6-4B-Q4_K_M', 'choices': [{'index': 0, 'delta': {'role': 'assistant', 'content': None}, 'finish_reas
+PASS  after a client disconnect the next request runs promptly  -- 0.2 s
+PASS  a request with tools renders and returns a tool call  -- {'role': 'assistant', 'content': '', 'reasoning_content': 'The user wants the weather in Paris for the next 3 days. I\'ll use the get_weather tool with city="Paris" and days=3.', 'tool_calls': [{'index': 0, 'id': 'call_30_0', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': '{"ci
+PASS  tool arguments are typed by the schema  -- {'city': 'Paris', 'days': 3}
+PASS  an image without a projector is a clear 400  -- {'error': {'message': 'invalid operation parameter: this model was loaded without a vision projector, so it cannot read images (load an mmproj file with --mmproj)', 'type': 'invalid_request_error', 'c
+PASS  --api-key: no key is refused  -- status 401
+PASS  --api-key: Bearer key accepted  -- status 200
+PASS  --api-key: x-api-key accepted  -- status 200
+PASS  a foreign web page gets 403  -- status 403
+PASS  a localhost page is allowed  -- status 200
+PASS  a non-local Host on loopback gets 403 (DNS rebinding)  -- status 403
+PASS  --cors ORIGIN allows that page  -- status 200
+
+45/45 passed

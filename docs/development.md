@@ -9,7 +9,7 @@
 | `src/tensor/`, `src/ops/`, `src/nn/` | Tensors, operations, attention, KV cache, MoE routing |
 | `src/loader/` | safetensors and GGUF parsing |
 | `src/model/` | The general transformer engine (Qwen2.5/3, Granite, OLMo 2, LFM2) |
-| `src/hybrid/` | The large-model engine for Qwen3.5-family hybrids: memory planner, forward pass, sessions, drafters |
+| `src/hybrid/` | The large-model engine for Qwen3.5-family hybrids (and, experimentally, Flint and Spark): memory planner, forward pass, sessions, drafters |
 | `src/vision/` | Qwen3-VL image encoder |
 | `src/tokenizer/`, `src/reference/` | Tokenizers; CPU reference implementations used as test oracles |
 | `src/bin/` | `ferrum-cli`, `ferrum-server`, `ferrum-tui` |
@@ -39,8 +39,9 @@ cargo run --release -- run --model /path/to/Qwen2.5-0.5B-Instruct \
 cargo run --release -- profile --model /path/to/Qwen2.5-0.5B-Instruct \
   --prompt 'Hello!' --max-new-tokens 8 --temperature 0 --warmup
 
-# Raw generation on the hybrid engine
-cargo run --release -- hybrid --model /path/to/model.gguf --prompt 'The capital of France is'
+# Generation on the hybrid engine: one user turn through the GGUF's chat template,
+# or plain completion with --raw
+cargo run --release -- hybrid --model /path/to/model.gguf --raw --prompt 'The capital of France is'
 ```
 
 - Point `--model` at a checkpoint directory with its config, tokenizer and weights, or at a GGUF file.
@@ -90,13 +91,13 @@ FERRUM_CHECK_MODEL=/path/to/model.gguf FERRUM_CHECK_DRAFTER=/path/to/drafter \
   FERRUM_CHECK_DEPTH=4 cargo test --release --bin ferrum-tui -- --ignored --nocapture keeps_its_answers
 ```
 
-The agent benchmark's tasks can be checked without a model as well. This installs all ten into a temporary folder and checks, in the sandbox, that each fails as checked out and passes with its real fix:
+`FERRUM_CHECK_DRAFTER=mtp` uses the model's MTP head, `FERRUM_CHECK_DRAFTER=lookup` prompt lookup, and `FERRUM_CHECK_QUANT=q8_0` loads the drafter in 8 bits. On a dense 27B each pass takes about 15 minutes.
+
+The agent benchmark's tasks can be checked without a model as well. This clones all ten (it needs the network) into a temporary folder and checks, in the sandbox, that each fails as checked out and passes with its real fix:
 
 ```sh
 cargo test --release --bin ferrum-tui -- --ignored --nocapture tasks_fail_before
 ```
-
-`FERRUM_CHECK_DRAFTER=mtp` uses the model's MTP head and `FERRUM_CHECK_QUANT=q8_0` loads the drafter in 8 bits. On a dense 27B each pass takes about 15 minutes.
 
 Python is only used by the optional comparison tools. To set up the reference environment:
 

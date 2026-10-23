@@ -1577,7 +1577,7 @@ mod tests {
     /// Headless answer check of one drafter against plain decoding, for
     /// drafter and kernel changes. Baseline answers are recomputed, not cached.
     ///
-    /// FERRUM_CHECK_MODEL=m.gguf FERRUM_CHECK_DRAFTER=dir|mtp [FERRUM_CHECK_DEPTH=4]
+    /// FERRUM_CHECK_MODEL=m.gguf FERRUM_CHECK_DRAFTER=dir|mtp|lookup [FERRUM_CHECK_DEPTH=4]
     /// [FERRUM_CHECK_QUANT=q8_0] cargo test --release --bin ferrum-tui -- --ignored --nocapture keeps_its_answers
     #[test]
     #[ignore = "needs a model and a drafter on disk"]
@@ -1596,15 +1596,15 @@ mod tests {
             },
             on: true,
         };
-        let draft = cand(if drafter == "mtp" {
-            Source::Mtp
-        } else {
-            Source::Drafter {
+        let draft = cand(match drafter.as_str() {
+            "mtp" => Source::Mtp,
+            "lookup" => Source::Lookup,
+            _ => Source::Drafter {
                 path: drafter.into(),
                 label: "drafter".into(),
                 kind: "drafter",
                 max_depth: depth,
-            }
+            },
         });
         let plan = Plan {
             model,

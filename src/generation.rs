@@ -1,7 +1,7 @@
 //! CPU token selection and orchestration; all model arithmetic remains on Metal.
 #![forbid(unsafe_code)]
 use crate::{Error, MetalDevice, Result, Tensor};
-/// Copy only the final [vocabulary] row using the existing checked copy operation.
+/// Copy only the final `[vocabulary]` row using the existing checked copy operation.
 pub fn final_logits(_d: &MetalDevice, logits: &Tensor) -> Result<Vec<f32>> {
     let shape = logits.shape().dimensions();
     if shape.len() != 2 || shape.contains(&0) {

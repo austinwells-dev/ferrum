@@ -117,8 +117,8 @@ fn scan(dir: &Path, project: &Path, out: &mut Vec<Skill>) {
     }
 }
 
-/// Skills in `<project>/*/`, `<project>/skills/*/` and `<project>/.ferrum/skills/*/`,
-/// then `~/.ferrum/skills/*/`. A project skill wins over a global one of the same name.
+/// Skills in `<project>/skills/*/`, `<project>/.ferrum/skills/*/` and `<project>/*/`,
+/// then `~/.ferrum/skills/*/`. The first skill of a name wins, in that order.
 pub fn discover(project: &Path) -> Vec<Skill> {
     let mut out = Vec::new();
     for dir in [

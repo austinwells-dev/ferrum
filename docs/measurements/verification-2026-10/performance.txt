@@ -1,0 +1,224 @@
+== flint-lookup-exact (10:30:43)
+   exit 0, 50 s
+   prompt 0: 128 tokens, 56.6 tok/s, acceptance 2.53 (17 steps), baseline 50.5 tok/s, diverges at 85 (target top-2 margin 0.0353)
+   speculative: 52.05 tok/s, acceptance length 2.304, draft 0.0 ms/step, verify 37.2 ms/step
+   baseline: 49.67 tok/s; speedup 1.05x; greedy mismatches 1
+== flint-speccheck-2 (10:31:37)
+   exit 0, 10 s
+   speculative output == greedy reference (96 tokens)
+   verify rows vs single-row decode over 3 positions: max |dlogit| 0.0101, max KL 1.21e-6
+   replay after commit(2) vs plain forward: max |dlogit| 0.0000 (scale 59.4), argmax 32 vs 32
+== flint-speccheck-3 (10:31:51)
+   exit 0, 9 s
+   speculative output == greedy reference (96 tokens)
+   verify rows vs single-row decode over 4 positions: max |dlogit| 0.0101, max KL 1.21e-6
+   replay after commit(2) vs plain forward: max |dlogit| 0.0000 (scale 59.4), argmax 32 vs 32
+== flint-speccheck-8 (10:32:04)
+   exit 0, 10 s
+   speculative output == greedy reference (96 tokens)
+   verify rows vs single-row decode over 9 positions: max |dlogit| 0.0575, max KL 2.59e-5
+   replay after commit(5) vs plain forward: max |dlogit| 0.0223 (scale 53.6), argmax 332 vs 332
+   swift: 96 greedy tokens identical on main and branch
+== regress-swift-main-1 (10:32:57)
+   exit 0, 65 s
+   | Miroslav 1.0 | pp512 | 196.91 ± 0.95 |
+   | Miroslav 1.0 | tg128 | 7.39 ± 0.02 |
+== regress-swift-branch-1 (10:34:07)
+   exit 0, 66 s
+   | Miroslav 1.0 | pp512 | 185.41 ± 9.87 |
+   | Miroslav 1.0 | tg128 | 7.32 ± 0.16 |
+== regress-swift-main-2 (10:35:17)
+   exit 0, 65 s
+   | Miroslav 1.0 | pp512 | 195.54 ± 2.09 |
+   | Miroslav 1.0 | tg128 | 7.35 ± 0.12 |
+== regress-swift-branch-2 (10:36:26)
+   exit 0, 66 s
+   | Miroslav 1.0 | pp512 | 192.21 ± 1.72 |
+   | Miroslav 1.0 | tg128 | 7.27 ± 0.07 |
+   (preflight not clear after 180 s)
+== regress-swift-main-3 (10:40:33)
+   exit 0, 66 s
+   | Miroslav 1.0 | pp512 | 183.60 ± 15.85 |
+   | Miroslav 1.0 | tg128 | 7.25 ± 0.08 |
+   (preflight not clear after 180 s)
+== regress-swift-branch-3 (10:44:39)
+   exit 0, 67 s
+   | Miroslav 1.0 | pp512 | 197.16 ± 0.11 |
+   | Miroslav 1.0 | tg128 | 7.22 ± 0.05 |
+   tiel: 96 greedy tokens identical on main and branch
+   (preflight not clear after 180 s)
+== regress-tiel-main-1 (10:49:02)
+   exit 0, 16 s
+   | Ornith-1.5-35B | pp512 | 972.30 ± 0.45 |
+   | Ornith-1.5-35B | tg128 | 40.40 ± 1.75 |
+   (preflight not clear after 180 s)
+== regress-tiel-branch-1 (10:52:18)
+   exit 0, 16 s
+   | Ornith-1.5-35B | pp512 | 971.84 ± 1.64 |
+   | Ornith-1.5-35B | tg128 | 43.88 ± 0.03 |
+== regress-tiel-main-2 (10:55:00)
+   exit 0, 16 s
+   | Ornith-1.5-35B | pp512 | 975.31 ± 0.05 |
+   | Ornith-1.5-35B | tg128 | 43.32 ± 2.43 |
+== regress-tiel-branch-2 (10:55:20)
+   exit 0, 16 s
+   | Ornith-1.5-35B | pp512 | 972.94 ± 0.34 |
+   | Ornith-1.5-35B | tg128 | 44.52 ± 0.06 |
+== regress-tiel-main-3 (10:55:40)
+   exit 0, 16 s
+   | Ornith-1.5-35B | pp512 | 903.08 ± 2.77 |
+   | Ornith-1.5-35B | tg128 | 44.59 ± 0.16 |
+== regress-tiel-branch-3 (10:56:00)
+   exit 0, 16 s
+   | Ornith-1.5-35B | pp512 | 973.18 ± 0.47 |
+   | Ornith-1.5-35B | tg128 | 42.91 ± 2.09 |
+== bench-swift-ferrum-1 (10:56:20)
+   exit 0, 461 s
+   | Miroslav 1.0 | tg@0 | 7.53 (step 132.80 ms) |
+   | Miroslav 1.0 | tg@32768 | 6.16 (step 162.24 ms) |
+   | Miroslav 1.0 | pp512 | 175.92 ± 3.48 |
+   | Miroslav 1.0 | pp8192 | 166.19 ± 1.54 |
+   | Miroslav 1.0 | tg128 | 6.01 ± 0.28 |
+== bench-swift-llama-1 (11:04:05)
+   exit 0, 298 s
+== bench-swift-llama-depth-1 (11:09:07)
+   exit 0, 267 s
+== bench-swift-ferrum-2 (11:13:39)
+   exit 0, 462 s
+   | Miroslav 1.0 | tg@0 | 7.09 (step 141.04 ms) |
+   | Miroslav 1.0 | tg@32768 | 5.94 (step 168.25 ms) |
+   | Miroslav 1.0 | pp512 | 165.13 ± 3.39 |
+   | Miroslav 1.0 | pp8192 | 166.73 ± 1.05 |
+   | Miroslav 1.0 | tg128 | 7.06 ± 0.14 |
+== bench-swift-llama-2 (11:21:25)
+   exit 0, 293 s
+== bench-swift-llama-depth-2 (11:26:23)
+   exit 0, 267 s
+== bench-tiel-ferrum-1 (11:30:54)
+   exit 0, 154 s
+   | Ornith-1.5-35B | tg@0 | 41.71 (step 23.98 ms) |
+   | Ornith-1.5-35B | tg@32768 | 30.32 (step 32.98 ms) |
+   | Ornith-1.5-35B | pp512 | 802.10 ± 70.50 |
+   | Ornith-1.5-35B | pp16384 | 654.45 ± 8.50 |
+   | Ornith-1.5-35B | tg128 | 39.37 ± 0.05 |
+== bench-tiel-llama-1 (11:33:32)
+   exit 0, 107 s
+== bench-tiel-llama-depth-1 (11:35:23)
+   exit 0, 57 s
+== bench-tiel-ferrum-2 (11:36:24)
+   exit 0, 147 s
+   | Ornith-1.5-35B | tg@0 | 42.78 (step 23.38 ms) |
+   | Ornith-1.5-35B | tg@32768 | 31.03 (step 32.23 ms) |
+   | Ornith-1.5-35B | pp512 | 919.61 ± 7.74 |
+   | Ornith-1.5-35B | pp16384 | 683.26 ± 1.71 |
+   | Ornith-1.5-35B | tg128 | 41.85 ± 0.07 |
+== bench-tiel-llama-2 (11:38:55)
+   exit 0, 107 s
+== bench-tiel-llama-depth-2 (11:40:46)
+   exit 0, 57 s
+== bench-spark-ferrum-1 (11:41:47)
+   exit 0, 24 s
+   | Dense F32 | pp512 | 1197.28 ± 18.49 |
+   | Dense F32 | pp2048 | 1098.72 ± 9.74 |
+   | Dense F32 | tg128 | 36.88 ± 1.28 |
+== bench-spark-llama-1 (11:42:30)
+   exit 0, 19 s
+== bench-flint-ferrum-1 (11:42:54)
+   exit 0, 26 s
+   | Flint Preview | pp512 | 965.04 ± 4.62 |
+   | Flint Preview | pp2048 | 893.87 ± 37.15 |
+   | Flint Preview | tg128 | 50.54 ± 0.22 |
+== bench-spark-ferrum-2 (11:43:24)
+   exit 0, 24 s
+   | Dense F32 | pp512 | 1194.65 ± 22.37 |
+   | Dense F32 | pp2048 | 1082.41 ± 66.97 |
+   | Dense F32 | tg128 | 38.53 ± 0.08 |
+== bench-spark-llama-2 (11:43:52)
+   exit 0, 19 s
+== bench-flint-ferrum-2 (11:44:29)
+   exit 0, 27 s
+   | Flint Preview | pp512 | 955.89 ± 12.35 |
+   | Flint Preview | pp2048 | 924.97 ± 4.14 |
+   | Flint Preview | tg128 | 50.63 ± 0.11 |
+== verify-swift-ferrum (11:45:00)
+   exit 0, 22 s
+   | 1 | 143.0 | 1.00 | 143.0 |
+   | 2 | 149.4 | 1.04 | 74.7 |
+   | 4 | 186.9 | 1.31 | 46.7 |
+   | 8 | 197.2 | 1.38 | 24.6 |
+   | 9 | 193.9 | 1.36 | 21.5 |
+   | 16 | 216.5 | 1.51 | 13.5 |
+   | 17 | 345.8 | 2.42 | 20.3 |
+== verify-swift-llama (11:45:26)
+   exit 0, 23 s
+== verify-tiel-ferrum (11:45:54)
+   exit 0, 9 s
+   | 1 | 24.4 | 1.00 | 24.4 |
+   | 2 | 27.3 | 1.12 | 13.6 |
+   | 4 | 35.0 | 1.43 | 8.8 |
+   | 8 | 61.6 | 2.52 | 7.7 |
+   | 9 | 64.0 | 2.62 | 7.1 |
+   | 16 | 80.6 | 3.30 | 5.0 |
+   | 17 | 92.4 | 3.78 | 5.4 |
+== verify-tiel-llama (11:46:07)
+   exit 0, 8 s
+== early-tiel-on-1 (11:46:19)
+   exit 0, 15 s
+   | Ornith-1.5-35B | tg128 | 40.92 ± 1.82 |
+== early-tiel-off-1 (11:46:38)
+   exit 0, 15 s
+   | Ornith-1.5-35B | tg128 | 41.52 ± 0.04 |
+== early-tiel-on-2 (11:46:57)
+   exit 0, 15 s
+   | Ornith-1.5-35B | tg128 | 42.11 ± 0.57 |
+== early-tiel-off-2 (11:47:16)
+   exit 0, 14 s
+   | Ornith-1.5-35B | tg128 | 41.47 ± 0.03 |
+== early-tiel-on-3 (11:47:35)
+   exit 0, 14 s
+   | Ornith-1.5-35B | tg128 | 42.51 ± 0.02 |
+== early-tiel-off-3 (11:47:53)
+   exit 0, 15 s
+   | Ornith-1.5-35B | tg128 | 39.37 ± 1.57 |
+== spec ferrum-swift-base (11:48:20)
+   decode 7.04 tok/s over 1008 tokens; draft acceptance 0/0 (0.0%)
+== spec llama-swift-base (11:51:03)
+   decode 6.95 tok/s over 1009 tokens; draft acceptance 0/0 (0.0%)
+== spec ferrum-swift-mtp (11:54:07)
+   decode 11.91 tok/s over 1008 tokens; draft acceptance 657/1043 (63.0%)
+== spec llama-swift-mtp (11:55:53)
+   decode 13.12 tok/s over 1009 tokens; draft acceptance 648/1050 (61.7%)
+== spec ferrum-swift-dflash2 (11:57:35)
+   decode 18.04 tok/s over 1008 tokens; draft acceptance 774/1613 (48.0%)
+== spec llama-swift-dflash2 (11:58:58)
+   decode 11.43 tok/s over 1009 tokens; draft acceptance 774/1558 (49.7%)
+== spec ferrum-swift-redhat (12:01:01)
+   decode 16.62 tok/s over 1008 tokens; draft acceptance 763/1912 (39.9%)
+== spec llama-swift-redhat (12:02:27)
+   decode 6.07 tok/s over 1009 tokens; draft acceptance 756/1893 (39.9%)
+== spec ferrum-tiel-base (12:05:50)
+   decode 41.75 tok/s over 998 tokens; draft acceptance 0/0 (0.0%)
+== spec llama-tiel-base (12:06:32)
+   decode 40.25 tok/s over 999 tokens; draft acceptance 0/0 (0.0%)
+== spec ferrum-tiel-dflash2 (12:07:16)
+   decode 60.85 tok/s over 998 tokens; draft acceptance 601/790 (76.1%)
+== spec llama-tiel-dflash2 (12:07:51)
+   decode 54.67 tok/s over 999 tokens; draft acceptance 596/783 (76.1%)
+== spec ferrum-spark-base (12:08:22)
+   decode 36.70 tok/s over 1024 tokens; draft acceptance 0/0 (0.0%)
+== spec ferrum-spark-lookup (12:09:02)
+   decode 41.48 tok/s over 1024 tokens; draft acceptance 152/436 (34.9%)
+== spec ferrum-flint-base (12:09:43)
+   decode 50.10 tok/s over 1024 tokens; draft acceptance 0/0 (0.0%)
+== spec ferrum-flint-lookup (12:10:20)
+   decode 54.73 tok/s over 1024 tokens; draft acceptance 158/325 (48.6%)
+== answers-tiel-dflash2 (12:10:49)
+   exit 0, 114 s
+   plain decoding 30/30; drafter Verdict { n: 30, lost: 0, gained: 0, same: 30 }
+   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 104 filtered out; finished in 113.48s
+== answers-spark-lookup (12:12:48)
+   exit 0, 212 s
+   plain decoding missed check-29: Some("120")
+   plain decoding 29/30; drafter Verdict { n: 30, lost: 0, gained: 0, same: 30 }
+   test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 104 filtered out; finished in 212.17s
+DONE

@@ -1,6 +1,8 @@
 //! Qwen3.5-family hybrid models (`qwen35`, `qwen35moe` GGUF): Gated DeltaNet
 //! linear attention interleaved with gated full attention, on a dedicated
-//! kernel library with preallocated state.
+//! kernel library with preallocated state. The same engine runs the
+//! attention-only `flint` and `spark2_5` architectures (experimental), whose
+//! sliding-window layers keep K/V rings.
 #![forbid(unsafe_code)]
 pub mod bench;
 pub mod chat;

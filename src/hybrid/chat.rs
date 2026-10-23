@@ -15,11 +15,32 @@ pub struct ChatTemplate {
     opens_thinking: bool,
 }
 
-/// Python `json.dumps(value, ensure_ascii=False)`: insertion order, `", "`
-/// and `": "` separators, no HTML escaping (Hugging Face's `tojson`).
-fn python_json(value: &Json, indent: Option<usize>, depth: usize, out: &mut String) {
+/// Keyword arguments of Python's `json.dumps` that `tojson` accepts.
+struct JsonStyle<'a> {
+    indent: Option<usize>,
+    /// Between items, and between a key and its value (`separators`).
+    item: &'a str,
+    key: &'a str,
+    sort_keys: bool,
+}
+
+impl JsonStyle<'_> {
+    /// `json.dumps` defaults: `", "` between items (`","` when indenting).
+    fn new(indent: Option<usize>) -> Self {
+        Self {
+            indent,
+            item: if indent.is_some() { "," } else { ", " },
+            key: ": ",
+            sort_keys: false,
+        }
+    }
+}
+
+/// Python `json.dumps(value, ensure_ascii=False, ...)`: insertion order unless
+/// `sort_keys`, no HTML escaping (Hugging Face's `tojson`).
+fn python_json(value: &Json, style: &JsonStyle, depth: usize, out: &mut String) {
     let newline = |out: &mut String, depth: usize| {
-        if let Some(width) = indent {
+        if let Some(width) = style.indent {
             out.push('\n');
             out.push_str(&" ".repeat(width * depth));
         }
@@ -30,18 +51,19 @@ fn python_json(value: &Json, indent: Option<usize>, depth: usize, out: &mut Stri
                 out.push_str("{}");
                 return;
             }
+            let mut entries: Vec<_> = map.iter().collect();
+            if style.sort_keys {
+                entries.sort_by(|a, b| a.0.cmp(b.0));
+            }
             out.push('{');
-            for (i, (k, v)) in map.iter().enumerate() {
+            for (i, (k, v)) in entries.into_iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
-                    if indent.is_none() {
-                        out.push(' ');
-                    }
+                    out.push_str(style.item);
                 }
                 newline(out, depth + 1);
                 out.push_str(&serde_json::to_string(k).unwrap_or_default());
-                out.push_str(": ");
-                python_json(v, indent, depth + 1, out);
+                out.push_str(style.key);
+                python_json(v, style, depth + 1, out);
             }
             newline(out, depth);
             out.push('}');
@@ -54,13 +76,10 @@ fn python_json(value: &Json, indent: Option<usize>, depth: usize, out: &mut Stri
             out.push('[');
             for (i, v) in items.iter().enumerate() {
                 if i > 0 {
-                    out.push(',');
-                    if indent.is_none() {
-                        out.push(' ');
-                    }
+                    out.push_str(style.item);
                 }
                 newline(out, depth + 1);
-                python_json(v, indent, depth + 1, out);
+                python_json(v, style, depth + 1, out);
             }
             newline(out, depth);
             out.push(']');
@@ -107,16 +126,27 @@ impl ChatTemplate {
             |value: Value,
              kwargs: minijinja::value::Kwargs|
              -> std::result::Result<Value, minijinja::Error> {
-                let indent: Option<usize> = kwargs.get("indent")?;
+                let mut style = JsonStyle::new(kwargs.get("indent")?);
                 // Hugging Face's default is ensure_ascii=False.
                 let ensure_ascii: bool =
                     kwargs.get::<Option<bool>>("ensure_ascii")?.unwrap_or(false);
+                style.sort_keys = kwargs.get::<Option<bool>>("sort_keys")?.unwrap_or(false);
+                let separators: Option<Vec<String>> = kwargs.get("separators")?;
                 kwargs.assert_all_used()?;
+                if let Some(s) = &separators {
+                    let [item, key] = s.as_slice() else {
+                        return Err(minijinja::Error::new(
+                            ErrorKind::InvalidOperation,
+                            "tojson separators must be (item_separator, key_separator)",
+                        ));
+                    };
+                    (style.item, style.key) = (item, key);
+                }
                 let json: Json = serde_json::to_value(&value).map_err(|e| {
                     minijinja::Error::new(ErrorKind::InvalidOperation, e.to_string())
                 })?;
                 let mut out = String::new();
-                python_json(&json, indent, 0, &mut out);
+                python_json(&json, &style, 0, &mut out);
                 if ensure_ascii {
                     // Non-ASCII only occurs inside JSON strings, so escaping the
                     // output is the same as escaping the strings.
@@ -396,8 +426,31 @@ mod tests {
     fn tojson_matches_python_json_dumps() {
         let value: Json = serde_json::from_str(r#"{"b": 1, "a": [1.0, "x<y"], "c": {}}"#).unwrap();
         let mut out = String::new();
-        python_json(&value, None, 0, &mut out);
+        python_json(&value, &JsonStyle::new(None), 0, &mut out);
         assert_eq!(out, r#"{"b": 1, "a": [1.0, "x<y"], "c": {}}"#);
+    }
+
+    /// `indent`, `separators` and `sort_keys` as `json.dumps` applies them.
+    #[test]
+    fn tojson_takes_python_keyword_arguments() {
+        let t = ChatTemplate::new(
+            "{{ v | tojson(separators=(',', ':')) }}|{{ v | tojson(indent=2) }}|{{ v | tojson(sort_keys=true) }}",
+        )
+        .unwrap();
+        let out = t
+            .render(
+                &[],
+                None,
+                false,
+                &serde_json::from_str(r#"{"v": {"b": 1, "a": [1.0, "x"], "c": {}}}"#).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            out,
+            "{\"b\":1,\"a\":[1.0,\"x\"],\"c\":{}}|\
+             {\n  \"b\": 1,\n  \"a\": [\n    1.0,\n    \"x\"\n  ],\n  \"c\": {}\n}|\
+             {\"a\": [1.0, \"x\"], \"b\": 1, \"c\": {}}"
+        );
     }
 
     #[test]
@@ -460,8 +513,31 @@ mod tests {
         }
     }
 
-    /// Every case in tests/fixtures/flint/render_cases.json renders byte for
-    /// byte as Jinja2 renders the Flint template (see render_cases.py).
+    /// Every case in `cases` (a render_cases.json) renders byte for byte as
+    /// Jinja2 renders `template` (see the fixture's render_cases.py).
+    fn renders_like_jinja2(template: &ChatTemplate, cases: &str) {
+        let cases: Vec<Json> = serde_json::from_str(cases).unwrap();
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let messages = case["messages"].as_array().unwrap();
+            let tools = case["tools"].as_array().map(Vec::as_slice);
+            let extra = case
+                .get("extra")
+                .and_then(Json::as_object)
+                .cloned()
+                .unwrap_or_default();
+            let out = template
+                .render(
+                    messages,
+                    tools,
+                    case["add_generation_prompt"].as_bool().unwrap(),
+                    &extra,
+                )
+                .unwrap();
+            assert_eq!(out, case["expect"].as_str().unwrap(), "case {name}");
+        }
+    }
+
     #[test]
     fn renders_flint_template_like_jinja2() {
         let template = ChatTemplate::with_special_tokens(
@@ -470,23 +546,27 @@ mod tests {
             "<|end_of_text|>",
         )
         .unwrap();
-        let cases: Vec<Json> =
-            serde_json::from_str(include_str!("../../tests/fixtures/flint/render_cases.json"))
-                .unwrap();
-        for case in cases {
-            let name = case["name"].as_str().unwrap();
-            let messages = case["messages"].as_array().unwrap();
-            let tools = case["tools"].as_array().map(Vec::as_slice);
-            let out = template
-                .render(
-                    messages,
-                    tools,
-                    case["add_generation_prompt"].as_bool().unwrap(),
-                    &Map::new(),
-                )
-                .unwrap();
-            assert_eq!(out, case["expect"].as_str().unwrap(), "case {name}");
-        }
+        renders_like_jinja2(
+            &template,
+            include_str!("../../tests/fixtures/flint/render_cases.json"),
+        );
+    }
+
+    /// Spark's template calls `tojson(separators=...)`, reads `loop.previtem`
+    /// and `loop.nextitem`, and switches on `enable_thinking` and
+    /// `reasoning_effort`.
+    #[test]
+    fn renders_spark_template_like_jinja2() {
+        let template = ChatTemplate::with_special_tokens(
+            include_str!("../../tests/fixtures/spark/chat_template.jinja"),
+            "",
+            "",
+        )
+        .unwrap();
+        renders_like_jinja2(
+            &template,
+            include_str!("../../tests/fixtures/spark/render_cases.json"),
+        );
     }
 
     #[test]

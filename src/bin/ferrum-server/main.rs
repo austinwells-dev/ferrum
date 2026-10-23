@@ -1,4 +1,5 @@
-//! OpenAI- and Anthropic-compatible local HTTP server for Qwen3.5-family GGUFs.
+//! OpenAI- and Anthropic-compatible local HTTP server for Qwen3.5-family GGUFs
+//! (and, experimentally, Flint and Spark).
 //!
 //! The model runs on its own thread behind a FIFO queue; every connection
 //! gets a thread, so health and status endpoints answer while a request is
@@ -34,6 +35,7 @@ use worker::{Event, Job, Shared, Status, Work};
 
 const HELP: &str = "\
 ferrum-server: OpenAI/Anthropic-compatible server for Qwen3.5-family GGUF models
+(experimental: Flint, Spark)
 
 usage: ferrum-server --model FILE.gguf [options]
 
@@ -55,11 +57,13 @@ memory:
   --snapshots N             recurrent snapshots kept for prefix reuse (default 2)
   --chunk N                 prompt tokens per forward pass (default 512)
 speculative decoding (lossless; off by default):
-  --draft mtp|DIR|FILE      drafter: the GGUF's MTP block, a DFlash / DFlash2 /
-                            DSpark checkpoint directory (or its HF cache entry),
-                            or a DFlash / DFlash2 GGUF
-  --draft-max N             drafts per step (default: 3 for MTP; the trained block
-                            for dense targets, 2 for MoE targets)
+  --draft mtp|lookup|DIR|FILE
+                            drafter: the GGUF's MTP block, prompt lookup (copies
+                            spans from the context; no drafter model), a DFlash /
+                            DFlash2 / DSpark checkpoint directory (or its HF cache
+                            entry), or a DFlash / DFlash2 GGUF
+  --draft-max N             drafts per step (default: 3 for MTP and lookup; the
+                            trained block for dense targets, 2 for MoE targets)
   --draft-quant q4_0|q8_0   draft weight precision (default q4_0)
   --draft-context N         context slots for drafts without a sliding window (8192)
   --draft-p-min P           DSpark: stop drafting below this confidence (0)

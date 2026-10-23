@@ -1,0 +1,130 @@
+== kld-tiel-exact-write (10:05:03)
+   exit 0, 59 s
+   positions 2040; Ferrum PPL 17.5182; llama.cpp PPL 17.5205; mean KLD 0.006843; median 0.003462; p99 0.051400; max 0.135761; same top-1 96.76%; 52.4 s
+== kld-tiel-vs-exact (10:06:02)
+   exit 0, 19 s
+   positions 2040; Ferrum PPL 17.5253; llama.cpp PPL 17.5182; mean KLD 0.007359; median 0.004042; p99 0.052912; max 0.137232; same top-1 95.59%; 14.4 s
+== kld-tiel-llama-vs-exact (10:06:21)
+   exit 0, 10 s
+   chunk             PPL               ln(PPL(Q)/PPL(base))          KL Divergence              Δp RMS            Same top p
+   Mean PPL(Q)                   :  17.520490 ±   1.200226
+   Mean PPL(base)                :  17.518227 ±   1.198814
+   Mean PPL(Q)/PPL(base)         :   1.000129 ±   0.003060
+   Mean PPL(Q)-PPL(base)         :   0.002262 ±   0.053603
+   Mean    KLD:   0.006835 ±   0.000228
+   Same top p: 96.765 ± 0.392 %
+== kld-tiel-f16-write (10:06:31)
+   exit 0, 20 s
+== kld-tiel-q8-vs-f16 (10:06:51)
+   exit 0, 19 s
+   positions 2040; Ferrum PPL 17.5212; llama.cpp PPL 17.5252; mean KLD 0.009520; median 0.004571; p99 0.081140; max 0.905729; same top-1 95.49%; 14.4 s
+   llama swift: The capital of France is Paris.|The capital of Germany is Berlin.|The capital of Italy is|
+   ferrum swift:  Paris.|The capital of Germany is Berlin.|The capital of Italy is|
+   llama tiel: The capital of France is Paris. Paris is the largest city in France and is located in the north-central|
+   ferrum tiel:  Paris. Paris is the largest city in France and is located in the north-central|
+   llama spark: The capital of France is Paris.|fc||The capital of France is Paris.|fc||
+   ferrum spark:  Paris.|fc||The capital of France is Paris.|fc||
+== speccheck-swift (10:07:25)
+   exit 0, 27 s
+   13 verify steps, 7.38 tokens/step, 4 corrupted blocks
+   speculative output == greedy reference (96 tokens)
+   verify rows vs single-row decode over 9 positions: max |dlogit| 0.0110, max KL 2.54e-7
+   replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 24.8), argmax 5759 vs 5759
+== session-swift (10:07:52)
+   exit 0, 58 s
+   replace       prompt   16 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+   extend again  prompt   73 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+   PASS
+== speccheck-tiel (10:08:50)
+   exit 0, 12 s
+   44 verify steps, 2.18 tokens/step, 14 corrupted blocks
+   first divergence at token 59: reference margin 0.0012 (near-tie if small)
+   verify rows vs single-row decode over 9 positions: max |dlogit| 0.0101, max KL 1.55e-6
+   replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 21.1), argmax 2336 vs 2336
+== session-tiel (10:09:02)
+   exit 0, 17 s
+   replace       prompt   16 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+   extend again  prompt   73 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+   PASS
+== speccheck-flint (10:09:19)
+   exit 0, 10 s
+   13 verify steps, 7.38 tokens/step, 4 corrupted blocks
+   speculative output == greedy reference (96 tokens)
+   verify rows vs single-row decode over 9 positions: max |dlogit| 0.0575, max KL 2.59e-5
+   replay after commit(5) vs plain forward: max |dlogit| 0.0223 (scale 53.6), argmax 332 vs 332
+== session-flint (10:09:29)
+   exit 0, 15 s
+   replace       prompt   25 tokens, reused    6: identical (32 tokens, 0 verify steps, acceptance 0.00)
+   extend again  prompt   94 tokens, reused    6: identical (32 tokens, 0 verify steps, acceptance 0.00)
+   PASS
+== speccheck-spark (10:09:44)
+   exit 0, 5 s
+   13 verify steps, 7.38 tokens/step, 4 corrupted blocks
+   speculative output == greedy reference (96 tokens)
+   verify rows vs single-row decode over 9 positions: max |dlogit| 0.0224, max KL 2.99e-6
+   replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 35.0), argmax 198 vs 198
+== session-spark (10:09:49)
+   exit 0, 13 s
+   replace       prompt   32 tokens, reused    8: identical (25 tokens, 0 verify steps, acceptance 0.00)
+   extend again  prompt  108 tokens, reused    8: identical (32 tokens, 0 verify steps, acceptance 0.00)
+   PASS
+== session-spark-lookup (10:10:02)
+   exit 0, 10 s
+   replace       prompt   32 tokens, reused    8: identical (25 tokens, 3 verify steps, acceptance 3.00)
+   extend again  prompt  108 tokens, reused    8: identical (32 tokens, 11 verify steps, acceptance 2.09)
+   PASS
+== session-swift-mtp (10:10:12)
+   exit 0, 34 s
+   replace       prompt   16 tokens, reused    0: identical (32 tokens, 9 verify steps, acceptance 3.56)
+   extend again  prompt   73 tokens, reused    0: identical (32 tokens, 11 verify steps, acceptance 2.82)
+   PASS
+== spec-swift-mtp (10:10:46)
+   exit 0, 248 s
+   speculative: 12.35 tok/s, acceptance length 2.872, draft 34.0 ms/step, verify 195.3 ms/step
+   baseline: 6.80 tok/s; speedup 1.82x; greedy mismatches 0
+== spec-swift-dflash2 (10:14:54)
+   exit 0, 247 s
+   speculative: 16.68 tok/s, acceptance length 4.294, draft 32.0 ms/step, verify 217.9 ms/step
+   baseline: 6.11 tok/s; speedup 2.73x; greedy mismatches 0
+== spec-swift-dspark-redhat (10:19:01)
+   exit 0, 245 s
+   speculative: 15.72 tok/s, acceptance length 4.102, draft 33.8 ms/step, verify 219.6 ms/step
+   baseline: 6.32 tok/s; speedup 2.48x; greedy mismatches 0
+== spec-tiel-mtp (10:23:06)
+   exit 1, 6 s
+   Error: Gguf("MTP blocks with routed experts are not supported")
+== spec-tiel-dflash2 (10:23:12)
+   exit 0, 54 s
+   speculative: 60.46 tok/s, acceptance length 2.518, draft 8.7 ms/step, verify 30.9 ms/step
+   baseline: 39.60 tok/s; speedup 1.53x; greedy mismatches 0
+== spec-spark-lookup (10:24:06)
+   exit 0, 55 s
+   speculative: 41.93 tok/s, acceptance length 2.034, draft 0.0 ms/step, verify 32.9 ms/step
+   baseline: 36.78 tok/s; speedup 1.14x; greedy mismatches 0
+== spec-flint-lookup (10:25:01)
+   exit 0, 49 s
+   prompt 0: 128 tokens, 58.4 tok/s, acceptance 2.53 (17 steps), baseline 50.5 tok/s, diverges at 85 (target top-2 margin 0.0314)
+   prompt 4: 128 tokens, 60.2 tok/s, acceptance 2.93 (14 steps), baseline 50.0 tok/s, diverges at 123 (target top-2 margin 0.0528)
+   prompt 5: 128 tokens, 54.9 tok/s, acceptance 2.00 (22 steps), baseline 50.4 tok/s, diverges at 26 (target top-2 margin 0.0314)
+   prompt 6: 128 tokens, 49.2 tok/s, acceptance 1.82 (11 steps), baseline 50.3 tok/s, diverges at 74 (target top-2 margin 0.3153)
+   speculative: 55.19 tok/s, acceptance length 2.423, draft 0.0 ms/step, verify 30.8 ms/step
+   baseline: 49.28 tok/s; speedup 1.12x; greedy mismatches 4
+== needle-flint (10:25:50)
+   exit 0, 73 s
+   depth 0.10: 14349 prompt tokens, prefill 22.9 s (625 tok/s), decode 38.4 tok/s, answer "1000-amber" -> PASS
+   depth 0.50: 14349 prompt tokens, prefill 22.0 s (652 tok/s), decode 39.9 tok/s, answer "8919-violet" -> PASS
+   depth 0.90: 14351 prompt tokens, prefill 22.2 s (648 tok/s), decode 38.4 tok/s, answer "7838-cobalt" -> PASS
+   device memory: 18337.3 MiB at start, 18337.5 MiB at end (plan predicted 18437.1 MiB)
+== needle-spark (10:27:03)
+   exit 0, 47 s
+   depth 0.10: 12945 prompt tokens, prefill 15.2 s (852 tok/s), decode 30.2 tok/s, answer "1000-amber" -> PASS
+   depth 0.50: 12945 prompt tokens, prefill 14.9 s (869 tok/s), decode 30.0 tok/s, answer "8919-violet" -> PASS
+   depth 0.90: 12945 prompt tokens, prefill 15.1 s (859 tok/s), decode 30.5 tok/s, answer "7838-cobalt" -> PASS
+   device memory: 4222.8 MiB at start, 4223.0 MiB at end (plan predicted 4319.6 MiB)
+== needle-tiel (10:27:50)
+   exit 0, 62 s
+   depth 0.10: 12845 prompt tokens, prefill 19.0 s (676 tok/s), decode 32.0 tok/s, answer "1000-amber" -> PASS
+   depth 0.50: 12845 prompt tokens, prefill 18.4 s (698 tok/s), decode 36.6 tok/s, answer "8919-violet" -> PASS
+   depth 0.90: 12846 prompt tokens, prefill 18.5 s (694 tok/s), decode 35.9 tok/s, answer "7838-cobalt" -> PASS
+   device memory: 17642.7 MiB at start, 17642.9 MiB at end (plan predicted 17741.9 MiB)
+DONE

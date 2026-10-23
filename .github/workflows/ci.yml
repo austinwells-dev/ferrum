@@ -24,3 +24,9 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo build --release --locked
       - run: cargo test --no-run --locked
+      # Tests that never touch Metal: chat templates against Jinja2 renderings,
+      # tool-call parsing, prompt lookup and GGUF parsing.
+      - run: cargo test --lib --locked -- hybrid::chat:: hybrid::lookup:: loader::gguf::
+      - run: cargo doc --no-deps --lib --locked
+        env:
+          RUSTDOCFLAGS: -D warnings

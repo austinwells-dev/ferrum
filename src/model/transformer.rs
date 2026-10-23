@@ -248,7 +248,7 @@ impl Transformer {
             kinds,
         )
     }
-    /// Empty-cache prefill. Returns all position logits [S,vocab] and populated cache.
+    /// Empty-cache prefill. Returns all position logits `[S, vocab]` and populated cache.
     pub fn forward_prefill(&self, d: &MetalDevice, tokens: &[u32]) -> Result<(Tensor, KvCache)> {
         let mut cache = self.new_cache()?;
         let logits = self.forward(d, tokens, &mut cache, None)?;
@@ -285,7 +285,7 @@ impl Transformer {
     ) -> Result<Tensor> {
         self.forward_impl(d, &[token], cache, None, true, true)
     }
-    /// One new token, returning [1,vocab]; an empty cache is also supported.
+    /// One new token, returning `[1, vocab]`; an empty cache is also supported.
     pub fn forward_decode(
         &self,
         d: &MetalDevice,

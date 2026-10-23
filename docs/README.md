@@ -8,7 +8,7 @@
 | [tui.md](tui.md) | The full-screen launcher: chat, the sandboxed coding agent, the speed and intelligence benchmarks |
 | [development.md](development.md) | Building, testing, profiling and using the crate as a library |
 | [architecture.md](architecture.md) | How the system fits together, and the runtime's safety argument |
-| [experimental.md](experimental.md) | **Experimental** Flint support: status, validation numbers, known gaps (`experimental` branch) |
+| [experimental.md](experimental.md) | **Experimental** Flint and Spark support: status, validation numbers, known gaps |
 | [vision.md](vision.md) | The image encoder and how image tokens are positioned |
 
 ## Engineering journals
@@ -28,5 +28,6 @@ Ferrum was built in phases, with each phase's experiments recorded as they happe
 | 9 | Lossless speculative decoding: MTP, DFlash, DSpark | [Plan](phase9-plan.md), [journal](phase9-journal.md) |
 | 10 | Long-context attention: Q8 K/V cache, TensorOps verify and staged prompt attention | [Journal](phase10-journal.md) |
 | — | Image input (Qwen3-VL projector) | [vision.md](vision.md) |
+| — | Re-check of every documented claim against llama.cpp build 11669 (October 2026) | [Record](measurements/verification-2026-10/README.md) |
 
 The journals mention work branches such as `codex/phase2-transformer`. Those branches have been merged into `main` and archived as tags, for example `archive/codex/phase2-transformer`.

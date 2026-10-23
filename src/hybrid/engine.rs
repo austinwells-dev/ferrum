@@ -1,7 +1,7 @@
 //! Forward pass for Qwen3.5-family hybrid models on fixed, preallocated storage.
 #![forbid(unsafe_code)]
 use super::{
-    config::{AttnSpec, HybridConfig, KvCache},
+    config::{AttnSpec, HybridConfig, KvCache, Variant},
     weights::{
         AttentionWeights, DeltaWeights, DenseFfn, Ffn, Format, Matrix, Mixer, MoeFfn, Weights,
     },
@@ -528,7 +528,11 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
         chunk * c.kv_heads * c.head_dim,
         chunk * c.kv_heads * c.head_dim,
         chunk * c.heads * c.head_dim,
-        chunk * c.heads,
+        if c.variant == Variant::Spark {
+            chunk * c.heads
+        } else {
+            1
+        },
         MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim,
         MAX_SPLITS * MAX_SPLIT_ROWS * 2,
         chunk * c.conv_channels(),
@@ -635,7 +639,12 @@ impl Scratch {
                 DType::F16,
             )?,
             att: f(&[chunk, c.heads * c.head_dim])?,
-            head_gate: f(&[chunk, c.heads])?,
+            // Only Spark has a per-head output gate.
+            head_gate: f(&if c.variant == Variant::Spark {
+                [chunk, c.heads]
+            } else {
+                [1, 1]
+            })?,
             attn_partial: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim])?,
             attn_ml: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * 2])?,
             qkv: f(&[chunk, c.conv_channels()])?,
@@ -1229,7 +1238,7 @@ impl HybridModel {
         let x1 = rows(&s.x[1], 0, m, h)?;
         let xn = rows(&s.xn, 0, m, h)?;
         let mix = rows(&s.mix, 0, m, h)?;
-        self.get_rows(d, &self.weights.embedding, &ids, &x0)?;
+        Self::get_rows(d, &self.weights.embedding, &ids, &x0)?;
         // Image rows take the vision encoder's embeddings in place of the pad token's.
         for span in state
             .media
@@ -2035,7 +2044,7 @@ impl HybridModel {
         if identity {
             Self::project_id(d, &f.gate_exps, xn, &ids, routes, used, &gate)?;
             Self::project_id(d, &f.up_exps, xn, &ids, routes, used, &up)?;
-            self.swiglu(d, &gate, &up, &act)?;
+            self.glu(d, &gate, &up, &act)?;
             Self::project_id(d, &f.down_exps, &act, &ids, routes, 1, &down)?;
         } else {
             let offsets = ms.offsets.view(0, [experts + 1])?;
@@ -2062,7 +2071,7 @@ impl HybridModel {
             )?;
             self.project_mm_id(d, &f.gate_exps, &xg, &offsets, m, &gate)?;
             self.project_mm_id(d, &f.up_exps, &xg, &offsets, m, &up)?;
-            self.swiglu(d, &gate, &up, &act)?;
+            self.glu(d, &gate, &up, &act)?;
             self.project_mm_id(d, &f.down_exps, &act, &offsets, m, &down)?;
         }
         let position = ms.position.view(0, [routes])?;
@@ -2092,10 +2101,15 @@ impl HybridModel {
         )
     }
 
-    fn swiglu(&self, d: &MetalDevice, gate: &Tensor, up: &Tensor, out: &Tensor) -> Result<()> {
+    /// `out = act(gate) * up`: SiLU, or GELU (tanh) for `gelu_ffn` models.
+    fn glu(&self, d: &MetalDevice, gate: &Tensor, up: &Tensor, out: &Tensor) -> Result<()> {
         let n = gate.numel();
         d.dispatch_hybrid(
-            "h_swiglu",
+            if self.config.gelu_ffn {
+                "h_geglu"
+            } else {
+                "h_swiglu"
+            },
             &[gate.binding(), up.binding()],
             &[out.binding()],
             &Params::default().u(n)?.0,
@@ -2205,15 +2219,7 @@ impl HybridModel {
         let act = rows(&s.ffn_act, 0, m, width)?;
         Self::project(d, &f.gate, xn, m, &gate)?;
         Self::project(d, &f.up, xn, m, &up)?;
-        d.dispatch_hybrid(
-            if self.config.gelu_ffn { "h_geglu" } else { "h_swiglu" },
-            &[gate.binding(), up.binding()],
-            &[act.binding()],
-            &Params::default().u(m * width)?.0,
-            [(m * width).div_ceil(256), 1, 1],
-            [256, 1, 1],
-            0,
-        )?;
+        self.glu(d, &gate, &up, &act)?;
         Self::project(d, &f.down, &act, m, out)
     }
 
@@ -2246,13 +2252,7 @@ impl HybridModel {
         )
     }
 
-    pub(crate) fn get_rows(
-        &self,
-        d: &MetalDevice,
-        w: &Matrix,
-        ids: &Tensor,
-        y: &Tensor,
-    ) -> Result<()> {
+    pub(crate) fn get_rows(d: &MetalDevice, w: &Matrix, ids: &Tensor, y: &Tensor) -> Result<()> {
         let tokens = ids.numel();
         let name = match w.format {
             Format::Q4K => "h_get_rows_q4_k",
@@ -3063,6 +3063,68 @@ mod tests {
     /// A ring layer can resume at a position only while its ring still holds
     /// that position's window (from its start aligned down to 64); linear
     /// layers can always resume.
+    /// Spark's feed-forward activation, gelu(gate) * up with ggml's tanh
+    /// approximation, and its per-head output gate, att *= sigmoid(gate[head]).
+    #[test]
+    fn spark_geglu_and_head_gate_match_the_cpu() {
+        let d = MetalDevice::new().unwrap();
+        let t = |v: &[f32]| Tensor::from_f32(&d, [v.len()], DType::F32, v).unwrap();
+        let close = |got: &[f32], want: &[f32], what: &str| {
+            for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                assert!(
+                    (g - w).abs() <= 1e-5 * w.abs().max(1.),
+                    "{what} {i}: {g} vs {w}"
+                );
+            }
+        };
+        let n = 1000;
+        let gate: Vec<f32> = random(n, 3).iter().map(|v| v * 6.).collect();
+        let up = random(n, 4);
+        let (g, u, y) = (t(&gate), t(&up), t(&vec![0.; n]));
+        d.dispatch_hybrid(
+            "h_geglu",
+            &[g.binding(), u.binding()],
+            &[y.binding()],
+            &Params::default().u(n).unwrap().0,
+            [n.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+        )
+        .unwrap();
+        let want: Vec<f32> = gate
+            .iter()
+            .zip(&up)
+            .map(|(&x, &u)| {
+                let x = x as f64;
+                let inner = (2. / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x);
+                (0.5 * x * (1. + inner.tanh()) * u as f64) as f32
+            })
+            .collect();
+        close(&y.to_f32(), &want, "geglu");
+
+        let (tokens, heads, head_dim) = (3, 4, 128);
+        let logits: Vec<f32> = random(tokens * heads, 5).iter().map(|v| v * 8.).collect();
+        let att = random(tokens * heads * head_dim, 6);
+        let (l, a) = (t(&logits), t(&att));
+        let n = att.len();
+        d.dispatch_hybrid(
+            "h_head_gate",
+            &[l.binding()],
+            &[a.binding()],
+            &Params::default().u(n).unwrap().u(head_dim).unwrap().0,
+            [n.div_ceil(256), 1, 1],
+            [256, 1, 1],
+            0,
+        )
+        .unwrap();
+        let want: Vec<f32> = att
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v / (1. + (-logits[i / head_dim]).exp()))
+            .collect();
+        close(&a.to_f32(), &want, "head gate");
+    }
+
     #[test]
     fn ring_states_resume_only_inside_the_ring() {
         let state = |written: usize| HybridState {
