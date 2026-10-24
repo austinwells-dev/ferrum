@@ -265,6 +265,12 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
             "{phase:?}: an unticked drafter shows only in the setup list"
         );
     }
+    // The setup's plan lists the trees each drafter tries, and counts them:
+    // the baseline, 3 depths and 2 trees of the one ticked drafter.
+    app.bench.as_mut().unwrap().phase = BenchPhase::Setup;
+    let text = screen_text(&app, 240, 60);
+    assert!(text.contains("T15, auto"), "the plan lists no trees");
+    assert!(text.contains("6 runs"), "the plan does not count the trees");
     // Progress lands on the ticked drafter: 1 of its 3 depths and 2 trees
     // measured.
     app.bench.as_mut().unwrap().phase = BenchPhase::Running;

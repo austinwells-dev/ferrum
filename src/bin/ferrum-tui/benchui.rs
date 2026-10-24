@@ -860,6 +860,7 @@ impl App {
             let mut rows = vec![crate::benchview::table_head(&[
                 ("candidate", w.rows.saturating_sub(30).min(48), false),
                 ("depths", 16, false),
+                ("trees", 10, false),
                 ("quant", 6, false),
             ])];
             let mut runs = 0;
@@ -869,9 +870,20 @@ impl App {
                     _ => bench::depth_list(c.max_depth(), b.quick),
                 };
                 runs += depths.len().max(1);
+                // The trees each tree-capable drafter also tries.
+                let trees = if c.trees() {
+                    runs += bench::TREES.len();
+                    bench::TREES
+                        .iter()
+                        .map(|t| t.short())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    "–".to_string()
+                };
                 rows.push(Line::styled(
                     format!(
-                        "  {} {} {}",
+                        "  {} {} {} {}",
                         fit_w(
                             &short_drafter(&c.label()),
                             w.rows.saturating_sub(30).min(48)
@@ -888,6 +900,7 @@ impl App {
                             },
                             16
                         ),
+                        fit_w(&trees, 10),
                         if depths.is_empty() {
                             "–"
                         } else {
