@@ -104,7 +104,7 @@ Ferrum supports four kinds of drafter:
 
 Drafters are loaded from Hugging Face checkpoints (or DFlash GGUF files) and quantized to Q4_0 when they load, with no measurable loss in accuracy. The memory planner budgets for the drafter up front and shrinks the automatic context to make room.
 
-**Draft trees (MTP).** With `--draft-tree N`, the MTP head also proposes its next-best guesses where it is unsure, up to N guesses in all, and the model checks the whole tree in the same single forward pass, keeping the longest path it agrees with. Trees apply to greedy requests without repetition penalties (other requests keep chains), and the output is still the same as without speculation. On the dense 27B, `--draft mtp --draft-tree 15` drafts 5 deep and accepts 3.8–3.9 tokens per pass against the 3-draft chain's 2.7–3.0, for about 13.0 tok/s against 11.0–12.3 on a coding and a prose prompt. Keep N at 15 or below: 16 or more guesses push the check past 16 rows, where it costs about 60% more ([Phase 11 journal](phase11-journal.md)).
+**Draft trees (MTP).** With `--draft-tree N`, the MTP head drafts a tree of up to N guesses instead of a chain: it keeps extending its likeliest guesses, including its second and third choices where it is unsure, and the model checks the whole tree in the same single forward pass, keeping the longest path it agrees with. Trees apply to greedy requests without repetition penalties (other requests keep chains), and the output is still the same as without speculation. On the dense 27B, `--draft mtp --draft-tree 15` accepts 4.0–4.2 tokens per pass against the 3-draft chain's 2.7–3.0, for 14.2–15.1 tok/s against 12.0–13.2 on a coding and a prose prompt (2.0–2.1× plain decoding). Keep N at 15: smaller trees are shallower, and 16 or more guesses push the check past 16 rows, where it costs about 60% more ([Phase 11 journal](phase11-journal.md)).
 
 ```sh
 # The model's built-in MTP head
@@ -121,8 +121,9 @@ ferrum-cli --model tiel.gguf \
 | Flag | Meaning |
 |---|---|
 | `--draft mtp\|lookup\|DIR\|FILE` | Drafter to use (off by default): the MTP head, prompt lookup, a checkpoint directory or its Hugging Face cache entry, or a DFlash GGUF |
-| `--draft-max N` | Most tokens drafted per step (default: 3 for MTP and lookup, 5 for MTP with `--draft-tree`, the trained block size for dense targets, 2 for MoE targets) |
+| `--draft-max N` | Most tokens drafted per step, and the depth of draft trees (default: 3 for MTP and lookup, 7 for MTP with `--draft-tree`, the trained block size for dense targets, 2 for MoE targets) |
 | `--draft-tree N` | Draft trees of up to N guesses (1–31; 15 recommended) for greedy requests, instead of chains |
+| `--draft-tree-search best-first\|siblings` | How MTP grows trees: extending its likeliest guesses (default), or its chain plus each step's next-best guesses as leaves |
 | `--draft-quant q4_0\|q8_0` | Drafter weight precision (default `q4_0`) |
 | `--draft-context N` | Context slots for drafters without a sliding window (default 8192) |
 | `--draft-p-min P` | DSpark: stop drafting below this confidence |

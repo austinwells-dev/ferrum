@@ -58,7 +58,8 @@ Per phase, on a fixed prompt set:
 3. Accept walk and session loop; prompt-lookup trees; `--draft-tree N`.
 4. MTP chain plus leaf siblings; benchmark against chains, sweeping the node
    budget (4, 8, 12, 15, 16, 24) on a coding and a prose prompt.
-5. (Pending a decision on Phase 4's numbers.) Full best-first MTP trees,
-   expanding siblings too, with tree-masked MTP drafting.
+5. Full best-first MTP trees, expanding siblings too, with tree-masked MTP
+   drafting (rows partway into a tree); checked against MTP's own chain
+   logit for logit, and benchmarked against chains and sibling trees.
 
 Progress and measurements go in the [Phase 11 journal](phase11-journal.md).

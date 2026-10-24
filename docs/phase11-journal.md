@@ -147,8 +147,83 @@ and one prose prompt (causes of the French Revolution), 192 tokens each.
 | 16 | 242.2 | 244.9 | 248.4 | 3.90 | 3.84 |
 
 **Decision taken:** with `--draft-tree`, MTP drafts 5 deep unless
-`--draft-max` says otherwise. **Open:** whether full best-first trees
-(expanding siblings, which needs tree-masked MTP drafting) are worth it.
-Siblings already lift first-draft acceptance to 92–97%; the remaining
-misses are deeper in the chain, where an expanded sibling would need its own
-continuation.
+`--draft-max` says otherwise (superseded by Experiment 5 for best-first
+trees).
+
+## Experiment 5 — best-first MTP trees
+
+Siblings fix most first-guess misses (first draft accepted 92–97%), but a
+sibling's own continuation is never drafted. Best-first trees expand any
+node: each MTP pass runs the likeliest frontier tokens together, each
+reading its parent's MTP hidden state and attending, through the tree
+kernels, to the anchor's prefix and its own ancestors only, at position
+anchor + depth; their top 4 tokens join the frontier. This needed the tree
+mask to cover rows partway into a tree (nodes stored by earlier passes):
+the tree buffer now starts with the first row's node index, a one-row pass
+with a tree runs on the verify kernels rather than decode, and the key
+range starts from the tree root's window. The kernel test also runs the
+later half and the last node of every tree on their own (14,490 tree runs,
+same worst error).
+
+**Drafting check** (`examples/hybrid_mtp_tree_check.rs`): along 48 greedy
+steps on Swift, MTP's chain and a best-first tree from the same state;
+wherever the tree expanded the chain's path, its nodes' top-16 logits must
+equal the chain's steps. With exact kernels 192/192 are bit-identical; with
+default kernels max |Δlogit| 0.006. Drafting without the tree mask (nodes
+seeing their siblings, at row positions) gives 0.325, while an argmax-only
+check missed it: a few extra keys rarely move MTP's top token.
+
+**Wave size.** Budget 15, depth 7, one coding and one prose prompt (192
+tokens), interleaved:
+
+| Nodes per pass | Coding tok/s | per pass | Prose tok/s | per pass | draft ms |
+|---|---|---|---|---|---|
+| 1 | 12.09 | 4.57 | 10.82 | 4.17 | 162 |
+| 2 | 15.23 | 4.57 | 14.05 | 4.17 | 87 |
+| **3** | 15.35 / 14.36 | 4.24 | 13.70 / 13.72 | 4.00 | 60 |
+| 4 | 14.04 / 13.75 | 3.92 | 12.05 / 12.26 | 3.49 | 55 |
+
+(Rows 1 and 2 come from one run, rows 3 and 4 from two interleaved rounds of
+their own.) Waves of 4 spend the first pass on four guesses for the first
+token, so trees grow wide and shallow; waves of 1 search best first exactly
+but pay a pass per node. Waves of 3 are the default.
+
+**Against chains and siblings**, same prompts, two interleaved rounds, best
+(other):
+
+| Coding | tok/s | per pass | draft ms | verify ms |
+|---|---|---|---|---|
+| plain | 7.06 (6.34) | | | |
+| chain, 3 drafts | 12.01 (10.68) | 2.70 | 32 | 190 |
+| chain, 5 drafts | 12.49 (11.42) | 3.25 | 54 | 203 |
+| siblings, depth 5, 12 nodes | 13.45 (12.45) | 3.77 | 56 | 220 |
+| best first, depth 5, 15 nodes | 14.81 (14.79) | 4.24 | 60 | 224 |
+| **best first, depth 7, 15 nodes** | **15.12** (14.96) | 4.24 | 60 | 219 |
+
+| Prose | tok/s | per pass | draft ms | verify ms |
+|---|---|---|---|---|
+| plain | 7.10 (7.02) | | | |
+| chain, 3 drafts | 13.21 (13.05) | 2.95 | 32 | 188 |
+| chain, 5 drafts | 13.35 (13.10) | 3.43 | 53 | 201 |
+| siblings, depth 5, 12 nodes | 14.03 (13.91) | 3.90 | 56 | 220 |
+| best first, depth 5, 15 nodes | 13.89 (13.87) | 4.00 | 60 | 224 |
+| **best first, depth 7, 15 nodes** | **14.23** (14.09) | 4.00 | 60 | 221 |
+
+Best-first trees beat sibling trees by 12% on code and 1% on prose, and the
+default 3-draft chain by 26% and 8% (2.1× and 2.0× plain decoding). At 8 or
+12 nodes best-first trees are shallower than sibling trees and lose on prose
+(12.95 at 12 nodes, against siblings' 14.03), so 15 is the budget to use;
+16 or more crosses the 17-row verify cliff as before. Every greedy output
+checked against plain decoding was identical: the 60 runs of a first sweep
+(waves of 4, depths 5 and 7, every budget, with the 8-prompt and exact-kernel
+gates) and the final gate below.
+
+**Final gate**, with the defaults below (`--draft mtp --draft-tree 15`):
+8 chat prompts × 128 tokens on Swift, all identical to plain decoding, at
+14.63 tok/s against plain 6.89 (2.12×) and 4.16 tokens per pass; 3 prompts
+× 64 tokens with exact kernels likewise identical; the drafting check at
+depth 7 bit-identical on 240/240 chain-path nodes.
+
+**Decisions:** best-first is the default tree search (`--draft-tree-search
+siblings` keeps Experiment 4's trees), with waves of 3 and, unless
+`--draft-max` says otherwise, 7 MTP steps deep (5 for sibling trees).
