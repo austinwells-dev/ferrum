@@ -17,11 +17,12 @@ what changed:
   verify-width GEMMs on the matrix units, adapted from src/kernels/tensor/verify8t.metal (qmm8t_impl, qmm8t2_impl):
   integer codes as exact tensor_ops operands with an fp32 group epilogue, in 8-row tiles and 16-row tile pairs, and the
   T-table operand layout they read (from src/kernels/verify8.metal, v8t_input_of_slot).
-- src/hybrid/engine.rs, HybridModel::project_mlx_tiles: the tiling rule of src/model/qwen35_v8.cpp (v8t_plan).
 
 Ideas taken from Kapitsa's code and documentation without copying code, credited where they are used:
 
 - src/hybrid/mlx.rs: how MLX conversions of Qwen3.5-family checkpoints store their tensors (src/model/qwen35.cpp).
+- src/hybrid/engine.rs, HybridModel::project_mlx_tiles: the verify GEMMs' tiling rule (src/model/qwen35_v8.cpp,
+  v8t_plan).
 
 Review reference: be57c8f (the Kapitsa commit the adaptations were read from).
 The Apache License 2.0 text is in LICENSE-APACHE.
