@@ -293,6 +293,18 @@ pub struct DraftOptions {
     /// frequency). None: the full vocabulary. Verification always uses the
     /// full vocabulary, so this trades acceptance for draft speed only.
     pub vocab: Option<usize>,
+    /// How MTP grows draft trees.
+    pub tree_search: TreeSearch,
+}
+
+/// How MTP grows a draft tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TreeSearch {
+    /// Expand the likeliest nodes, a few per MTP pass, wherever they are.
+    #[default]
+    BestFirst,
+    /// Keep MTP's chain and add each step's next-best tokens as leaves.
+    Siblings,
 }
 
 impl Default for DraftOptions {
@@ -302,6 +314,7 @@ impl Default for DraftOptions {
             context_cap: 8192,
             confidence_min: 0.,
             vocab: None,
+            tree_search: TreeSearch::default(),
         }
     }
 }

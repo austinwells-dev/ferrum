@@ -4,6 +4,7 @@
 //!        [--only I,J]  (these prompt indices instead of the first N)
 //!        [--tree N]  (draft trees of N nodes; greedy only)
 //!        [--sweep 0,4,8,15]  (each tree budget in turn, 0 = chains, on one load)
+//!        [--tree-search best-first|siblings]  (how MTP grows trees)
 //!        [--pmin P]  (DSpark confidence cut-off)
 //!        [--depth N --filler FILE]  (generate after N tokens of FILE in the prompt)
 //!
@@ -80,6 +81,11 @@ fn main() -> Result<()> {
                 ferrum::hybrid::draft::DraftQuant::Q4_0
             } else {
                 ferrum::hybrid::draft::DraftQuant::Q8_0
+            },
+            tree_search: if get("--tree-search", "best-first") == "siblings" {
+                ferrum::hybrid::draft::TreeSearch::Siblings
+            } else {
+                ferrum::hybrid::draft::TreeSearch::BestFirst
             },
             ..Default::default()
         },

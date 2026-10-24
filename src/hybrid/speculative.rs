@@ -140,7 +140,7 @@ pub fn accept_walk(tree: &DraftTree, targets: &[u32]) -> (Vec<usize>, u32) {
 /// Natural log-probabilities of `candidates` (logits of the top tokens),
 /// normalized over the candidates themselves: an approximation, since the
 /// tail of the vocabulary is missing, that only shapes trees.
-fn log_softmax(candidates: &[(u32, f32)]) -> Vec<(u32, f64)> {
+pub(crate) fn log_softmax(candidates: &[(u32, f32)]) -> Vec<(u32, f64)> {
     let max = candidates
         .iter()
         .fold(f64::NEG_INFINITY, |m, c| m.max(f64::from(c.1)));

@@ -6,7 +6,7 @@ use super::{
     HybridConfig, LoadedHybrid, Variant,
     chat::{ChatTemplate, ParsedOutput, parse_output},
     config::uint,
-    draft::{DraftModel, DraftOptions, DraftQuant, check_drafter_tokenizer},
+    draft::{DraftModel, DraftOptions, DraftQuant, TreeSearch, check_drafter_tokenizer},
     engine::ImageSpan,
     engine::{SpecGeometry, spec_bytes},
     lookup::Lookup,
@@ -74,7 +74,8 @@ const MAX_TREE_NODES: usize = 31;
 #[derive(Debug, Clone)]
 pub struct SpecOptions {
     pub source: DraftSource,
-    /// Drafts per step (None: 3 for MTP, 5 with trees; the trained block for dense
+    /// Drafts per step (None: 3 for MTP, 7 with best-first trees and 5 with
+    /// sibling trees; the trained block for dense
     /// targets and 2 for MoE targets, whose verify cost grows with the
     /// number of distinct experts).
     pub max_drafts: Option<usize>,
@@ -98,7 +99,8 @@ impl SpecOptions {
     /// `ferrum-server`; returns false when `key` is not a draft flag.
     /// `--draft mtp|lookup|DIR|FILE.gguf` enables speculation; the others tune it:
     /// `--draft-max N`, `--draft-tree N` (draft trees of N nodes for greedy
-    /// requests), `--draft-quant q8_0|q4_0`, `--draft-context N`
+    /// requests), `--draft-tree-search best-first|siblings` (how MTP grows
+    /// them), `--draft-quant q8_0|q4_0`, `--draft-context N`
     /// (context slots for drafts without a sliding window) and
     /// `--draft-p-min P` (DSpark confidence cut-off).
     pub fn apply_flag(spec: &mut Option<Self>, key: &str, value: &str) -> Result<bool> {
@@ -138,6 +140,13 @@ impl SpecOptions {
             }
             "--draft-context" => s.draft.context_cap = value.parse().map_err(|_| bad())?,
             "--draft-p-min" => s.draft.confidence_min = value.parse().map_err(|_| bad())?,
+            "--draft-tree-search" => {
+                s.draft.tree_search = match value {
+                    "best-first" => TreeSearch::BestFirst,
+                    "siblings" => TreeSearch::Siblings,
+                    _ => return Err(bad()),
+                }
+            }
             "--draft-vocab" => s.draft.vocab = Some(value.parse().map_err(|_| bad())?),
             _ => return Ok(false),
         }
@@ -147,8 +156,11 @@ impl SpecOptions {
     fn drafts(&self, target: &HybridConfig, trained: usize) -> usize {
         self.max_drafts
             .unwrap_or(match (&self.source, target.variant) {
-                // Trees measured best at five MTP steps, chains at three.
-                (DraftSource::Mtp, _) if self.tree.is_some() => 5,
+                // Measured best: best-first trees 7 deep, sibling trees 5, chains 3.
+                (DraftSource::Mtp, _) if self.tree.is_some() => match self.draft.tree_search {
+                    TreeSearch::BestFirst => 7,
+                    TreeSearch::Siblings => 5,
+                },
                 (DraftSource::Mtp, _) => 3,
                 (DraftSource::Lookup, _) => LOOKUP_DRAFTS,
                 (_, Variant::Moe | Variant::Flint) => trained.min(2),
@@ -181,7 +193,7 @@ impl SpecOptions {
                     (2 * target.kv_cache.row_bytes(target.kv_heads * target.head_dim)) as f64;
                 Ok(DraftMemory {
                     weights: mtp_weight_bytes(file, target),
-                    fixed: mtp_state_bytes(target, 0, chunk, k)
+                    fixed: mtp_state_bytes(target, 0, chunk, k, self.tree.unwrap_or(0))
                         + spec_bytes(target, chunk, &geometry),
                     per_token,
                 })
@@ -235,6 +247,8 @@ impl SpecOptions {
                     capacity,
                     k,
                     self.draft.vocab,
+                    self.tree.unwrap_or(0),
+                    self.draft.tree_search,
                 )?)
             }
             DraftSource::Lookup => Box::new(Lookup::new(self.drafts(&model.config, LOOKUP_DRAFTS))),
