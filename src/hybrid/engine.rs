@@ -98,8 +98,6 @@ pub(crate) const TREE_MAX_ROWS: usize = 32;
 /// Plan of a draft-tree verify whose root sits at rotary position `base`:
 /// node i is stored at the i-th new cache position but sits at `base +
 /// depth(i)`, through the position table with all three axes equal.
-// Reached from the tree verify, which lands in a later phase; tested now.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tree_plan(d: &MetalDevice, base: i32, parents: &[Option<usize>]) -> Result<RopePlan> {
     let rows = tree_rows(parents)?;
     let mut table = Vec::with_capacity(rows.len() * 3 * 4);
@@ -133,8 +131,6 @@ pub(crate) fn tree_plan(d: &MetalDevice, base: i32, parents: &[Option<usize>]) -
 /// root, row 0; parents come before their children). Returns per row the
 /// mask of rows it sees (itself and its ancestors) and its depth, the layout
 /// of `KeyMask` in `hybrid.metal`.
-// Reached from the tree verify, which lands in a later phase; tested now.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn tree_rows(parents: &[Option<usize>]) -> Result<Vec<(u32, u32)>> {
     if parents.is_empty() || parents.len() > TREE_MAX_ROWS {
         return Err(Error::Parameter(format!(
@@ -166,6 +162,8 @@ pub struct HybridState {
     valid: bool,
     /// Rows written by a speculative verify and not yet committed.
     verified: usize,
+    /// Parents of those rows when the verify was a draft tree (else empty).
+    verified_tree: Vec<Option<usize>>,
     /// Images in the cached or incoming prompt, ordered by position.
     media: Vec<ImageSpan>,
     k: Vec<Option<Tensor>>,
@@ -227,6 +225,7 @@ impl HybridState {
             len: 0,
             valid: true,
             verified: 0,
+            verified_tree: Vec::new(),
             media: Vec::new(),
             k: Vec::new(),
             v: Vec::new(),
@@ -289,6 +288,7 @@ impl HybridState {
         self.len = 0;
         self.valid = true;
         self.verified = 0;
+        self.verified_tree.clear();
         self.written = 0;
         self.media.clear();
     }
@@ -355,6 +355,27 @@ impl HybridState {
             tree: None,
         })
     }
+    /// Rotary positions and visibility for a draft-tree verify of the nodes
+    /// with `parents` (see `tree_rows`) at cache positions `pos..`.
+    fn tree_plan(
+        &self,
+        d: &MetalDevice,
+        pos: usize,
+        parents: &[Option<usize>],
+    ) -> Result<RopePlan> {
+        if self
+            .media
+            .iter()
+            .any(|s| s.start < pos + parents.len() && s.end() > pos)
+        {
+            return Err(Error::Parameter(
+                "a draft tree cannot hold image tokens".into(),
+            ));
+        }
+        let base = i32::try_from(rope_position(&self.media, pos))
+            .map_err(|_| Error::Cache("rotary position exceeds i32".into()))?;
+        tree_plan(d, base, parents)
+    }
     /// Recurrent tensors (conv windows then delta-rule matrices) in a fixed order.
     pub(crate) fn recurrent(&self) -> impl Iterator<Item = &Tensor> {
         self.conv.iter().flatten().chain(self.ssm.iter().flatten())
@@ -399,6 +420,7 @@ impl HybridState {
         self.len = position;
         self.valid = true;
         self.verified = 0;
+        self.verified_tree.clear();
         Ok(())
     }
     pub(crate) fn is_valid(&self) -> bool {
@@ -499,6 +521,8 @@ pub(crate) struct Spec {
     logits: Tensor,
     candidates: Tensor,
     tokens: Tensor,
+    /// `[rows, gather_width]`: staging for `commit_path`.
+    gather: Tensor,
 }
 
 impl Spec {
@@ -509,7 +533,7 @@ impl Spec {
             .chain(&self.tape_qkv)
             .chain(&self.tape_g)
             .chain(&self.tape_b)
-            .chain([&self.logits, &self.candidates, &self.tokens])
+            .chain([&self.logits, &self.candidates, &self.tokens, &self.gather])
             .map(|t| page(t.byte_size()))
             .sum()
     }
@@ -539,7 +563,19 @@ pub fn spec_bytes(c: &HybridConfig, chunk: usize, g: &SpecGeometry) -> usize {
     }
     total += c.recurrent_layer_count()
         * (f32s(g.rows * c.conv_channels()) + 2 * f32s(g.rows * c.ssm_v_heads));
-    total + f32s(g.rows * c.vocab) + f32s(g.rows * c.vocab.div_ceil(1024) * 64) + f32s(g.rows)
+    total
+        + f32s(g.rows * c.vocab)
+        + f32s(g.rows * c.vocab.div_ceil(1024) * 64)
+        + f32s(g.rows)
+        + f32s(g.rows * gather_width(c, g))
+}
+
+/// Widest row `commit_path` stages: captured features, the hidden state, or
+/// a K/V row (at most two bytes per element, so this overcounts).
+fn gather_width(c: &HybridConfig, g: &SpecGeometry) -> usize {
+    (g.aux_layers.len() * c.hidden)
+        .max(c.hidden)
+        .max(c.kv_heads * c.head_dim)
 }
 
 fn copy(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
@@ -560,6 +596,27 @@ fn copy(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
 
 /// Attention options of `layer`. Layers past the trunk (the MTP block) use the
 /// Qwen3.5 layout: full window, RoPE, gated, no sinks.
+/// `dst[r] = src[idx[r]]` for `n` rows of `width` (`src` rows `src_stride` apart).
+fn gather_rows(
+    d: &MetalDevice,
+    src: &Tensor,
+    idx: &Tensor,
+    dst: &Tensor,
+    n: usize,
+    width: usize,
+    src_stride: usize,
+) -> Result<()> {
+    d.dispatch_hybrid(
+        "h_gather_rows",
+        &[src.binding(), idx.binding()],
+        &[dst.binding()],
+        &Params::default().u(n)?.u(width)?.u(src_stride)?.0,
+        [(n * width).div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
+}
+
 pub(crate) fn attn_spec(c: &HybridConfig, layer: usize) -> AttnSpec {
     c.attn.get(layer).copied().unwrap_or(AttnSpec {
         window: None,
@@ -938,6 +995,7 @@ impl HybridModel {
             logits: f(&[g.rows, c.vocab])?,
             candidates: f(&[g.rows, c.vocab.div_ceil(1024) * 64])?,
             tokens: f(&[g.rows])?,
+            gather: f(&[g.rows, gather_width(c, g)])?,
         });
         Ok(())
     }
@@ -1000,11 +1058,12 @@ impl HybridModel {
         let pieces = tokens.chunks(chunk).count();
         // An uncommitted verify only wrote K/V rows past `len`; drop it.
         state.verified = 0;
+        state.verified_tree.clear();
         for (index, piece) in tokens.chunks(chunk).enumerate() {
             let last = index + 1 == pieces;
             let out = if last { &output } else { &Output::None };
             state.valid = false;
-            produced = self.forward_chunk(d, state, piece, out, None, false)?;
+            produced = self.forward_chunk(d, state, piece, out, None, false, None)?;
             state.len += piece.len();
             state.valid = true;
         }
@@ -1030,8 +1089,9 @@ impl HybridModel {
         }
         state.valid = false;
         state.verified = 0;
+        state.verified_tree.clear();
         let mut all = Vec::new();
-        self.forward_chunk(d, state, tokens, &Output::None, Some(&mut all), false)?;
+        self.forward_chunk(d, state, tokens, &Output::None, Some(&mut all), false, None)?;
         state.len += tokens.len();
         state.valid = true;
         Ok(all)
@@ -1047,6 +1107,40 @@ impl HybridModel {
         d: &MetalDevice,
         state: &mut HybridState,
         tokens: &[u32],
+        output: RowOutput,
+    ) -> Result<RowsProduced> {
+        self.verify_rows(d, state, tokens, None, output)
+    }
+
+    /// Speculative verify of a draft tree: row i holds node `tokens[i]`, a
+    /// child of row `parents[i]` (`None` for the anchor, row 0; parents come
+    /// before their children). Each row sees the cached sequence and its own
+    /// ancestors, at position `len + depth`, and recurrent layers start each
+    /// node from its parent's state. `commit_path` keeps one root-to-node path.
+    pub fn verify_tree(
+        &self,
+        d: &MetalDevice,
+        state: &mut HybridState,
+        tokens: &[u32],
+        parents: &[Option<usize>],
+        output: RowOutput,
+    ) -> Result<RowsProduced> {
+        if parents.len() != tokens.len() {
+            return Err(Error::Parameter(format!(
+                "{} parents for {} tree rows",
+                parents.len(),
+                tokens.len()
+            )));
+        }
+        self.verify_rows(d, state, tokens, Some(parents), output)
+    }
+
+    fn verify_rows(
+        &self,
+        d: &MetalDevice,
+        state: &mut HybridState,
+        tokens: &[u32],
+        parents: Option<&[Option<usize>]>,
         output: RowOutput,
     ) -> Result<RowsProduced> {
         let rows = self
@@ -1081,13 +1175,17 @@ impl HybridModel {
             return Err(Error::Parameter("one penalty set per verify row".into()));
         }
         state.verified = 0;
+        state.verified_tree.clear();
         // The recurrent state is never written, so a failure leaves it valid.
-        let produced = self.forward_chunk(d, state, tokens, &Output::None, None, true);
+        let produced = self.forward_chunk(d, state, tokens, &Output::None, None, true, parents);
         let produced = match produced {
             Ok(_) => self.verify_outputs(d, tokens.len(), &output)?,
             Err(e) => return Err(e),
         };
         state.verified = tokens.len();
+        if let Some(p) = parents {
+            state.verified_tree = p.to_vec();
+        }
         Ok(produced)
     }
 
@@ -1100,39 +1198,187 @@ impl HybridModel {
                 state.verified
             )));
         }
+        if !state.verified_tree.is_empty()
+            && !(0..n).all(|i| i == 0 || state.verified_tree[i] == Some(i - 1))
+        {
+            return Err(Error::Cache(
+                "the first rows of the last tree verify are not a path; use commit_path".into(),
+            ));
+        }
+        let spec = self.spec.borrow();
+        let spec = spec.as_ref().expect("verify implies speculation");
+        let s = self.scratch.borrow();
+        state.valid = false;
+        let e = d.execution_with_shared_encoder(true)?;
+        self.replay(d, &s, spec, state, n, None)?;
+        e.finish()?;
+        state.len += n;
+        state.verified = 0;
+        state.verified_tree.clear();
+        state.valid = true;
+        Ok(())
+    }
+
+    /// Keep the root-to-node `path` (verify rows, starting at the anchor's 0)
+    /// of the last tree verify: its K/V rows, recurrent replay and captured
+    /// features move to the next `path.len()` positions, and the sequence
+    /// advances by that much.
+    pub fn commit_path(
+        &self,
+        d: &MetalDevice,
+        state: &mut HybridState,
+        path: &[usize],
+    ) -> Result<()> {
+        let n = path.len();
+        if path.first() != Some(&0) || n > state.verified {
+            return Err(Error::Cache(format!(
+                "commit of path {path:?} after a verify of {} rows",
+                state.verified
+            )));
+        }
+        if path.iter().enumerate().all(|(i, &row)| i == row) {
+            return self.commit(d, state, n);
+        }
+        let tree = &state.verified_tree;
+        if tree.is_empty()
+            || path
+                .windows(2)
+                .any(|w| tree.get(w[1]).copied().flatten() != Some(w[0]))
+        {
+            return Err(Error::Cache(format!(
+                "path {path:?} does not follow the last verify's tree"
+            )));
+        }
         let c = &self.config;
         let spec = self.spec.borrow();
         let spec = spec.as_ref().expect("verify implies speculation");
         let s = self.scratch.borrow();
-        let channels = c.conv_channels();
-        let heads = c.ssm_v_heads;
+        let index = |v: &[usize]| {
+            Tensor::from_le_bytes(
+                d,
+                [v.len()],
+                DType::F32,
+                &v.iter()
+                    .flat_map(|&i| (i as u32).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // Rows already in place (the path's chain prefix) stay where they are.
+        let first = path
+            .iter()
+            .enumerate()
+            .take_while(|&(i, &row)| i == row)
+            .count();
+        let from = index(&path[first..])?;
+        let to = index(&(first..n).collect::<Vec<_>>())?;
+        let path_t = index(path)?;
         state.valid = false;
         let e = d.execution_with_shared_encoder(true)?;
-        for (layer, index) in spec.recurrent_index.iter().enumerate() {
-            let Some(r) = *index else { continue };
-            let Mixer::Delta(w) = &self.weights.layers[layer].mixer else {
-                unreachable!("recurrent index on an attention layer")
+        self.replay(d, &s, spec, state, n, Some(&path_t))?;
+        let moved = n - first;
+        for layer in 0..c.layers {
+            let (Some(kc), Some(vc)) = (&state.k[layer], &state.v[layer]) else {
+                continue;
             };
-            let qkv = rows(&spec.tape_qkv[r], 0, n, channels)?;
-            let conv = rows(&s.conv, 0, n, channels)?;
-            let delta = rows(&s.delta, 0, n, c.ssm_value_dim())?;
-            self.gdn_conv(d, &qkv, w, &conv, state, layer, n, true)?;
-            self.gdn_recurrent(
-                d,
-                &conv,
-                &rows(&spec.tape_g[r], 0, n, heads)?,
-                &rows(&spec.tape_b[r], 0, n, heads)?,
-                &delta,
-                state,
-                layer,
-                n,
-                true,
+            for cache in [kc, vc] {
+                let args = Params::default()
+                    .u(moved)?
+                    .u(c.kv_heads * c.head_dim)?
+                    .u(cache.shape().dimensions()[0])?
+                    .u(usize::from(c.kv_cache == KvCache::Q8))?
+                    .u(state.ring[layer])?
+                    .u(state.len)?;
+                let units = moved * c.kv_heads * c.head_dim;
+                d.dispatch_hybrid(
+                    "h_kv_gather",
+                    &[cache.binding(), from.binding()],
+                    &[spec.gather.binding()],
+                    &args.0,
+                    [units.div_ceil(256), 1, 1],
+                    [256, 1, 1],
+                    0,
+                )?;
+                d.dispatch_hybrid(
+                    "h_kv_scatter",
+                    &[spec.gather.binding(), to.binding()],
+                    &[cache.binding()],
+                    &args.0,
+                    [units.div_ceil(256), 1, 1],
+                    [256, 1, 1],
+                    0,
+                )?;
+            }
+        }
+        // Captured rows the drafter ingests next: rows 0..n become the path's.
+        for captured in spec.features.iter().chain(&spec.hidden) {
+            let width = captured.numel() / captured.shape().dimensions()[0];
+            gather_rows(d, captured, &path_t, &spec.gather, n, width, width)?;
+            d.dispatch_hybrid(
+                "h_copy_rows",
+                &[spec.gather.binding()],
+                &[captured.binding()],
+                &Params::default()
+                    .u(n)?
+                    .u(width)?
+                    .u(width)?
+                    .u(width)?
+                    .u(0)?
+                    .0,
+                [(n * width).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
             )?;
         }
         e.finish()?;
         state.len += n;
         state.verified = 0;
+        state.verified_tree.clear();
         state.valid = true;
+        Ok(())
+    }
+
+    /// Replay `n` verify rows into the recurrent state: tape rows `0..n`, or
+    /// the tape rows `path` lists, gathered into the chunk scratch.
+    fn replay(
+        &self,
+        d: &MetalDevice,
+        s: &Scratch,
+        spec: &Spec,
+        state: &HybridState,
+        n: usize,
+        path: Option<&Tensor>,
+    ) -> Result<()> {
+        let c = &self.config;
+        let channels = c.conv_channels();
+        let heads = c.ssm_v_heads;
+        for (layer, index) in spec.recurrent_index.iter().enumerate() {
+            let Some(r) = *index else { continue };
+            let Mixer::Delta(w) = &self.weights.layers[layer].mixer else {
+                unreachable!("recurrent index on an attention layer")
+            };
+            let (qkv, g, b) = match path {
+                None => (
+                    rows(&spec.tape_qkv[r], 0, n, channels)?,
+                    rows(&spec.tape_g[r], 0, n, heads)?,
+                    rows(&spec.tape_b[r], 0, n, heads)?,
+                ),
+                Some(path) => {
+                    let (qkv, g, b) = (
+                        rows(&s.qkv, 0, n, channels)?,
+                        rows(&s.g, 0, n, heads)?,
+                        rows(&s.b, 0, n, heads)?,
+                    );
+                    gather_rows(d, &spec.tape_qkv[r], path, &qkv, n, channels, channels)?;
+                    gather_rows(d, &spec.tape_g[r], path, &g, n, heads, heads)?;
+                    gather_rows(d, &spec.tape_b[r], path, &b, n, heads, heads)?;
+                    (qkv, g, b)
+                }
+            };
+            let conv = rows(&s.conv, 0, n, channels)?;
+            let delta = rows(&s.delta, 0, n, c.ssm_value_dim())?;
+            self.gdn_conv(d, &qkv, w, &conv, state, layer, n, true, None)?;
+            self.gdn_recurrent(d, &conv, &g, &b, &delta, state, layer, n, true, None)?;
+        }
         Ok(())
     }
 
@@ -1273,6 +1519,7 @@ impl HybridModel {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_chunk(
         &self,
         d: &MetalDevice,
@@ -1281,6 +1528,7 @@ impl HybridModel {
         output: &Output,
         all_logits: Option<&mut Vec<f32>>,
         verify: bool,
+        tree: Option<&[Option<usize>]>,
     ) -> Result<Produced> {
         let c = &self.config;
         let s = self.scratch.borrow();
@@ -1340,7 +1588,10 @@ impl HybridModel {
                 0,
             )?;
         }
-        let rope = state.rope_plan(d, pos, m)?;
+        let rope = match tree {
+            Some(parents) => state.tree_plan(d, pos, parents)?,
+            None => state.rope_plan(d, pos, m)?,
+        };
         self.rmsnorm(d, &x0, &self.weights.layers[0].attn_norm, &xn, m)?;
         let spec = self.spec.borrow();
         let spec = spec.as_ref();
@@ -1358,7 +1609,7 @@ impl HybridModel {
                         }
                         _ => None,
                     };
-                    self.delta(d, &s, w, state, i, &xn, &mix, m, tape)?
+                    self.delta(d, &s, w, state, i, &xn, &mix, m, tape, rope.tree.as_ref())?
                 }
             }
             self.add_rmsnorm(d, cur, &mix, &layer.post_norm, next, &xn, m)?;
@@ -1960,6 +2211,7 @@ impl HybridModel {
         out: &Tensor,
         m: usize,
         tape: Option<(&Tensor, &Tensor, &Tensor)>,
+        tree: Option<&Tensor>,
     ) -> Result<()> {
         let c = &self.config;
         let channels = c.conv_channels();
@@ -2007,8 +2259,10 @@ impl HybridModel {
             [64, 1, 1],
             0,
         )?;
-        self.gdn_conv(d, &qkv, w, &conv, state, layer, m, write_state)?;
-        self.gdn_recurrent(d, &conv, &g, &b, &delta, state, layer, m, write_state)?;
+        // Tree rows only arise in a verify, which never writes the state.
+        let tree = tree.filter(|_| tape.is_some());
+        self.gdn_conv(d, &qkv, w, &conv, state, layer, m, write_state, tree)?;
+        self.gdn_recurrent(d, &conv, &g, &b, &delta, state, layer, m, write_state, tree)?;
         self.dump(d, "attn_output", layer, &delta)?;
         d.dispatch_hybrid(
             "h_gated_rmsnorm",
@@ -2036,28 +2290,49 @@ impl HybridModel {
         layer: usize,
         m: usize,
         write_state: bool,
+        tree: Option<&Tensor>,
     ) -> Result<()> {
         let c = &self.config;
         let channels = c.conv_channels();
         let conv_state = state.conv[layer]
             .as_ref()
             .expect("delta layer has conv state");
-        d.dispatch_hybrid(
-            "h_gdn_conv",
-            &[qkv.binding(), w.conv.binding()],
-            &[conv.binding(), conv_state.binding()],
-            &Params::default()
-                .u(channels)?
-                .u(m)?
-                .u(c.ssm_key_dim())?
-                .u(c.ssm_head_dim)?
-                .f(c.eps)
-                .u(usize::from(write_state))?
-                .0,
-            [channels / c.ssm_head_dim, 1, 1],
-            [c.ssm_head_dim, 1, 1],
-            0,
-        )
+        let params = Params::default()
+            .u(channels)?
+            .u(m)?
+            .u(c.ssm_key_dim())?
+            .u(c.ssm_head_dim)?
+            .f(c.eps)
+            .u(usize::from(write_state))?
+            .0;
+        let groups = [channels / c.ssm_head_dim, 1, 1];
+        let threads = [c.ssm_head_dim, 1, 1];
+        match tree {
+            // Draft-tree rows read their ancestors' rows; the state is only read.
+            Some(tree) => d.dispatch_hybrid(
+                "h_gdn_conv_tree",
+                &[
+                    qkv.binding(),
+                    w.conv.binding(),
+                    conv_state.binding(),
+                    tree.binding(),
+                ],
+                &[conv.binding()],
+                &params,
+                groups,
+                threads,
+                0,
+            ),
+            None => d.dispatch_hybrid(
+                "h_gdn_conv",
+                &[qkv.binding(), w.conv.binding()],
+                &[conv.binding(), conv_state.binding()],
+                &params,
+                groups,
+                threads,
+                0,
+            ),
+        }
     }
 
     /// Sequential gated delta rule over `m` conv rows into `delta`.
@@ -2073,29 +2348,50 @@ impl HybridModel {
         layer: usize,
         m: usize,
         write_state: bool,
+        tree: Option<&Tensor>,
     ) -> Result<()> {
         let c = &self.config;
         let ssm = state.ssm[layer]
             .as_ref()
             .expect("delta layer has recurrent state");
         const NSG: usize = 4;
-        d.dispatch_hybrid(
-            "h_gdn_recurrent",
-            &[conv.binding(), g.binding(), b.binding()],
-            &[delta.binding(), ssm.binding()],
-            &Params::default()
-                .u(m)?
-                .u(c.ssm_v_heads)?
-                .u(c.ssm_k_heads)?
-                .u(c.conv_channels())?
-                .u(c.ssm_key_dim())?
-                .f(1. / (c.ssm_head_dim as f32).sqrt())
-                .u(usize::from(write_state))?
-                .0,
-            [c.ssm_head_dim / NSG, c.ssm_v_heads, 1],
-            [32, NSG, 1],
-            0,
-        )
+        let params = Params::default()
+            .u(m)?
+            .u(c.ssm_v_heads)?
+            .u(c.ssm_k_heads)?
+            .u(c.conv_channels())?
+            .u(c.ssm_key_dim())?
+            .f(1. / (c.ssm_head_dim as f32).sqrt())
+            .u(usize::from(write_state))?
+            .0;
+        let groups = [c.ssm_head_dim / NSG, c.ssm_v_heads, 1];
+        match tree {
+            // Draft-tree rows start from their parent's state; the state is only read.
+            Some(tree) => d.dispatch_hybrid(
+                "h_gdn_recurrent_tree",
+                &[
+                    conv.binding(),
+                    g.binding(),
+                    b.binding(),
+                    ssm.binding(),
+                    tree.binding(),
+                ],
+                &[delta.binding()],
+                &params,
+                groups,
+                [32, NSG, 1],
+                0,
+            ),
+            None => d.dispatch_hybrid(
+                "h_gdn_recurrent",
+                &[conv.binding(), g.binding(), b.binding()],
+                &[delta.binding(), ssm.binding()],
+                &params,
+                groups,
+                [32, NSG, 1],
+                0,
+            ),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2671,6 +2967,7 @@ mod tests {
             len: 0,
             valid: true,
             verified: 0,
+            verified_tree: Vec::new(),
             media: media.to_vec(),
             k: Vec::new(),
             v: Vec::new(),
@@ -3251,6 +3548,7 @@ mod tests {
             len: written,
             valid: true,
             verified: 0,
+            verified_tree: Vec::new(),
             media: Vec::new(),
             k: Vec::new(),
             v: Vec::new(),

@@ -1567,6 +1567,51 @@ kernel void h_gdn_conv(constant ConvArgs & p [[buffer(4)]],
     state[2 * p.channels + c] = s2;
 }
 
+// Parent of draft-tree node t (see KeyMask): its latest ancestor, or -1 for
+// the root.
+inline int tree_parent(device const uint * tree, uint t) {
+    const uint ancestors = tree[2 * t] & ~(1u << t);
+    return ancestors == 0 ? -1 : int(31 - clz(ancestors));
+}
+
+// h_gdn_conv over the nodes of a draft tree (speculative verify; the state is
+// only read): node t convolves its own row with its three latest ancestors'
+// rows, continuing into the state above the root, in the same arithmetic as
+// a chain of the same rows.
+kernel void h_gdn_conv_tree(constant ConvArgs & p [[buffer(5)]],
+                            device const float * x [[buffer(0)]],        // [tokens][channels]
+                            device const float * w [[buffer(1)]],        // [channels][4]
+                            device const float * state [[buffer(2)]],    // [3][channels]
+                            device const uint * tree [[buffer(3)]],
+                            device float * y [[buffer(4)]],              // [tokens][channels]
+                            uint group [[threadgroup_position_in_grid]],
+                            ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    const uint c = group * p.head_dim + tid;
+    const bool normalize = c < 2 * p.key_dim;
+    float4 wc = ((device const float4 *)w)[c];
+    for (uint t = 0; t < p.tokens; t++) {
+        // prev[0] is the parent's row, prev[2] the oldest; past the root, the
+        // state's rows from its newest.
+        float prev[3];
+        int a = tree_parent(tree, t);
+        uint k = 0;
+        for (; k < 3 && a >= 0; k++) {
+            prev[k] = x[(ulong)a * p.channels + c];
+            a = tree_parent(tree, uint(a));
+        }
+        for (uint r = 0; k < 3; k++, r++) prev[k] = state[(2 - r) * p.channels + c];
+        const float xt = x[(ulong)t * p.channels + c];
+        float v = wc[0] * prev[2] + wc[1] * prev[1] + wc[2] * prev[0] + wc[3] * xt;
+        v = v / (1.f + exp(-v));
+        if (normalize) {
+            float ss = block_sum(v * v, scratch, tid, p.head_dim);
+            v = v * rsqrt(max(ss, p.eps * p.eps));
+        }
+        y[(ulong)t * p.channels + c] = v;
+    }
+}
+
 struct DeltaArgs {
     uint tokens;
     uint v_heads;      // 48
@@ -1626,6 +1671,59 @@ kernel void h_gdn_recurrent(constant DeltaArgs & p [[buffer(5)]],
                             device float * state [[buffer(4)]],
                             uint3 tgpig [[threadgroup_position_in_grid]], uint3 tpitg [[thread_position_in_threadgroup]]) {
     gdn_recurrent_impl<4>(p, qkv, g, b, out, state, tgpig, tpitg);
+}
+
+// h_gdn_recurrent over the nodes of a draft tree (speculative verify; the
+// state is only read): node t starts from its parent's state, kept per node,
+// or from the live state at the root, then runs the same update as a chain.
+template<short NSG>
+void gdn_recurrent_tree_impl(constant DeltaArgs & p, device const float * qkv, device const float * g,
+                             device const float * b, device const float * state, device const uint * tree,
+                             device float * out, uint3 tgpig, uint3 tpitg) {
+    constexpr uint S = 128;
+    const uint tx = tpitg.x;
+    const uint ty = tpitg.y;
+    const uint h = tgpig.y;
+    const uint i = tgpig.x * NSG + ty;
+    const uint kh = h % p.k_heads;
+    device const float * s_ptr = state + ((ulong)h * S + i) * S;
+    float root[NSG];
+    float saved[32][NSG];
+    FOR_UNROLL (short j = 0; j < NSG; j++) root[j] = s_ptr[tx * NSG + j];
+    for (uint t = 0; t < p.tokens; t++) {
+        const int parent = tree_parent(tree, t);
+        float ls[NSG];
+        FOR_UNROLL (short j = 0; j < NSG; j++) ls[j] = parent < 0 ? root[j] : saved[parent][j];
+        device const float * row = qkv + (ulong)t * p.channels;
+        device const float * q = row + kh * S;
+        device const float * k = row + p.key_dim + kh * S;
+        const float v = row[2 * p.key_dim + h * S + i];
+        const float ge = exp(g[t * p.v_heads + h]);
+        const float beta = b[t * p.v_heads + h];
+        float s_k = 0.f;
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            ls[j] *= ge;
+            s_k += ls[j] * k[tx * NSG + j];
+        }
+        s_k = simd_sum(s_k);
+        const float d = (v - s_k) * beta;
+        float yv = 0.f;
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            ls[j] += k[tx * NSG + j] * d;
+            yv += ls[j] * q[tx * NSG + j];
+        }
+        yv = simd_sum(yv);
+        if (tx == 0) out[((ulong)t * p.v_heads + h) * S + i] = yv * p.scale;
+        FOR_UNROLL (short j = 0; j < NSG; j++) saved[t][j] = ls[j];
+    }
+}
+
+kernel void h_gdn_recurrent_tree(constant DeltaArgs & p [[buffer(6)]],
+                                 device const float * qkv [[buffer(0)]], device const float * g [[buffer(1)]],
+                                 device const float * b [[buffer(2)]], device const float * state [[buffer(3)]],
+                                 device const uint * tree [[buffer(4)]], device float * out [[buffer(5)]],
+                                 uint3 tgpig [[threadgroup_position_in_grid]], uint3 tpitg [[thread_position_in_threadgroup]]) {
+    gdn_recurrent_tree_impl<4>(p, qkv, g, b, state, tree, out, tgpig, tpitg);
 }
 
 struct GatedNormArgs { uint heads; uint head_dim; float eps; };
@@ -3330,6 +3428,58 @@ kernel void h_copy_rows(constant CopyRowsArgs & a [[buffer(2)]], device const fl
     if (i >= a.rows * a.width) return;
     const uint r = i / a.width, c = i % a.width;
     dst[(ulong)r * a.dst_stride + a.dst_offset + c] = src[(ulong)r * a.src_stride + c];
+}
+
+struct GatherRowsArgs { uint rows; uint width; uint src_stride; };
+
+// dst[r*width + c] = src[idx[r]*src_stride + c]; one thread per value.
+kernel void h_gather_rows(constant GatherRowsArgs & a [[buffer(3)]], device const float * src [[buffer(0)]],
+                          device const uint * idx [[buffer(1)]], device float * dst [[buffer(2)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i >= a.rows * a.width) return;
+    const uint r = i / a.width, c = i % a.width;
+    dst[(ulong)r * a.width + c] = src[(ulong)idx[r] * a.src_stride + c];
+}
+
+struct KvRowsArgs {
+    uint rows;      // K/V rows moved
+    uint stride;    // elements per cache row (kv_heads * head_dim)
+    uint kv_rows;   // rows the cache buffer holds (locates Q8 scales)
+    uint q8;
+    uint ring;      // see kv_row
+    uint position;  // cache position of slot 0
+};
+
+// 16-bit unit u of the cache row at position `key`: F16 rows are `stride`
+// units; Q8 rows are stride / 2 units of values, then stride / 32 scales.
+inline ulong kv_unit(constant KvRowsArgs & a, uint key, uint u) {
+    const ulong row = kv_row(key, a.ring);
+    if (a.q8 == 0) return row * a.stride + u;
+    const uint values = a.stride / 2;
+    return u < values ? row * values + u : (ulong)a.kv_rows * values + row * (a.stride / 32) + (u - values);
+}
+inline uint kv_units(constant KvRowsArgs & a) {
+    return a.q8 == 0 ? a.stride : a.stride / 2 + a.stride / 32;
+}
+
+// tmp[r] = cache row at position + slot[r] (16-bit units, any K/V format).
+kernel void h_kv_gather(constant KvRowsArgs & a [[buffer(3)]], device const ushort * cache [[buffer(0)]],
+                        device const uint * slot [[buffer(1)]], device ushort * tmp [[buffer(2)]],
+                        uint i [[thread_position_in_grid]]) {
+    const uint n = kv_units(a);
+    if (i >= a.rows * n) return;
+    const uint r = i / n, u = i % n;
+    tmp[(ulong)r * n + u] = cache[kv_unit(a, a.position + slot[r], u)];
+}
+
+// Cache row at position + slot[r] = tmp[r].
+kernel void h_kv_scatter(constant KvRowsArgs & a [[buffer(3)]], device const ushort * tmp [[buffer(0)]],
+                         device const uint * slot [[buffer(1)]], device ushort * cache [[buffer(2)]],
+                         uint i [[thread_position_in_grid]]) {
+    const uint n = kv_units(a);
+    if (i >= a.rows * n) return;
+    const uint r = i / n, u = i % n;
+    cache[kv_unit(a, a.position + slot[r], u)] = tmp[(ulong)r * n + u];
 }
 
 // ---------------------------------------------------------------- block-diffusion drafters

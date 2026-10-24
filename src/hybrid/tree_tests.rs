@@ -674,3 +674,98 @@ fn tree_rotary_positions_are_plain_rope_at_depth() {
         );
     }
 }
+
+/// `commit_path`'s K/V move: rows of an accepted path (gathered, then
+/// scattered back to consecutive positions) land byte for byte where a chain
+/// would have stored them, with Q8 scales, across a ring's wrap, and with
+/// every other row untouched.
+#[test]
+fn kv_rows_move_to_the_path_positions() {
+    let d = MetalDevice::new().unwrap();
+    let stride = 4 * 64;
+    let path = [0usize, 2, 5, 6, 9];
+    let first = 1; // path[0] is already in place
+    for kv in [KvCache::F16, KvCache::Q8] {
+        // A linear cache, and a ring whose rows wrap between the moved slots.
+        for (rows, ring, position) in [(160usize, 0usize, 70usize), (128, 128, 122)] {
+            let q8 = kv == KvCache::Q8;
+            let bytes = rows * kv.row_bytes(stride);
+            let raw: Vec<u8> = random(bytes, 21)
+                .iter()
+                .map(|v| ((v + 1.) * 127.5) as u8)
+                .collect();
+            // Raw bytes; F32 so they read back unconverted.
+            let cache = Tensor::from_le_bytes(&d, [bytes / 4], DType::F32, &raw).unwrap();
+            let index = |v: &[usize]| {
+                Tensor::from_le_bytes(
+                    &d,
+                    [v.len()],
+                    DType::F32,
+                    &v.iter()
+                        .flat_map(|&i| (i as u32).to_le_bytes())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap()
+            };
+            let from = index(&path[first..]);
+            let to = index(&(first..path.len()).collect::<Vec<_>>());
+            let tmp = Tensor::zeros(&d, [path.len() * stride], DType::F32).unwrap();
+            let moved = path.len() - first;
+            let mut args = Params::default();
+            for v in [moved, stride, rows, usize::from(q8), ring, position] {
+                args = args.u(v).unwrap();
+            }
+            let e = d.execution_with_shared_encoder(true).unwrap();
+            for (name, input, idx, output) in [
+                ("h_kv_gather", &cache, &from, &tmp),
+                ("h_kv_scatter", &tmp, &to, &cache),
+            ] {
+                d.dispatch_hybrid(
+                    name,
+                    &[input.binding(), idx.binding()],
+                    &[output.binding()],
+                    &args.0,
+                    [(moved * stride).div_ceil(256), 1, 1],
+                    [256, 1, 1],
+                    0,
+                )
+                .unwrap();
+            }
+            e.finish().unwrap();
+            // CPU: the same rows (values, and for Q8 their block scales) moved.
+            let row = |slot: usize| {
+                let r = position + slot;
+                if ring > 0 { r % ring } else { r }
+            };
+            let (value_bytes, scale_bytes) = if q8 {
+                (stride, stride / 16)
+            } else {
+                (2 * stride, 0)
+            };
+            let mut want = raw.clone();
+            for (k, &slot) in path.iter().enumerate().skip(first) {
+                let (src, dst) = (row(slot), row(k));
+                want.copy_within(
+                    src * value_bytes..(src + 1) * value_bytes,
+                    dst * value_bytes,
+                );
+                if q8 {
+                    let base = rows * value_bytes;
+                    want.copy_within(
+                        base + src * scale_bytes..base + (src + 1) * scale_bytes,
+                        base + dst * scale_bytes,
+                    );
+                }
+            }
+            let got: Vec<u8> = cache
+                .to_f32()
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect();
+            assert!(
+                got[..bytes] == want[..],
+                "{kv} ring {ring}: moved K/V rows differ"
+            );
+        }
+    }
+}
