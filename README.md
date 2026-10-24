@@ -206,4 +206,4 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 
 ## License
 
-Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option. Model weights are not included and keep their own licenses.
+Dual-licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option, except for the files adapted from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI), which stay Apache-2.0 only; [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES) lists them. Model weights are not included and keep their own licenses.

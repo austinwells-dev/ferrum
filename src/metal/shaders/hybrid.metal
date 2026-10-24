@@ -1620,7 +1620,12 @@ struct DeltaArgs {
     uint key_dim;      // offset of K within a row (Q at 0, V at 2*key_dim)
     float scale;       // 1/sqrt(head_dim)
     uint write_state;  // 0 during a speculative verify: the state is only read
+    uint grouped;      // V head h reads K head h / (v_heads / k_heads) (Hugging Face order); else h % k_heads (GGUF)
 };
+
+inline uint delta_key_head(constant DeltaArgs & p, uint h) {
+    return p.grouped != 0 ? h / (p.v_heads / p.k_heads) : h % p.k_heads;
+}
 
 // Sequential gated delta rule after llama.cpp's kernel_gated_delta_net_impl.
 // State per V head is stored transposed: M[i][j] = S[j][i], row i contiguous.
@@ -1635,7 +1640,7 @@ void gdn_recurrent_impl(constant DeltaArgs & p, device const float * qkv, device
     const uint ty = tpitg.y;
     const uint h = tgpig.y;
     const uint i = tgpig.x * NSG + ty;
-    const uint kh = h % p.k_heads;
+    const uint kh = delta_key_head(p, h);
     device float * s_ptr = state + ((ulong)h * S + i) * S;
     float ls[NSG];
     FOR_UNROLL (short j = 0; j < NSG; j++) ls[j] = s_ptr[tx * NSG + j];
@@ -1685,7 +1690,7 @@ void gdn_recurrent_tree_impl(constant DeltaArgs & p, device const float * qkv, d
     const uint ty = tpitg.y;
     const uint h = tgpig.y;
     const uint i = tgpig.x * NSG + ty;
-    const uint kh = h % p.k_heads;
+    const uint kh = delta_key_head(p, h);
     device const float * s_ptr = state + ((ulong)h * S + i) * S;
     float root[NSG];
     float saved[32][NSG];

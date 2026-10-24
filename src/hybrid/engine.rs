@@ -2408,6 +2408,7 @@ impl HybridModel {
             .u(c.ssm_key_dim())?
             .f(1. / (c.ssm_head_dim as f32).sqrt())
             .u(usize::from(write_state))?
+            .u(usize::from(c.ssm_grouped_heads))?
             .0;
         let groups = [c.ssm_head_dim / NSG, c.ssm_v_heads, 1];
         match tree {
@@ -2643,7 +2644,7 @@ impl HybridModel {
             Format::Iq3S => "h_mm_id_iq3_s",
             Format::Iq3Xxs => "h_mm_id_iq3_xxs",
             Format::Iq2S => "h_mm_id_iq2_s",
-            Format::F32 | Format::Bf16 => {
+            Format::F32 | Format::Bf16 | Format::Mlx4 => {
                 return Err(Error::Gguf(format!(
                     "{} experts are unsupported",
                     w.format.name()
@@ -2719,6 +2720,7 @@ impl HybridModel {
             Format::Q4_0 => "h_get_rows_q4_0",
             Format::Iq4Xs => "h_get_rows_iq4_xs",
             Format::Bf16 => "h_get_rows_bf16",
+            Format::Mlx4 => "h_get_rows_mlx4",
             f => return Err(Error::Gguf(format!("no embedding lookup for {}", f.name()))),
         };
         d.dispatch_hybrid(
@@ -2838,6 +2840,7 @@ impl HybridModel {
                 Format::Iq3S => "h_mm_iq3_s",
                 Format::Iq3Xxs => "h_mm_iq3_xxs",
                 Format::Iq2S => "h_mm_iq2_s",
+                Format::Mlx4 => "h_mm_mlx4",
             };
             return d.dispatch_hybrid(
                 name,
@@ -2931,6 +2934,7 @@ fn mvb_kernel(format: Format) -> &'static str {
         Format::Iq3S => "h_mvb_iq3_s",
         Format::Iq3Xxs => "h_mvb_iq3_xxs",
         Format::Iq2S => "h_mvb_iq2_s",
+        Format::Mlx4 => "h_mvb_mlx4",
         Format::F32 => "h_mvb_f32",
         Format::Bf16 => "h_mvb_bf16",
     }
@@ -2948,6 +2952,7 @@ fn mms_kernel(format: Format) -> &'static str {
         Format::Iq3S => "h_mms_iq3_s",
         Format::Iq3Xxs => "h_mms_iq3_xxs",
         Format::Iq2S => "h_mms_iq2_s",
+        Format::Mlx4 => "h_mms_mlx4",
         Format::F32 => "h_mms_f32",
         Format::Bf16 => "h_mms_bf16",
     }
@@ -2968,6 +2973,10 @@ fn mv_kernel(format: Format, expert: bool) -> (&'static str, usize, usize, usize
         Format::Iq3S => (pick("h_mv_iq3_s", "h_mv_id_iq3_s"), 8, 2, 512 * 4),
         Format::Iq3Xxs => (pick("h_mv_iq3_xxs", "h_mv_id_iq3_xxs"), 8, 2, 256 * 4 + 128),
         Format::Iq2S => (pick("h_mv_iq2_s", "h_mv_id_iq2_s"), 8, 2, 0),
+        // Expert matrices are never MLX (`moe_ffn` refuses them first). One row
+        // per SIMD group with 16-byte loads beat Kapitsa's 2 x 8 (its M4 Pro
+        // tuning) on every 27B shape on the M5.
+        Format::Mlx4 => ("h_mv_mlx4", 4, 4, 0),
     }
 }
 

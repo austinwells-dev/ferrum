@@ -12,6 +12,9 @@ pub mod engine;
 #[cfg(test)]
 mod iq_tests;
 pub mod lookup;
+pub mod mlx;
+#[cfg(test)]
+mod mlx_tests;
 pub mod mtp;
 pub mod plan;
 pub mod runtime;
@@ -99,6 +102,9 @@ pub fn load_with(
     options: plan::PlanOptions,
 ) -> Result<LoadedHybrid> {
     let start = std::time::Instant::now();
+    if mlx::is_mlx_dir(path.as_ref()) {
+        return load_mlx(device, path.as_ref(), options, start);
+    }
     let mut file = GgufFile::open(path)?;
     let mut config = HybridConfig::from_gguf(&file)?;
     config.kv_cache = options.kv_cache;
@@ -129,8 +135,47 @@ pub fn load_with(
     })
 }
 
+/// `load_with` for an MLX checkpoint directory (`mlx`).
+fn load_mlx(
+    device: &MetalDevice,
+    dir: &Path,
+    options: plan::PlanOptions,
+    start: std::time::Instant,
+) -> Result<LoadedHybrid> {
+    let mut config = mlx::config(dir)?;
+    config.kv_cache = options.kv_cache;
+    let plan = plan::plan_for_weights(
+        mlx::weight_bytes(dir, &config)?,
+        &config,
+        device.recommended_max_working_set() as usize,
+        options,
+    )?;
+    let chat = mlx::chat_files(dir)?;
+    let before = device.allocated_bytes();
+    let weights = mlx::load_weights(device, dir, &config)?;
+    let model = HybridModel::new(device, config, weights, options.chunk, options.logit_rows)?;
+    Ok(LoadedHybrid {
+        model,
+        tokenizer: chat.tokenizer,
+        eos_ids: chat.eos_ids,
+        chat_template: chat.template,
+        chat_special_tokens: chat.special,
+        load_time: start.elapsed(),
+        plan,
+        loaded_bytes: device.allocated_bytes().saturating_sub(before),
+    })
+}
+
 /// The chat template embedded in a GGUF (no weights are read).
 pub fn load_chat_template(path: impl AsRef<Path>) -> Result<Option<chat::ChatTemplate>> {
+    if mlx::is_mlx_dir(path.as_ref()) {
+        let chat = mlx::chat_files(path.as_ref())?;
+        let (bos, eos) = &chat.special;
+        return chat
+            .template
+            .map(|t| chat::ChatTemplate::with_special_tokens(&t, bos, eos))
+            .transpose();
+    }
     let file = GgufFile::open(path)?;
     let (bos, eos) = special_tokens(file.metadata());
     let flint = matches!(
@@ -172,6 +217,9 @@ fn special_tokens(md: &std::collections::BTreeMap<String, MetadataValue>) -> (St
 
 /// Build only the tokenizer of a hybrid GGUF (no weights are read).
 pub fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
+    if mlx::is_mlx_dir(path.as_ref()) {
+        return Ok(mlx::chat_files(path.as_ref())?.tokenizer);
+    }
     let file = GgufFile::open(path)?;
     let config = HybridConfig::from_gguf(&file)?;
     Ok(tokenizer(&file, config.vocab)?.0)

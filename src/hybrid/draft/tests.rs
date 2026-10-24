@@ -411,6 +411,7 @@ fn target() -> HybridConfig {
         ssm_head_dim: 128,
         ssm_k_heads: 1,
         ssm_v_heads: 1,
+        ssm_grouped_heads: false,
         moe: None,
         trained_context: 4096,
         kv_cache: KvCache::F16,

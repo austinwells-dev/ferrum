@@ -1,0 +1,23 @@
+Third-party notices
+
+Ferrum (Copyright 2026 Austin Wells) is dual-licensed under MIT or Apache-2.0, except for the files listed below,
+which are adapted from other projects and stay under those projects' licenses. Model weights are not part of Ferrum:
+they keep their own licenses.
+
+================================================================================
+Kapitsa (Nace AI), Apache License 2.0
+https://github.com/nace-ai/kapitsa
+Copyright 2026 Nace AI
+
+Files adapted from Kapitsa, Apache-2.0 only (not dual-licensed); each file's header says what it was adapted from and
+what changed:
+
+- src/metal/shaders/hybrid_mlx.metal: the MLX affine 4-bit decode GEMV, adapted from src/kernels/qmv.metal (qmv3_impl)
+  and src/kernels/quant.h (load_x, dot_row): the shift-free dequantization and the per-group epilogue.
+
+Ideas taken from Kapitsa's code and documentation without copying code, credited where they are used:
+
+- src/hybrid/mlx.rs: how MLX conversions of Qwen3.5-family checkpoints store their tensors (src/model/qwen35.cpp).
+
+Review reference: be57c8f (the Kapitsa commit the adaptations were read from).
+The Apache License 2.0 text is in LICENSE-APACHE.

@@ -25,6 +25,10 @@ pub enum Format {
     Iq3S,
     Iq2S,
     Iq4Xs,
+    /// MLX affine 4-bit, group 64: each row holds its `cols / 8` code words,
+    /// then its `cols / 64` bf16 scales, then as many bf16 biases
+    /// (`Matrix::from_mlx`).
+    Mlx4,
 }
 
 impl Format {
@@ -56,6 +60,7 @@ impl Format {
             Self::Iq3S => "iq3_s",
             Self::Iq2S => "iq2_s",
             Self::Iq4Xs => "iq4_xs",
+            Self::Mlx4 => "mlx4",
         }
     }
 }
@@ -722,6 +727,52 @@ impl Matrix {
             cols,
             experts,
             format,
+            row_bytes,
+            storage,
+        })
+    }
+
+    /// An MLX affine 4-bit, group-64 matrix from its three arrays (`codes`
+    /// `[rows, cols / 8]` little-endian u32 words, `scales` and `biases`
+    /// `[rows, cols / 64]` bf16), repacked so each row holds its codes, then
+    /// its scales, then its biases (`Format::Mlx4`).
+    pub(crate) fn from_mlx(
+        device: &MetalDevice,
+        rows: usize,
+        cols: usize,
+        codes: &[u8],
+        scales: &[u8],
+        biases: &[u8],
+    ) -> Result<Self> {
+        if !cols.is_multiple_of(64)
+            || codes.len() != rows * cols / 2
+            || scales.len() != rows * cols / 32
+            || biases.len() != rows * cols / 32
+        {
+            return Err(Error::Shape(format!(
+                "MLX 4-bit [{rows}, {cols}]: {} code, {} scale and {} bias bytes",
+                codes.len(),
+                scales.len(),
+                biases.len()
+            )));
+        }
+        let (code_bytes, group_bytes) = (cols / 2, cols / 32);
+        let row_bytes = code_bytes + 2 * group_bytes;
+        let storage = PackedStorage::from_reader(device, rows * row_bytes, |dst| {
+            for (r, out) in dst.chunks_exact_mut(row_bytes).enumerate() {
+                out[..code_bytes].copy_from_slice(&codes[r * code_bytes..][..code_bytes]);
+                out[code_bytes..][..group_bytes]
+                    .copy_from_slice(&scales[r * group_bytes..][..group_bytes]);
+                out[code_bytes + group_bytes..]
+                    .copy_from_slice(&biases[r * group_bytes..][..group_bytes]);
+            }
+            Ok(())
+        })?;
+        Ok(Matrix {
+            rows,
+            cols,
+            experts: 1,
+            format: Format::Mlx4,
             row_bytes,
             storage,
         })

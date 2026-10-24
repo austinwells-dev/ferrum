@@ -1788,11 +1788,12 @@ impl MetalDevice {
         if let Some(p) = self.builtins.borrow().get(name) {
             return Ok(p.clone());
         }
-        let p = self.compile_kernel_version(
+        // The MLX kernels (Apache-2.0, adapted from Kapitsa) build on hybrid.metal's types.
+        const SOURCE: &str = concat!(
             include_str!("shaders/hybrid.metal"),
-            name,
-            MTLLanguageVersion::Version4_0,
-        )?;
+            include_str!("shaders/hybrid_mlx.metal")
+        );
+        let p = self.compile_kernel_version(SOURCE, name, MTLLanguageVersion::Version4_0)?;
         self.builtins.borrow_mut().insert(name, p.clone());
         Ok(p)
     }

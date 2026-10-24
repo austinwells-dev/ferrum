@@ -146,6 +146,17 @@ pub fn plan(
     recommended_working_set: usize,
     options: PlanOptions,
 ) -> Result<MemoryPlan> {
+    plan_for_weights(weight_bytes(file, c), c, recommended_working_set, options)
+}
+
+/// `plan` for a model whose weights take `weights` bytes (an MLX checkpoint's,
+/// from `mlx::weight_bytes`).
+pub fn plan_for_weights(
+    weights: usize,
+    c: &HybridConfig,
+    recommended_working_set: usize,
+    options: PlanOptions,
+) -> Result<MemoryPlan> {
     let budget = options
         .budget
         .unwrap_or_else(|| recommended_working_set.saturating_sub(options.reserve));
@@ -156,7 +167,7 @@ pub fn plan(
     let kv_ring = kv_ring_bytes(c, max_rows);
     let kv_per_token = (kv_bytes(c, probe, max_rows) - kv_ring) as f64 / probe as f64;
     let mut plan = MemoryPlan {
-        weights: weight_bytes(file, c),
+        weights,
         scratch: scratch_bytes(c, options.chunk, options.logit_rows),
         recurrent,
         snapshots: options.snapshots * recurrent,

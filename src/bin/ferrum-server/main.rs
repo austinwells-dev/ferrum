@@ -15,10 +15,10 @@ use ferrum::hybrid::{
     self,
     chat::ChatTemplate,
     plan::PlanOptions,
-    runtime::{SpecOptions, recommended_sampling},
+    runtime::{SpecOptions, recommended_sampling_for},
     session::SamplingParams,
 };
-use ferrum::{loader::gguf::GgufFile, tokenizer::Tokenizer};
+use ferrum::tokenizer::Tokenizer;
 use serde_json::{Map, Value as Json, json};
 use std::{
     io::BufReader,
@@ -330,9 +330,7 @@ fn run(o: Options) -> Result<(), String> {
         env!("CARGO_PKG_VERSION"),
         o.model.display()
     );
-    let file = GgufFile::open(&o.model).map_err(|e| e.to_string())?;
-    let mut sampling = recommended_sampling(&file);
-    drop(file);
+    let mut sampling = recommended_sampling_for(&o.model).map_err(|e| e.to_string())?;
     for (key, v) in &o.sampling {
         match key.as_str() {
             "--temp" | "--temperature" => sampling.temperature = *v,

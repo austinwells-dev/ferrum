@@ -149,6 +149,10 @@ pub struct HybridConfig {
     pub ssm_head_dim: usize,
     pub ssm_k_heads: usize,
     pub ssm_v_heads: usize,
+    /// Delta-rule V head h reads K head h / (v_heads / k_heads), as in Hugging
+    /// Face checkpoints; GGUF conversions reorder the V heads so it reads
+    /// h % k_heads.
+    pub ssm_grouped_heads: bool,
     pub moe: Option<MoeConfig>,
     pub trained_context: usize,
     /// K/V cache format (a load option, not GGUF metadata).
@@ -333,6 +337,7 @@ impl HybridConfig {
             ssm_head_dim,
             ssm_k_heads,
             ssm_v_heads,
+            ssm_grouped_heads: false,
             moe,
             trained_context: uint(md, &key("context_length"))?,
             kv_cache: KvCache::F16,
@@ -341,7 +346,7 @@ impl HybridConfig {
         Ok(config)
     }
 
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let bad = |m: &str| Err(Error::Config(format!("unsupported hybrid geometry: {m}")));
         if embedding_mismatch(self) {
             return bad("embedding width");

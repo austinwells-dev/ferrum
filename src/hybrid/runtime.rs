@@ -174,15 +174,19 @@ impl SpecOptions {
         drafts.max(self.tree.unwrap_or(0)) + 1
     }
 
-    /// Memory the drafter will take next to `target`, before loading.
+    /// Memory the drafter will take next to `target`, before loading. `file`
+    /// is the target's GGUF (None for an MLX checkpoint).
     pub fn memory(
         &self,
-        file: &GgufFile,
+        file: Option<&GgufFile>,
         target: &HybridConfig,
         chunk: usize,
     ) -> Result<DraftMemory> {
         match &self.source {
             DraftSource::Mtp => {
+                let file = file.ok_or_else(|| {
+                    Error::Config("the MTP drafter reads the NextN block of a GGUF target".into())
+                })?;
                 let k = self.drafts(target, 3);
                 let geometry = SpecGeometry {
                     rows: self.verify_rows(k),
@@ -211,7 +215,11 @@ impl SpecOptions {
                 })
             }
             DraftSource::Checkpoint(dir) => {
-                check_drafter_tokenizer(dir, file.metadata())?;
+                // An MLX target's tokenizer is its own tokenizer.json; the
+                // drafter's config still checks the vocabulary below.
+                if let Some(file) = file {
+                    check_drafter_tokenizer(dir, file.metadata())?;
+                }
                 let (config, weights, state) = DraftModel::memory(dir, target, chunk, self.draft)?;
                 let k = self.drafts(target, config.max_drafts());
                 let geometry = SpecGeometry {
@@ -253,10 +261,12 @@ impl SpecOptions {
             }
             DraftSource::Lookup => Box::new(Lookup::new(self.drafts(&model.config, LOOKUP_DRAFTS))),
             DraftSource::Checkpoint(dir) => {
-                let header = std::fs::File::open(target_path)
-                    .map_err(|e| Error::Gguf(format!("{}: {e}", target_path.display())))?;
-                let header = GgufFile::from_reader_skipping_arrays(header, 4096)?;
-                check_drafter_tokenizer(dir, header.metadata())?;
+                if !super::mlx::is_mlx_dir(target_path) {
+                    let header = std::fs::File::open(target_path)
+                        .map_err(|e| Error::Gguf(format!("{}: {e}", target_path.display())))?;
+                    let header = GgufFile::from_reader_skipping_arrays(header, 4096)?;
+                    check_drafter_tokenizer(dir, header.metadata())?;
+                }
                 let (config, _, _) =
                     DraftModel::memory(dir, &model.config, model.chunk(), self.draft)?;
                 let k = self.drafts(&model.config, config.max_drafts());
@@ -414,14 +424,19 @@ impl Runtime {
             options.vision = crate::vision::projector_bytes(mmproj);
         }
         let device = MetalDevice::new()?;
-        let file = GgufFile::open(path)?;
-        let default_sampling = recommended_sampling(&file);
+        let default_sampling = recommended_sampling_for(path)?;
         if let Some(spec) = spec {
-            let mut config = HybridConfig::from_gguf(&file)?;
-            config.kv_cache = options.kv_cache;
-            options.draft = spec.memory(&file, &config, options.chunk.max(1))?;
+            if super::mlx::is_mlx_dir(path) {
+                let mut config = super::mlx::config(path)?;
+                config.kv_cache = options.kv_cache;
+                options.draft = spec.memory(None, &config, options.chunk.max(1))?;
+            } else {
+                let file = GgufFile::open(path)?;
+                let mut config = HybridConfig::from_gguf(&file)?;
+                config.kv_cache = options.kv_cache;
+                options.draft = spec.memory(Some(&file), &config, options.chunk.max(1))?;
+            }
         }
-        drop(file);
         let loaded = super::load_with(&device, path, options)?;
         let (bos, eos) = &loaded.chat_special_tokens;
         let template = ChatTemplate::with_special_tokens(
@@ -916,6 +931,25 @@ pub fn normalize_thinking(template: &str, vars: &mut Map<String, Json>) {
 }
 
 /// The GGUF's recommended sampling (`general.sampling.*`), with Qwen defaults.
+/// The model's recommended sampling: a GGUF's `general.sampling.*`
+/// metadata, or an MLX checkpoint's `generation_config.json`.
+pub fn recommended_sampling_for(path: &Path) -> Result<SamplingParams> {
+    if !super::mlx::is_mlx_dir(path) {
+        return Ok(recommended_sampling(&GgufFile::open(path)?));
+    }
+    let g: serde_json::Value = std::fs::read(path.join("generation_config.json"))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or(serde_json::Value::Null);
+    Ok(SamplingParams {
+        temperature: g["temperature"].as_f64().unwrap_or(1.0) as f32,
+        top_p: g["top_p"].as_f64().unwrap_or(0.95) as f32,
+        top_k: g["top_k"].as_u64().unwrap_or(20) as usize,
+        min_p: g["min_p"].as_f64().unwrap_or(0.) as f32,
+        ..SamplingParams::default()
+    })
+}
+
 pub fn recommended_sampling(file: &GgufFile) -> SamplingParams {
     let md = file.metadata();
     let float = |key: &str| match md.get(key) {
