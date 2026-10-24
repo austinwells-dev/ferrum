@@ -52,6 +52,7 @@ fn row(cand: usize, label: &str, depth: Option<usize>, tps: f64, same: Option<Ma
             String::new()
         },
         depth,
+        tree: None,
         tps,
         accept: depth.map(|_| 2.4),
         per_prompt: vec![tps; 3],
@@ -264,7 +265,8 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
             "{phase:?}: an unticked drafter shows only in the setup list"
         );
     }
-    // Progress lands on the ticked drafter: 1 of its depths measured.
+    // Progress lands on the ticked drafter: 1 of its 3 depths and 2 trees
+    // measured.
     app.bench.as_mut().unwrap().phase = BenchPhase::Running;
     let text = screen_text(&app, 240, 60);
     let queue: Vec<&str> = text
@@ -272,7 +274,7 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
         .filter(|l| l.contains("Ticked-Drafter"))
         .collect();
     assert!(
-        queue.iter().any(|l| l.contains(" 1/3")),
-        "no 1/3 progress on the ticked drafter: {queue:?}"
+        queue.iter().any(|l| l.contains(" 1/5")),
+        "no 1/5 progress on the ticked drafter: {queue:?}"
     );
 }

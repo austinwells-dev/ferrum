@@ -322,8 +322,8 @@ impl App {
             .get(b.model)
             .map(|m| m.path.display().to_string())
             .unwrap_or_default();
-        let best_label = match best.depth {
-            Some(d) => format!("{} · depth {d} · {}", best.label, shown_quant(&best.quant)),
+        let best_label = match best.shape() {
+            Some(shape) => format!("{} · {shape} · {}", best.label, shown_quant(&best.quant)),
             None => "no drafter".to_string(),
         };
         bench::record(
@@ -635,12 +635,12 @@ impl App {
     fn bench_help(&self, line: Line_, b: &BenchState) -> String {
         match line {
             Line_::Model => "The model to tune. Only models ferrum can run are offered.".into(),
-            Line_::Measure => "Speed finds the fastest drafter and depth for this Mac; intelligence scores answers; agentic coding runs real bug fixes. m switches.".into(),
+            Line_::Measure => "Speed finds the fastest drafter, depth and draft tree for this Mac; intelligence scores answers; agentic coding runs real bug fixes. m switches.".into(),
             Line_::Cand(i) if b.cands.get(i).is_some_and(|c| c.source == Source::Baseline) => {
                 "Plain decoding, no drafter: the speed and the answers every drafter is checked against.".into()
             }
             Line_::Cand(_) => "A drafter guesses several tokens ahead and the model checks them in one step. Space includes or skips it.".into(),
-            Line_::Sweep => "Quick tries a few draft depths per drafter; full tries every depth up to the drafter's maximum.".into(),
+            Line_::Sweep => "Quick tries a few draft depths per drafter; full tries every depth up to the drafter's maximum. Both then try draft trees: 15 guesses, and KFlash's learned budget.".into(),
             Line_::Tokens => "Tokens generated per prompt. More gives steadier numbers and takes longer.".into(),
             Line_::Q8 => "Also try each drafter at q8_0: more memory, sometimes more accepted drafts.".into(),
             Line_::Chunks => "Also find the fastest prefill chunk for the server: how many prompt rows go through per pass.".into(),
@@ -785,7 +785,11 @@ impl App {
                     let (mark, mark_color) = speed_mark(r);
                     ChartBar {
                         label: short_drafter(&r.label),
-                        sub: r.depth.map_or(String::new(), |d| format!("d{d}")),
+                        sub: match (r.tree, r.depth) {
+                            (Some(t), _) => t.short(),
+                            (None, Some(d)) => format!("d{d}"),
+                            (None, None) => String::new(),
+                        },
                         share: r.tps / top,
                         margin: 0.0,
                         color: if is_best {
@@ -825,9 +829,9 @@ impl App {
                 });
             }
             let title = match (b.phase, best, base) {
-                (BenchPhase::Results, Some(best), Some(base)) => match best.depth {
-                    Some(d) => format!(
-                        "★ {} · depth {d} · {} → {:.2}× plain decoding",
+                (BenchPhase::Results, Some(best), Some(base)) => match best.shape() {
+                    Some(shape) => format!(
+                        "★ {} · {shape} · {} → {:.2}× plain decoding",
                         short_drafter(&best.label),
                         shown_quant(&best.quant),
                         best.tps / base.max(1e-9)
@@ -965,14 +969,21 @@ impl App {
         let planned = match c.source {
             Source::Baseline => 1,
             _ => bench::depth_list(c.max_depth(), b.quick).len(),
-        };
+        } + if c.trees() { bench::TREES.len() } else { 0 };
         let measured: Vec<&Row> = b.rows.iter().filter(|r| r.cand == i).collect();
         let skipped = b.skipped.iter().any(|(l, _)| *l == c.label());
+        // A tree that could not run (say, too little memory) is done too.
+        let prefix = format!("{} · ", c.label());
+        let done = measured.len()
+            + b.skipped
+                .iter()
+                .filter(|(l, _)| l.starts_with(&prefix))
+                .count();
         let running = b.phase == BenchPhase::Running;
         // Candidates run in order: the first unfinished one is running.
         let now = running
             && !skipped
-            && measured.len() < planned
+            && done < planned
             && b.cands[..i].iter().enumerate().all(|(j, cj)| {
                 !cj.on
                     || b.rows.iter().filter(|r| r.cand == j).count()
@@ -987,14 +998,14 @@ impl App {
             BenchPhase::Setup if c.on => ("[x]".to_string(), TEXT),
             BenchPhase::Setup => ("[ ]".to_string(), FAINT),
             _ if skipped => (" ✗ ".to_string(), BAD),
-            _ if measured.len() >= planned => (" ✓ ".to_string(), GOOD),
+            _ if done >= planned => (" ✓ ".to_string(), GOOD),
             _ if now => (format!(" {} ", spinner(self.elapsed())), EMBER),
             _ => (" · ".to_string(), FAINT),
         };
         let right = match b.phase {
             BenchPhase::Setup if c.source == Source::Baseline => "baseline".to_string(),
             BenchPhase::Setup => format!("≤{} · {}", c.max_depth(), c.quant_label()),
-            _ => format!("{}/{planned}", measured.len()),
+            _ => format!("{done}/{planned}"),
         };
         let best = measured.iter().map(|r| r.tps).fold(0.0, f64::max);
         let sub = match b.phase {
@@ -1048,10 +1059,10 @@ impl App {
             let Some(v) = &r.check else { continue };
             out.push(Line::styled(
                 format!(
-                    " {} {} d{}: {}/{} same, {} lost, {} gained",
+                    " {} {} {}: {}/{} same, {} lost, {} gained",
                     if v.passed() { "≈✓" } else { "≈✗" },
                     short_drafter(&r.label),
-                    r.depth.unwrap_or(0),
+                    r.shape().unwrap_or_default(),
                     v.same,
                     v.n,
                     v.lost,
@@ -1107,7 +1118,7 @@ impl App {
         let mut lines = vec![Line::styled(
             format!(
                 "   {:<label_w$} {:>5} {:>5} {:>8}  {:<bar_w$} {:>6} {:>6} {:>5}",
-                "config", "depth", "quant", "tok/s", "", "×base", "accept", "same"
+                "config", "draft", "quant", "tok/s", "", "×base", "accept", "same"
             ),
             Style::new().fg(DIM).add_modifier(Modifier::BOLD),
         )];
@@ -1133,7 +1144,7 @@ impl App {
                 Span::styled(
                     format!(
                         " {:>5} {:>5} ",
-                        r.depth.map_or("–".to_string(), |d| d.to_string()),
+                        r.shape_short(),
                         if r.quant.is_empty() { "–" } else { &r.quant }
                     ),
                     Style::new().fg(DIM),

@@ -1,6 +1,7 @@
 //! Benchmark engine: finds the fastest drafter, draft depth and prefill chunk
 //! for one model on this Mac. Each drafter is loaded once and its depth swept
-//! with `Session::depth_cap`; every run is greedy, so a correct speculative
+//! with `Session::depth_cap`, then MTP and drafter models also try draft trees
+//! (a fixed tree of 15 guesses, and KFlash's learned budget); every run is greedy, so a correct speculative
 //! run reproduces the no-drafter output, up to near-tie flips from batched
 //! verification (see [`Match`]). Near-tie rows that would win are then
 //! asked the answer-check questions ([`eval`]) before they are recommended.
@@ -42,6 +43,44 @@ When free frames run low the kernel evicts pages that were not used recently, wr
 const MTP_MAX_DEPTH: usize = 6;
 /// Most prompt-lookup drafts worth trying.
 const LOOKUP_MAX_DEPTH: usize = 6;
+
+/// A draft tree instead of a chain (`--draft-tree`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tree {
+    /// Up to this many guesses per step.
+    Fixed(usize),
+    /// KFlash: as many guesses as pay each cycle, learned and cached (for
+    /// DFlash2 also a 16-row block over a reduced draft vocabulary).
+    Auto,
+}
+
+impl Tree {
+    /// The `--draft-tree` / `draft_tree` setting value.
+    pub fn value(self) -> String {
+        match self {
+            Self::Fixed(n) => n.to_string(),
+            Self::Auto => "auto".into(),
+        }
+    }
+
+    pub fn label(self) -> String {
+        match self {
+            Self::Fixed(n) => format!("tree {n}"),
+            Self::Auto => "KFlash trees".into(),
+        }
+    }
+
+    /// For narrow columns.
+    pub fn short(self) -> String {
+        match self {
+            Self::Fixed(n) => format!("T{n}"),
+            Self::Auto => "auto".into(),
+        }
+    }
+}
+
+/// The trees the benchmark tries after a drafter's depth sweep.
+pub const TREES: [Tree; 2] = [Tree::Fixed(15), Tree::Auto];
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Source {
@@ -103,7 +142,13 @@ impl Candidate {
         }
     }
 
-    fn spec(&self, depth: Option<usize>) -> Option<SpecOptions> {
+    /// Whether this source can draft trees in the benchmark (prompt lookup's
+    /// trees are a test vehicle, not offered).
+    pub fn trees(&self) -> bool {
+        matches!(self.source, Source::Mtp | Source::Drafter { .. })
+    }
+
+    fn spec(&self, depth: Option<usize>, tree: Option<Tree>) -> Option<SpecOptions> {
         let source = match &self.source {
             Source::Baseline => return None,
             Source::Mtp => DraftSource::Mtp,
@@ -117,7 +162,13 @@ impl Candidate {
         } else {
             ferrum::hybrid::draft::DraftQuant::Q4_0
         };
-        Some(spec)
+        let mut spec = Some(spec);
+        if let Some(tree) = tree {
+            // Valid by construction (1..=31 nodes or auto).
+            SpecOptions::apply_flag(&mut spec, "--draft-tree", &tree.value())
+                .expect("a benchmark tree is a valid --draft-tree");
+        }
+        spec
     }
 }
 
@@ -161,7 +212,7 @@ impl Plan {
             let depths = match c.source {
                 Source::Baseline => 1,
                 _ => depth_list(c.max_depth(), self.quick).len(),
-            };
+            } + if c.trees() { TREES.len() } else { 0 };
             total += 25 + depths * per_run;
         }
         if self.chunks {
@@ -178,8 +229,10 @@ pub struct Row {
     pub label: String,
     pub draft_value: String,
     pub quant: String,
-    /// None: no drafter.
+    /// None: no drafter. For a tree, the drafter's deepest guess.
     pub depth: Option<usize>,
+    /// Drafted as a tree (None: a chain of `depth`).
+    pub tree: Option<Tree>,
     /// Decoded tokens per second over all prompts.
     pub tps: f64,
     /// Mean tokens per verify step (1.0 = no gain).
@@ -190,6 +243,26 @@ pub struct Row {
     /// Answer check of a `Close` row (None: not checked).
     pub check: Option<Verdict>,
     pub tokens: usize,
+}
+
+impl Row {
+    /// How it drafts: "depth 4", "tree 15", "KFlash trees" (None: no drafter).
+    pub fn shape(&self) -> Option<String> {
+        match (self.tree, self.depth) {
+            (Some(t), _) => Some(t.label()),
+            (None, Some(d)) => Some(format!("depth {d}")),
+            (None, None) => None,
+        }
+    }
+
+    /// [`Row::shape`] for narrow columns: "4", "T15", "auto" ("–": none).
+    pub fn shape_short(&self) -> String {
+        match (self.tree, self.depth) {
+            (Some(t), _) => t.short(),
+            (None, Some(d)) => d.to_string(),
+            (None, None) => "–".into(),
+        }
+    }
 }
 
 /// How a speculative run's output compares with plain decoding.
@@ -339,6 +412,17 @@ pub fn load(
     depth: Option<usize>,
     chunk: Option<usize>,
 ) -> Result<Runtime, String> {
+    load_tree(plan, cand, depth, None, chunk)
+}
+
+/// [`load`], drafting trees when `tree` is set.
+pub fn load_tree(
+    plan: &Plan,
+    cand: &Candidate,
+    depth: Option<usize>,
+    tree: Option<Tree>,
+    chunk: Option<usize>,
+) -> Result<Runtime, String> {
     let mut options = PlanOptions {
         context: Some(plan.context),
         kv_cache: plan.kv_cache,
@@ -348,7 +432,7 @@ pub fn load(
         options.chunk = c;
     }
     let attempt = |depth: Option<usize>| {
-        let spec = cand.spec(depth);
+        let spec = cand.spec(depth, tree);
         Runtime::load_speculative(&plan.model, options, spec.as_ref())
     };
     match attempt(depth) {
@@ -403,100 +487,95 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
             }
             rt.session.depth_cap = depth;
             rt.session.speculate = depth.is_some();
-            send(Event::Stage(format!(
-                "{} · {}",
-                cand.label(),
-                depth.map_or("baseline".to_string(), |d| format!("depth {d}"))
-            )));
-            let (mut samples, mut per_prompt) = (Vec::new(), Vec::new());
-            let (mut steps, mut accepted) = (0usize, 0usize);
-            let mut failed = None;
-            for (name, prompt) in PROMPTS {
-                send(Event::Stage(format!(
-                    "{} · {} · {name}",
-                    cand.label(),
-                    depth.map_or("baseline".to_string(), |d| format!("depth {d}"))
-                )));
-                match generate(&mut rt, prompt, plan.tokens, None, &stop) {
-                    Ok(s) => {
-                        per_prompt.push(s.tokens as f64 / s.decode);
-                        let st = &rt.session.spec_stats;
-                        steps += st.steps;
-                        accepted += st.accepted;
-                        samples.push(s);
+            let shape = depth.map_or("baseline".to_string(), |d| format!("depth {d}"));
+            match measure(
+                &mut rt,
+                &plan,
+                ci,
+                depth,
+                None,
+                &shape,
+                &baseline_ids,
+                &send,
+                &stop,
+            ) {
+                Ok(Some((row, ids))) => {
+                    if cand.source == Source::Baseline {
+                        baseline_ids = ids;
                     }
-                    Err(e) => {
-                        failed = Some(e);
-                        break;
-                    }
+                    rows.push(row.clone());
+                    send(Event::Row(row));
                 }
-                if stop.load(Ordering::SeqCst) {
+                Ok(None) => break,
+                Err(e) => {
+                    send(Event::Skipped(cand.label(), e));
                     break;
                 }
             }
-            if let Some(e) = failed {
-                send(Event::Skipped(cand.label(), e));
-                break;
-            }
-            if samples.len() < PROMPTS.len() {
-                break; // cancelled part-way: do not report a partial row
-            }
-            let tokens: usize = samples.iter().map(|s| s.tokens).sum();
-            let secs: f64 = samples.iter().map(|s| s.decode).sum();
-            let ids: Vec<Vec<u32>> = samples.iter().map(|s| s.ids.clone()).collect();
-            let same = if cand.source == Source::Baseline {
-                baseline_ids = ids;
-                None
-            } else if baseline_ids.is_empty() {
-                None
-            } else {
-                Some(compare(&baseline_ids, &ids))
-            };
-            let row = Row {
-                cand: ci,
-                label: cand.label(),
-                draft_value: cand.draft_value(),
-                quant: if depth.is_some() && cand.source != Source::Lookup {
-                    cand.quant.into()
-                } else {
-                    String::new()
-                },
-                depth,
-                tps: tokens as f64 / secs,
-                accept: (steps > 0).then(|| (accepted + steps) as f64 / steps as f64),
-                per_prompt,
-                same,
-                check: None,
-                tokens,
-            };
-            rows.push(row.clone());
-            send(Event::Row(row));
         }
         drop(rt);
+        // Trees, each on its own load (KFlash also sets the drafting block).
+        for tree in TREES.into_iter().filter(|_| cand.trees()) {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let label = format!("{} · {}", cand.label(), tree.label());
+            send(Event::Stage(format!("loading {label}")));
+            let loaded = load_tree(&plan, cand, None, Some(tree), None)
+                .and_then(|mut rt| rt.warmup().map(|_| rt).map_err(|e| e.to_string()));
+            let mut rt = match loaded {
+                Ok(rt) => rt,
+                Err(e) => {
+                    send(Event::Skipped(label, e));
+                    continue;
+                }
+            };
+            let reach = rt.session.drafter().map_or(0, |d| d.max_drafts());
+            match measure(
+                &mut rt,
+                &plan,
+                ci,
+                Some(reach),
+                Some(tree),
+                &tree.label(),
+                &baseline_ids,
+                &send,
+                &stop,
+            ) {
+                Ok(Some((row, _))) => {
+                    rows.push(row.clone());
+                    send(Event::Row(row));
+                }
+                Ok(None) => break,
+                Err(e) => send(Event::Skipped(label, e)),
+            }
+        }
     }
     if !stop.load(Ordering::SeqCst) {
         check_close_rows(&plan, &mut rows, &send, &stop);
     }
     if plan.chunks && !stop.load(Ordering::SeqCst) {
         // Prefill speed depends on how many prompt rows go through one pass.
-        let (cand, depth) = match best(&rows) {
-            Some(r) if r.depth.is_some() => (plan.candidates[r.cand].clone(), r.depth),
-            _ => (plan.candidates[0].clone(), None),
+        let (cand, depth, tree) = match best(&rows) {
+            Some(r) if r.depth.is_some() => (plan.candidates[r.cand].clone(), r.depth, r.tree),
+            _ => (plan.candidates[0].clone(), None, None),
         };
+        // A tree keeps the drafter's own depth.
+        let depth = if tree.is_some() { None } else { depth };
         let long = LONG_PARAGRAPH.repeat(14);
         for chunk in [256usize, 512, 1024, 2048] {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
             send(Event::Stage(format!("prefill chunk {chunk}")));
-            let Ok(mut rt) = load(&plan, &cand, depth, Some(chunk)) else {
+            let Ok(mut rt) = load_tree(&plan, &cand, depth, tree, Some(chunk)) else {
                 continue;
             };
             if rt.warmup().is_err() {
                 continue;
             }
             rt.session.depth_cap = depth;
-            rt.session.speculate = depth.is_some();
+            rt.session.speculate = depth.is_some() || tree.is_some();
             if let Ok(s) = generate(&mut rt, &long, 1, None, &stop) {
                 send(Event::Chunk(ChunkRow {
                     chunk,
@@ -506,6 +585,68 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
         }
     }
     send(Event::Done);
+}
+
+/// A measured row and its runs' token ids, one list per prompt.
+type Measured = (Row, Vec<Vec<u32>>);
+
+/// Runs every prompt on `rt` as configured and makes its row, with the
+/// runs' token ids (None: cancelled part-way, no partial row).
+#[allow(clippy::too_many_arguments)]
+fn measure(
+    rt: &mut Runtime,
+    plan: &Plan,
+    ci: usize,
+    depth: Option<usize>,
+    tree: Option<Tree>,
+    shape: &str,
+    baseline_ids: &[Vec<u32>],
+    send: &impl Fn(Event),
+    stop: &AtomicBool,
+) -> Result<Option<Measured>, String> {
+    let cand = &plan.candidates[ci];
+    send(Event::Stage(format!("{} · {shape}", cand.label())));
+    let (mut samples, mut per_prompt) = (Vec::new(), Vec::new());
+    let (mut steps, mut accepted) = (0usize, 0usize);
+    for (name, prompt) in PROMPTS {
+        send(Event::Stage(format!("{} · {shape} · {name}", cand.label())));
+        let s = generate(rt, prompt, plan.tokens, None, stop)?;
+        per_prompt.push(s.tokens as f64 / s.decode);
+        let st = &rt.session.spec_stats;
+        steps += st.steps;
+        accepted += st.accepted;
+        samples.push(s);
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+    }
+    if samples.len() < PROMPTS.len() {
+        return Ok(None);
+    }
+    let tokens: usize = samples.iter().map(|s| s.tokens).sum();
+    let secs: f64 = samples.iter().map(|s| s.decode).sum();
+    let ids: Vec<Vec<u32>> = samples.iter().map(|s| s.ids.clone()).collect();
+    let same = (cand.source != Source::Baseline && !baseline_ids.is_empty())
+        .then(|| compare(baseline_ids, &ids));
+    let row = Row {
+        cand: ci,
+        label: cand.label(),
+        draft_value: cand.draft_value(),
+        quant: if depth.is_some() && cand.source != Source::Lookup {
+            cand.quant.into()
+        } else {
+            String::new()
+        },
+        depth,
+        tree,
+        tps: tokens as f64 / secs,
+        accept: (steps > 0).then(|| (accepted + steps) as f64 / steps as f64),
+        per_prompt,
+        same,
+        check: None,
+        tokens,
+    };
+    Ok(Some((row, ids)))
 }
 
 /// Asks the answer-check questions of near-tie rows that would beat every
@@ -538,7 +679,7 @@ fn check_close_rows(plan: &Plan, rows: &mut [Row], send: &impl Fn(Event), stop: 
                 quant: "q4_0",
                 on: true,
             };
-            match answer_check(plan, &plain, None, &items, send, stop) {
+            match answer_check(plan, &plain, None, None, &items, send, stop) {
                 Ok(answers) => {
                     eval::store_baseline(&cache, &key, &answers);
                     base = Some(answers);
@@ -554,7 +695,7 @@ fn check_close_rows(plan: &Plan, rows: &mut [Row], send: &impl Fn(Event), stop: 
         let Some(base) = &base else { return };
         let row = &rows[i];
         let cand = &plan.candidates[row.cand];
-        match answer_check(plan, cand, row.depth, &items, send, stop) {
+        match answer_check(plan, cand, row.depth, row.tree, &items, send, stop) {
             Ok(answers) => {
                 let verdict = eval::compare_answers(base, &answers);
                 let passed = verdict.passed();
@@ -573,24 +714,29 @@ fn check_close_rows(plan: &Plan, rows: &mut [Row], send: &impl Fn(Event), stop: 
     }
 }
 
-/// Loads `cand` at `depth` and grades its answers to `items`.
+/// Loads `cand` at `depth` (or drafting `tree`) and grades its answers to
+/// `items`.
 pub fn answer_check(
     plan: &Plan,
     cand: &Candidate,
     depth: Option<usize>,
+    tree: Option<Tree>,
     items: &[eval::Item],
     send: &impl Fn(Event),
     stop: &AtomicBool,
 ) -> Result<Vec<eval::Graded>, String> {
-    let label = match depth {
-        Some(d) => format!("{} · depth {d} · {}", cand.label(), cand.quant_label()),
-        None => cand.label(),
+    let label = match (tree, depth) {
+        (Some(t), _) => format!("{} · {} · {}", cand.label(), t.label(), cand.quant_label()),
+        (None, Some(d)) => format!("{} · depth {d} · {}", cand.label(), cand.quant_label()),
+        (None, None) => cand.label(),
     };
     send(Event::Stage(format!("answer check · loading {label}")));
-    let mut rt = load(plan, cand, depth, None)?;
+    // A tree keeps the drafter's own depth.
+    let depth = if tree.is_some() { None } else { depth };
+    let mut rt = load_tree(plan, cand, depth, tree, None)?;
     rt.warmup().map_err(|e| e.to_string())?;
     rt.session.depth_cap = depth;
-    rt.session.speculate = depth.is_some();
+    rt.session.speculate = depth.is_some() || tree.is_some();
     eval::answer_items(&mut rt, items, stop, |n| {
         send(Event::Stage(format!(
             "answer check · {label} · question {}/{}",
@@ -625,7 +771,8 @@ pub fn spawn(plan: Plan) -> Result<Running, String> {
 
 /// The fastest row whose output matches plain decoding: exactly, or within
 /// tolerance once the answer check passed (other rows are only considered
-/// when nothing matches); on a near tie, the shallower, cheaper one.
+/// when nothing matches); on a near tie, a chain over a tree, then the
+/// shallower, cheaper one.
 pub fn best(rows: &[Row]) -> Option<&Row> {
     let ok = |r: &&Row| match r.same {
         Some(Match::Differs) => false,
@@ -640,7 +787,7 @@ pub fn best(rows: &[Row]) -> Option<&Row> {
     let top = pool.iter().map(|r| r.tps).fold(0.0, f64::max);
     pool.into_iter()
         .filter(|r| r.tps >= top * 0.99)
-        .min_by_key(|r| (r.depth.unwrap_or(0), r.quant == "q8_0"))
+        .min_by_key(|r| (r.tree.is_some(), r.depth.unwrap_or(0), r.quant == "q8_0"))
 }
 
 pub fn baseline(rows: &[Row]) -> Option<&Row> {
@@ -660,7 +807,13 @@ pub fn best_chunk(chunks: &[ChunkRow]) -> Option<usize> {
 pub fn settings_for(row: &Row, chunk: Option<usize>) -> Map<String, Json> {
     let mut v = Map::new();
     v.insert("draft".into(), json!(row.draft_value));
-    if let Some(d) = row.depth {
+    if let Some(t) = row.tree {
+        // A tree's depth is the drafter's default for trees.
+        v.insert("draft_tree".into(), json!(t.value()));
+        if row.quant == "q8_0" {
+            v.insert("draft_quant".into(), json!("q8_0"));
+        }
+    } else if let Some(d) = row.depth {
         v.insert("draft_max".into(), json!(d.to_string()));
         if row.quant == "q8_0" {
             v.insert("draft_quant".into(), json!("q8_0"));
@@ -797,6 +950,7 @@ mod tests {
                 String::new()
             },
             depth,
+            tree: None,
             tps,
             accept: depth.map(|_| 2.0),
             per_prompt: vec![tps; 3],
@@ -929,6 +1083,11 @@ mod tests {
         assert_eq!(v["draft_max"], "4");
         assert_eq!(v["chunk"], "512");
         assert!(!v.contains_key("draft_quant"));
+        let mut tree = row("t", Some(15), 95.0);
+        tree.tree = Some(Tree::Auto);
+        let t = settings_for(&tree, None);
+        assert_eq!(t["draft_tree"], "auto");
+        assert!(!t.contains_key("draft_max"));
         let v = settings_for(&row("none", None, 40.0), None);
         assert_eq!(v["draft"], "off");
         assert!(!v.contains_key("draft_max"));
@@ -946,9 +1105,80 @@ mod tests {
         assert_eq!(c.draft_value(), "lookup");
         assert_eq!(c.quant_label(), "–");
         assert_eq!(c.max_depth(), LOOKUP_MAX_DEPTH);
-        let spec = c.spec(Some(3)).expect("lookup speculates");
+        let spec = c.spec(Some(3), None).expect("lookup speculates");
         assert!(matches!(spec.source, DraftSource::Lookup));
         assert_eq!(spec.max_drafts, Some(3));
+    }
+
+    #[test]
+    #[ignore = "needs a model and a drafter on disk"]
+    fn the_sweep_measures_trees() {
+        let var = |k: &str| std::env::var(k).expect(k);
+        let cand = |source| Candidate {
+            source,
+            quant: "q4_0",
+            on: true,
+        };
+        let plan = Plan {
+            model: var("FERRUM_CHECK_MODEL").into(),
+            candidates: vec![
+                cand(Source::Baseline),
+                cand(Source::Drafter {
+                    path: var("FERRUM_CHECK_DRAFTER").into(),
+                    label: "drafter".into(),
+                    kind: "drafter",
+                    max_depth: 2,
+                }),
+            ],
+            quick: true,
+            tokens: 96,
+            chunks: false,
+            context: 8192,
+            kv_cache: KvCache::F16,
+        };
+        let running = spawn(plan).unwrap();
+        let mut rows = Vec::new();
+        for event in running.rx.iter() {
+            match event {
+                Event::Row(r) => {
+                    eprintln!(
+                        "{} {}: {:.1} tok/s, same {:?}",
+                        r.label,
+                        r.shape_short(),
+                        r.tps,
+                        r.same
+                    );
+                    rows.push(r);
+                }
+                Event::Skipped(l, e) => panic!("{l} skipped: {e}"),
+                Event::Done => break,
+                _ => {}
+            }
+        }
+        let trees: Vec<&Row> = rows.iter().filter(|r| r.tree.is_some()).collect();
+        assert_eq!(trees.len(), TREES.len());
+        // Greedy trees reproduce plain decoding (up to near-tie flips).
+        assert!(trees.iter().all(|r| r.same != Some(Match::Differs)));
+        eprintln!("best: {:?}", best(&rows).and_then(Row::shape));
+    }
+
+    #[test]
+    fn tree_rows_draft_trees() {
+        let mtp = Candidate {
+            source: Source::Mtp,
+            quant: "q4_0",
+            on: true,
+        };
+        assert!(mtp.trees());
+        let fixed = mtp.spec(None, Some(Tree::Fixed(15))).unwrap();
+        assert_eq!((fixed.tree, fixed.tree_rule), (Some(15), false));
+        let auto = mtp.spec(None, Some(Tree::Auto)).unwrap();
+        assert!(auto.tree_rule && auto.draft.kflash);
+        let lookup = Candidate {
+            source: Source::Lookup,
+            ..mtp
+        };
+        assert!(!lookup.trees());
     }
 
     #[test]

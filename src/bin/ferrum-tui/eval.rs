@@ -1618,12 +1618,20 @@ mod tests {
         let items = check_items();
         let stop = AtomicBool::new(false);
         let quiet = |_| {};
-        let base =
-            answer_check(&plan, &cand(Source::Baseline), None, &items, &quiet, &stop).unwrap();
+        let base = answer_check(
+            &plan,
+            &cand(Source::Baseline),
+            None,
+            None,
+            &items,
+            &quiet,
+            &stop,
+        )
+        .unwrap();
         for (item, g) in items.iter().zip(&base).filter(|(_, g)| !g.correct) {
             eprintln!("plain decoding missed {}: {:?}", item.id, g.answer);
         }
-        let run = answer_check(&plan, &draft, Some(depth), &items, &quiet, &stop).unwrap();
+        let run = answer_check(&plan, &draft, Some(depth), None, &items, &quiet, &stop).unwrap();
         let v = compare_answers(&base, &run);
         let right = base.iter().filter(|g| g.correct).count();
         eprintln!("plain decoding {right}/{}; drafter {v:?}", items.len());

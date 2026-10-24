@@ -245,6 +245,9 @@ impl App {
                 "draft" if drafting => "--draft",
                 "draft_max" if drafting => "--draft-max",
                 "draft_quant" if drafting => "--draft-quant",
+                "draft_tree" if drafting => "--draft-tree",
+                "draft_block" if drafting => "--draft-block",
+                "draft_vocab" if drafting => "--draft-vocab",
                 "think" => {
                     args.push("--no-think".into());
                     continue;

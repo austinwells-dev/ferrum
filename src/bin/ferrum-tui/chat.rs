@@ -134,6 +134,17 @@ impl ChatOpts {
             if !quant.is_empty() {
                 apply("--draft-quant", quant)?;
             }
+            // Cycle fields: their first option is the default, never passed.
+            for (key, flag, default) in [
+                ("draft_tree", "--draft-tree", "off"),
+                ("draft_block", "--draft-block", "trained"),
+                ("draft_vocab", "--draft-vocab", "full"),
+            ] {
+                let v = app.value(key);
+                if !v.is_empty() && v != default {
+                    apply(flag, v)?;
+                }
+            }
             spec
         };
         Ok(Self {
