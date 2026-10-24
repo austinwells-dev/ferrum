@@ -38,7 +38,7 @@ pub trait Drafter {
         max: usize,
     ) -> Result<Vec<u32>>;
     /// Propose a draft tree of at most `budget` nodes, at most `max` deep,
-    /// under `anchor` (greedy verify only). By default, the chain `draft`
+    /// under `anchor`. By default, the chain `draft`
     /// proposes.
     fn draft_tree(
         &mut self,
@@ -144,7 +144,7 @@ impl DraftTree {
     }
 }
 
-/// Greedy accept walk over a verified tree: from the anchor, follow the
+/// Accept walk over a verified tree: from the anchor, follow the
 /// child whose token is the target's choice at its parent's row. Returns the
 /// verify rows of the accepted path (starting at the anchor's 0) and the
 /// target's token after it. `targets[r]` is the target's token at row r.

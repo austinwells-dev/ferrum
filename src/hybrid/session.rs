@@ -10,8 +10,6 @@ use super::{
     speculative::{DraftTree, Drafter, SpecStats, accept_walk},
 };
 use crate::{DType, Error, MetalDevice, Result, Tensor};
-use rand::{Rng, SeedableRng};
-use rand_chacha::ChaCha8Rng;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -256,8 +254,8 @@ impl Session {
     }
 
     /// Draft trees of up to `budget` nodes instead of chains (None: chains).
-    /// Trees apply to greedy generation without penalties; sampling keeps
-    /// chains. Widens the target's verify buffers to `budget + 1` rows and
+    /// Trees apply to every request: sampled rows are accepted when they
+    /// equal their own position-keyed draw. Widens the target's verify buffers to `budget + 1` rows and
     /// clears the session.
     pub fn set_tree_budget(
         &mut self,
@@ -546,7 +544,6 @@ impl Session {
         self.sync_drafter(d, model)?;
         self.spec_stats = SpecStats::default();
         hooks.begin(prompt.len(), reused);
-        let mut rng = ChaCha8Rng::seed_from_u64(params.seed);
         let mut generated: Vec<u32> = Vec::new();
         let output = |generated: &[u32]| -> Output {
             if params.uses_candidates() {
@@ -582,7 +579,7 @@ impl Session {
         hooks.prefill(body.len() + 1, body.len() + 1);
         let prefill = start.elapsed();
         let decode_start = Instant::now();
-        let mut next = select(produced, params, &mut rng)?;
+        let mut next = select(produced, params, self.state.len())?;
         let speculate = self.speculate && self.drafter.is_some();
         let stop = 'generation: loop {
             if eos.contains(&next) {
@@ -603,8 +600,10 @@ impl Session {
             if self.state.len() + feed.len() > self.capacity() {
                 break StopReason::ContextFull;
             }
-            // Speculative step: draft after `next`, verify, keep the prefix
-            // the target agrees with (rejection sampling when sampling).
+            // Speculative step: draft after `next`, verify, keep the path the
+            // target agrees with: each row's own token (its argmax, or when
+            // sampling its draw with the uniform of the position it fills, as
+            // plain decoding draws it), so the output is plain decoding's.
             let room = self.capacity() - self.state.len() - 1;
             let k = if speculate && feed.len() == 1 {
                 let drafter = self.drafter.as_ref().expect("speculate implies a drafter");
@@ -616,10 +615,7 @@ impl Session {
             } else {
                 0
             };
-            let tree_budget = self
-                .tree_budget
-                .filter(|_| k > 0 && !params.uses_candidates())
-                .map(|b| b.min(room));
+            let tree_budget = self.tree_budget.filter(|_| k > 0).map(|b| b.min(room));
             let plan = self
                 .tree_rule
                 .as_ref()
@@ -653,41 +649,50 @@ impl Session {
             if drafts.is_empty() {
                 let produced = self.step(d, model, &feed, output(&generated))?;
                 generated.extend_from_slice(&feed[1..]);
-                next = select(produced, params, &mut rng)?;
+                next = select(produced, params, self.state.len())?;
                 continue;
             }
             let t0 = Instant::now();
             let (rows, parents) = drafts.rows(next);
             // The accepted path (verify rows from the anchor's 0) and the
             // target's token after it.
-            let (path, bonus) = if tree_budget.is_some() {
-                let RowsProduced::Tokens(targets) =
-                    model.verify_tree(d, &mut self.state, &rows, &parents, RowOutput::Argmax)?
-                else {
-                    unreachable!("greedy verify returns tokens")
-                };
-                accept_walk(&drafts, &targets)
+            let anchor_pos = self.state.len();
+            let depths = drafts.depths();
+            let row_output = if params.uses_candidates() {
+                // Each row's penalties see its own root path.
+                let mut seen: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
+                seen.push(generated.clone());
+                for (i, &token) in drafts.tokens.iter().enumerate() {
+                    let mut path = seen[drafts.parents[i].map_or(0, |p| p + 1)].clone();
+                    path.push(token);
+                    seen.push(path);
+                }
+                RowOutput::Candidates(seen.iter().map(|s| penalties(params, s)).collect())
             } else {
-                let row_output = if params.uses_candidates() {
-                    let mut seen = generated.clone();
-                    let per_row = rows
-                        .iter()
-                        .enumerate()
-                        .map(|(i, &token)| {
-                            if i > 0 {
-                                seen.push(token);
-                            }
-                            penalties(params, &seen)
-                        })
-                        .collect();
-                    RowOutput::Candidates(per_row)
-                } else {
-                    RowOutput::Argmax
-                };
-                let verified = model.verify(d, &mut self.state, &rows, row_output)?;
-                let (accepted, bonus) = accept(verified, &drafts.tokens, params, &mut rng)?;
-                ((0..=accepted).collect(), bonus)
+                RowOutput::Argmax
             };
+            let verified = if tree_budget.is_some() {
+                model.verify_tree(d, &mut self.state, &rows, &parents, row_output)?
+            } else {
+                model.verify(d, &mut self.state, &rows, row_output)?
+            };
+            let targets = match verified {
+                RowsProduced::Tokens(targets) => targets,
+                RowsProduced::Candidates(mut per_row) => per_row
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(r, c)| {
+                        let depth = if r == 0 { 0 } else { depths[r - 1] };
+                        sample(c, params, uniform(params.seed, anchor_pos + depth + 1))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                RowsProduced::Logits(_) => {
+                    return Err(Error::Parameter("verify produced logits".into()));
+                }
+            };
+            // The accepted path (verify rows from the anchor's 0) and the
+            // target's token after it.
+            let (path, bonus) = accept_walk(&drafts, &targets);
             self.spec_stats.verify_seconds += t0.elapsed().as_secs_f64();
             self.spec_stats
                 .record(drafts.len(), drafts.depth(), path.len() - 1);
@@ -697,7 +702,6 @@ impl Session {
                 for &row in &path {
                     on_path[row] = true;
                 }
-                let depths = drafts.depths();
                 let records: Vec<Record> = (0..drafts.len())
                     .filter(|&i| on_path[drafts.parents[i].map_or(0, |p| p + 1)])
                     .map(|i| Record {
@@ -755,7 +759,7 @@ impl Session {
                 }
                 let produced = self.step(d, model, &feed, output(&generated))?;
                 generated.extend_from_slice(&feed[1..]);
-                next = select(produced, params, &mut rng)?;
+                next = select(produced, params, self.state.len())?;
                 continue;
             }
             next = bonus;
@@ -776,51 +780,22 @@ impl Session {
     }
 }
 
-/// Decide how many drafts the target accepts and the token that follows
-/// them. Greedy: drafts must equal the target's argmax. Sampling: draft i is
-/// accepted with the target's probability of it (the drafter's proposal is
-/// deterministic); on rejection the replacement is drawn from the target's
-/// distribution with the draft removed, so the output has exactly the
-/// target's distribution.
-fn accept(
-    verified: RowsProduced,
-    drafts: &[u32],
-    params: &SamplingParams,
-    rng: &mut ChaCha8Rng,
-) -> Result<(usize, u32)> {
-    match verified {
-        RowsProduced::Tokens(targets) => {
-            let accepted = drafts
-                .iter()
-                .zip(&targets)
-                .take_while(|(a, b)| a == b)
-                .count();
-            Ok((accepted, targets[accepted]))
-        }
-        RowsProduced::Logits(_) => Err(Error::Parameter("verify produced logits".into())),
-        RowsProduced::Candidates(mut rows) => {
-            for (i, &draft) in drafts.iter().enumerate() {
-                let dist = distribution(&mut rows[i], params)?;
-                let p = dist
-                    .iter()
-                    .find(|(t, _)| *t == draft)
-                    .map_or(0., |(_, p)| *p);
-                if params.temperature == 0. {
-                    if p < 1. {
-                        return Ok((i, dist[0].0));
-                    }
-                    continue;
-                }
-                if rng.random::<f64>() < p {
-                    continue;
-                }
-                let rest: Vec<(u32, f64)> = dist.into_iter().filter(|(t, _)| *t != draft).collect();
-                return Ok((i, draw(&rest, rng)));
-            }
-            let dist = distribution(&mut rows[drafts.len()], params)?;
-            Ok((drafts.len(), draw(&dist, rng)))
-        }
+/// The uniform that samples the token at sequence position `pos`: one per
+/// position (Kapitsa's shared sampling stream), so a draft row and plain
+/// decoding filling the same position draw with the same number, and
+/// accepting a draft exactly when it equals its row's draw emits plain
+/// decoding's tokens. For a deterministic draft that acceptance has the
+/// draft's probability under the target, as rejection sampling does.
+fn uniform(seed: u64, pos: usize) -> f64 {
+    // SplitMix64 over the seed and position.
+    let mut z = seed ^ (pos as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    for _ in 0..2 {
+        z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^= z >> 31;
     }
+    (z >> 11) as f64 / (1u64 << 53) as f64
 }
 
 fn penalties(params: &SamplingParams, generated: &[u32]) -> Penalties {
@@ -837,25 +812,51 @@ fn penalties(params: &SamplingParams, generated: &[u32]) -> Penalties {
     }
 }
 
-fn select(produced: Produced, params: &SamplingParams, rng: &mut ChaCha8Rng) -> Result<u32> {
+/// How far the draw for sequence position `pos` falls from the nearest edge
+/// between two tokens of the sampling distribution over `logits`, as a
+/// fraction of its mass: a draw this close to an edge flips with a logit
+/// change of about that relative size (diagnostics for sampled outputs that
+/// differ between kernels).
+pub fn draw_margin(logits: &[f32], params: &SamplingParams, pos: usize) -> Result<f64> {
+    let mut candidates: Vec<(u32, f32)> = logits
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.is_finite())
+        .map(|(i, &l)| (i as u32, l))
+        .collect();
+    let dist = distribution(&mut candidates, params)?;
+    let mass: f64 = dist.iter().map(|(_, p)| p).sum();
+    let u = uniform(params.seed, pos);
+    let mut edge = 0.;
+    let mut nearest = f64::INFINITY;
+    for (_, p) in &dist {
+        nearest = nearest.min((u - edge / mass).abs());
+        edge += p;
+    }
+    Ok(nearest.min((u - 1.).abs()))
+}
+
+/// The token at sequence position `pos` from a forward's output.
+fn select(produced: Produced, params: &SamplingParams, pos: usize) -> Result<u32> {
     match produced {
         Produced::Token(t) => Ok(t),
-        Produced::Candidates(mut c) => sample(&mut c, params, rng),
+        Produced::Candidates(mut c) => sample(&mut c, params, uniform(params.seed, pos)),
         _ => Err(Error::Parameter("forward produced no token".into())),
     }
 }
 
-/// Temperature, top-k, min-p then top-p over GPU candidates.
+/// Temperature, top-k, min-p then top-p over GPU candidates, drawn with the
+/// uniform `u` in [0, 1).
 pub(crate) fn sample(
     candidates: &mut [(u32, f32)],
     params: &SamplingParams,
-    rng: &mut impl Rng,
+    u: f64,
 ) -> Result<u32> {
     let dist = distribution(candidates, params)?;
     if params.temperature == 0. {
         return Ok(dist[0].0);
     }
-    Ok(draw(&dist, rng))
+    Ok(draw(&dist, u))
 }
 
 /// The sampling distribution over candidates (unnormalized probabilities,
@@ -902,9 +903,9 @@ fn distribution(candidates: &mut [(u32, f32)], params: &SamplingParams) -> Resul
 }
 
 /// Draw from an (unnormalized) distribution.
-fn draw(dist: &[(u32, f64)], rng: &mut impl Rng) -> u32 {
+fn draw(dist: &[(u32, f64)], u: f64) -> u32 {
     let mass: f64 = dist.iter().map(|(_, p)| p).sum();
-    let mut left = rng.random::<f64>() * mass;
+    let mut left = u * mass;
     for &(t, p) in dist {
         if left < p {
             return t;
@@ -918,67 +919,131 @@ fn draw(dist: &[(u32, f64)], rng: &mut impl Rng) -> u32 {
 mod tests {
     use super::*;
 
-    /// Rejection sampling against a deterministic draft reproduces the
-    /// target distribution (after temperature and top-k), whatever the draft.
+    /// A toy target: candidate logits after a history depend on its last
+    /// token.
+    fn toy_logits(last: u32) -> Vec<(u32, f32)> {
+        (0..6u32)
+            .map(|t| (t, ((t * 7 + last * 3) % 11) as f32 * 0.3))
+            .collect()
+    }
+
+    /// Accepting tree rows that equal their own position-keyed draws emits
+    /// plain sampling's tokens, whatever the tree.
     #[test]
-    fn speculative_acceptance_preserves_the_distribution() {
+    fn sampled_trees_emit_plain_sampling() {
+        let params = SamplingParams {
+            temperature: 0.8,
+            top_k: 4,
+            seed: 3,
+            ..Default::default()
+        };
+        let plain = |start: u32, pos: usize, n: usize| -> Vec<u32> {
+            let mut out = Vec::new();
+            let mut last = start;
+            for i in 0..n {
+                last = sample(
+                    &mut toy_logits(last),
+                    &params,
+                    uniform(params.seed, pos + i),
+                )
+                .unwrap();
+                out.push(last);
+            }
+            out
+        };
+        let mut x = 99u64;
+        let mut rand = |n: u32| {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as u32 % n
+        };
+        let mut accepted_any = false;
+        for trial in 0..500 {
+            let (anchor, pos) = (trial % 6, 40 + trial as usize);
+            // A random tree of 12 nodes over the 6 tokens.
+            let mut tree = DraftTree::default();
+            for i in 0..12 {
+                let parent = (i > 0 && rand(3) > 0).then(|| rand(i) as usize);
+                tree.push(rand(6), parent);
+            }
+            let (rows, _) = tree.rows(anchor);
+            let depths = tree.depths();
+            let targets: Vec<u32> = rows
+                .iter()
+                .enumerate()
+                .map(|(r, &token)| {
+                    let depth = if r == 0 { 0 } else { depths[r - 1] };
+                    sample(
+                        &mut toy_logits(token),
+                        &params,
+                        uniform(params.seed, pos + depth + 1),
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let (path, bonus) = accept_walk(&tree, &targets);
+            let mut emitted: Vec<u32> = path[1..].iter().map(|&r| rows[r]).collect();
+            emitted.push(bonus);
+            accepted_any |= emitted.len() > 1;
+            assert_eq!(
+                emitted,
+                plain(anchor, pos + 1, emitted.len()),
+                "trial {trial}"
+            );
+        }
+        assert!(accepted_any);
+    }
+
+    /// Position-keyed draws follow the sampling distribution.
+    #[test]
+    fn position_draws_follow_the_distribution() {
         let logits = vec![(3, 2.0f32), (8, 1.5), (1, 1.0), (6, 0.2), (4, -1.0)];
         let params = SamplingParams {
             temperature: 0.8,
             top_k: 4,
+            seed: 11,
             ..Default::default()
         };
         let mut expect = distribution(&mut logits.clone(), &params).unwrap();
         expect.sort_by_key(|&(t, _)| t);
-        for draft in [3u32, 6, 4] {
-            let mut rng = ChaCha8Rng::seed_from_u64(11);
-            let mut counts = std::collections::BTreeMap::<u32, usize>::new();
-            let trials = 200_000;
-            for _ in 0..trials {
-                // One draft: row 0 judges it, row 1 supplies the bonus token.
-                let rows = RowsProduced::Candidates(vec![logits.clone(), logits.clone()]);
-                let (accepted, bonus) = accept(rows, &[draft], &params, &mut rng).unwrap();
-                let first = if accepted == 1 { draft } else { bonus };
-                *counts.entry(first).or_default() += 1;
-            }
-            for &(t, p) in &expect {
-                let got = *counts.get(&t).unwrap_or(&0) as f64 / trials as f64;
-                assert!(
-                    (got - p).abs() < 0.005,
-                    "draft {draft}: token {t} sampled {got:.4}, expected {p:.4}"
-                );
-            }
-            let outside: usize = counts
-                .iter()
-                .filter(|(t, _)| !expect.iter().any(|(e, _)| e == *t))
-                .map(|(_, n)| n)
-                .sum();
-            assert_eq!(outside, 0, "draft {draft}: sampled outside top-k");
+        let trials = 200_000;
+        let mut counts = std::collections::BTreeMap::<u32, usize>::new();
+        for pos in 0..trials {
+            let t = sample(&mut logits.clone(), &params, uniform(params.seed, pos)).unwrap();
+            *counts.entry(t).or_default() += 1;
         }
+        for &(t, p) in &expect {
+            let got = *counts.get(&t).unwrap_or(&0) as f64 / trials as f64;
+            assert!(
+                (got - p).abs() < 0.005,
+                "token {t}: {got:.4}, expected {p:.4}"
+            );
+        }
+        assert!(counts.keys().all(|t| expect.iter().any(|e| e.0 == *t)));
     }
 
     #[test]
     fn sampling_respects_top_k_min_p_and_greedy() {
-        let mut rng = ChaCha8Rng::seed_from_u64(7);
         let mut c = vec![(5, 1.0), (9, 3.0), (2, 2.0)];
         let greedy = SamplingParams::default();
-        assert_eq!(sample(&mut c, &greedy, &mut rng).unwrap(), 9);
+        assert_eq!(sample(&mut c, &greedy, 0.5).unwrap(), 9);
         let top1 = SamplingParams {
             temperature: 1.,
             top_k: 1,
             ..Default::default()
         };
-        for _ in 0..20 {
-            assert_eq!(sample(&mut c, &top1, &mut rng).unwrap(), 9);
+        for i in 0..20 {
+            assert_eq!(sample(&mut c, &top1, uniform(7, i)).unwrap(), 9);
         }
         let min_p = SamplingParams {
             temperature: 1.,
             min_p: 0.5,
             ..Default::default()
         };
-        for _ in 0..50 {
+        for i in 0..50 {
             // exp(2-3)=0.37 < 0.5 of the top probability: only token 9 survives.
-            assert_eq!(sample(&mut c, &min_p, &mut rng).unwrap(), 9);
+            assert_eq!(sample(&mut c, &min_p, uniform(7, i)).unwrap(), 9);
         }
     }
 }

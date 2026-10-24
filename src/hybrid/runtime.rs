@@ -97,7 +97,7 @@ pub struct SpecOptions {
     /// targets and 2 for MoE targets, whose verify cost grows with the
     /// number of distinct experts).
     pub max_drafts: Option<usize>,
-    /// Draft trees of at most this many nodes, for greedy generation (None:
+    /// Draft trees of at most this many nodes (None:
     /// chains). Drafts per step bound the trees' depth.
     pub tree: Option<usize>,
     /// Let KFlash's budget pick each cycle's tree rows within `tree` and
@@ -121,7 +121,7 @@ impl SpecOptions {
     /// `ferrum-server`; returns false when `key` is not a draft flag.
     /// `--draft mtp|lookup|DIR|FILE.gguf` enables speculation; the others tune it:
     /// `--draft-max N`, `--draft-tree N|auto` (draft trees of N nodes for
-    /// greedy requests; auto: as many rows as pay each cycle, learned), `--draft-tree-search best-first|siblings` (how MTP grows
+    /// requests; auto: as many rows as pay each cycle, learned), `--draft-tree-search best-first|siblings` (how MTP grows
     /// them), `--draft-quant q8_0|q4_0`, `--draft-context N`
     /// (context slots for drafts without a sliding window) and
     /// `--draft-p-min P` (DSpark confidence cut-off).

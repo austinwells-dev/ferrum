@@ -13,7 +13,7 @@
 //!
 //! Each prompt is rendered with the model's chat template (thinking on) and
 //! generated with speculation. With --baseline the same prompt is first
-//! generated without speculation; greedy outputs are compared token by token
+//! generated without speculation; outputs are compared token by token
 //! and any divergence is reported with the target's top-2 logit margin at
 //! that point (a near-tie means single-row and multi-row kernels rounded
 //! differently, not a verification error). In a sweep, tree outputs are also
@@ -140,6 +140,11 @@ fn main() -> Result<()> {
     } else {
         String::new()
     };
+    let margin_name = if temperature > 0. {
+        "draw margin"
+    } else {
+        "target top-2 margin"
+    };
     let label = |config: Option<usize>| match config {
         None => "chain".to_owned(),
         Some(AUTO) => format!("tree auto ({auto_nodes})"),
@@ -226,7 +231,7 @@ fn main() -> Result<()> {
                 stats.acceptance_length(),
                 stats.steps
             );
-            if temperature == 0. {
+            {
                 if let Some(base) = &base {
                     match base.iter().zip(&spec).position(|(a, b)| a != b) {
                         None if base.len() == spec.len() => line += ", identical",
@@ -236,8 +241,8 @@ fn main() -> Result<()> {
                         }
                         Some(i) => {
                             totals[c].3 += 1;
-                            let margin = margin(&rt, &tokens, &base[..i])?;
-                            line += &format!(", diverges at {i} (target top-2 margin {margin:.4})");
+                            let margin = margin(&rt, &tokens, &base[..i], &sampling)?;
+                            line += &format!(", diverges at {i} ({} {margin:.4})", margin_name);
                         }
                     }
                 }
@@ -248,9 +253,9 @@ fn main() -> Result<()> {
                             None if chain.len() == spec.len() => line += ", = chain",
                             None => line += ", chain prefix",
                             Some(i) => {
-                                let margin = margin(&rt, &tokens, &chain[..i])?;
+                                let margin = margin(&rt, &tokens, &chain[..i], &sampling)?;
                                 line += &format!(
-                                    ", leaves the chain at {i} (target top-2 margin {margin:.4})"
+                                    ", leaves the chain at {i} ({margin_name} {margin:.4})"
                                 );
                             }
                         }
@@ -310,8 +315,10 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-/// Target top-2 logit margin after `prompt` + `prefix`.
-fn margin(rt: &Runtime, prompt: &[u32], prefix: &[u32]) -> Result<f32> {
+/// Greedy: the target's top-2 logit margin after `prompt` + `prefix`.
+/// Sampling: how close that position's draw fell to an edge between tokens
+/// (`session::draw_margin`).
+fn margin(rt: &Runtime, prompt: &[u32], prefix: &[u32], sampling: &SamplingParams) -> Result<f32> {
     let model = &rt.loaded.model;
     let mut state = HybridState::new(
         &rt.device,
@@ -325,6 +332,10 @@ fn margin(rt: &Runtime, prompt: &[u32], prefix: &[u32]) -> Result<f32> {
     else {
         unreachable!()
     };
+    if sampling.temperature > 0. {
+        let pos = prompt.len() + prefix.len();
+        return Ok(ferrum::hybrid::session::draw_margin(&logits, sampling, pos)? as f32);
+    }
     let mut sorted = logits;
     sorted.sort_by(|a, b| b.total_cmp(a));
     Ok(sorted[0] - sorted[1])

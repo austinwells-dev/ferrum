@@ -26,6 +26,8 @@ Ideas taken from Kapitsa's code and documentation without copying code, credited
 - src/hybrid/mlx.rs: how MLX conversions of Qwen3.5-family checkpoints store their tensors (src/model/qwen35.cpp).
 - src/hybrid/speculative.rs, lattice_best_first: ranking lattice-tree nodes by calibrated path probability (KFlash's
   kf_build); src/hybrid/session.rs: the per-cycle budget loop and its calibration records (kf_accept).
+- src/hybrid/session.rs, uniform and the speculative step: sampled acceptance with one uniform per position, a row
+  kept when it equals its own draw (kf_accept's T > 0 rule).
 - src/hybrid/draft.rs, DraftOptions::block and ::kflash: drafting DFlash2 with a 16-row block over a reduced head of
   98,304 ids (src/model/dflash2.cpp, NI_DFLASH_BLOCK and NI_DFLASH_HEAD).
 - src/hybrid/engine.rs, HybridModel::project_mlx_tiles: the verify GEMMs' tiling rule (src/model/qwen35_v8.cpp,

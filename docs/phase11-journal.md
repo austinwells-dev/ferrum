@@ -362,3 +362,25 @@ saves in verify time.
 is the recommended setup on MLX checkpoints; `--draft-block` and
 `--draft-vocab` are exposed for GGUF targets, where a fixed tree of 15 with
 both is as fast.
+
+## Experiment 8 — exact sampled trees
+
+Kapitsa's sampled acceptance, ported as an idea (`session.rs`): every token
+is drawn with a uniform keyed by the request's seed and its sequence
+position, in plain decoding too, and a chain or tree row is accepted when its
+token equals the row's own draw (the uniform of the position it would fill).
+Rows at one depth share a position and so a uniform, and the walk emits
+exactly the tokens plain decoding draws, whatever the tree. For a
+deterministic draft this accepts with the draft's probability under the
+target, as the rejection sampling it replaces did, and trees now apply to
+sampled and penalized requests. A seed's text differs from earlier releases
+(the stream changed), not its distribution.
+
+MLX 27B, DFlash2 block 16, T 0.6 (top-k 20, top-p 0.95), 8 prompts × 256:
+chain 19.10 tok/s (2.48× plain), auto trees 22.80 (2.95×; 4.61 per pass).
+Five prompts equal plain sampling token for token; three part at single
+tokens (chain and tree at the same token on one). In strict math
+(`FERRUM_HYBRID_EXACT=1`) all three equal plain sampling, chain and tree, so
+the default-kernel divergences are rounding; at the one that repeated, the
+draw fell 0.001 of the distribution's mass from an edge between two tokens
+(the bench now reports this draw margin for sampled runs).
