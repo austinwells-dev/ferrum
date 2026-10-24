@@ -424,6 +424,7 @@ fn load(plan: &AgentPlan, context: usize) -> Result<Runtime, String> {
         chunks: false,
         context,
         kv_cache: plan.kv_cache,
+        trees: false,
     };
     let plain = Candidate {
         source: Source::Baseline,

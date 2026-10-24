@@ -1182,6 +1182,7 @@ fn run(plan: EvalPlan, suite: Suite, tx: Sender<EvalEvent>, stop: Arc<AtomicBool
         chunks: false,
         context: plan.context,
         kv_cache: plan.kv_cache,
+        trees: false,
     };
     let plain = Candidate {
         source: Source::Baseline,
@@ -1614,6 +1615,7 @@ mod tests {
             chunks: false,
             context: 8192,
             kv_cache: KvCache::default(),
+            trees: false,
         };
         let items = check_items();
         let stop = AtomicBool::new(false);

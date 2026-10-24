@@ -201,9 +201,28 @@ pub struct Plan {
     pub chunks: bool,
     pub context: usize,
     pub kv_cache: KvCache,
+    /// The target verifies draft trees well ([`tree_target`]), so drafters
+    /// also try [`TREES`].
+    pub trees: bool,
+}
+
+/// Whether a target is worth trying draft trees on: dense models. On MoE
+/// models (and Flint, which routes experts too) every tree row routes to its
+/// own experts, so a tree costs more than it saves and the wide verify's
+/// rounding drifts from plain decoding (the runtime keeps them on 2-draft
+/// chains for the same reason).
+pub fn tree_target(config: Option<&ferrum::hybrid::HybridConfig>) -> bool {
+    use ferrum::hybrid::config::Variant;
+    config.is_some_and(|c| !matches!(c.variant, Variant::Moe | Variant::Flint))
 }
 
 impl Plan {
+    /// The trees `c` tries after its depth sweep (none on MoE targets, the
+    /// baseline and prompt lookup).
+    pub fn trees_for(&self, c: &Candidate) -> &'static [Tree] {
+        if self.trees && c.trees() { &TREES } else { &[] }
+    }
+
     /// Rough run time in seconds, assuming a typical 30 tokens/s decode.
     pub fn estimate_secs(&self) -> usize {
         let per_run = PROMPTS.len() * (self.tokens / 30 + 1);
@@ -212,7 +231,7 @@ impl Plan {
             let depths = match c.source {
                 Source::Baseline => 1,
                 _ => depth_list(c.max_depth(), self.quick).len(),
-            } + if c.trees() { TREES.len() } else { 0 };
+            } + self.trees_for(c).len();
             total += 25 + depths * per_run;
         }
         if self.chunks {
@@ -515,7 +534,7 @@ fn run(plan: Plan, tx: Sender<Event>, stop: Arc<AtomicBool>) {
         }
         drop(rt);
         // Trees, each on its own load (KFlash also sets the drafting block).
-        for tree in TREES.into_iter().filter(|_| cand.trees()) {
+        for &tree in plan.trees_for(cand) {
             if stop.load(Ordering::SeqCst) {
                 break;
             }
@@ -1135,6 +1154,7 @@ mod tests {
             chunks: false,
             context: 8192,
             kv_cache: KvCache::F16,
+            trees: true,
         };
         let running = spawn(plan).unwrap();
         let mut rows = Vec::new();
@@ -1202,8 +1222,13 @@ mod tests {
             chunks: false,
             context: 8192,
             kv_cache: KvCache::F16,
+            trees: false,
         };
         let quick = plan.estimate_secs();
+        // Trees add runs on a dense target only.
+        plan.trees = true;
+        assert!(plan.estimate_secs() > quick);
+        plan.trees = false;
         plan.quick = false;
         assert!(plan.estimate_secs() > quick);
         plan.chunks = true;

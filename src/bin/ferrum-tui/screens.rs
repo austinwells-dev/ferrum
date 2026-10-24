@@ -231,7 +231,30 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
         kind: "dflash2",
         max_depth: 7,
     };
+    // A dense model: drafters try trees on it.
+    app.models.push(crate::catalog::Model {
+        path: "/m/dense.gguf".into(),
+        name: "dense".into(),
+        origin: String::new(),
+        size: 1,
+        info: Some(crate::catalog::Info {
+            arch: "qwen35".into(),
+            name: None,
+            layers: None,
+            experts: None,
+            train_ctx: None,
+            sampling: String::new(),
+        }),
+        hybrid: None,
+        mtp: false,
+        mtp_why: String::new(),
+        vision: None,
+        problem: None,
+        tokenizer: Default::default(),
+    });
+    let dense = app.models.len() - 1;
     let b = app.bench.as_mut().unwrap();
+    b.model = dense;
     b.measure = Measure::Speed;
     b.cands = vec![
         Candidate {
@@ -283,4 +306,12 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
         queue.iter().any(|l| l.contains(" 1/5")),
         "no 1/5 progress on the ticked drafter: {queue:?}"
     );
+    // On an MoE model the plan has no trees: 3 depths, no tree runs.
+    if let Some(info) = app.models[dense].info.as_mut() {
+        info.arch = "qwen35moe".into();
+    }
+    app.bench.as_mut().unwrap().phase = BenchPhase::Setup;
+    let text = screen_text(&app, 240, 60);
+    assert!(!text.contains("T15, auto"), "trees planned on an MoE model");
+    assert!(text.contains("4 runs"), "an MoE plan still counts trees");
 }

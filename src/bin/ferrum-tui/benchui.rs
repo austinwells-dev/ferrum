@@ -98,6 +98,15 @@ pub fn ago(secs: u64) -> String {
     }
 }
 
+/// Whether drafters try trees on `m` ([`bench::tree_target`]); without a
+/// parsed config, by its GGUF architecture (`qwen35` is the dense one).
+fn tree_model(m: &Model) -> bool {
+    match &m.hybrid {
+        Some(c) => bench::tree_target(Some(c)),
+        None => m.info.as_ref().is_some_and(|i| i.arch == "qwen35"),
+    }
+}
+
 impl App {
     fn runnable_models(&self) -> Vec<usize> {
         (0..self.models.len())
@@ -226,7 +235,16 @@ impl App {
             chunks: b.chunks,
             context: 8192,
             kv_cache: self.kv_cache().unwrap_or_default(),
+            trees: tree_model(model),
         })
+    }
+
+    /// Whether the benchmark's model is one drafters try trees on.
+    fn bench_trees(&self) -> bool {
+        self.bench
+            .as_ref()
+            .and_then(|b| self.models.get(b.model))
+            .is_some_and(tree_model)
     }
 
     /// How many (candidate, depth) rows the run will produce.
@@ -234,9 +252,12 @@ impl App {
         plan.candidates
             .iter()
             .filter(|c| c.on)
-            .map(|c| match c.source {
-                Source::Baseline => 1,
-                _ => bench::depth_list(c.max_depth(), plan.quick).len(),
+            .map(|c| {
+                let chains = match c.source {
+                    Source::Baseline => 1,
+                    _ => bench::depth_list(c.max_depth(), plan.quick).len(),
+                };
+                chains + plan.trees_for(c).len()
             })
             .sum()
     }
@@ -864,6 +885,7 @@ impl App {
                 ("quant", 6, false),
             ])];
             let mut runs = 0;
+            let tree_target = self.bench_trees();
             for c in b.cands.iter().filter(|c| c.on) {
                 let depths = match c.source {
                     Source::Baseline => vec![],
@@ -871,7 +893,7 @@ impl App {
                 };
                 runs += depths.len().max(1);
                 // The trees each tree-capable drafter also tries.
-                let trees = if c.trees() {
+                let trees = if tree_target && c.trees() {
                     runs += bench::TREES.len();
                     bench::TREES
                         .iter()
@@ -982,7 +1004,11 @@ impl App {
         let planned = match c.source {
             Source::Baseline => 1,
             _ => bench::depth_list(c.max_depth(), b.quick).len(),
-        } + if c.trees() { bench::TREES.len() } else { 0 };
+        } + if self.bench_trees() && c.trees() {
+            bench::TREES.len()
+        } else {
+            0
+        };
         let measured: Vec<&Row> = b.rows.iter().filter(|r| r.cand == i).collect();
         let skipped = b.skipped.iter().any(|(l, _)| *l == c.label());
         // A tree that could not run (say, too little memory) is done too.
