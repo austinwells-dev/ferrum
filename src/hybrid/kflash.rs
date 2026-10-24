@@ -314,6 +314,9 @@ pub struct Budget {
     head: [usize; D],
     calibration: Calibration,
     costs: Costs,
+    /// Row counts this process has verified (bit n): a count's first cycle
+    /// builds its kernels' pipelines, so its time is not its cost.
+    warm: u64,
     rate_tokens: f64,
     rate_ms: f64,
     rate_cycles: usize,
@@ -354,6 +357,7 @@ impl Budget {
             head: [0; D],
             calibration: Calibration::default(),
             costs: Costs::default(),
+            warm: 0,
             rate_tokens: 0.,
             rate_ms: 0.,
             rate_cycles: 0,
@@ -403,10 +407,16 @@ impl Budget {
         self.rows_sum += n;
         self.expected_sum += expected;
         self.tokens_sum += (accepted + 1) as f64;
-        self.costs.observe(n, ms);
-        self.rate_tokens = self.rate_tokens * (63. / 64.) + (accepted + 1) as f64;
-        self.rate_ms = self.rate_ms * (63. / 64.) + ms;
-        self.rate_cycles += 1;
+        // Cycles are timed on the host clock (Kapitsa times the GPU), which
+        // also counts a count's first pipeline builds: a cold cycle that set
+        // the base would offset every count measured before this process.
+        if self.timed(n) {
+            self.costs.observe(n, ms);
+            self.rate_tokens = self.rate_tokens * (63. / 64.) + (accepted + 1) as f64;
+            self.rate_ms = self.rate_ms * (63. / 64.) + ms;
+            self.rate_cycles += 1;
+        }
+        self.warm |= 1 << n;
         for r in records {
             if (1..=MAX_ROWS).contains(&r.depth) {
                 self.add_record(r.depth, r.lq, r.accepted);
@@ -439,6 +449,11 @@ impl Budget {
             self.y[d][self.head[d]] = y;
             self.head[d] = (self.head[d] + 1) % WINDOW;
         }
+    }
+
+    /// Whether this process has verified `rows` rows before.
+    fn timed(&self, rows: usize) -> bool {
+        (self.warm >> rows) & 1 == 1
     }
 
     pub fn cycles(&self) -> usize {
@@ -597,12 +612,39 @@ mod tests {
             let ms = if n <= 8 { 150. } else { 170. };
             b.observe(n, 1., 1, ms, &[]);
         }
-        assert_eq!(seen.len(), 5 * EXPLORE);
+        // (each count's first cycle is cold, so it runs once more)
+        assert_eq!(seen.len(), 5 * (EXPLORE + 1));
         // Sure nodes: 16 rows pay; doubtful ones past the 8th do not.
         let sure = vec![-0.01f32; 15];
         assert_eq!(b.plan().rows(&sure).0, 16);
         let mut doubtful = vec![-0.01f32; 7];
         doubtful.extend([-6f32; 8]);
         assert_eq!(b.plan().rows(&doubtful).0, 8);
+    }
+
+    #[test]
+    fn a_loaded_table_follows_the_base() {
+        let mut c = Costs::default();
+        let mut cached = vec![0.; D];
+        for (n, ms) in [(2, 158.), (8, 178.), (16, 191.), (32, 282.)] {
+            cached[n] = ms;
+        }
+        c.load(&cached);
+        // This process runs 25 ms slower than the cache, every count alike;
+        // each count's first cycle also builds its pipelines (300 ms more).
+        let mut b = Budget::new(None, 32);
+        b.costs = c;
+        for (n, ms) in [(32, 607.), (17, 590.)] {
+            b.observe(n, 1., 0, ms, &[]);
+        }
+        for _ in 0..50 {
+            for (n, ms) in [(8, 203.), (16, 216.)] {
+                let first = !b.timed(n);
+                b.observe(n, 1., 0, if first { ms + 300. } else { ms }, &[]);
+            }
+        }
+        let c = &b.costs;
+        assert!((c.at(2) - 183.).abs() < 5., "2 rows: {}", c.at(2));
+        assert!((c.at(32) - 307.).abs() < 5., "32 rows: {}", c.at(32));
     }
 }

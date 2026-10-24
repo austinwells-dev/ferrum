@@ -292,6 +292,9 @@ fn run(
                     _ => unreachable!(),
                 };
                 record(&shared, &job, completion, &event, rt.session.len());
+                if let Some(summary) = rt.session.tree_rule_summary() {
+                    debug!(Some(job.id), "{summary}");
+                }
                 event
             }
             Ok(Err(e)) => {
