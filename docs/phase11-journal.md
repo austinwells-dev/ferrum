@@ -384,3 +384,38 @@ tokens (chain and tree at the same token on one). In strict math
 the default-kernel divergences are rounding; at the one that repeated, the
 draw fell 0.001 of the distribution's mass from an edge between two tokens
 (the bench now reports this draw margin for sampled runs).
+
+## Experiment 9 — head-to-head with Kapitsa after the port
+
+Same 4 chat prompts through each server (`h2h.py`, client-side decode
+tok/s, two passes each, ranges below), the base Qwen3.8-27B, its
+DFlash2 drafter, Apple M5, one slot. Kapitsa 0.2.16 runs its defaults
+(16-row DFlash2 block, KFlash trees, MLX 4-bit weights).
+
+| Setup | code-fib | code-bsearch | prose-revolution | prose-haiku |
+|---|---|---|---|---|
+| Kapitsa, greedy | 31.2–31.3 | 27.3–28.1 | 22.3–22.6 | 24.2–24.3 |
+| Ferrum MLX, `--draft-tree auto`, greedy | 25.8–26.9 | 23.9–24.1 | 18.1–19.2 | 20.8–22.1 |
+| Ferrum GGUF Q4_K_XL, auto, greedy | 17.1–17.7 | 18.6–19.0 | 14.6–14.7 | 16.4–16.5 |
+| Kapitsa, T 0.6 | 22.3–22.8 | 22.9–23.1 | 23.6–23.8 | 25.4–25.8 |
+| Ferrum MLX, auto, T 0.6 | 19.4–21.2 | 19.8–20.4 | 17.8–18.2 | 21.3–21.5 |
+| Ferrum GGUF, auto, T 0.6 | 16.5–16.6 | 17.3–17.5 | 12.7–12.9 | 16.5–16.9 |
+
+Before the port, Ferrum's best (GGUF, block-8 DFlash2 tree 15) reached 17.5
+greedy. On MLX Ferrum now reaches 82–91% of Kapitsa greedy and 75–93% at
+T 0.6. Plain decoding is level: Kapitsa 7.66–7.72 tok/s, Ferrum on the same
+MLX checkpoint 7.42–7.84. Both engines' GEMVs stream at this Mac's measured
+read ceiling (about 121 GB/s), so qmvf's fusion was not ported.
+
+The rest of the gap, from both servers' budget logs: Kapitsa's 16-row cycle
+costs 183–190 ms of GPU time for 5.06–5.68 tokens; Ferrum's costs 196 ms of
+wall time for 5.0–5.3. Kapitsa drafts and builds the tree on the GPU in the
+same command stream as the verify; Ferrum reads the candidate lattice back
+and builds on the host (about 5 ms), and its verify costs 4% more at a full
+context's capacity than at 8K (163 against 170 ms), which is worth a look.
+On the GGUF target `auto` is 3–5% behind `--draft-block 16 --draft-vocab
+98304 --draft-tree 15`, whose Q4_K verify makes 2-row cycles look cheap.
+
+A bug found on the way: wall-clock costs include a row count's first
+pipeline builds, which skewed the cached table when such a cycle set the
+cost base; a count's first cycle in a process is now left out of the costs.
