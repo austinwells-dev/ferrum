@@ -13,8 +13,6 @@ Ferrum runs 27B–35B language models on a 32 GB Mac, at llama.cpp's speed on th
 
 You give it a model file and then either chat in the terminal, use the full-screen TUI (chat, a sandboxed coding agent, and a benchmarking tool), or run a local server that speaks the **OpenAI** and **Anthropic** APIs, so existing clients and coding agents work with it unchanged.
 
-> **Experimental.** Flint (unsloth's `flint-GGUF`) and Spark-X2.6-4B support is not production-ready: each is checked against llama.cpp on one quant only, their tool-call parsing is new, and the API they sit behind may change. The Qwen3.5-family models are unaffected. Details and known gaps: [docs/experimental.md](docs/experimental.md).
-
 ## Highlights
 
 - **Competitive with llama.cpp on the same files.** Against llama.cpp build 11669 on an M5: 10–12% faster prefill and 2–6% faster decode on a dense 27B model; on a 35B mixture-of-experts, 3–5% faster decode and 2–7% slower prefill. [Numbers below](#performance).
