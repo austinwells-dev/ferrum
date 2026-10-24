@@ -1,5 +1,7 @@
 # Phase 6 architecture journal
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 ## Starting checkpoint (2026-09-23)
 
 - Branch: `codex/phase6-modern-architectures`, created from clean Phase 5.5 checkpoint `e12964cf136262e35c4237415b111f13c93cce51`.
@@ -135,17 +137,17 @@ Fresh release profiles on Apple M5 used greedy `Hello!` generation, eight new to
 
 | Checkpoint / prompt→new tokens | Load ms | Retained model bytes | Prefill tok/s | First token ms | Cached decode tok/s | Complete generation tok/s | KV active / reserved bytes | Other state bytes | Transient peak bytes | Peak RSS bytes |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| Qwen2.5-0.5B-Instruct BF16, 21→8 ([profile](measurements/phase6/qwen2.5-0.5b-profile.log)) | 260.2 | 988,065,536 | 383.7 | 55.1 | 94.5 | 59.9 | 344,064 / 3,145,728 | 0 | 37,027,840 | 1,123,319,808 |
-| Qwen2.5-0.5B-Instruct Q8_0, 21→8 ([profile](measurements/phase6/qwen2.5-0.5b-q8-profile.log)) | 772.9 | 524,976,896 | 362.1 | 58.4 | 123.0 | 67.8 | 344,064 / 3,145,728 | 0 | 37,027,840 | 805,748,736 |
-| Qwen3-0.6B BF16, 21→8 ([profile](measurements/phase6/qwen3-0.6b-profile.log)) | 354.2 | 1,192,099,840 | 93.9 | 224.0 | 76.2 | 25.1 | 3,211,264 / 29,360,128 | 0 | 45,613,056 | 1,646,313,472 |
-| Qwen3-1.7B BF16, 21→8 ([profile](measurements/phase6/qwen3-1.7b-profile.log)) | 515.4 | 3,441,149,952 | 155.5 | 135.4 | 29.5 | 21.3 | 3,211,264 / 29,360,128 | 0 | 67,764,224 | 4,206,690,304 |
-| Qwen3-0.6B Q8_0 GGUF, 21→8 ([profile](measurements/phase6/qwen3-0.6b-q8-profile.log)) | 554.9 | 633,364,480 | 296.4 | 71.2 | 98.9 | 55.3 | 3,211,264 / 29,360,128 | 0 | 45,613,056 | 938,377,216 |
-| Granite 4.0 350M BF16, 21→8 ([profile](measurements/phase6/granite-4.0-350m-profile.log)) | 190.8 | 704,759,808 | 428.3 | 49.3 | 118.0 | 71.6 | 802,816 / 7,340,032 | 0 | 34,209,792 | 845,905,920 |
-| OLMo 2 0425 1B F32, 2→8 ([profile](measurements/phase6/olmo2-1b-profile.log)) | 1,158.6 | 5,939,666,944 | 27.8 | 72.2 | 22.8 | 20.9 | 2,359,296 / 67,108,864 | 0 | 7,380,992 | 6,114,164,736 |
-| Granite 3.1 1B-A400M BF16, 21→8 ([profile](measurements/phase6/granite-3.1-1b-a400m-profile.log)) | 526.0 | 2,669,256,704 | 119.7 | 175.5 | 61.8 | 27.5 | 1,376,256 / 12,582,912 | 0 | 2,689,024 | 2,752,626,688 |
-| LFM2.5-230M BF16, 11→8 ([profile](measurements/phase6/lfm2-230m-generation-profile.log)) | 125.5 | 459,386,368 | 385.9 | 28.6 | 186.7 | 121.0 | 221,184 / 3,145,728 | 49,152 | 9,355,264 | 558,792,704 |
-| LFM2.5-8B-A1B BF16, 11→8 ([profile](measurements/phase6/lfm2-8b-a1b-generation-profile.log)) | 6,665.4 | 16,935,715,072 | 21.1 | 520.8 | 24.4 | 9.9 | 221,184 / 3,145,728 | 221,184 | 4,244,480 | 16,536,403,968 |
-| LFM2.5-8B-A1B Q4_K_M GGUF, 11→8 ([profile](measurements/phase6/lfm2-8b-a1b-q4-k-m-ferrum-profile.log)) | 678.9 | 5,144,019,200 | 21.0 | 524.8 | 19.0 | 9.0 | 221,184 / 3,145,728 | 221,184 | 4,244,480 | 5,386,010,624 |
+| Qwen2.5-0.5B-Instruct BF16, 21→8 ([profile](../measurements/phase6/qwen2.5-0.5b-profile.log)) | 260.2 | 988,065,536 | 383.7 | 55.1 | 94.5 | 59.9 | 344,064 / 3,145,728 | 0 | 37,027,840 | 1,123,319,808 |
+| Qwen2.5-0.5B-Instruct Q8_0, 21→8 ([profile](../measurements/phase6/qwen2.5-0.5b-q8-profile.log)) | 772.9 | 524,976,896 | 362.1 | 58.4 | 123.0 | 67.8 | 344,064 / 3,145,728 | 0 | 37,027,840 | 805,748,736 |
+| Qwen3-0.6B BF16, 21→8 ([profile](../measurements/phase6/qwen3-0.6b-profile.log)) | 354.2 | 1,192,099,840 | 93.9 | 224.0 | 76.2 | 25.1 | 3,211,264 / 29,360,128 | 0 | 45,613,056 | 1,646,313,472 |
+| Qwen3-1.7B BF16, 21→8 ([profile](../measurements/phase6/qwen3-1.7b-profile.log)) | 515.4 | 3,441,149,952 | 155.5 | 135.4 | 29.5 | 21.3 | 3,211,264 / 29,360,128 | 0 | 67,764,224 | 4,206,690,304 |
+| Qwen3-0.6B Q8_0 GGUF, 21→8 ([profile](../measurements/phase6/qwen3-0.6b-q8-profile.log)) | 554.9 | 633,364,480 | 296.4 | 71.2 | 98.9 | 55.3 | 3,211,264 / 29,360,128 | 0 | 45,613,056 | 938,377,216 |
+| Granite 4.0 350M BF16, 21→8 ([profile](../measurements/phase6/granite-4.0-350m-profile.log)) | 190.8 | 704,759,808 | 428.3 | 49.3 | 118.0 | 71.6 | 802,816 / 7,340,032 | 0 | 34,209,792 | 845,905,920 |
+| OLMo 2 0425 1B F32, 2→8 ([profile](../measurements/phase6/olmo2-1b-profile.log)) | 1,158.6 | 5,939,666,944 | 27.8 | 72.2 | 22.8 | 20.9 | 2,359,296 / 67,108,864 | 0 | 7,380,992 | 6,114,164,736 |
+| Granite 3.1 1B-A400M BF16, 21→8 ([profile](../measurements/phase6/granite-3.1-1b-a400m-profile.log)) | 526.0 | 2,669,256,704 | 119.7 | 175.5 | 61.8 | 27.5 | 1,376,256 / 12,582,912 | 0 | 2,689,024 | 2,752,626,688 |
+| LFM2.5-230M BF16, 11→8 ([profile](../measurements/phase6/lfm2-230m-generation-profile.log)) | 125.5 | 459,386,368 | 385.9 | 28.6 | 186.7 | 121.0 | 221,184 / 3,145,728 | 49,152 | 9,355,264 | 558,792,704 |
+| LFM2.5-8B-A1B BF16, 11→8 ([profile](../measurements/phase6/lfm2-8b-a1b-generation-profile.log)) | 6,665.4 | 16,935,715,072 | 21.1 | 520.8 | 24.4 | 9.9 | 221,184 / 3,145,728 | 221,184 | 4,244,480 | 16,536,403,968 |
+| LFM2.5-8B-A1B Q4_K_M GGUF, 11→8 ([profile](../measurements/phase6/lfm2-8b-a1b-q4-k-m-ferrum-profile.log)) | 678.9 | 5,144,019,200 | 21.0 | 524.8 | 19.0 | 9.0 | 221,184 / 3,145,728 | 221,184 | 4,244,480 | 5,386,010,624 |
 
 ### Remaining limits and handoff
 

@@ -1,5 +1,7 @@
 # Phase 4 — final measured Rust/Metal runtime report
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 > The first-pass short-context milestone and its external comparisons are retained below as historical context. The expanded Phase 4 goal is now closed by the final matrix and audit in [matrix optimization progress](phase4-matrix-progress.md#phase-4-closeout-audit).
 
 Measured on Apple M5, macOS 27, Rust 1.96, September 2026. Runtime: independent Rust + Metal, shared storage, batch one, Qwen2.5-0.5B-Instruct BF16. Checkpoint revision `7ae557604adf67be50417f59c2c2f167def9a775`. Immutable Phase 3 control: `7dc2dbdf3721a96d5a44055352084ede71f35ea2`; working branch: `codex/phase4-runtime-optimization`.
@@ -21,7 +23,7 @@ FERRUM_BATCH_LIMIT=1 target/release/ferrum profile --model "$MODEL" \
 
 The Qwen chat template produces 21 prompt IDs. Ordinary runs request 32 tokens and stop on EOS at 10 generated tokens. Profile runs request 8 tokens to match the control diagnostic. Decode is the median cached forward latency, excluding text streaming; first-token latency includes prefill and first selection, excluding checkpoint load/construction/tokenization. Each repeated run warms the model before measurement. Times reflect a desktop, not a thermally controlled laboratory. The fresh control was run before modifications; a later clean detached worktree at the same immutable commit provided the memory control.
 
-All raw results are in [measurements/phase4](measurements/phase4). `a-*` is the fresh baseline, `b/c/d-*` incremental optimizations, `e-*` the pre-follow-up candidate, `f-*` follow-up experiments, and `g-*` the final repeat/validation. Rejected experiments are explicitly identified below. Earlier checkpoints' allocation accounting predates the fix that includes retired GPU-owned resources in peak/live counters; do not compare their transient peaks as if identically defined.
+All raw results are in [measurements/phase4](../measurements/phase4). `a-*` is the fresh baseline, `b/c/d-*` incremental optimizations, `e-*` the pre-follow-up candidate, `f-*` follow-up experiments, and `g-*` the final repeat/validation. Rejected experiments are explicitly identified below. Earlier checkpoints' allocation accounting predates the fix that includes retired GPU-owned resources in peak/live counters; do not compare their transient peaks as if identically defined.
 
 ## First-pass short-context before/after (historical)
 
@@ -81,7 +83,7 @@ These are incremental measurements, not all repeated confidence estimates. Batch
 
 ### Completion, reuse and copies
 
-See [current architecture](architecture.md#phase-4-current-execution-and-storage-model) for the contracts. Resources remain owned until completion; pending tensors cannot be mapped or reused. Writes have range-specific completion states. The cache is staged and committed only after successful GPU completion, including late-error handling. Failed suffixes cannot poison published prefixes, and retries/branches never overwrite reserved suffixes.
+See [current architecture](architecture-by-phase.md#phase-4-current-execution-and-storage-model) for the contracts. Resources remain owned until completion; pending tensors cannot be mapped or reused. Writes have range-specific completion states. The cache is staged and committed only after successful GPU completion, including late-error handling. Failed suffixes cannot poison published prefixes, and retries/branches never overwrite reserved suffixes.
 
 | Old layout work | Shapes / reason | Final path |
 |---|---|---|

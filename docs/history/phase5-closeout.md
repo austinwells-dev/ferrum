@@ -1,5 +1,7 @@
 # Ferrum Phase 5 closeout
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 **Status: complete.** Phase 5 delivers native packed quantized inference and a bounded interoperability contract. The Phase 4 BF16 runtime and its historical reports remain intact. Phase 5.5 owns further performance work; Phase 5 ends without requiring parity with MLX or llama.cpp.
 
 The detailed experiment history, six-workload matrices, quality and memory measurements, accepted/rejected experiments, external comparisons, and artifact links are in [`phase5-experiments.md`](phase5-experiments.md).
@@ -20,7 +22,7 @@ The GGUF v2/v3 reader validates common metadata and tensor layouts; the runtime 
 
 GGUF dense F32, F16, and BF16 tensors are accepted. Q4_1, Q8_1, Q2_K, Q3_K, and Q8_K have index geometry for safe range validation but are not runtime-loadable. Other unknown/quantized GGML types, including IQ families, reject explicitly.
 
-MLX support is limited to the pinned [`mlx-community/Qwen2.5-0.5B-Instruct-4bit`](measurements/phase5/model-source.json) revision `a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3`: Qwen2, affine Q4, group size 64, tied embeddings, one safetensors file. Ferrum repacks to its own 64-value packed layout and has no MLX runtime dependency. This is not general MLX repository support.
+MLX support is limited to the pinned [`mlx-community/Qwen2.5-0.5B-Instruct-4bit`](../measurements/phase5/model-source.json) revision `a5339a4131f135d0fdc6a5c8b5bbed2753bbe0f3`: Qwen2, affine Q4, group size 64, tied embeddings, one safetensors file. Ferrum repacks to its own 64-value packed layout and has no MLX runtime dependency. This is not general MLX repository support.
 
 ## Correctness and quality
 
@@ -39,7 +41,7 @@ The last Phase 5 experiment, completed before closeout, accepted an 8-output-row
 ## Final validation
 
 - `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --all-targets`: 90 passed, 0 failed. The two environment-gated official-model tests were then run explicitly; both passed, including 128-step lifetime/cache stress.
-- Final Q8 odd-tail/aligned-tile tests and official Qwen short generation passed with Metal API and GPU shader validation enabled. GGUF Q4_0/Q5/Q6_K and pinned MLX kernels and real-model generation have retained Metal-validation logs: [`q4_0-metal-validation.txt`](measurements/phase5/q4_0-metal-validation.txt), [`validation-metal-q5-qk.txt`](measurements/phase5/validation-metal-q5-qk.txt), [`q6_k-metal-validation.txt`](measurements/phase5/q6_k-metal-validation.txt), [`validation-metal-mlx-affine4.txt`](measurements/phase5/validation-metal-mlx-affine4.txt), and [`validation-mlx-real-generation.txt`](measurements/phase5/validation-mlx-real-generation.txt).
+- Final Q8 odd-tail/aligned-tile tests and official Qwen short generation passed with Metal API and GPU shader validation enabled. GGUF Q4_0/Q5/Q6_K and pinned MLX kernels and real-model generation have retained Metal-validation logs: [`q4_0-metal-validation.txt`](../measurements/phase5/q4_0-metal-validation.txt), [`validation-metal-q5-qk.txt`](../measurements/phase5/validation-metal-q5-qk.txt), [`q6_k-metal-validation.txt`](../measurements/phase5/q6_k-metal-validation.txt), [`validation-metal-mlx-affine4.txt`](../measurements/phase5/validation-metal-mlx-affine4.txt), and [`validation-mlx-real-generation.txt`](../measurements/phase5/validation-mlx-real-generation.txt).
 - `cargo fmt --all -- --check`, `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`, and `cargo build --release --all-targets` passed.
 - Cache ordering, failure behavior, snapshots/branches, malformed GGUF inputs, unsupported type rejection, quantized tails/metadata, and Phase 4 BF16 fallback are covered by the final suite and recorded tests.
 

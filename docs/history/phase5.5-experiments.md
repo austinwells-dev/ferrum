@@ -1,5 +1,7 @@
 # Phase 5.5 Experiments
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 ## Goal and status
 
 Phase 5.5 compares Ferrum’s supported GGUF quantized and MLX affine-Q4 paths with current llama.cpp Metal and native MLX/MLX-LM on the same Apple M5. This phase starts from clean Phase 5 commit `b47f03367672b62b2b5208242dc467c902dc9ff7`. No Phase 6 work is included.

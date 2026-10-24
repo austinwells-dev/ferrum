@@ -124,6 +124,7 @@ impl Tensor {
             dtype,
         })
     }
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn output(device: &MetalDevice, dims: &[usize], dtype: DType) -> Result<Self> {
         let shape = Shape::new(dims)?;
         let layout = Layout::contiguous(&shape)?;
@@ -299,6 +300,7 @@ impl Tensor {
     pub(crate) fn binding(&self) -> (&MetalBuffer, usize, usize) {
         (&self.storage, self.offset, self.byte_size())
     }
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn buffer(&self) -> &MetalBuffer {
         &self.storage
     }
@@ -330,6 +332,7 @@ impl PackedStorage {
     pub(crate) fn binding(&self) -> (&MetalBuffer, usize, usize) {
         (&self.storage, 0, self.byte_len)
     }
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn buffer(&self) -> &MetalBuffer {
         &self.storage
     }

@@ -1,5 +1,7 @@
 # Phase 8 — Large hybrid models
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 Phase 7 tuned GGUF kernels on sub-1B and 8B-A1B models. Phase 8 makes Ferrum usable on
 the two models below, on the reference Apple M5 (32 GB, 24 GiB GPU working set).
 

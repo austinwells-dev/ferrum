@@ -1,5 +1,7 @@
 # Phase 11 journal — tree speculative decoding
 
+> **History.** Phase 11 is still in progress, so this file is still being written; earlier entries are not revised. The current docs start at [docs/README.md](../README.md).
+
 Plan: [phase11-plan.md](phase11-plan.md). Measured on the same M5 (32 GB) as
 Phases 9 and 10, with `caffeinate` and the screen unlocked; Swift 27B is
 `Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf` with its own MTP head, Spark 4B is

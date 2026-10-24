@@ -191,6 +191,7 @@ impl Weights {
         Ok(Self { tensors })
     }
     /// Rename validated entries by sharing immutable storage; no payload copy.
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn remap<'a>(
         &self,
         names: impl IntoIterator<Item = (&'a str, &'a str)>,
@@ -209,6 +210,7 @@ impl Weights {
         }
         Ok(Self { tensors })
     }
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn insert(&mut self, name: String, tensor: Tensor) -> Result<()> {
         if self.tensors.insert(name.clone(), tensor).is_some() {
             return Err(Error::Weight {
@@ -218,6 +220,7 @@ impl Weights {
         }
         Ok(())
     }
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn remove(&mut self, name: &str) -> Result<Tensor> {
         self.tensors.remove(name).ok_or_else(|| Error::Weight {
             name: name.into(),
@@ -240,6 +243,7 @@ impl Weights {
         self.tensors.values().map(Tensor::byte_size).sum()
     }
     /// Check a published tied-weight duplicate without copying either tensor to host memory.
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn payload_equal(&self, first: &str, second: &str) -> Result<bool> {
         let a = self.get(first)?;
         let b = self.get(second)?;

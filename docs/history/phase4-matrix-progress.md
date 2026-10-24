@@ -1,5 +1,7 @@
 # Phase 4 broader workload optimization — in progress
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 The expanded user goal supersedes the short-context completion assessment in `phase4-results.md`. Phase 4 is active: the updated 150 tok/s decode and 2,500 tok/s approximately 1k-token prefill targets are directions, not stopping criteria. Remaining major bottlenecks still need systematic matrix evaluation and concrete experiments.
 
 ## Reproducible matrix

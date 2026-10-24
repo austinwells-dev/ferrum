@@ -1,5 +1,7 @@
 # Phase 2 completion report
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 Measured on 2026-09-20 on Apple M5, arm64 macOS 27.0, Rust/Cargo 1.96.0. Phase 1 foundation: `f2e1234`. Work branch: `codex/phase2-transformer`. Phase 2 stops at synthetic model execution; no pretrained model was downloaded or executed.
 
 ## Implementation and dependencies
@@ -98,7 +100,7 @@ F32 per-stage maxima across the two layers:
 | MLP | 3.16649675e-8 |
 | Decoder output | 5.96046448e-8 |
 
-Exact low-precision agreement is an observation for these rounded deterministic fixtures, not a universal accuracy guarantee. Cached equivalence feeds `[3,8,4,11,2]` one token at a time and compares every position with full-sequence logits. It also compares active K/V and verifies a two-token prefill followed by a three-token append. Separate tied-embedding, MHA, single-KV-head, and awkward-dimension cases pass. Raw errors: [transformer log](measurements/phase2/transformer.txt).
+Exact low-precision agreement is an observation for these rounded deterministic fixtures, not a universal accuracy guarantee. Cached equivalence feeds `[3,8,4,11,2]` one token at a time and compares every position with full-sequence logits. It also compares active K/V and verifies a two-token prefill followed by a three-token append. Separate tied-embedding, MHA, single-KV-head, and awkward-dimension cases pass. Raw errors: [transformer log](../measurements/phase2/transformer.txt).
 
 ## Timings, dispatches, and memory
 
@@ -116,7 +118,7 @@ Release smoke, Apple M5, F32 primary fixture; ten samples after pipeline compila
 
 Model retained weight payload is **23,104 bytes**. Five-token active K/V is **640 bytes**; the configured 16-token capacity would contain **2,048 bytes**, but is not reserved. Safetensors load plus model construction/transposition took **10.040792 ms** in this process; synthetic serialization is outside that measurement. Decode dispatches exceed prefill by four because each of two layers concatenates both K and V into an existing cache.
 
-Temporary allocation volume is total newly allocated physical bytes minus final cache and returned logits; it is **not peak live memory** and excludes pre-existing cache/source allocations. A CPU file byte vector and construction-time source/transposed matrices can coexist during loading. Keeping diagnostic traces intentionally retains additional activations. Raw output: [transformer smoke](measurements/phase2/transformer-smoke.txt).
+Temporary allocation volume is total newly allocated physical bytes minus final cache and returned logits; it is **not peak live memory** and excludes pre-existing cache/source allocations. A CPU file byte vector and construction-time source/transposed matrices can coexist during loading. Keeping diagnostic traces intentionally retains additional activations. Raw output: [transformer smoke](../measurements/phase2/transformer-smoke.txt).
 
 The unchanged primitive benchmark was rerun because backend counters were added. No material regression appeared against the recorded Phase 1 estimates:
 
@@ -136,7 +138,7 @@ The unchanged primitive benchmark was rerun because backend counters were added.
 | Matmul F32 256×512×256 | 399.07 | 321.84 |
 | Matmul F16 256×512×256 | 328.78 | 316.83 |
 
-These variations are not attributed to optimization: the Phase 1 primitive shaders are unchanged, runs are short, and the desktop environment is uncontrolled. Full confidence intervals and separate GPU/submission medians are in [primitive benchmark](measurements/phase2/primitive-benchmark.txt).
+These variations are not attributed to optimization: the Phase 1 primitive shaders are unchanged, runs are short, and the desktop environment is uncontrolled. Full confidence intervals and separate GPU/submission medians are in [primitive benchmark](../measurements/phase2/primitive-benchmark.txt).
 
 ## Safety and quality gates
 
@@ -157,7 +159,7 @@ All required gates passed:
 | `MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --test correctness -- --test-threads=1` | PASS: all nine unchanged suites |
 | `cargo bench --bench runtime -- --noplot` | PASS: all 13 primitive cases |
 
-Evidence: [quality gates](measurements/phase2/quality-gates.txt), [Metal validation](measurements/phase2/metal-validation.txt), [unsafe audit](measurements/phase2/unsafe-audit.txt). Phase 1 tests and benchmark source were preserved unchanged.
+Evidence: [quality gates](../measurements/phase2/quality-gates.txt), [Metal validation](../measurements/phase2/metal-validation.txt), [unsafe audit](../measurements/phase2/unsafe-audit.txt). Phase 1 tests and benchmark source were preserved unchanged.
 
 ## Limits and exact Phase 3 work
 

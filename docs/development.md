@@ -4,39 +4,42 @@
 
 | Path | Contents |
 |---|---|
-| `src/metal/` | Metal backend: device, pipeline cache, command batching, residency. The only module allowed to use `unsafe` |
-| `src/metal/shaders/` | All GPU kernels (`ops.metal`, `project_mpp.metal`, `hybrid.metal`) |
-| `src/tensor/`, `src/ops/`, `src/nn/` | Tensors, operations, attention, KV cache, MoE routing |
-| `src/loader/` | safetensors and GGUF parsing |
-| `src/model/` | The general transformer engine (Qwen2.5/3, Granite, OLMo 2, LFM2) |
-| `src/hybrid/` | The large-model engine for Qwen3.5-family hybrids (and, experimentally, Flint and Spark): memory planner, forward pass, sessions, drafters |
-| `src/vision/` | Qwen3-VL image encoder |
-| `src/tokenizer/`, `src/reference/` | Tokenizers; CPU reference implementations used as test oracles |
+| `src/metal/` | Metal backend: device, pipeline cache, command batching, residency. The only module allowed to use `unsafe`. `metal/legacy.rs` holds the general engine's dispatcher and kernel switches |
+| `src/metal/shaders/` | All GPU kernels (`hybrid.metal` and `hybrid_mlx.metal` for the hybrid engine; `ops.metal` and `project_mpp.metal` for the general engine, plus the keep-alive kernel) |
+| `src/tensor/`, `src/loader/` | Tensors; safetensors and GGUF parsing |
+| `src/hybrid/` | The engine the apps run: Qwen3.5-family hybrids (and, experimentally, Flint and Spark): memory planner, forward pass, sessions, drafters |
+| `src/vision/`, `src/tokenizer/` | Qwen3-VL image encoder; tokenizers |
+| `src/model/`, `src/ops/`, `src/nn/`, `src/generation.rs`, `src/sampling.rs`, `src/quantization.rs`, `src/reference/` | The general transformer engine (Qwen2.5/3, Granite, OLMo 2, LFM2) and its CPU test oracles. Built only with `--features legacy-engine` |
 | `src/bin/` | `ferrum-cli`, `ferrum-server`, `ferrum-tui` |
-| `tests/`, `benches/`, `examples/` | Integration tests, Criterion benchmarks, probes and measurement harnesses |
-| `tools/` | Optional Python scripts that compare against Transformers, MLX and llama.cpp |
+| `tests/`, `benches/`, `examples/` | Integration tests and Criterion benchmarks (all general-engine, so they need the feature), `examples/hybrid_*` probes for the hybrid engine |
+| `tools/` | Optional Python scripts that compare against Transformers, MLX and llama.cpp, and `check_links.py` (run by CI) |
 
 ## Building
 
 ```sh
 cargo build --release
+cargo build --release --features legacy-engine   # also the general engine
 ```
 
-`.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=15.0` because the Metal compile options Ferrum uses need macOS 15. The release profile keeps build-time proc-macro dylibs unstripped, because macOS 27's dyld rejects some stripped ones ([Phase 1 results](phase1-results.md) has the details).
+The general engine (`ferrum run`, `smoke`, `transformer-smoke`, `profile`, the integration tests in `tests/`, `benches/` and the non-hybrid examples) is behind the `legacy-engine` feature, off by default. The TUI, server and CLI don't use it.
+
+`.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=15.0` because the Metal compile options Ferrum uses need macOS 15. The release profile keeps build-time proc-macro dylibs unstripped, because macOS 27's dyld rejects some stripped ones ([Phase 1 results](history/phase1-results.md) has the details).
 
 ## Developer subcommands
 
 ```sh
 cargo run --release -- info                # Metal device and compiler capabilities
-cargo run --release -- smoke               # Quick GPU sanity check against CPU references
-cargo run --release -- transformer-smoke
+
+# General engine only (--features legacy-engine)
+cargo run --release --features legacy-engine -- smoke   # Quick GPU sanity check against CPU references
+cargo run --release --features legacy-engine -- transformer-smoke
 
 # Generate text from a local checkpoint with the general engine
-cargo run --release -- run --model /path/to/Qwen2.5-0.5B-Instruct \
+cargo run --release --features legacy-engine -- run --model /path/to/Qwen2.5-0.5B-Instruct \
   --prompt 'Hello!' --max-new-tokens 32 --temperature 0 --warmup
 
 # Same, with per-operation timing
-cargo run --release -- profile --model /path/to/Qwen2.5-0.5B-Instruct \
+cargo run --release --features legacy-engine -- profile --model /path/to/Qwen2.5-0.5B-Instruct \
   --prompt 'Hello!' --max-new-tokens 8 --temperature 0 --warmup
 
 # Generation on the hybrid engine: one user turn through the GGUF's chat template,
@@ -59,27 +62,31 @@ cargo run --release -- hybrid --model /path/to/model.gguf --raw --prompt 'The ca
 ```sh
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo test                              # hybrid engine, apps, Metal backend
+cargo test --features legacy-engine     # adds the general engine and tests/
+python3 tools/check_links.py            # relative links and #anchors in all markdown
 ```
+
+The branch flow, the pre-PR checklist and the regression checks for large changes are in [AGENTS.md](../AGENTS.md).
 
 GPU tests need a Mac with Metal. Tests that need real model weights are `#[ignore]`d by default:
 
 ```sh
 # With Metal's API and shader validation layers
-MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --lib \
+MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --features legacy-engine --lib \
   --test correctness --test transformer --test runtime_optimization -- --test-threads=1
 
 # Against a real local checkpoint
 FERRUM_QWEN_MODEL=/path/to/checkpoint MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 \
-  cargo test --release --test real_model -- --ignored --test-threads=1
+  cargo test --release --features legacy-engine --test real_model -- --ignored --test-threads=1
 ```
 
 ### Probes and benchmarks
 
 ```sh
-cargo run --release --example qwen_probe -- /path/to/checkpoint --diagnostic-f32
+cargo run --release --features legacy-engine --example qwen_probe -- /path/to/checkpoint --diagnostic-f32
 python3 tools/check_phase4_probe.py
-cargo bench --bench runtime -- --noplot
+cargo bench --features legacy-engine --bench runtime -- --noplot
 ```
 
 The `examples/hybrid_*` programs measure the hybrid engine: `hybrid_bench` (prefill and decode), `hybrid_kld` (KL divergence against llama.cpp logits), `hybrid_spec` (speculative decoding, `--depth N --filler FILE` for long context, `--sweep 0,4,8,15` for draft-tree budgets), `hybrid_verify_cost` (verify cost against block width), `hybrid_tree_check` (draft-tree verify and path commit against plain decoding and a chain, with oracle trees), `hybrid_tree_cost` (tree verify and commit cost against a chain's), `hybrid_mtp_tree_check` (best-first MTP trees against MTP's own chain, logit for logit), `hybrid_attention` and `hybrid_prefill_attention` (attention kernels alone, per query width and K/V format), `hybrid_plan` (memory plan per K/V format) and `hybrid_needle` (long-context retrieval).

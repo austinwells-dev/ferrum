@@ -45,7 +45,7 @@ This builds an optimized release and puts four binaries on your `PATH` (in `~/.c
 | `ferrum-tui` | Full-screen launcher: chat, coding agent, server and benchmarks |
 | `ferrum-cli` | Plain terminal chat |
 | `ferrum-server` | OpenAI- and Anthropic-compatible HTTP server |
-| `ferrum` | Developer tool: device info, smoke tests, small-model runner |
+| `ferrum` | Developer tool: device info and a one-shot hybrid-engine runner (smoke tests and the small-model runner need `--features legacy-engine`) |
 
 If you'd rather not install, `cargo build --release` puts the same binaries in `target/release/`.
 
@@ -153,7 +153,7 @@ Both engines accept the same share of drafts (within two points), so the differe
 | Ferrum, Q4_K_XL GGUF | 14.6–19.0 | 12.7–17.5 |
 | Plain decoding, Kapitsa / Ferrum (MLX) | 7.66–7.72 / 7.42–7.84 | |
 
-On MLX, Ferrum reaches 82–91% of Kapitsa greedy and 75–93% at T 0.6. Kapitsa drafts and builds its trees on the GPU, while Ferrum builds them on the CPU. The [Phase 11 journal](docs/phase11-journal.md) breaks the gap down.
+On MLX, Ferrum reaches 82–91% of Kapitsa greedy and 75–93% at T 0.6. Kapitsa drafts and builds its trees on the GPU, while Ferrum builds them on the CPU. The [Phase 11 journal](docs/history/phase11-journal.md) breaks the gap down.
 
 Accuracy is measured as KL divergence over llama-perplexity's text chunks: on Swift, Ferrum matches llama.cpp to a mean KLD of 1.2×10⁻⁴ (99.5% same top token); on Tiel, both are about as close to a high-precision Ferrum reference (0.0074 for Ferrum, 0.0068 for llama.cpp). Small models (under 1B) ran at 0.6–1.0× llama.cpp's speed when last measured (Phase 7), because fixed per-kernel overhead dominates at that size. Full methodology and raw logs are in the [engineering journals](docs/README.md) and [docs/measurements/verification-2026-10](docs/measurements/verification-2026-10/README.md).
 
@@ -189,7 +189,7 @@ The design is covered in [docs/architecture.md](docs/architecture.md). How it wa
 
 ## Other supported models
 
-The developer binary `ferrum run` has a second, general transformer engine that runs smaller checkpoints. Each was validated against reference logits:
+The developer binary `ferrum run` has a second, general transformer engine that runs smaller checkpoints. None of the apps use it, so it is behind a cargo feature that is off by default; install with `cargo install --path . --features legacy-engine` to get it. Each checkpoint was validated against reference logits:
 
 | Family | Validated checkpoints |
 |---|---|
@@ -217,12 +217,13 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | [Vision](docs/vision.md) | How image input is encoded and positioned |
 | [Experimental](docs/experimental.md) | Flint, Spark, MLX checkpoints and KFlash: status, validation numbers, known gaps |
 | [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
+| [Contributing](AGENTS.md) | Branch and PR flow (topic → `experimental` → `main`), checks, docs and regression rules |
 
 ## Limitations
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - One request at a time (batch size 1).
-- The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint and Spark. Other architectures go through the developer runner.
+- The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint and Spark. Other architectures go through the developer runner, built with `--features legacy-engine`.
 - Vision supports the Qwen3-VL projector only (no video).
 - No training and no language bindings.
 

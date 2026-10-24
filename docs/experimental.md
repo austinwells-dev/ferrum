@@ -110,7 +110,7 @@ MLX 4-bit 27B with its DFlash2 drafter, `hybrid_spec`, 8 chat prompts × 256 tok
 | T 0.6, `FERRUM_HYBRID_EXACT=1`, the 3 that parted | identical: rounding, not the acceptance rule (one draw fell 0.001 from a token edge) |
 | Budget's expected tokens per step vs measured | 5.03 vs 5.02 |
 
-Against Kapitsa through each server (same prompts): 82–91% of its greedy speed and 75–93% at T 0.6 on the same MLX checkpoint ([README](../README.md#performance), [Phase 11 journal](phase11-journal.md)).
+Against Kapitsa through each server (same prompts): 82–91% of its greedy speed and 75–93% at T 0.6 on the same MLX checkpoint ([README](../README.md#performance), [Phase 11 journal](history/phase11-journal.md)).
 
 ## Known gaps
 
