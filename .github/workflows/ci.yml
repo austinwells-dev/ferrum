@@ -2,13 +2,35 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, experimental]
   pull_request:
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # main only takes changes that went through experimental first (AGENTS.md).
+  branch-policy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: PRs into main must come from experimental
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+        run: |
+          if [ "$HEAD_REF" != experimental ] || [ "$HEAD_REPO" != "$GITHUB_REPOSITORY" ]; then
+            echo "::error::PRs into main must come from $GITHUB_REPOSITORY:experimental, not $HEAD_REPO:$HEAD_REF. Open this PR against experimental instead."
+            exit 1
+          fi
+      - run: echo "branch policy ok"
+
+  docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 tools/check_links.py
+
   check:
     # Hosted macOS runners are virtual machines without a real Apple GPU, so CI
     # builds, lints and compiles the tests; GPU tests run locally (docs/development.md).
@@ -23,7 +45,9 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo build --release --locked
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --no-run --locked
+      - run: cargo test --no-run --locked --features legacy-engine
       # Tests that never touch Metal: chat templates against Jinja2 renderings,
       # tool-call parsing, prompt lookup and GGUF parsing.
       - run: "cargo test --lib --locked -- hybrid::chat:: hybrid::lookup:: loader::gguf::"

@@ -12,7 +12,7 @@
 | `src/model/`, `src/ops/`, `src/nn/`, `src/generation.rs`, `src/sampling.rs`, `src/quantization.rs`, `src/reference/` | The general transformer engine (Qwen2.5/3, Granite, OLMo 2, LFM2) and its CPU test oracles. Built only with `--features legacy-engine` |
 | `src/bin/` | `ferrum-cli`, `ferrum-server`, `ferrum-tui` |
 | `tests/`, `benches/`, `examples/` | Integration tests and Criterion benchmarks (all general-engine, so they need the feature), `examples/hybrid_*` probes for the hybrid engine |
-| `tools/` | Optional Python scripts that compare against Transformers, MLX and llama.cpp |
+| `tools/` | Optional Python scripts that compare against Transformers, MLX and llama.cpp, and `check_links.py` (run by CI) |
 
 ## Building
 
@@ -64,7 +64,10 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test                              # hybrid engine, apps, Metal backend
 cargo test --features legacy-engine     # adds the general engine and tests/
+python3 tools/check_links.py            # relative links and #anchors in all markdown
 ```
+
+The branch flow, the pre-PR checklist and the regression checks for large changes are in [AGENTS.md](../AGENTS.md).
 
 GPU tests need a Mac with Metal. Tests that need real model weights are `#[ignore]`d by default:
 

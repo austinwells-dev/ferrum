@@ -217,6 +217,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | [Vision](docs/vision.md) | How image input is encoded and positioned |
 | [Experimental](docs/experimental.md) | Flint, Spark, MLX checkpoints and KFlash: status, validation numbers, known gaps |
 | [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
+| [Contributing](AGENTS.md) | Branch and PR flow (topic → `experimental` → `main`), checks, docs and regression rules |
 
 ## Limitations
 
