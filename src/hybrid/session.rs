@@ -6,6 +6,7 @@ use super::{
     engine::{
         HybridModel, HybridState, ImageSpan, Output, Penalties, Produced, RowOutput, RowsProduced,
     },
+    kflash::{Budget, Calibration, MAX_ROWS, Record, SAVE_EVERY},
     speculative::{DraftTree, Drafter, SpecStats, accept_walk},
 };
 use crate::{DType, Error, MetalDevice, Result, Tensor};
@@ -180,6 +181,9 @@ pub struct Session {
     /// Draft trees of at most this many nodes instead of chains (see
     /// `set_tree_budget`).
     tree_budget: Option<usize>,
+    /// KFlash's budget: each cycle verifies the tree rows it expects to pay
+    /// (see `set_tree_rule`), within `tree_budget`.
+    tree_rule: Option<Budget>,
     /// Acceptance statistics of the latest generation.
     pub spec_stats: SpecStats,
     /// Images of the next prompt, taken by the next `prefill`/`generate`.
@@ -218,6 +222,7 @@ impl Session {
             depth_cap: None,
             drafter_rewind: None,
             tree_budget: None,
+            tree_rule: None,
             spec_stats: SpecStats::default(),
             pending_media: Vec::new(),
         })
@@ -281,6 +286,32 @@ impl Session {
 
     pub fn tree_budget(&self) -> Option<usize> {
         self.tree_budget
+    }
+
+    /// Let KFlash's budget (`kflash::Budget`) choose each cycle's tree rows
+    /// within the tree budget, and calibrate lattice trees, learning both
+    /// from the cycles; `key` names its cache file (None: nothing kept).
+    /// `enabled` false goes back to whole trees of the budget.
+    pub fn set_tree_rule(&mut self, enabled: bool, key: Option<&str>) {
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.set_calibration(&Calibration::default());
+        }
+        self.tree_rule =
+            enabled.then(|| Budget::new(key, self.tree_budget.map_or(MAX_ROWS, |b| b + 1)));
+    }
+
+    /// Install `rule` as the tree budget's (None: whole trees of the budget)
+    /// and return the previous one, so a caller can park its state.
+    pub fn swap_tree_rule(&mut self, rule: Option<Budget>) -> Option<Budget> {
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.set_calibration(&Calibration::default());
+        }
+        std::mem::replace(&mut self.tree_rule, rule)
+    }
+
+    /// The tree budget's state, for logs.
+    pub fn tree_rule_summary(&self) -> Option<String> {
+        self.tree_rule.as_ref().map(Budget::summary)
     }
 
     /// Apply a pending drafter rewind.
@@ -589,14 +620,31 @@ impl Session {
                 .tree_budget
                 .filter(|_| k > 0 && !params.uses_candidates())
                 .map(|b| b.min(room));
+            let plan = self
+                .tree_rule
+                .as_ref()
+                .filter(|_| tree_budget.is_some())
+                .map(Budget::plan);
+            let cycle = Instant::now();
+            let mut expected = 0.;
             let drafts = if k > 0 {
                 let t0 = Instant::now();
                 let pos = self.state.len();
                 let drafter = self.drafter.as_mut().expect("speculate implies a drafter");
-                let drafts = match tree_budget {
-                    Some(budget) => drafter.draft_tree(d, model, pos, next, k, budget)?,
+                let mut drafts = match tree_budget {
+                    Some(budget) => {
+                        if let Some(plan) = &plan {
+                            drafter.set_calibration(&plan.calibration);
+                        }
+                        drafter.draft_tree(d, model, pos, next, k, budget)?
+                    }
                     None => DraftTree::chain(&drafter.draft(d, model, pos, next, k)?),
                 };
+                if let Some(plan) = plan.as_ref().filter(|_| !drafts.score.is_empty()) {
+                    let (rows, e) = plan.rows(&drafts.score);
+                    drafts.truncate(rows - 1);
+                    expected = e;
+                }
                 self.spec_stats.draft_seconds += t0.elapsed().as_secs_f64();
                 drafts
             } else {
@@ -643,6 +691,24 @@ impl Session {
             self.spec_stats.verify_seconds += t0.elapsed().as_secs_f64();
             self.spec_stats
                 .record(drafts.len(), drafts.depth(), path.len() - 1);
+            if let Some(rule) = self.tree_rule.as_mut().filter(|_| expected > 0.) {
+                // Calibration records: every node whose parent is on the path.
+                let mut on_path = vec![false; drafts.len() + 1];
+                for &row in &path {
+                    on_path[row] = true;
+                }
+                let depths = drafts.depths();
+                let records: Vec<Record> = (0..drafts.len())
+                    .filter(|&i| on_path[drafts.parents[i].map_or(0, |p| p + 1)])
+                    .map(|i| Record {
+                        depth: depths[i],
+                        lq: drafts.lq[i],
+                        accepted: on_path[i + 1],
+                    })
+                    .collect();
+                let ms = cycle.elapsed().as_secs_f64() * 1e3;
+                rule.observe(rows.len(), expected, path.len() - 1, ms, &records);
+            }
             // Emit the accepted drafts one by one; the anchor row is always kept.
             let mut keep = 1;
             let mut stopped = None;
@@ -694,6 +760,9 @@ impl Session {
             }
             next = bonus;
         };
+        if let Some(rule) = self.tree_rule.as_mut() {
+            rule.save(SAVE_EVERY);
+        }
         Ok(Completion {
             tokens: generated,
             stop,

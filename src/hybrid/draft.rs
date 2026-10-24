@@ -26,6 +26,7 @@ pub use gguf::{check_tokenizer, is_dflash};
 use super::{
     HybridConfig,
     engine::{HybridModel, Params, SpecGeometry, page},
+    kflash::Calibration,
     speculative::{DraftTree, Drafter, lattice_best_first, log_softmax},
     weights::{Format, Matrix, gguf_matrix},
 };
@@ -293,6 +294,15 @@ pub struct DraftOptions {
     /// frequency). None: the full vocabulary. Verification always uses the
     /// full vocabulary, so this trades acceptance for draft speed only.
     pub vocab: Option<usize>,
+    /// DFlash and DFlash2: rows of the drafting block (the anchor and its
+    /// mask slots) when wider than the trained block. One pass then drafts
+    /// a deeper candidate lattice for trees (Kapitsa runs DFlash2 drafters
+    /// trained on 8 rows with 16). None: the trained block.
+    pub block: Option<usize>,
+    /// Tune DFlash2 for KFlash trees (`--draft-tree auto`), as Kapitsa does:
+    /// unless `block` and `vocab` are set, a 16-row drafting block over the
+    /// first 98,304 token ids.
+    pub kflash: bool,
     /// How MTP grows draft trees.
     pub tree_search: TreeSearch,
 }
@@ -314,6 +324,8 @@ impl Default for DraftOptions {
             context_cap: 8192,
             confidence_min: 0.,
             vocab: None,
+            block: None,
+            kflash: false,
             tree_search: TreeSearch::default(),
         }
     }
@@ -781,6 +793,8 @@ pub struct DraftModel {
     /// Draft LM head (a prefix of the target's) and its vocabulary.
     head: Matrix,
     vocab: usize,
+    /// How lattice trees rank their nodes (`Drafter::set_calibration`).
+    calibration: Calibration,
 }
 
 impl DraftModel {
@@ -795,7 +809,9 @@ impl DraftModel {
         max_drafts: Option<usize>,
         options: DraftOptions,
     ) -> Result<Self> {
-        let (config, mut src, label) = open(path.as_ref())?;
+        let (mut config, mut src, label) = open(path.as_ref())?;
+        let options = kflash_defaults(&config, options);
+        widen_block(&mut config, options.block)?;
         let t = &target.config;
         check_target(&config, t)?;
         let vocab = t.vocab;
@@ -900,6 +916,7 @@ impl DraftModel {
             weight_bytes,
             head: target.weights.output.prefix_rows(vocab_limit),
             vocab: vocab_limit,
+            calibration: Calibration::default(),
         })
     }
 
@@ -1543,6 +1560,36 @@ fn check_target(c: &DraftConfig, t: &HybridConfig) -> Result<()> {
     Ok(())
 }
 
+/// `DraftOptions::kflash`'s defaults for a DFlash2 drafter.
+fn kflash_defaults(c: &DraftConfig, mut options: DraftOptions) -> DraftOptions {
+    if options.kflash && matches!(c.kind, Kind::DFlash2 { .. }) {
+        options.block.get_or_insert(c.block_size.max(16));
+        options.vocab.get_or_insert(98_304);
+    }
+    options
+}
+
+/// Widen a DFlash or DFlash2 drafting block to `block` rows. Mask slots
+/// carry no per-position weights (positions enter through RoPE), so a wider
+/// block is the same forward over more rows; DSpark's Markov chain and
+/// confidence head are trained on its block and keep it.
+fn widen_block(c: &mut DraftConfig, block: Option<usize>) -> Result<()> {
+    let Some(block) = block.filter(|&b| b != c.block_size) else {
+        return Ok(());
+    };
+    if matches!(c.kind, Kind::DSpark { .. }) {
+        return Err(Error::Config("DSpark keeps its trained block".into()));
+    }
+    if !(c.block_size..=32).contains(&block) {
+        return Err(Error::Config(format!(
+            "drafting block {block}: {}..=32 rows",
+            c.block_size
+        )));
+    }
+    c.block_size = block;
+    Ok(())
+}
+
 /// Bytes a `DraftModel` allocates beyond its weights: the context ring and
 /// the block and ingestion buffers.
 fn state_bytes(c: &DraftConfig, t: &HybridConfig, ring: usize, chunk: usize) -> usize {
@@ -1585,7 +1632,9 @@ impl DraftModel {
         chunk: usize,
         options: DraftOptions,
     ) -> Result<(DraftConfig, usize, usize)> {
-        let (config, src, _) = open(path.as_ref())?;
+        let (mut config, src, _) = open(path.as_ref())?;
+        let options = kflash_defaults(&config, options);
+        widen_block(&mut config, options.block)?;
         check_target(&config, target)?;
         let quantized = |cols: usize| match options.quant {
             DraftQuant::Q8_0 => cols / 32 * 34,
@@ -1780,7 +1829,13 @@ impl Drafter for DraftModel {
                     return Ok(DraftTree::default());
                 }
                 let (lattice, cond) = self.dspark_lattice(d, anchor, &chain)?;
-                Ok(lattice_best_first(anchor, &lattice, budget, cond))
+                Ok(lattice_best_first(
+                    anchor,
+                    &lattice,
+                    budget,
+                    &self.calibration,
+                    cond,
+                ))
             }
             Kind::DFlash => {
                 let mut ids = vec![c.mask_token; max + 1];
@@ -1795,6 +1850,7 @@ impl Drafter for DraftModel {
                     anchor,
                     &tokens(&cands),
                     budget,
+                    &self.calibration,
                     |i, _| marginals[i].clone(),
                 ))
             }
@@ -1805,6 +1861,7 @@ impl Drafter for DraftModel {
                     anchor,
                     &tokens(&cands),
                     budget,
+                    &self.calibration,
                     |i, prev| {
                         memo.entry((i, prev))
                             .or_insert_with(|| {
@@ -1816,6 +1873,10 @@ impl Drafter for DraftModel {
                 ))
             }
         }
+    }
+
+    fn set_calibration(&mut self, calibration: &Calibration) {
+        self.calibration.clone_from(calibration);
     }
 
     fn rewind(&mut self, _d: &MetalDevice, _t: &HybridModel, _len: usize) -> Result<()> {

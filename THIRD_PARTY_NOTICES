@@ -17,10 +17,17 @@ what changed:
   verify-width GEMMs on the matrix units, adapted from src/kernels/tensor/verify8t.metal (qmm8t_impl, qmm8t2_impl):
   integer codes as exact tensor_ops operands with an fp32 group epilogue, in 8-row tiles and 16-row tile pairs, and the
   T-table operand layout they read (from src/kernels/verify8.metal, v8t_input_of_slot).
+- src/hybrid/kflash.rs: KFlash's tree budget, adapted from src/model/kflash_budget.{h,cpp} (KfBudget, KfCosts: the
+  per-depth logistic calibration and its fit, the cost table, the E(n) - rate * cost(n) row rule, the cache file) and
+  src/kernels/kflash.h (kf_lcal, and kf_build_impl's E(n) and choice of rows).
 
 Ideas taken from Kapitsa's code and documentation without copying code, credited where they are used:
 
 - src/hybrid/mlx.rs: how MLX conversions of Qwen3.5-family checkpoints store their tensors (src/model/qwen35.cpp).
+- src/hybrid/speculative.rs, lattice_best_first: ranking lattice-tree nodes by calibrated path probability (KFlash's
+  kf_build); src/hybrid/session.rs: the per-cycle budget loop and its calibration records (kf_accept).
+- src/hybrid/draft.rs, DraftOptions::block and ::kflash: drafting DFlash2 with a 16-row block over a reduced head of
+  98,304 ids (src/model/dflash2.cpp, NI_DFLASH_BLOCK and NI_DFLASH_HEAD).
 - src/hybrid/engine.rs, HybridModel::project_mlx_tiles: the verify GEMMs' tiling rule (src/model/qwen35_v8.cpp,
   v8t_plan).
 

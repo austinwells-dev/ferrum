@@ -11,6 +11,7 @@ pub mod draft;
 pub mod engine;
 #[cfg(test)]
 mod iq_tests;
+pub mod kflash;
 pub mod lookup;
 pub mod mlx;
 #[cfg(test)]

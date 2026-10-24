@@ -321,3 +321,44 @@ routes to its own experts: MoE targets stay on 2-draft chains.
 DSpark as well as MTP; defaults are unchanged (chains unless
 `--draft-tree`). For a dense target, `--draft DFlash2 --draft-tree 15` is
 the recommended configuration; DSpark trees help prose only.
+
+## Experiment 7 — KFlash from Kapitsa: wide blocks, calibrated trees, a learned budget
+
+Ported from Kapitsa (Nace AI, Apache-2.0; `src/hybrid/kflash.rs`, see
+THIRD_PARTY_NOTICES): per-depth logistic calibration of the drafter's node
+probabilities, fitted online from every verified node whose parent was
+accepted; a cost table per verify row count; and each cycle verifying the
+allowed n (2, 4, 8, 12, 16, 24, 32 rows) that maximizes E(n) − rate·cost(n).
+Also from Kapitsa's DFlash2 defaults: a 16-row drafting block for a drafter
+trained on 8 (mask slots carry no per-position weights), and a draft head
+over the first 98,304 ids. Ferrum builds the tree on the host and measures
+cycles by wall time, where Kapitsa builds on the GPU and uses GPU time.
+
+DFlash2 on the MLX 4-bit 27B, prompts 4 and 3, 512 tokens:
+
+| Setup | tok/s | Per pass | Draft ms | Verify ms |
+|---|---|---|---|---|
+| block 8, tree 15 | 23.2 | 4.52 | 24.5 | 164.8 |
+| + 98,304-id head | 24.1 | 4.54 | 19.0 | 164.3 |
+| block 16, head, tree 15 | 24.3 | 4.75 | 23.7 | 166.2 |
+| block 16, head, auto (warm cache) | 24.5 | 4.87 | 23.7 | 169.5 |
+
+Over all 8 prompts (256 tokens), auto reaches 25.38 tok/s, 5.02 tokens per
+pass (the budget expected 5.03), against the 16-row chain's 20.97 and plain
+decoding's 7.74. Every output is identical to plain decoding and to the chain,
+and so is the strict-math run (`FERRUM_HYBRID_EXACT=1`, 2 prompts). The rule
+settles on 16 rows on 97% of cycles: 17 or more rows leave the pair kernel
+(275 ms against 189 ms). The fitted calibration shrinks the drafter's
+confidence past depth 1 (beta 0.6–0.9, alpha −0.3 to −1.1).
+
+On the Q4_K_XL GGUF (8 prompts, 256 tokens), the 16-row block with the
+reduced head lifts tree 15 from 18.18 to 19.31–19.77 tok/s (5.44 per pass
+against 5.08), and auto ties it (18.94–19.71). There, a 16-row check costs
+1.45× a 2-row one (270 ms against 187 ms), so 20% of cycles fall back to a
+single draft, which costs acceptance (5.12 per pass) about as much as it
+saves in verify time.
+
+**Decisions:** `--draft-tree auto` (KFlash, with the DFlash2 defaults above)
+is the recommended setup on MLX checkpoints; `--draft-block` and
+`--draft-vocab` are exposed for GGUF targets, where a fixed tree of 15 with
+both is as fast.

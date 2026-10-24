@@ -106,6 +106,8 @@ Drafters are loaded from Hugging Face checkpoints (or DFlash GGUF files) and qua
 
 **Draft trees.** With `--draft-tree N`, the drafter proposes a tree of up to N guesses instead of a chain, including its second and third choices where it is unsure, and the model checks the whole tree in the same single forward pass, keeping the longest path it agrees with. The MTP head keeps extending its likeliest guesses; DFlash, DFlash2 and DSpark build the tree from the candidates their one drafting pass already scores, at no extra drafting cost. Trees apply to greedy requests without repetition penalties (other requests keep chains), and the output is still the same as without speculation. On the dense 27B, `--draft mtp --draft-tree 15` accepts 4.0–4.2 tokens per pass against the 3-draft chain's 2.7–3.0, for 14.2–15.1 tok/s against 12.0–13.2 on a coding and a prose prompt (2.0–2.1× plain decoding); with the `z-lab/Qwen3.8-27B-DFlash2` drafter, trees of 15 reach 17.9–19.8 tok/s against its chain's 16.4–18.7, the fastest setup measured. DSpark trees help prose only (about +6%). Keep N at 15: 16 or more guesses push the check past 16 rows, where it costs about 60% more. On MoE targets keep chains: each guess routes to its own experts, so trees make the check slower than they save ([Phase 11 journal](phase11-journal.md)).
 
+**KFlash (`--draft-tree auto`).** Ported from [Kapitsa](https://github.com/nace-ai/kapitsa): DFlash2 drafts a 16-row block (15 guesses deep) over its first 98,304 token ids, the tree ranks guesses by a per-depth calibration of the drafter's probabilities learned from what the model accepted, and each cycle checks as many guesses as are expected to pay for their cost. On the MLX 4-bit 27B with its DFlash2 drafter this gives 25.4 tok/s over 8 prompts (3.3× plain decoding, against 2.7× for the chain). On the Q4_K_XL GGUF, `--draft-block 16 --draft-vocab 98304 --draft-tree 15` is as fast (19.3–19.8 tok/s, against 18.2 with the trained 8-row block).
+
 ```sh
 # The model's built-in MTP head
 ferrum-server --model swift.gguf --draft mtp
@@ -122,7 +124,9 @@ ferrum-cli --model tiel.gguf \
 |---|---|
 | `--draft mtp\|lookup\|DIR\|FILE` | Drafter to use (off by default): the MTP head, prompt lookup, a checkpoint directory or its Hugging Face cache entry, or a DFlash GGUF |
 | `--draft-max N` | Most tokens drafted per step, and the depth of draft trees (default: 3 for MTP and lookup, 7 for MTP with `--draft-tree`, the trained block size for dense targets, 2 for MoE targets) |
-| `--draft-tree N` | Draft trees of up to N guesses (1–31; 15 recommended) for greedy requests, instead of chains |
+| `--draft-tree N\|auto` | Draft trees of up to N guesses (1–31; 15 recommended) for greedy requests, instead of chains. `auto`: KFlash's budget picks each cycle's guesses (up to 31), learning the drafter's calibration and the check's cost as it runs (kept in `~/.cache/ferrum/kflash`); for DFlash2 it also defaults `--draft-block 16` and `--draft-vocab 98304` |
+| `--draft-block N` | DFlash/DFlash2: draft N rows per pass (N−1 guesses deep), wider than the drafter's trained block |
+| `--draft-vocab N` | Draft among the first N token ids only (the check still uses the full vocabulary) |
 | `--draft-tree-search best-first\|siblings` | How MTP grows trees: extending its likeliest guesses (default), or its chain plus each step's next-best guesses as leaves |
 | `--draft-quant q4_0\|q8_0` | Drafter weight precision (default `q4_0`) |
 | `--draft-context N` | Context slots for drafters without a sliding window (default 8192) |

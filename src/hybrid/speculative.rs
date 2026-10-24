@@ -2,6 +2,7 @@
 //! The generation loop that drives a drafter lives in `session`.
 #![forbid(unsafe_code)]
 use super::engine::{HybridModel, SpecGeometry};
+use super::kflash::Calibration;
 use crate::{MetalDevice, Result};
 
 /// A draft model that proposes tokens for the target to verify.
@@ -56,6 +57,9 @@ pub trait Drafter {
             max.min(budget),
         )?))
     }
+    /// The calibration lattice trees rank their nodes by (KFlash's budget
+    /// learns it from the cycles). Drafters without lattice trees ignore it.
+    fn set_calibration(&mut self, _calibration: &Calibration) {}
     /// The target sequence now ends at `len` (prefix reuse or reset).
     fn rewind(&mut self, d: &MetalDevice, target: &HybridModel, len: usize) -> Result<()>;
     /// Whether `rewind` accepts any length, not only snapshot positions, so an
@@ -74,10 +78,16 @@ pub trait Drafter {
 /// Drafts as a tree under the anchor: node i holds `tokens[i]` and follows
 /// node `parents[i]`, or the anchor when that is `None`. Parents come before
 /// their children.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DraftTree {
     pub tokens: Vec<u32>,
     pub parents: Vec<Option<usize>>,
+    /// Lattice trees (empty otherwise): each node's log-probability under the
+    /// drafter given its parent, and the calibrated log-probability of its
+    /// whole path (`kflash::Calibration`), non-increasing in node order, so
+    /// the first n nodes are the builder's best tree of n.
+    pub lq: Vec<f32>,
+    pub score: Vec<f32>,
 }
 
 impl DraftTree {
@@ -85,7 +95,23 @@ impl DraftTree {
         Self {
             tokens: tokens.to_vec(),
             parents: (0..tokens.len()).map(|i| i.checked_sub(1)).collect(),
+            ..Default::default()
         }
+    }
+    /// Keep the first `n` nodes (a tree, since parents come first).
+    pub fn truncate(&mut self, n: usize) {
+        self.tokens.truncate(n);
+        self.parents.truncate(n);
+        self.lq.truncate(n);
+        self.score.truncate(n);
+    }
+    /// Depth of each node (1: a child of the anchor).
+    pub fn depths(&self) -> Vec<usize> {
+        let mut depth = vec![0; self.len()];
+        for i in 0..self.len() {
+            depth[i] = self.parents[i].map_or(0, |p| depth[p]) + 1;
+        }
+        depth
     }
     pub fn len(&self) -> usize {
         self.tokens.len()
@@ -95,11 +121,7 @@ impl DraftTree {
     }
     /// Nodes on the longest root-to-leaf path.
     pub fn depth(&self) -> usize {
-        let mut depth = vec![0; self.len()];
-        for i in 0..self.len() {
-            depth[i] = self.parents[i].map_or(0, |p| depth[p]) + 1;
-        }
-        depth.into_iter().max().unwrap_or(0)
+        self.depths().into_iter().max().unwrap_or(0)
     }
     /// Append a node under `parent` (None: the anchor) and return its index.
     pub fn push(&mut self, token: u32, parent: Option<usize>) -> usize {
@@ -235,29 +257,32 @@ pub fn chain_with_siblings(
 /// depth i + 1, and `cond(i, prev)` their log-probabilities (aligned with
 /// `candidates[i]`) after `prev`, the parent's token (the anchor at depth 0).
 /// Nodes are taken best first by the probability of the whole path, the
-/// product of its conditionals; a node's children open when it is taken, so
-/// parents come before children. With conditionals that ignore `prev` the
-/// positions are independent.
+/// product of its conditionals, each mapped through `calibration` to the
+/// probability that the target accepts the node (Kapitsa's KFlash builder;
+/// the identity keeps the drafter's own); a node's children open when it is
+/// taken, so parents come before children. With conditionals that ignore
+/// `prev` the positions are independent.
 pub fn lattice_best_first(
     anchor: u32,
     candidates: &[Vec<u32>],
     budget: usize,
+    calibration: &Calibration,
     mut cond: impl FnMut(usize, u32) -> Vec<f64>,
 ) -> DraftTree {
     let mut tree = DraftTree::default();
-    // Frontier entries: (path log-probability, depth, candidate index, parent).
-    let mut frontier: Vec<(f64, usize, usize, Option<usize>)> = Vec::new();
-    let mut open = |frontier: &mut Vec<(f64, usize, usize, Option<usize>)>,
-                    depth: usize,
-                    prev: u32,
-                    parent: Option<usize>,
-                    base: f64| {
-        if depth < candidates.len() {
-            for (j, lp) in cond(depth, prev).into_iter().enumerate() {
-                frontier.push((base + lp, depth, j, parent));
+    // Frontier entries: (path log-probability, depth, candidate index,
+    // parent, own log q).
+    type Entry = (f64, usize, usize, Option<usize>, f64);
+    let mut frontier: Vec<Entry> = Vec::new();
+    let mut open =
+        |frontier: &mut Vec<Entry>, depth: usize, prev: u32, parent: Option<usize>, base: f64| {
+            if depth < candidates.len() {
+                for (j, lq) in cond(depth, prev).into_iter().enumerate() {
+                    let lp = calibration.log_p(depth + 1, lq);
+                    frontier.push((base + lp, depth, j, parent, lq));
+                }
             }
-        }
-    };
+        };
     open(&mut frontier, 0, anchor, None, 0.);
     while tree.len() < budget {
         // Likeliest first; ties to shallower nodes, then the drafter's ranking.
@@ -267,12 +292,14 @@ pub fn lattice_best_first(
         }) else {
             break;
         };
-        let (score, depth, j, parent) = frontier.swap_remove(best);
+        let (score, depth, j, parent, lq) = frontier.swap_remove(best);
         if score == f64::NEG_INFINITY {
             break;
         }
         let token = candidates[depth][j];
         let node = tree.push(token, parent);
+        tree.lq.push(lq as f32);
+        tree.score.push(score as f32);
         open(&mut frontier, depth + 1, token, Some(node), score);
     }
     tree
@@ -392,7 +419,7 @@ mod tests {
             _ => vec![ln(0.9), ln(0.1)],
         };
         // 5 (0.6), 7 under 5 (0.54), 6 (0.4), 7 under 6 (0.36).
-        let tree = lattice_best_first(1, &candidates, 4, independent);
+        let tree = lattice_best_first(1, &candidates, 4, &Calibration::default(), independent);
         assert_eq!(tree.tokens, vec![5, 7, 6, 7]);
         assert_eq!(tree.parents, vec![None, Some(0), None, Some(2)]);
         // Conditionals: after 6 the drafter is sure of 8; after 5 it splits.
@@ -403,16 +430,20 @@ mod tests {
             _ => unreachable!("only the anchor, 5 and 6 have children"),
         };
         // 5 (0.6), 6 (0.4), 8 under 6 (0.396), 7 under 5 (0.3), 8 under 5 (0.3).
-        let tree = lattice_best_first(1, &candidates, 5, conditional);
+        let tree = lattice_best_first(1, &candidates, 5, &Calibration::default(), conditional);
         assert_eq!(tree.tokens, vec![5, 6, 8, 7, 8]);
         assert_eq!(tree.parents, vec![None, None, Some(1), Some(0), Some(0)]);
         // The chain's next node can lose to a sibling of its first.
-        let tree = lattice_best_first(1, &candidates, 2, conditional);
+        let tree = lattice_best_first(1, &candidates, 2, &Calibration::default(), conditional);
         assert_eq!(tree.tokens, vec![5, 6]);
-        let chain = lattice_best_first(1, &candidates, 2, independent);
-        assert_eq!(chain, DraftTree::chain(&[5, 7]));
+        let chain = lattice_best_first(1, &candidates, 2, &Calibration::default(), independent);
+        let expected = DraftTree::chain(&[5, 7]);
+        assert_eq!(
+            (chain.tokens, chain.parents),
+            (expected.tokens, expected.parents)
+        );
         // Budget beyond the lattice: every path, parents first.
-        let tree = lattice_best_first(1, &candidates, 20, conditional);
+        let tree = lattice_best_first(1, &candidates, 20, &Calibration::default(), conditional);
         assert_eq!(tree.len(), 6);
         assert!(
             tree.parents
@@ -420,5 +451,8 @@ mod tests {
                 .enumerate()
                 .all(|(i, p)| p.is_none_or(|p| p < i))
         );
+        // Path scores fall in build order, so every prefix is a best tree.
+        assert!(tree.score.windows(2).all(|w| w[1] <= w[0]));
+        assert_eq!(tree.lq.len(), tree.len());
     }
 }

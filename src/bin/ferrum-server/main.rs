@@ -65,8 +65,12 @@ speculative decoding (lossless; off by default):
   --draft-max N             drafts per step, and draft-tree depth (default: 3 for MTP
                             and lookup, 7 for MTP trees; the trained block for dense
                             targets, 2 for MoE targets)
-  --draft-tree N            draft trees of up to N guesses for greedy requests
-                            (1-31; 15 recommended)
+  --draft-tree N|auto       draft trees of up to N guesses for greedy requests
+                            (1-31; 15 recommended); auto: KFlash picks the guesses
+                            per cycle, learned and cached (DFlash2: block 16,
+                            draft vocab 98304)
+  --draft-block N           DFlash/DFlash2: draft N rows per pass
+  --draft-vocab N           draft among the first N token ids
   --draft-tree-search best-first|siblings
                             how MTP grows trees (default best-first)
   --draft-quant q4_0|q8_0   draft weight precision (default q4_0)

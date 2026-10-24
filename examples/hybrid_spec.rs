@@ -3,9 +3,12 @@
 //!        [--tokens 256] [--context 8192] [--temp 0] [--baseline] [--prompts N]
 //!        [--only I,J]  (these prompt indices instead of the first N)
 //!        [--tree N]  (draft trees of N nodes; greedy only)
-//!        [--sweep 0,4,8,15]  (each tree budget in turn, 0 = chains, on one load)
+//!        [--sweep 0,4,8,15,auto]  (each tree budget in turn, 0 = chains, auto = the
+//!        KFlash budget up to --auto-nodes 31; --no-cache: start it afresh)
 //!        [--tree-search best-first|siblings]  (how MTP grows trees)
 //!        [--pmin P]  (DSpark confidence cut-off)
+//!        [--vocab N]  (draft among the first N token ids)
+//!        [--block N]  (DFlash drafting block rows, wider than trained)
 //!        [--depth N --filler FILE]  (generate after N tokens of FILE in the prompt)
 //!
 //! Each prompt is rendered with the model's chat template (thinking on) and
@@ -56,27 +59,39 @@ fn main() -> Result<()> {
     let depth: usize = get("--depth", "0").parse().expect("depth");
     let drafter_arg = get("--drafter", "mtp");
     let drafts: usize = get("--drafts", "0").parse().expect("drafts");
+    // Each configuration is a tree budget, or None for chains; "auto" is the
+    // KFlash budget (up to AUTO nodes, rows chosen per cycle).
+    const AUTO: usize = usize::MAX;
     let list = |key: &str| -> Option<Vec<usize>> {
         has(key).then(|| {
             get(key, "")
                 .split(',')
-                .map(|v| v.parse().expect("list of numbers"))
+                .map(|v| {
+                    if v == "auto" {
+                        AUTO
+                    } else {
+                        v.parse().expect("list of numbers")
+                    }
+                })
                 .collect()
         })
     };
-    // Each configuration is a tree budget, or None for chains.
     let configs: Vec<Option<usize>> = match list("--sweep") {
         Some(budgets) => budgets.iter().map(|&b| (b > 0).then_some(b)).collect(),
         None => vec![list("--tree").map(|b| b[0])],
     };
-    let widest = configs.iter().flatten().max().copied();
+    let auto_nodes: usize = get("--auto-nodes", "31").parse().expect("auto-nodes");
+    let nodes = |b: usize| if b == AUTO { auto_nodes } else { b };
+    let widest = configs.iter().flatten().map(|&b| nodes(b)).max();
     let spec = SpecOptions {
         source: DraftSource::parse(&drafter_arg),
         max_drafts: (drafts > 0).then_some(drafts),
         tree: widest,
+        tree_rule: false,
         draft: DraftOptions {
             confidence_min: get("--pmin", "0").parse().expect("pmin"),
             vocab: get("--vocab", "0").parse().ok().filter(|&v: &usize| v > 0),
+            block: get("--block", "0").parse().ok().filter(|&v: &usize| v > 0),
             quant: if get("--quant", "q4_0") == "q4_0" {
                 ferrum::hybrid::draft::DraftQuant::Q4_0
             } else {
@@ -125,7 +140,24 @@ fn main() -> Result<()> {
     } else {
         String::new()
     };
-    let label = |config: Option<usize>| config.map_or("chain".to_owned(), |b| format!("tree {b}"));
+    let label = |config: Option<usize>| match config {
+        None => "chain".to_owned(),
+        Some(AUTO) => format!("tree auto ({auto_nodes})"),
+        Some(b) => format!("tree {b}"),
+    };
+    // One KFlash budget across the prompts (as a server keeps it), parked
+    // while other configurations run; its cache key is the run's.
+    let mut rule = configs.contains(&Some(AUTO)).then(|| {
+        let key = ferrum::hybrid::runtime::tree_rule_key(
+            std::path::Path::new(&args[1]),
+            rt.session.drafter(),
+            &rt.device,
+        );
+        ferrum::hybrid::kflash::Budget::new(
+            (!has("--no-cache")).then_some(key.as_str()),
+            auto_nodes + 1,
+        )
+    });
     let selected: Vec<usize> =
         list("--only").unwrap_or_else(|| (0..prompts.min(PROMPTS.len())).collect());
     let (mut base_tokens, mut base_secs) = (0usize, 0f64);
@@ -176,9 +208,15 @@ fn main() -> Result<()> {
         for (c, &config) in configs.iter().enumerate() {
             if configs.len() > 1 || config.is_some() {
                 rt.session
-                    .set_tree_budget(&rt.device, &rt.loaded.model, config)?;
+                    .set_tree_budget(&rt.device, &rt.loaded.model, config.map(nodes))?;
+            }
+            if config == Some(AUTO) {
+                rt.session.swap_tree_rule(rule.take());
             }
             let (spec, secs) = run(&mut rt, true)?;
+            if config == Some(AUTO) {
+                rule = rt.session.swap_tree_rule(None);
+            }
             let stats = rt.session.spec_stats.clone();
             let mut line = format!(
                 "prompt {index} {}: {} tokens, {:.1} tok/s, acceptance {:.2} ({} steps)",
@@ -265,6 +303,9 @@ fn main() -> Result<()> {
             );
         }
         println!("{line}");
+    }
+    if let Some(rule) = &rule {
+        println!("{}", rule.summary());
     }
     Ok(())
 }

@@ -70,6 +70,24 @@ const LOOKUP_DRAFTS: usize = 3;
 /// Most draft-tree nodes: the verify takes the anchor plus at most 31 rows.
 const MAX_TREE_NODES: usize = 31;
 
+/// The KFlash budget's cache key: the model, the drafter and its block
+/// depth, and the chip (costs and calibration are each of these).
+pub fn tree_rule_key(
+    path: &Path,
+    drafter: Option<&dyn super::speculative::Drafter>,
+    device: &MetalDevice,
+) -> String {
+    // A checkpoint directory by its name (dots and all), a GGUF by its stem.
+    let name = if path.is_dir() {
+        path.file_name()
+    } else {
+        path.file_stem()
+    };
+    let model = name.map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+    let drafter = drafter.map_or_else(String::new, |d| format!("{}-k{}", d.name(), d.max_drafts()));
+    format!("{model}-{drafter}-{}", device.name())
+}
+
 /// Speculative decoding setup for `Runtime::load_speculative`.
 #[derive(Debug, Clone)]
 pub struct SpecOptions {
@@ -82,6 +100,9 @@ pub struct SpecOptions {
     /// Draft trees of at most this many nodes, for greedy generation (None:
     /// chains). Drafts per step bound the trees' depth.
     pub tree: Option<usize>,
+    /// Let KFlash's budget pick each cycle's tree rows within `tree` and
+    /// calibrate the drafter's lattice (`--draft-tree auto`).
+    pub tree_rule: bool,
     pub draft: DraftOptions,
 }
 
@@ -91,6 +112,7 @@ impl SpecOptions {
             source,
             max_drafts: None,
             tree: None,
+            tree_rule: false,
             draft: DraftOptions::default(),
         }
     }
@@ -98,8 +120,8 @@ impl SpecOptions {
     /// Apply one command-line flag shared by `ferrum-cli` and
     /// `ferrum-server`; returns false when `key` is not a draft flag.
     /// `--draft mtp|lookup|DIR|FILE.gguf` enables speculation; the others tune it:
-    /// `--draft-max N`, `--draft-tree N` (draft trees of N nodes for greedy
-    /// requests), `--draft-tree-search best-first|siblings` (how MTP grows
+    /// `--draft-max N`, `--draft-tree N|auto` (draft trees of N nodes for
+    /// greedy requests; auto: as many rows as pay each cycle, learned), `--draft-tree-search best-first|siblings` (how MTP grows
     /// them), `--draft-quant q8_0|q4_0`, `--draft-context N`
     /// (context slots for drafts without a sliding window) and
     /// `--draft-p-min P` (DSpark confidence cut-off).
@@ -111,6 +133,7 @@ impl SpecOptions {
             if let Some(p) = previous {
                 next.max_drafts = p.max_drafts;
                 next.tree = p.tree;
+                next.tree_rule = p.tree_rule;
                 next.draft = p.draft;
             }
             *spec = Some(next);
@@ -122,6 +145,11 @@ impl SpecOptions {
         let s = spec.get_or_insert_with(|| Self::new(DraftSource::Mtp));
         match key {
             "--draft-max" => s.max_drafts = Some(value.parse().map_err(|_| bad())?),
+            "--draft-tree" if value == "auto" => {
+                s.tree = Some(MAX_TREE_NODES);
+                s.tree_rule = true;
+                s.draft.kflash = true;
+            }
             "--draft-tree" => {
                 let budget: usize = value.parse().map_err(|_| bad())?;
                 if !(1..=MAX_TREE_NODES).contains(&budget) {
@@ -148,6 +176,7 @@ impl SpecOptions {
                 }
             }
             "--draft-vocab" => s.draft.vocab = Some(value.parse().map_err(|_| bad())?),
+            "--draft-block" => s.draft.block = Some(value.parse().map_err(|_| bad())?),
             _ => return Ok(false),
         }
         Ok(true)
@@ -461,6 +490,10 @@ impl Runtime {
             session.set_drafter(&device, &loaded.model, drafter)?;
             if spec.tree.is_some() {
                 session.set_tree_budget(&device, &loaded.model, spec.tree)?;
+            }
+            if spec.tree_rule {
+                let key = tree_rule_key(path, session.drafter(), &device);
+                session.set_tree_rule(true, Some(&key));
             }
             draft_loaded_bytes = device.allocated_bytes().saturating_sub(before);
         }
