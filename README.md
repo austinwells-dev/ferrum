@@ -13,12 +13,17 @@ Ferrum runs 27B–35B language models on a 32 GB Mac, at llama.cpp's speed on th
 
 You give it a model file and then either chat in the terminal, use the full-screen TUI (chat, a sandboxed coding agent, and a benchmarking tool), or run a local server that speaks the **OpenAI** and **Anthropic** APIs, so existing clients and coding agents work with it unchanged.
 
-> **Experimental.** Flint (unsloth's `flint-GGUF`) and Spark-X2.6-4B support is not production-ready: each is checked against llama.cpp on one quant only, their tool-call parsing is new, and the API they sit behind may change. The Qwen3.5-family models are unaffected. Details and known gaps: [docs/experimental.md](docs/experimental.md).
+> **Experimental.** Several recent additions are not production-ready, and their flags and behaviour may change:
+> - **Flint and Spark.** Flint (unsloth's `flint-GGUF`) and Spark-X2.6-4B are each checked against llama.cpp on one quant only, and their tool-call parsing is new.
+> - **MLX checkpoints.** MLX 4-bit Qwen3.5-family checkpoint directories load, but only the 27B is validated.
+> - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets, 16-row DFlash2 blocks, and sampled output identical to plain decoding.
+>
+> GGUF Qwen3.5-family models without these flags behave as before. Details and known gaps: [docs/experimental.md](docs/experimental.md).
 
 ## Highlights
 
 - **Competitive with llama.cpp on the same files.** Against llama.cpp build 11669 on an M5: 10–12% faster prefill and 2–6% faster decode on a dense 27B model; on a 35B mixture-of-experts, 3–5% faster decode and 2–7% slower prefill. [Numbers below](#performance).
-- **Lossless speculative decoding, up to 2.5× faster.** Supports MTP heads, DFlash/DFlash2 and DSpark drafters, and model-free prompt lookup, and MTP can draft trees of guesses (`--draft-tree`) that the model checks in one pass. Output is identical with and without speculation, sampled output too (for the same seed). On the dense 27B, Ferrum checks 8 drafted tokens for 1.4× the cost of one token, where llama.cpp pays 1.8×, so DFlash2 and DSpark blocks run 1.6–2.7× faster than in llama.cpp.
+- **Lossless speculative decoding, up to 3.3× faster.** Supports MTP heads, DFlash/DFlash2 and DSpark drafters, and model-free prompt lookup. Every drafter model can draft trees of guesses (`--draft-tree N`) that the model checks in one pass. With KFlash (`--draft-tree auto`, experimental, from Kapitsa), each step checks as many guesses as are expected to pay off, learned on your Mac. Output is identical with and without speculation, sampled output too (for the same seed). On the dense 27B, Ferrum checks 8 drafted tokens for 1.4× the cost of one token, where llama.cpp pays 1.8×, so DFlash2 and DSpark blocks run 1.6–2.7× faster than in llama.cpp.
 - **Plans memory before loading weights.** Every buffer is predicted from GGUF metadata, and Ferrum picks the largest context that fits: 101K tokens for the 27B model (190K with the optional 8-bit KV cache, `--kv-cache q8`), the full 262K for the 35B MoE. Predictions match Metal's own accounting to within a few MiB.
 - **Matches llama.cpp's output.** Mean KL divergence against llama.cpp's own logits is 1.2×10⁻⁴ on the 27B model, with the same top token at 99.5% of positions.
 - **Drop-in server.** OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`, tool calls, reasoning controls, image input, and conversation caching that only processes the new suffix of each request.
@@ -71,6 +76,13 @@ hf download peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP \
 hf download unsloth/flint-GGUF flint-UD-Q3_K_XL.gguf --local-dir ~/models
 ```
 
+**Experimental: MLX checkpoints.** A directory holding an MLX affine 4-bit (group 64) conversion of a dense Qwen3.5-family model loads directly: `config.json`, `model*.safetensors`, `tokenizer.json` and `chat_template.jinja`. The validated one is the Qwen3.8-27B 4-bit conversion that Kapitsa downloads (`kapitsa serve --model 27b`, LM Studio's community quant), together with the DFlash2 drafter stored beside it:
+
+```sh
+ferrum-server --model ~/.cache/kapitsa/models/qwen3.8-27b-4bit \
+  --draft ~/.cache/kapitsa/models/qwen3.8-27b-4bit/dflash2 --draft-tree auto
+```
+
 The MoE model is the better place to start because it decodes at about 40 tok/s. The TUI finds models on its own in `~/models`, `~/Downloads`, the Hugging Face cache and LM Studio's folder, and greys out any file Ferrum can't run, with the reason.
 
 ## Quick start
@@ -94,7 +106,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Write a haiku about Rust."}]}'
 ```
 
-To make generation faster, add a drafter. On the dense 27B, `--draft mtp` uses the prediction head inside the GGUF and needs no extra download (the MoE's MTP head routes to experts, which Ferrum does not support yet). On the MoE, use a DFlash2 drafter such as `jzinno/Ornith-1.5-35B-A3B-DFlash2`. See [speculative decoding](docs/server.md#speculative-decoding).
+To make generation faster, add a drafter. On the dense 27B, `--draft mtp` uses the prediction head inside the GGUF and needs no extra download (the MoE's MTP head routes to experts, which Ferrum does not support yet). A DFlash2 drafter with draft trees is faster still: `--draft <dir> --draft-tree 15`, or the experimental `--draft-tree auto`. On the MoE, use a DFlash2 drafter such as `jzinno/Ornith-1.5-35B-A3B-DFlash2` and keep chains. See [speculative decoding](docs/server.md#speculative-decoding).
 
 ## The TUI
 
@@ -103,7 +115,7 @@ To make generation faster, add a drafter. On the dense 27B, `--draft mtp` uses t
 - **Chat.** Streaming markdown, a separate reasoning view, file and image attachments, optional agent tools, and `/new` and `/resume` for saved sessions.
 - **Agents.** A local coding agent that works in a project folder. It can read, grep, edit, run commands and checks, search the web (DuckDuckGo, SearXNG, Brave or your own endpoint), load `SKILL.md` skills from the project and keep a plan, all inside a Seatbelt sandbox and with an approval mode you choose.
 - **Serve.** Starts `ferrum-server` and shows its endpoint, health and live log.
-- **Benchmark.** Finds the fastest drafter and draft depth for a model on *your* Mac. It checks that every candidate's output matches plain decoding, and that a drafter whose output drifts late still answers the same questions right, then saves the winner as a favorite. Switched to *intelligence*, it scores the model instead: math, knowledge, instruction-following and code-reading questions, plus tool calling, long-context recall and writing code that must pass tests. Switched to *agent*, the coding agent fixes ten real bugs from open-source repos, and the tab counts the fixes that pass the projects' tests and the tokens they cost, and compares saved results across models and settings.
+- **Benchmark.** Finds the fastest drafter, draft depth and draft tree (including KFlash) for a model on *your* Mac. It checks that every candidate's output matches plain decoding, and that a drafter whose output drifts late still answers the same questions right, then saves the winner as a favorite. Switched to *intelligence*, it scores the model instead: math, knowledge, instruction-following and code-reading questions, plus tool calling, long-context recall and writing code that must pass tests. Switched to *agent*, the coding agent fixes ten real bugs from open-source repos, and the tab counts the fixes that pass the projects' tests and the tokens they cost, and compares saved results across models and settings.
 - **Models.** Every GGUF found on this Mac in one table: quant, size, architecture, context, vision support, matching drafters and its best measured results. Files Ferrum can't run stay listed with the reason.
 - **Settings.** Model folders, favorites, the web search provider and startup options.
 
@@ -132,6 +144,17 @@ These are measured on a 32 GB Apple M5 in October 2026, with Ferrum and llama.cp
 | Tiel + `jzinno/Ornith-1.5-35B-A3B-DFlash2` (2 drafts) | **60.85** | 54.67 |
 
 Both engines accept the same share of drafts (within two points), so the differences are the cost of verifying them. One forward of 9 rows (8 drafts) costs Ferrum 1.36× a decode step and llama.cpp 1.82×; 17 rows cost 2.42× and 3.69×. At MTP's 4 rows llama.cpp is cheaper, 1.17× against Ferrum's 1.31×.
+
+**Against Kapitsa** (experimental KFlash port, October 2026). Same 4 chat prompts through each server, Qwen3.8-27B with its DFlash2 drafter, one slot. Kapitsa 0.2.16 runs its defaults; Ferrum runs `--draft-tree auto`.
+
+| Setup (tok/s) | Greedy | T 0.6 |
+|---|---|---|
+| Kapitsa (MLX 4-bit) | **22.3–31.3** | **22.3–25.8** |
+| Ferrum, the same MLX 4-bit checkpoint | 18.1–26.9 | 17.8–21.5 |
+| Ferrum, Q4_K_XL GGUF | 14.6–19.0 | 12.7–17.5 |
+| Plain decoding, Kapitsa / Ferrum (MLX) | 7.66–7.72 / 7.42–7.84 | |
+
+On MLX, Ferrum reaches 82–91% of Kapitsa greedy and 75–93% at T 0.6. Kapitsa drafts and builds its trees on the GPU, while Ferrum builds them on the CPU. The [Phase 11 journal](docs/phase11-journal.md) breaks the gap down.
 
 Accuracy is measured as KL divergence over llama-perplexity's text chunks: on Swift, Ferrum matches llama.cpp to a mean KLD of 1.2×10⁻⁴ (99.5% same top token); on Tiel, both are about as close to a high-precision Ferrum reference (0.0074 for Ferrum, 0.0068 for llama.cpp). Small models (under 1B) ran at 0.6–1.0× llama.cpp's speed when last measured (Phase 7), because fixed per-kernel overhead dominates at that size. Full methodology and raw logs are in the [engineering journals](docs/README.md) and [docs/measurements/verification-2026-10](docs/measurements/verification-2026-10/README.md).
 
@@ -193,14 +216,14 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | [Development](docs/development.md) | Building, testing (including Metal validation layers), profiling, using Ferrum as a library |
 | [Architecture](docs/architecture.md) | Tensor and storage model, Metal backend, safety argument, the hybrid engine |
 | [Vision](docs/vision.md) | How image input is encoded and positioned |
-| [Experimental](docs/experimental.md) | Flint and Spark support: status, validation numbers, known gaps |
+| [Experimental](docs/experimental.md) | Flint, Spark, MLX checkpoints and KFlash: status, validation numbers, known gaps |
 | [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
 
 ## Limitations
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - One request at a time (batch size 1).
-- The server and TUI run Qwen3.5-family hybrids and, experimentally, Flint and Spark. Other architectures go through the developer runner.
+- The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint and Spark. Other architectures go through the developer runner.
 - Vision supports the Qwen3-VL projector only (no video).
 - No training and no language bindings.
 

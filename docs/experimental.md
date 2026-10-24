@@ -1,6 +1,8 @@
-# Experimental: Flint and Spark
+# Experimental: Flint, Spark, MLX checkpoints and KFlash
 
-> **Experimental.** This page covers Flint and Spark support. It is not production-ready. Expect rough edges, and expect the behaviour and the parsing to change.
+> **Experimental.** This page covers Flint and Spark support, MLX 4-bit checkpoints, and KFlash speculative decoding (ported from Kapitsa). None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
+
+Contents: [Flint](#what-works) · [Spark-X2.6-4B](#spark-x26-4b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding)
 
 ## What works
 
@@ -66,3 +68,55 @@ XHToken's `spark2_5` architecture: a 4.4B dense model with attention on all 36 l
 - Tool calls use Flint's `<arg_key>`/`<arg_value>` format and go through the same parser. A weather-tool request through `ferrum-server` returns a call with schema-typed arguments; broader tool use is untested.
 - `reasoning_effort` (`low`/`high`) is passed through to the template; the 1M trained context is capped by the memory plan.
 - No trained drafter (MTP, DFlash, DSpark) exists for Spark. Prompt lookup (`--draft lookup`, "Prompt lookup" in the TUI) works and is lossless: 1.13× on the `hybrid_spec` chat prompts (35.8 → 40.4 tok/s). Plain decode already reads weights at about 81% of the M5's measured bandwidth ceiling.
+
+# MLX 4-bit checkpoints
+
+A directory holding an MLX affine 4-bit (group 64) conversion of a dense Qwen3.5-family model loads in `ferrum-cli`, `ferrum-server` and `ferrum-tui`, with no conversion step. The directory needs `config.json`, `model*.safetensors`, `tokenizer.json` and `chat_template.jinja`, and `generation_config.json` gives the default sampling. The decode GEMV and the verify-width GEMMs (integer codes on the matrix units) are adapted from [Kapitsa](https://github.com/nace-ai/kapitsa); those files are Apache-2.0 only ([THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES)).
+
+## Validation
+
+The Qwen3.8-27B 4-bit conversion that Kapitsa downloads (`~/.cache/kapitsa/models/qwen3.8-27b-4bit`), on a 32 GB M5:
+
+| Check | Result |
+|---|---|
+| Greedy text vs Kapitsa's plain decoding | identical, except one newline at a boundary |
+| Every projection band (1–130 rows) vs a CPU dequantization (`mlx_tests`) | within 1×10⁻⁴ relative (1–2 rows), 2×10⁻³ (F16-input tiles) |
+| Plain decode, same prompts through each server | Ferrum 7.42–7.84 tok/s, Kapitsa 7.66–7.72 |
+
+## Known gaps
+
+- One checkpoint is validated. MLX MoE checkpoints, bit widths other than 4, and group sizes other than 64 are refused at load.
+- The MTP drafter reads the NextN block of a GGUF, so it is unavailable on MLX checkpoints. DFlash, DFlash2 and DSpark drafters work.
+- The decode GEMV streams at about 94% of this Mac's measured read bandwidth; Kapitsa's fused norm, gate and up GEMVs (`qmvf`) were not ported, since they could save only about 3 ms per token.
+
+# KFlash speculative decoding
+
+`--draft-tree auto` (the TUI's *Draft tree* `auto`) turns on KFlash, ported from Kapitsa (Nace AI, Apache-2.0; `src/hybrid/kflash.rs`):
+
+- **Calibrated trees.** The drafter's node probabilities are mapped to the probability that the model accepts them, per depth. The fit is learned online from every verified node whose parent was accepted, and trees are built best first by that calibrated path probability.
+- **A learned budget.** Each step verifies the number of rows (2, 4, 8, 12, 16, 24 or 32) that maximizes the expected tokens minus the recent token rate times that row count's measured cost. Costs and calibration are cached per model, drafter and chip in `~/.cache/ferrum/kflash`, so the first run spends some cycles exploring.
+- **Kapitsa's DFlash2 defaults.** A 16-row drafting block for a drafter trained on 8 (`--draft-block 16`), over the first 98,304 token ids (`--draft-vocab 98304`). Both can be set by hand for fixed trees too.
+- **Exact sampled speculation**, for every speculative request, not only KFlash. Each token is drawn with a uniform keyed by the seed and its position, and a draft is kept only when it equals its own draw. Sampled output is then plain sampling's for the same seed, and trees apply to sampled requests too. This changes which text a given seed produces, not its distribution.
+
+## Validation
+
+MLX 4-bit 27B with its DFlash2 drafter, `hybrid_spec`, 8 chat prompts × 256 tokens:
+
+| Check | Result |
+|---|---|
+| Greedy, default kernels | 25.4 tok/s (3.28× plain; the chain 2.71×); every output identical to plain decoding and to the chain |
+| Greedy, `FERRUM_HYBRID_EXACT=1` | identical |
+| T 0.6, default kernels | 22.8 tok/s (2.95× plain); 5 of 8 identical to plain sampling, 3 part at single tokens |
+| T 0.6, `FERRUM_HYBRID_EXACT=1`, the 3 that parted | identical: rounding, not the acceptance rule (one draw fell 0.001 from a token edge) |
+| Budget's expected tokens per step vs measured | 5.03 vs 5.02 |
+
+Against Kapitsa through each server (same prompts): 82–91% of its greedy speed and 75–93% at T 0.6 on the same MLX checkpoint ([README](../README.md#performance), [Phase 11 journal](phase11-journal.md)).
+
+## Known gaps
+
+- On the Q4_K_XL GGUF, `auto` is 3–5% behind `--draft-block 16 --draft-vocab 98304 --draft-tree 15`: Q4_K verifies make 2-row steps look cheap. Use the fixed tree there.
+- Ferrum builds trees on the CPU from the drafter's candidates read back each step, about 5 ms a cycle. Kapitsa builds them on the GPU, and that is most of the remaining gap.
+- Cycle costs are wall time, not GPU time, so a busy GPU or a hot Mac moves the learned table; a row count's first cycle in a process (pipeline builds) is left out.
+- MoE targets keep chains: every tree row routes to its own experts. Kapitsa's dynamic MoE trees were not ported.
+- Prompt lookup's trees stay a test vehicle and are not offered by the TUI.
+
