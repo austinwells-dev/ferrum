@@ -16,8 +16,9 @@ pub trait Drafter {
     fn geometry(&self) -> SpecGeometry;
     /// Most drafts one step can propose.
     fn max_drafts(&self) -> usize;
-    /// Rows `0..tokens.len()` of the target's last forward are committed at
-    /// positions `pos..`.
+    /// Rows `0..tokens.len()` of the target's last forward (after
+    /// `commit_path`, the accepted path's rows) are committed at positions
+    /// `pos..`.
     fn ingest(
         &mut self,
         d: &MetalDevice,
@@ -35,6 +36,26 @@ pub trait Drafter {
         anchor: u32,
         max: usize,
     ) -> Result<Vec<u32>>;
+    /// Propose a draft tree of at most `budget` nodes, at most `max` deep,
+    /// under `anchor` (greedy verify only). By default, the chain `draft`
+    /// proposes.
+    fn draft_tree(
+        &mut self,
+        d: &MetalDevice,
+        target: &HybridModel,
+        pos: usize,
+        anchor: u32,
+        max: usize,
+        budget: usize,
+    ) -> Result<DraftTree> {
+        Ok(DraftTree::chain(&self.draft(
+            d,
+            target,
+            pos,
+            anchor,
+            max.min(budget),
+        )?))
+    }
     /// The target sequence now ends at `len` (prefix reuse or reset).
     fn rewind(&mut self, d: &MetalDevice, target: &HybridModel, len: usize) -> Result<()>;
     /// Whether `rewind` accepts any length, not only snapshot positions, so an
@@ -50,6 +71,165 @@ pub trait Drafter {
     fn name(&self) -> &str;
 }
 
+/// Drafts as a tree under the anchor: node i holds `tokens[i]` and follows
+/// node `parents[i]`, or the anchor when that is `None`. Parents come before
+/// their children.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DraftTree {
+    pub tokens: Vec<u32>,
+    pub parents: Vec<Option<usize>>,
+}
+
+impl DraftTree {
+    pub fn chain(tokens: &[u32]) -> Self {
+        Self {
+            tokens: tokens.to_vec(),
+            parents: (0..tokens.len()).map(|i| i.checked_sub(1)).collect(),
+        }
+    }
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+    /// Nodes on the longest root-to-leaf path.
+    pub fn depth(&self) -> usize {
+        let mut depth = vec![0; self.len()];
+        for i in 0..self.len() {
+            depth[i] = self.parents[i].map_or(0, |p| depth[p]) + 1;
+        }
+        depth.into_iter().max().unwrap_or(0)
+    }
+    /// Append a node under `parent` (None: the anchor) and return its index.
+    pub fn push(&mut self, token: u32, parent: Option<usize>) -> usize {
+        self.tokens.push(token);
+        self.parents.push(parent);
+        self.tokens.len() - 1
+    }
+    /// The child of `parent` holding `token`.
+    pub fn child(&self, parent: Option<usize>, token: u32) -> Option<usize> {
+        (0..self.len()).find(|&i| self.parents[i] == parent && self.tokens[i] == token)
+    }
+    /// Verify rows: the anchor at row 0, node i at row i + 1, and each row's
+    /// parent row.
+    pub fn rows(&self, anchor: u32) -> (Vec<u32>, Vec<Option<usize>>) {
+        let mut tokens = vec![anchor];
+        tokens.extend(&self.tokens);
+        let mut parents = vec![None];
+        parents.extend(self.parents.iter().map(|p| Some(p.map_or(0, |p| p + 1))));
+        (tokens, parents)
+    }
+}
+
+/// Greedy accept walk over a verified tree: from the anchor, follow the
+/// child whose token is the target's choice at its parent's row. Returns the
+/// verify rows of the accepted path (starting at the anchor's 0) and the
+/// target's token after it. `targets[r]` is the target's token at row r.
+pub fn accept_walk(tree: &DraftTree, targets: &[u32]) -> (Vec<usize>, u32) {
+    let mut path = vec![0];
+    let mut node = None;
+    while let Some(next) = tree.child(node, targets[*path.last().expect("root")]) {
+        path.push(next + 1);
+        node = Some(next);
+    }
+    let bonus = targets[*path.last().expect("root")];
+    (path, bonus)
+}
+
+/// Natural log-probabilities of `candidates` (logits of the top tokens),
+/// normalized over the candidates themselves: an approximation, since the
+/// tail of the vocabulary is missing, that only shapes trees.
+fn log_softmax(candidates: &[(u32, f32)]) -> Vec<(u32, f64)> {
+    let max = candidates
+        .iter()
+        .fold(f64::NEG_INFINITY, |m, c| m.max(f64::from(c.1)));
+    let total: f64 = candidates
+        .iter()
+        .map(|c| (f64::from(c.1) - max).exp())
+        .sum();
+    let lse = max + total.ln();
+    candidates
+        .iter()
+        .map(|&(t, l)| (t, f64::from(l) - lse))
+        .collect()
+}
+
+/// A draft tree of at most `budget` nodes from a drafter's chain and its
+/// next-best guesses: `chain[i]` is the drafter's pick at depth i + 1, and
+/// `candidates[i]` that step's top tokens with their logits. The chain
+/// continues only through its own picks, so alternatives are leaves (a
+/// sibling of `chain[i]`). Nodes are taken best first by the drafter's
+/// probability of the whole path to them, with at most `siblings`
+/// alternatives per depth.
+pub fn chain_with_siblings(
+    chain: &[u32],
+    candidates: &[Vec<(u32, f32)>],
+    budget: usize,
+    siblings: usize,
+) -> DraftTree {
+    // Per depth: log-probability of the chain's pick, and the alternatives best first.
+    let steps: Vec<(f64, Vec<(u32, f64)>)> = chain
+        .iter()
+        .zip(candidates)
+        .map(|(&pick, cands)| {
+            let mut probs = log_softmax(cands);
+            probs.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            let own = probs
+                .iter()
+                .find(|c| c.0 == pick)
+                .map_or(f64::NEG_INFINITY, |c| c.1);
+            let alternatives = probs
+                .into_iter()
+                .filter(|c| c.0 != pick)
+                .take(siblings)
+                .collect();
+            (own, alternatives)
+        })
+        .collect();
+    let mut tree = DraftTree::default();
+    // Frontier entries: (path log-probability, depth, alternative rank or
+    // None for the chain's pick). The chain node at depth i heads depth i + 1.
+    let mut frontier: Vec<(f64, usize, Option<usize>)> = Vec::new();
+    let mut chain_node: Vec<usize> = Vec::new();
+    let open = |frontier: &mut Vec<(f64, usize, Option<usize>)>, depth: usize, base: f64| {
+        if let Some((own, alternatives)) = steps.get(depth) {
+            frontier.push((base + own, depth, None));
+            for (rank, alt) in alternatives.iter().enumerate() {
+                frontier.push((base + alt.1, depth, Some(rank)));
+            }
+        }
+    };
+    open(&mut frontier, 0, 0.);
+    while tree.len() < budget {
+        // Best first; ties go to the chain, then to shallower and better-ranked nodes.
+        let Some(best) = (0..frontier.len()).max_by(|&a, &b| {
+            let (x, y) = (frontier[a], frontier[b]);
+            x.0.total_cmp(&y.0)
+                .then(y.2.is_some().cmp(&x.2.is_some()))
+                .then(y.1.cmp(&x.1))
+                .then(y.2.cmp(&x.2))
+        }) else {
+            break;
+        };
+        let (score, depth, rank) = frontier.swap_remove(best);
+        if score == f64::NEG_INFINITY {
+            break;
+        }
+        let parent = depth.checked_sub(1).map(|p| chain_node[p]);
+        match rank {
+            None => {
+                chain_node.push(tree.push(chain[depth], parent));
+                open(&mut frontier, depth + 1, score);
+            }
+            Some(r) => {
+                tree.push(steps[depth].1[r].0, parent);
+            }
+        }
+    }
+    tree
+}
+
 /// Acceptance statistics of one generation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpecStats {
@@ -59,7 +239,7 @@ pub struct SpecStats {
     pub drafted: usize,
     /// Draft tokens accepted.
     pub accepted: usize,
-    /// Accepted drafts by position in the block.
+    /// Accepted drafts by position in the block (depth in a tree).
     pub accepted_at: Vec<usize>,
     /// Seconds spent drafting and verifying.
     pub draft_seconds: f64,
@@ -74,15 +254,82 @@ impl SpecStats {
         }
         (self.accepted + self.steps) as f64 / self.steps as f64
     }
-    pub(crate) fn record(&mut self, drafted: usize, accepted: usize) {
+    /// One verify of `drafted` drafts at most `depth` deep (`drafted` for a
+    /// chain), of which `accepted` were kept.
+    pub(crate) fn record(&mut self, drafted: usize, depth: usize, accepted: usize) {
         self.steps += 1;
         self.drafted += drafted;
         self.accepted += accepted;
-        if self.accepted_at.len() < drafted {
-            self.accepted_at.resize(drafted, 0);
+        if self.accepted_at.len() < depth {
+            self.accepted_at.resize(depth, 0);
         }
         for slot in &mut self.accepted_at[..accepted] {
             *slot += 1;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accept_walk_follows_the_targets_choices() {
+        // anchor -> a(0) -> b(2); anchor -> c(1); a -> d(3)
+        let mut tree = DraftTree::default();
+        let a = tree.push(10, None);
+        let c = tree.push(11, None);
+        let b = tree.push(12, Some(a));
+        tree.push(13, Some(a));
+        assert_eq!((a, c, b), (0, 1, 2));
+        let (tokens, parents) = tree.rows(99);
+        assert_eq!(tokens, vec![99, 10, 11, 12, 13]);
+        assert_eq!(parents, vec![None, Some(0), Some(0), Some(1), Some(1)]);
+        // Target picks 10 after the anchor, 12 after a, then 7 after b.
+        assert_eq!(accept_walk(&tree, &[10, 12, 0, 7, 0]), (vec![0, 1, 3], 7));
+        // A sibling: 11 after the anchor, then 5.
+        assert_eq!(accept_walk(&tree, &[11, 0, 5, 0, 0]), (vec![0, 2], 5));
+        // Nothing accepted: the bonus is the anchor row's choice.
+        assert_eq!(accept_walk(&tree, &[42, 0, 0, 0, 0]), (vec![0], 42));
+        // A chain tree accepts exactly the matching prefix.
+        assert_eq!(tree.depth(), 2);
+        let chain = DraftTree::chain(&[1, 2, 3]);
+        assert_eq!(chain.parents, vec![None, Some(0), Some(1)]);
+        assert_eq!(chain.depth(), 3);
+        assert_eq!(accept_walk(&chain, &[1, 2, 9, 9]), (vec![0, 1, 2], 9));
+    }
+
+    #[test]
+    fn siblings_join_where_the_drafter_is_unsure() {
+        // Depth 1 is a coin flip between 5 and 6, depth 2 is sure (7), depth 3
+        // splits 8 / 9 at 60 / 40.
+        let ln = |p: f64| p.ln() as f32;
+        let chain = [5, 7, 8];
+        let candidates = vec![
+            vec![(5, ln(0.5)), (6, ln(0.5))],
+            vec![(7, ln(0.98)), (1, ln(0.02))],
+            vec![(8, ln(0.6)), (9, ln(0.4))],
+        ];
+        // 5 (0.5), 6 (0.5), 7 (0.49), 8 (0.294), 9 (0.196), 1 (0.01).
+        let tree = chain_with_siblings(&chain, &candidates, 5, 2);
+        assert_eq!(tree.tokens, vec![5, 6, 7, 8, 9]);
+        assert_eq!(tree.parents, vec![None, None, Some(0), Some(2), Some(2)]);
+        // A budget of the chain's length when the chain is likeliest.
+        let tree = chain_with_siblings(&chain, &candidates, 3, 2);
+        assert_eq!(tree.tokens, vec![5, 6, 7]);
+        // No siblings allowed: the chain itself.
+        assert_eq!(
+            chain_with_siblings(&chain, &candidates, 8, 0),
+            DraftTree::chain(&chain)
+        );
+        // Budget beyond every candidate: all of them, parents first.
+        let tree = chain_with_siblings(&chain, &candidates, 20, 2);
+        assert_eq!(tree.len(), 6);
+        assert!(
+            tree.parents
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.is_none_or(|p| p < i))
+        );
     }
 }

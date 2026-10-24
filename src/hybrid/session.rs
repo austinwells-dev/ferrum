@@ -6,7 +6,7 @@ use super::{
     engine::{
         HybridModel, HybridState, ImageSpan, Output, Penalties, Produced, RowOutput, RowsProduced,
     },
-    speculative::{Drafter, SpecStats},
+    speculative::{DraftTree, Drafter, SpecStats, accept_walk},
 };
 use crate::{DType, Error, MetalDevice, Result, Tensor};
 use rand::{Rng, SeedableRng};
@@ -177,6 +177,9 @@ pub struct Session {
     pub depth_cap: Option<usize>,
     /// The drafter must rewind to this length before its next use.
     drafter_rewind: Option<usize>,
+    /// Draft trees of at most this many nodes instead of chains (see
+    /// `set_tree_budget`).
+    tree_budget: Option<usize>,
     /// Acceptance statistics of the latest generation.
     pub spec_stats: SpecStats,
     /// Images of the next prompt, taken by the next `prefill`/`generate`.
@@ -214,6 +217,7 @@ impl Session {
             speculate: false,
             depth_cap: None,
             drafter_rewind: None,
+            tree_budget: None,
             spec_stats: SpecStats::default(),
             pending_media: Vec::new(),
         })
@@ -244,6 +248,39 @@ impl Session {
 
     pub fn drafter(&self) -> Option<&dyn Drafter> {
         self.drafter.as_deref()
+    }
+
+    /// Draft trees of up to `budget` nodes instead of chains (None: chains).
+    /// Trees apply to greedy generation without penalties; sampling keeps
+    /// chains. Widens the target's verify buffers to `budget + 1` rows and
+    /// clears the session.
+    pub fn set_tree_budget(
+        &mut self,
+        d: &MetalDevice,
+        model: &HybridModel,
+        budget: Option<usize>,
+    ) -> Result<()> {
+        let drafter = self
+            .drafter
+            .as_ref()
+            .ok_or_else(|| Error::Parameter("a draft tree needs a drafter".into()))?;
+        let mut geometry = drafter.geometry();
+        if let Some(budget) = budget {
+            if budget == 0 {
+                return Err(Error::Parameter(
+                    "a draft tree needs at least one node".into(),
+                ));
+            }
+            geometry.rows = geometry.rows.max(budget + 1);
+        }
+        model.enable_speculation(d, &geometry)?;
+        self.tree_budget = budget;
+        self.reset();
+        Ok(())
+    }
+
+    pub fn tree_budget(&self) -> Option<usize> {
+        self.tree_budget
     }
 
     /// Apply a pending drafter rewind.
@@ -548,15 +585,22 @@ impl Session {
             } else {
                 0
             };
+            let tree_budget = self
+                .tree_budget
+                .filter(|_| k > 0 && !params.uses_candidates())
+                .map(|b| b.min(room));
             let drafts = if k > 0 {
                 let t0 = Instant::now();
                 let pos = self.state.len();
                 let drafter = self.drafter.as_mut().expect("speculate implies a drafter");
-                let drafts = drafter.draft(d, model, pos, next, k)?;
+                let drafts = match tree_budget {
+                    Some(budget) => drafter.draft_tree(d, model, pos, next, k, budget)?,
+                    None => DraftTree::chain(&drafter.draft(d, model, pos, next, k)?),
+                };
                 self.spec_stats.draft_seconds += t0.elapsed().as_secs_f64();
                 drafts
             } else {
-                Vec::new()
+                DraftTree::default()
             };
             if drafts.is_empty() {
                 let produced = self.step(d, model, &feed, output(&generated))?;
@@ -565,30 +609,46 @@ impl Session {
                 continue;
             }
             let t0 = Instant::now();
-            let mut rows = vec![next];
-            rows.extend_from_slice(&drafts);
-            let row_output = if params.uses_candidates() {
-                let mut seen = generated.clone();
-                let mut per_row = Vec::with_capacity(rows.len());
-                for i in 0..rows.len() {
-                    if i > 0 {
-                        seen.push(drafts[i - 1]);
-                    }
-                    per_row.push(penalties(params, &seen));
-                }
-                RowOutput::Candidates(per_row)
+            let (rows, parents) = drafts.rows(next);
+            // The accepted path (verify rows from the anchor's 0) and the
+            // target's token after it.
+            let (path, bonus) = if tree_budget.is_some() {
+                let RowsProduced::Tokens(targets) =
+                    model.verify_tree(d, &mut self.state, &rows, &parents, RowOutput::Argmax)?
+                else {
+                    unreachable!("greedy verify returns tokens")
+                };
+                accept_walk(&drafts, &targets)
             } else {
-                RowOutput::Argmax
+                let row_output = if params.uses_candidates() {
+                    let mut seen = generated.clone();
+                    let per_row = rows
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &token)| {
+                            if i > 0 {
+                                seen.push(token);
+                            }
+                            penalties(params, &seen)
+                        })
+                        .collect();
+                    RowOutput::Candidates(per_row)
+                } else {
+                    RowOutput::Argmax
+                };
+                let verified = model.verify(d, &mut self.state, &rows, row_output)?;
+                let (accepted, bonus) = accept(verified, &drafts.tokens, params, &mut rng)?;
+                ((0..=accepted).collect(), bonus)
             };
-            let verified = model.verify(d, &mut self.state, &rows, row_output)?;
-            let (accepted, bonus) = accept(verified, &drafts, params, &mut rng)?;
             self.spec_stats.verify_seconds += t0.elapsed().as_secs_f64();
-            self.spec_stats.record(drafts.len(), accepted);
+            self.spec_stats
+                .record(drafts.len(), drafts.depth(), path.len() - 1);
             // Emit the accepted drafts one by one; the anchor row is always kept.
             let mut keep = 1;
             let mut stopped = None;
             let mut inject = None;
-            for &token in &drafts[..accepted] {
+            for &row in &path[1..] {
+                let token = rows[row];
                 if eos.contains(&token) {
                     stopped = Some(StopReason::Eos);
                     break;
@@ -612,10 +672,11 @@ impl Session {
                 keep += 1;
             }
             let pos = self.state.len();
-            model.commit(d, &mut self.state, keep)?;
-            self.tokens.extend_from_slice(&rows[..keep]);
+            let kept: Vec<u32> = path[..keep].iter().map(|&r| rows[r]).collect();
+            model.commit_path(d, &mut self.state, &path[..keep])?;
+            self.tokens.extend_from_slice(&kept);
             if let Some(drafter) = self.drafter.as_mut() {
-                drafter.ingest(d, model, pos, &rows[..keep])?;
+                drafter.ingest(d, model, pos, &kept)?;
             }
             if let Some(reason) = stopped {
                 break 'generation reason;

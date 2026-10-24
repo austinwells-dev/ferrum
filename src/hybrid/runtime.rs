@@ -67,6 +67,8 @@ impl DraftSource {
 
 /// Default prompt-lookup drafts per step (`--draft-max` overrides).
 const LOOKUP_DRAFTS: usize = 3;
+/// Most draft-tree nodes: the verify takes the anchor plus at most 31 rows.
+const MAX_TREE_NODES: usize = 31;
 
 /// Speculative decoding setup for `Runtime::load_speculative`.
 #[derive(Debug, Clone)]
@@ -76,6 +78,9 @@ pub struct SpecOptions {
     /// targets and 2 for MoE targets, whose verify cost grows with the
     /// number of distinct experts).
     pub max_drafts: Option<usize>,
+    /// Draft trees of at most this many nodes, for greedy generation (None:
+    /// chains). Drafts per step bound the trees' depth.
+    pub tree: Option<usize>,
     pub draft: DraftOptions,
 }
 
@@ -84,6 +89,7 @@ impl SpecOptions {
         Self {
             source,
             max_drafts: None,
+            tree: None,
             draft: DraftOptions::default(),
         }
     }
@@ -91,7 +97,8 @@ impl SpecOptions {
     /// Apply one command-line flag shared by `ferrum-cli` and
     /// `ferrum-server`; returns false when `key` is not a draft flag.
     /// `--draft mtp|lookup|DIR|FILE.gguf` enables speculation; the others tune it:
-    /// `--draft-max N`, `--draft-quant q8_0|q4_0`, `--draft-context N`
+    /// `--draft-max N`, `--draft-tree N` (draft trees of N nodes for greedy
+    /// requests), `--draft-quant q8_0|q4_0`, `--draft-context N`
     /// (context slots for drafts without a sliding window) and
     /// `--draft-p-min P` (DSpark confidence cut-off).
     pub fn apply_flag(spec: &mut Option<Self>, key: &str, value: &str) -> Result<bool> {
@@ -101,6 +108,7 @@ impl SpecOptions {
             let mut next = Self::new(DraftSource::parse(value));
             if let Some(p) = previous {
                 next.max_drafts = p.max_drafts;
+                next.tree = p.tree;
                 next.draft = p.draft;
             }
             *spec = Some(next);
@@ -112,6 +120,15 @@ impl SpecOptions {
         let s = spec.get_or_insert_with(|| Self::new(DraftSource::Mtp));
         match key {
             "--draft-max" => s.max_drafts = Some(value.parse().map_err(|_| bad())?),
+            "--draft-tree" => {
+                let budget: usize = value.parse().map_err(|_| bad())?;
+                if !(1..=MAX_TREE_NODES).contains(&budget) {
+                    return Err(Error::Parameter(format!(
+                        "--draft-tree takes 1..={MAX_TREE_NODES} nodes"
+                    )));
+                }
+                s.tree = Some(budget);
+            }
             "--draft-quant" => {
                 s.draft.quant = match value.to_ascii_lowercase().as_str() {
                     "q8_0" => DraftQuant::Q8_0,
@@ -137,6 +154,12 @@ impl SpecOptions {
             })
     }
 
+    /// Verify rows for `drafts` per step: the anchor plus the drafts, or the
+    /// tree's nodes if wider.
+    fn verify_rows(&self, drafts: usize) -> usize {
+        drafts.max(self.tree.unwrap_or(0)) + 1
+    }
+
     /// Memory the drafter will take next to `target`, before loading.
     pub fn memory(
         &self,
@@ -148,7 +171,7 @@ impl SpecOptions {
             DraftSource::Mtp => {
                 let k = self.drafts(target, 3);
                 let geometry = SpecGeometry {
-                    rows: k + 1,
+                    rows: self.verify_rows(k),
                     aux_layers: Vec::new(),
                     final_hidden: true,
                 };
@@ -163,7 +186,7 @@ impl SpecOptions {
             }
             DraftSource::Lookup => {
                 let geometry = SpecGeometry {
-                    rows: self.drafts(target, LOOKUP_DRAFTS) + 1,
+                    rows: self.verify_rows(self.drafts(target, LOOKUP_DRAFTS)),
                     aux_layers: Vec::new(),
                     final_hidden: false,
                 };
@@ -178,7 +201,7 @@ impl SpecOptions {
                 let (config, weights, state) = DraftModel::memory(dir, target, chunk, self.draft)?;
                 let k = self.drafts(target, config.max_drafts());
                 let geometry = SpecGeometry {
-                    rows: k + 1,
+                    rows: self.verify_rows(k),
                     aux_layers: config.target_layers.clone(),
                     final_hidden: false,
                 };
@@ -405,6 +428,9 @@ impl Runtime {
             let before = device.allocated_bytes();
             let drafter = spec.build(&device, path, &loaded, loaded.plan.context)?;
             session.set_drafter(&device, &loaded.model, drafter)?;
+            if spec.tree.is_some() {
+                session.set_tree_budget(&device, &loaded.model, spec.tree)?;
+            }
             draft_loaded_bytes = device.allocated_bytes().saturating_sub(before);
         }
         let vision = match mmproj {

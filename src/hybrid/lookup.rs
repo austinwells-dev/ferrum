@@ -6,7 +6,7 @@
 #![forbid(unsafe_code)]
 use super::{
     engine::{HybridModel, SpecGeometry},
-    speculative::Drafter,
+    speculative::{DraftTree, Drafter},
 };
 use crate::{MetalDevice, Result};
 
@@ -48,6 +48,35 @@ pub(crate) fn propose(history: &[u32], max: usize) -> Vec<u32> {
     Vec::new()
 }
 
+/// A draft tree of at most `budget` nodes, at most `max` deep: the
+/// continuations of every earlier occurrence of the longest matching suffix
+/// of `history`, latest first (so the first branch is `propose`'s chain),
+/// then those of shorter suffixes, merged where they agree.
+pub(crate) fn propose_tree(history: &[u32], max: usize, budget: usize) -> DraftTree {
+    let mut tree = DraftTree::default();
+    for n in (NGRAM_MIN..=NGRAM_MAX).rev() {
+        if history.len() <= n {
+            continue;
+        }
+        let tail = &history[history.len() - n..];
+        for start in (0..history.len() - n).rev() {
+            if &history[start..start + n] != tail {
+                continue;
+            }
+            let from = start + n;
+            let mut parent = None;
+            for &token in &history[from..(from + max).min(history.len())] {
+                parent = Some(match tree.child(parent, token) {
+                    Some(node) => node,
+                    None if tree.len() < budget => tree.push(token, parent),
+                    None => return tree,
+                });
+            }
+        }
+    }
+    tree
+}
+
 impl Drafter for Lookup {
     fn geometry(&self) -> SpecGeometry {
         SpecGeometry {
@@ -84,6 +113,21 @@ impl Drafter for Lookup {
         self.tokens.pop();
         Ok(drafts)
     }
+    fn draft_tree(
+        &mut self,
+        _: &MetalDevice,
+        _: &HybridModel,
+        pos: usize,
+        anchor: u32,
+        max: usize,
+        budget: usize,
+    ) -> Result<DraftTree> {
+        self.tokens.truncate(pos);
+        self.tokens.push(anchor);
+        let tree = propose_tree(&self.tokens, max, budget);
+        self.tokens.pop();
+        Ok(tree)
+    }
     fn rewind(&mut self, _: &MetalDevice, _: &HybridModel, len: usize) -> Result<()> {
         self.tokens.truncate(len);
         Ok(())
@@ -98,7 +142,26 @@ impl Drafter for Lookup {
 
 #[cfg(test)]
 mod tests {
-    use super::propose;
+    use super::{DraftTree, propose, propose_tree};
+
+    #[test]
+    fn trees_merge_every_earlier_continuation() {
+        // "1 2 3" was followed by 9 9, then by 7 8, then (now) the anchor.
+        let h = [1, 2, 3, 9, 9, 1, 2, 3, 7, 8, 1, 2, 3];
+        let tree = propose_tree(&h, 2, 8);
+        // The latest continuation first (propose's chain), then the earlier one.
+        assert_eq!(tree.tokens, vec![7, 8, 9, 9]);
+        assert_eq!(tree.parents, vec![None, Some(0), None, Some(2)]);
+        assert_eq!(&tree.tokens[..2], &propose(&h, 2)[..]);
+        // The budget cuts the later branches.
+        assert_eq!(propose_tree(&h, 2, 3).tokens, vec![7, 8, 9]);
+        // Shared prefixes merge: "5 6" followed twice by 4, once by 2.
+        let h = [5, 6, 4, 1, 5, 6, 4, 2, 5, 6, 2, 5, 6];
+        let tree = propose_tree(&h, 2, 8);
+        assert_eq!(tree.tokens, vec![2, 5, 4, 2, 1]);
+        assert_eq!(tree.parents, vec![None, Some(0), None, Some(2), Some(2)]);
+        assert_eq!(propose_tree(&[1, 2, 3], 4, 4), DraftTree::default());
+    }
 
     #[test]
     fn proposes_what_followed_the_latest_longest_match() {

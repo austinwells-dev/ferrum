@@ -1,6 +1,9 @@
 //! Speculative decoding benchmark and losslessness check on chat prompts.
 //! usage: hybrid_spec MODEL.gguf --drafter mtp|DRAFT_DIR [--drafts K]
 //!        [--tokens 256] [--context 8192] [--temp 0] [--baseline] [--prompts N]
+//!        [--only I,J]  (these prompt indices instead of the first N)
+//!        [--tree N]  (draft trees of N nodes; greedy only)
+//!        [--sweep 0,4,8,15]  (each tree budget in turn, 0 = chains, on one load)
 //!        [--pmin P]  (DSpark confidence cut-off)
 //!        [--depth N --filler FILE]  (generate after N tokens of FILE in the prompt)
 //!
@@ -9,7 +12,8 @@
 //! generated without speculation; greedy outputs are compared token by token
 //! and any divergence is reported with the target's top-2 logit margin at
 //! that point (a near-tie means single-row and multi-row kernels rounded
-//! differently, not a verification error).
+//! differently, not a verification error). In a sweep, tree outputs are also
+//! compared with the chain's.
 use ferrum::{
     Result,
     hybrid::{
@@ -22,7 +26,6 @@ use ferrum::{
     },
 };
 use serde_json::json;
-use std::time::Instant;
 
 const PROMPTS: &[&str] = &[
     "Write a Python function that returns the n-th Fibonacci number using memoization, then explain its complexity.",
@@ -52,9 +55,24 @@ fn main() -> Result<()> {
     let depth: usize = get("--depth", "0").parse().expect("depth");
     let drafter_arg = get("--drafter", "mtp");
     let drafts: usize = get("--drafts", "0").parse().expect("drafts");
+    let list = |key: &str| -> Option<Vec<usize>> {
+        has(key).then(|| {
+            get(key, "")
+                .split(',')
+                .map(|v| v.parse().expect("list of numbers"))
+                .collect()
+        })
+    };
+    // Each configuration is a tree budget, or None for chains.
+    let configs: Vec<Option<usize>> = match list("--sweep") {
+        Some(budgets) => budgets.iter().map(|&b| (b > 0).then_some(b)).collect(),
+        None => vec![list("--tree").map(|b| b[0])],
+    };
+    let widest = configs.iter().flatten().max().copied();
     let spec = SpecOptions {
         source: DraftSource::parse(&drafter_arg),
         max_drafts: (drafts > 0).then_some(drafts),
+        tree: widest,
         draft: DraftOptions {
             confidence_min: get("--pmin", "0").parse().expect("pmin"),
             vocab: get("--vocab", "0").parse().ok().filter(|&v: &usize| v > 0),
@@ -101,11 +119,14 @@ fn main() -> Result<()> {
     } else {
         String::new()
     };
+    let label = |config: Option<usize>| config.map_or("chain".to_owned(), |b| format!("tree {b}"));
+    let selected: Vec<usize> =
+        list("--only").unwrap_or_else(|| (0..prompts.min(PROMPTS.len())).collect());
     let (mut base_tokens, mut base_secs) = (0usize, 0f64);
-    let (mut spec_tokens, mut spec_secs) = (0usize, 0f64);
-    let mut total = SpecStats::default();
-    let mut mismatches = 0;
-    for (index, prompt) in PROMPTS.iter().take(prompts).enumerate() {
+    // Per configuration: tokens, seconds, statistics, greedy mismatches.
+    let mut totals = vec![(0usize, 0f64, SpecStats::default(), 0usize); configs.len()];
+    for &index in &selected {
+        let prompt = PROMPTS[index];
         let content = if depth > 0 {
             format!("Reference material:\n\n{filler}\n\n---\n\n{prompt}")
         } else {
@@ -121,7 +142,6 @@ fn main() -> Result<()> {
         let run = |rt: &mut Runtime, speculate: bool| -> Result<(Vec<u32>, f64)> {
             rt.session.reset();
             rt.session.speculate = speculate;
-            let start = Instant::now();
             let completion = rt.session.generate(
                 &rt.device,
                 &rt.loaded.model,
@@ -131,76 +151,114 @@ fn main() -> Result<()> {
                 &eos,
                 &mut |_| Ok(true),
             )?;
-            let _ = start;
             Ok((completion.tokens, completion.decode.as_secs_f64()))
         };
         let base = if has("--baseline") {
             let (t, secs) = run(&mut rt, false)?;
             base_tokens += t.len();
             base_secs += secs;
-            Some((t, secs))
+            println!(
+                "prompt {index}: baseline {} tokens, {:.1} tok/s",
+                t.len(),
+                t.len() as f64 / secs
+            );
+            Some(t)
         } else {
             None
         };
-        let (spec, secs) = run(&mut rt, true)?;
-        let stats = rt.session.spec_stats.clone();
-        spec_tokens += spec.len();
-        spec_secs += secs;
-        let mut line = format!(
-            "prompt {index}: {} tokens, {:.1} tok/s, acceptance {:.2} ({} steps)",
-            spec.len(),
-            spec.len() as f64 / secs,
-            stats.acceptance_length(),
-            stats.steps
-        );
-        if let Some((base, bsecs)) = base {
-            line += &format!(", baseline {:.1} tok/s", base.len() as f64 / bsecs);
+        let mut chain_output: Option<Vec<u32>> = None;
+        for (c, &config) in configs.iter().enumerate() {
+            if configs.len() > 1 || config.is_some() {
+                rt.session
+                    .set_tree_budget(&rt.device, &rt.loaded.model, config)?;
+            }
+            let (spec, secs) = run(&mut rt, true)?;
+            let stats = rt.session.spec_stats.clone();
+            let mut line = format!(
+                "prompt {index} {}: {} tokens, {:.1} tok/s, acceptance {:.2} ({} steps)",
+                label(config),
+                spec.len(),
+                spec.len() as f64 / secs,
+                stats.acceptance_length(),
+                stats.steps
+            );
             if temperature == 0. {
-                match base.iter().zip(&spec).position(|(a, b)| a != b) {
-                    None if base.len() == spec.len() => line += ", identical",
-                    None => {
-                        line += &format!(", prefix-identical ({} vs {})", base.len(), spec.len())
-                    }
-                    Some(i) => {
-                        mismatches += 1;
-                        let margin = margin(&rt, &tokens, &base[..i])?;
-                        line += &format!(", diverges at {i} (target top-2 margin {margin:.4})");
+                if let Some(base) = &base {
+                    match base.iter().zip(&spec).position(|(a, b)| a != b) {
+                        None if base.len() == spec.len() => line += ", identical",
+                        None => {
+                            line +=
+                                &format!(", prefix-identical ({} vs {})", base.len(), spec.len())
+                        }
+                        Some(i) => {
+                            totals[c].3 += 1;
+                            let margin = margin(&rt, &tokens, &base[..i])?;
+                            line += &format!(", diverges at {i} (target top-2 margin {margin:.4})");
+                        }
                     }
                 }
+                match (&chain_output, config) {
+                    (None, None) => chain_output = Some(spec.clone()),
+                    (Some(chain), Some(_)) => {
+                        match chain.iter().zip(&spec).position(|(a, b)| a != b) {
+                            None if chain.len() == spec.len() => line += ", = chain",
+                            None => line += ", chain prefix",
+                            Some(i) => {
+                                let margin = margin(&rt, &tokens, &chain[..i])?;
+                                line += &format!(
+                                    ", leaves the chain at {i} (target top-2 margin {margin:.4})"
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
             }
+            println!("{line}");
+            let t = &mut totals[c];
+            t.0 += spec.len();
+            t.1 += secs;
+            t.2.steps += stats.steps;
+            t.2.drafted += stats.drafted;
+            t.2.accepted += stats.accepted;
+            if t.2.accepted_at.len() < stats.accepted_at.len() {
+                t.2.accepted_at.resize(stats.accepted_at.len(), 0);
+            }
+            for (a, b) in t.2.accepted_at.iter_mut().zip(&stats.accepted_at) {
+                *a += b;
+            }
+            t.2.draft_seconds += stats.draft_seconds;
+            t.2.verify_seconds += stats.verify_seconds;
+        }
+    }
+    println!();
+    if base_tokens > 0 {
+        println!("baseline: {:.2} tok/s", base_tokens as f64 / base_secs);
+    }
+    for (c, &config) in configs.iter().enumerate() {
+        let (tokens, secs, total, mismatches) = &totals[c];
+        let rate = *tokens as f64 / secs;
+        let rates: Vec<String> = total
+            .accepted_at
+            .iter()
+            .map(|&a| format!("{:.0}%", 100. * a as f64 / total.steps.max(1) as f64))
+            .collect();
+        let mut line = format!(
+            "{}: {rate:.2} tok/s, acceptance length {:.3}, {:.1} drafts/step, draft {:.1} ms/step, verify {:.1} ms/step, accepted by depth {}",
+            label(config),
+            total.acceptance_length(),
+            total.drafted as f64 / total.steps.max(1) as f64,
+            total.draft_seconds * 1e3 / total.steps.max(1) as f64,
+            total.verify_seconds * 1e3 / total.steps.max(1) as f64,
+            rates.join(" ")
+        );
+        if base_tokens > 0 {
+            line += &format!(
+                ", speedup {:.2}x, greedy mismatches {mismatches}",
+                rate / (base_tokens as f64 / base_secs)
+            );
         }
         println!("{line}");
-        total.steps += stats.steps;
-        total.drafted += stats.drafted;
-        total.accepted += stats.accepted;
-        if total.accepted_at.len() < stats.accepted_at.len() {
-            total.accepted_at.resize(stats.accepted_at.len(), 0);
-        }
-        for (a, b) in total.accepted_at.iter_mut().zip(&stats.accepted_at) {
-            *a += b;
-        }
-        total.draft_seconds += stats.draft_seconds;
-        total.verify_seconds += stats.verify_seconds;
-    }
-    println!(
-        "\nspeculative: {:.2} tok/s, acceptance length {:.3}, draft {:.1} ms/step, verify {:.1} ms/step",
-        spec_tokens as f64 / spec_secs,
-        total.acceptance_length(),
-        total.draft_seconds * 1e3 / total.steps.max(1) as f64,
-        total.verify_seconds * 1e3 / total.steps.max(1) as f64,
-    );
-    let rates: Vec<String> = total
-        .accepted_at
-        .iter()
-        .map(|&a| format!("{:.0}%", 100. * a as f64 / total.steps.max(1) as f64))
-        .collect();
-    println!("acceptance by position: {}", rates.join(" "));
-    if base_tokens > 0 {
-        println!(
-            "baseline: {:.2} tok/s; speedup {:.2}x; greedy mismatches {mismatches}",
-            base_tokens as f64 / base_secs,
-            (spec_tokens as f64 / spec_secs) / (base_tokens as f64 / base_secs)
-        );
     }
     Ok(())
 }
