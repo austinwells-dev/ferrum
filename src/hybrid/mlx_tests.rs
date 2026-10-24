@@ -49,12 +49,13 @@ fn mlx_matrix(rows: usize, cols: usize, seed: u64) -> (Vec<u8>, Vec<u8>, Vec<u8>
 #[test]
 fn mlx4_projections_match_the_cpu() {
     let d = MetalDevice::new().unwrap();
-    // (rows, cols): a q/k/v-shaped and an FFN-shaped matrix, odd row counts.
-    for (rows, cols) in [(1030usize, 5120usize), (96, 17408)] {
+    // (rows, cols): a q/k/v-shaped and an FFN-shaped matrix, odd row counts,
+    // and one past 131,072 rows (the LM heads' 32-row SIMD-group tiling).
+    for (rows, cols) in [(1030usize, 5120usize), (96, 17408), (131_100, 256)] {
         let (codes, scales, biases, w) = mlx_matrix(rows, cols, 3);
         let m = Matrix::from_mlx(&d, rows, cols, &codes, &scales, &biases).unwrap();
         assert_eq!(m.format, Format::Mlx4);
-        for tokens in [1usize, 2, 3, 4, 5, 9, 16, 33, 130] {
+        for tokens in [1usize, 2, 3, 4, 5, 8, 9, 15, 16, 17, 25, 32, 33, 130] {
             let x = random(tokens * cols, 7 + tokens as u64);
             let xt = Tensor::from_f32(&d, [tokens, cols], DType::F32, &x).unwrap();
             let y = Tensor::zeros(&d, [tokens, rows], DType::F32).unwrap();
@@ -72,8 +73,10 @@ fn mlx4_projections_match_the_cpu() {
                     worst = worst.max((f64::from(got[t * rows + r]) - want).abs());
                 }
             }
-            // The GEMVs accumulate in F32; the tiles round weights to F16.
-            let bound = if tokens <= 4 { 1e-4 } else { 2e-3 };
+            // The GEMVs (1 and 2 rows) accumulate F32 inputs; 3..=32 rows
+            // round the inputs to F16 (the integer-code GEMMs), wider tiles
+            // the weights.
+            let bound = if tokens <= 2 { 1e-4 } else { 2e-3 };
             assert!(
                 worst / scale < bound,
                 "[{rows}, {cols}] x {tokens} rows: max error {worst:.3e} of {scale:.3e}"

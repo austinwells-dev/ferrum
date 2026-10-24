@@ -2778,6 +2778,67 @@ impl HybridModel {
     }
 
     /// y[m][rows] = x[m][cols] · Wᵀ.
+    /// An MLX 4-bit projection of 2..=32 rows on the matrix units: the rows
+    /// as a T table (`h_mlx_ttable`), then Kapitsa's integer-code GEMM in
+    /// 8-row tiles, or tile pairs past 8 rows (`h_mlx_qmm8t*`).
+    fn project_mlx_tiles(
+        d: &MetalDevice,
+        w: &Matrix,
+        x: &Tensor,
+        m: usize,
+        y: &Tensor,
+    ) -> Result<()> {
+        let k = w.cols;
+        let groups = k / 64;
+        let pair = m > 8;
+        let trows = if pair { 16 } else { 8 };
+        let tiles = m.div_ceil(trows);
+        let rows = tiles * trows;
+        let (table, sums) = mlx_tables(d, rows * k, rows / 8 * groups * 8)?;
+        d.dispatch_hybrid(
+            "h_mlx_ttable",
+            &[x.binding()],
+            &[table.binding(), sums.binding()],
+            &Params::default().u(k)?.u(m)?.u(k)?.u(rows)?.0,
+            [groups, rows, 1],
+            [64, 1, 1],
+            0,
+        )?;
+        // Kapitsa's tiling (qwen35_v8.cpp v8t_plan): 32 weight rows per SIMD
+        // group for LM-head-sized grids, else 16; 4 k-slices for 33..=64
+        // groups, else 8.
+        let nt = if w.rows.div_ceil(16) > 8192 { 32 } else { 16 };
+        let mut ks = if groups > 32 && groups <= 64 { 4 } else { 8 };
+        while ks > 1 && groups < ks {
+            ks /= 2;
+        }
+        let per = w.rows.div_ceil(nt);
+        let name = match (pair, nt) {
+            (false, 16) => "h_mlx_qmm8t_nt16",
+            (false, _) => "h_mlx_qmm8t_nt32",
+            (true, 16) => "h_mlx_qmm8t2_nt16",
+            (true, _) => "h_mlx_qmm8t2_nt32",
+        };
+        d.dispatch_hybrid(
+            name,
+            &[w.binding(), table.binding(), sums.binding()],
+            &[y.binding()],
+            &Params::default()
+                .u(k)?
+                .u(m)?
+                .u(ks)?
+                .u(w.rows)?
+                .u(w.rows)?
+                .u(w.row_bytes)?
+                .u(per)?
+                .u(0)?
+                .0,
+            [per * tiles, 1, 1],
+            [32 * ks, 1, 1],
+            0,
+        )
+    }
+
     pub(crate) fn project(
         d: &MetalDevice,
         w: &Matrix,
@@ -2804,6 +2865,11 @@ impl HybridModel {
             .0;
         let inputs: [Binding; 2] = [w.binding(), x.binding()];
         let outputs: [Binding; 1] = [y.binding()];
+        // MLX from 3 rows: the integer-code tiles (2 rows: the batched GEMV,
+        // 133 against 148 ms per 27B forward; 3 rows: 185 against 148).
+        if w.format == Format::Mlx4 && (3..=MMS_MAX_ROWS).contains(&m) && !exact_math() {
+            return Self::project_mlx_tiles(d, w, x, m, y);
+        }
         if (2..=MVB_MAX_ROWS).contains(&m) && !exact_math() {
             const SIMDS: usize = 4;
             return d.dispatch_hybrid(
@@ -2863,6 +2929,35 @@ impl HybridModel {
             shared,
         )
     }
+}
+
+thread_local! {
+    /// T table and group sums of the MLX verify-width GEMMs
+    /// (`HybridModel::project_mlx_tiles`), grown to the widest use and reused:
+    /// at most 32 rows of the widest projection input (about 1.1 MB on the
+    /// 27B). Consecutive projections are ordered by the encoder's hazards.
+    static MLX_TABLES: RefCell<Option<(Tensor, Tensor)>> = const { RefCell::new(None) };
+}
+
+fn mlx_tables(d: &MetalDevice, halves: usize, sums: usize) -> Result<(Tensor, Tensor)> {
+    MLX_TABLES.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let fits = cell.as_ref().is_some_and(|(t, s)| {
+            d.owns(t.binding().0) && t.numel() >= halves && s.numel() >= sums
+        });
+        if !fits {
+            let (h, n) = match cell.as_ref().filter(|(t, _)| d.owns(t.binding().0)) {
+                Some((t, s)) => (halves.max(t.numel()), sums.max(s.numel())),
+                None => (halves, sums),
+            };
+            *cell = Some((
+                Tensor::zeros_resident(d, [h], DType::F16)?,
+                Tensor::zeros_resident(d, [n], DType::F32)?,
+            ));
+        }
+        let (t, s) = cell.as_ref().expect("allocated above");
+        Ok((t.clone(), s.clone()))
+    })
 }
 
 /// Diagnostic switches, read once from the environment:

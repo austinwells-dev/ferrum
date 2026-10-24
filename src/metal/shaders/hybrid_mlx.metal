@@ -240,3 +240,158 @@ kernel void h_get_rows_mlx4(constant GetRowsArgs & a [[buffer(3)]], device const
     FOR_UNROLL (short j = 0; j < 8; ++j) out[j] = s * float((wv.x >> (4 * j)) & 0xFu) + b;
     FOR_UNROLL (short j = 0; j < 8; ++j) out[8 + j] = s * float((wv.y >> (4 * j)) & 0xFu) + b;
 }
+
+// ---------------------------------------------------------------- verify widths on the matrix units (M5)
+//
+// Adapted from Kapitsa's src/kernels/tensor/verify8t.metal (qmm8t_impl, qmm8t2_impl at be57c8f): per 64-weight group,
+// one tensor_ops matmul2d of the integer 4-bit codes (uint8, the left operand, filled from registers) by the half
+// inputs (a "T table", the right operand), then the fp32 epilogue y += s * dot + b * sum(x). The codes are exact, so
+// the only roundings are the half inputs and the matrix unit's sums. qmm8t takes token rows in 8-row tiles (one
+// matmul per tile and weight load); qmm8t2 takes two tiles (16 rows) per weight load, for tree verifies. Changes:
+// one weight matrix per dispatch (Kapitsa fuses up to four), Ferrum's per-row MLX layout, Ferrum's T-table producer
+// (h_mlx_ttable, from already-normalized F32 rows) and parameter block.
+
+// T table (h_mlx_ttable): token row t's half inputs [K] with each 64-group's inputs permuted so that slot
+// 4c + 16jb + kk holds input 16c + 8(jb >> 1) + 2kk + (jb & 1) (the matrix unit's operand layout, probed by Kapitsa);
+// rows m .. rows_pad - 1 are zero. sums[(t / 8) * G * 8 + g * 8 + t % 8] = the group's sum of the half inputs.
+struct MlxTableArgs { uint k; uint m; uint x_stride; uint rows; };
+inline uint mlx_input_of_slot(uint s) {
+    const uint c = (s >> 2) & 3, jb = (s >> 4) & 3, kk = s & 3;
+    return 16 * c + 8 * (jb >> 1) + 2 * kk + (jb & 1);
+}
+// grid (K / 64, rows); threads 64.
+kernel void h_mlx_ttable(constant MlxTableArgs & a [[buffer(3)]], device const float * x [[buffer(0)]],
+                         device half * table [[buffer(1)]], device float * sums [[buffer(2)]],
+                         uint2 tg [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]],
+                         ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float part[2];
+    const uint g = tg.x, t = tg.y, groups = a.k / 64;
+    const half h = t < a.m ? half(x[(ulong)t * a.x_stride + g * 64 + mlx_input_of_slot(tid)]) : 0.h;
+    table[(ulong)t * a.k + g * 64 + tid] = h;
+    const float s = simd_sum(float(h));
+    if (lane == 0) part[sg] = s;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) sums[((t / 8) * groups + g) * 8 + t % 8] = part[0] + part[1];
+}
+
+struct MlxQmm8tArgs {
+    uint k;
+    uint m;          // token rows R (live)
+    uint ks;         // k-slices per threadgroup (one SIMD group each)
+    uint n;
+    uint y_stride;
+    uint row_bytes;
+    uint per;        // threadgroups per tile (or pair): ceil(n / NT)
+    uint pad;
+};
+
+// qmm8t: grid (per * tiles); threads 32 * ks; tiles fastest.
+template <int NT, int PF, int MAXKS, int TROWS>
+inline void mlx_qmm8t_impl(constant MlxQmm8tArgs & p, device const char * w, device const half * T,
+                           device const float * sums, device float * Y, threadgroup float * red,
+                           uint tg, uint sg, uint lane, uint ntgs) {
+    // TROWS = 8: one tile per threadgroup group; 16: a tile pair (qmm8t2).
+    const uint nt = ntgs > p.per ? ntgs / p.per : 1u;
+    const uint tile = tg % nt;
+    tg /= nt;
+    const uint gpr = p.k / 64;
+    T += (ulong)tile * TROWS * p.k;
+    const uint n0 = tg * NT;
+    const uint gper = (gpr + p.ks - 1) / p.ks, g0 = min(sg * gper, gpr), g1 = min(g0 + gper, gpr);
+    const uint c = (lane & 1) | (((lane >> 3) & 1) << 1), r = ((lane >> 1) & 3) | (((lane >> 4) & 1) << 2);
+    constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(NT, TROWS, 64, false, true, false,
+                                                               mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
+    auto Lw = op.template get_left_input_cooperative_tensor<uint8_t, half, float>();
+    auto tX = tensor<device half, dextents<int32_t, 2>, tensor_inline>((device half *)T, dextents<int32_t, 2>(p.k, TROWS));
+    auto Rx0 = tX.template slice<64, TROWS>(0, 0);
+    auto acc = op.template get_destination_cooperative_tensor<decltype(Lw), decltype(Rx0), float>();
+    FOR_UNROLL (uint16_t i = 0; i < acc.get_capacity(); ++i) acc[i] = 0.0f;
+    constexpr int NJ = NT / 8;
+    device const uint * wp[NJ];
+    device const ushort * sp[NJ];
+    device const ushort * bp[NJ];
+    FOR_UNROLL (int j = 0; j < NJ; ++j) {
+        const MlxRow row = mlx_row(w, min(n0 + r + 8 * j, p.n - 1), p.row_bytes, p.k);
+        wp[j] = row.codes + 2 * c;
+        sp[j] = (device const ushort *)row.scales;
+        bp[j] = (device const ushort *)row.biases;
+    }
+    // A pair's second tile (lanes with bit 3 set) reads its own sums block.
+    const uint t0 = TROWS == 16 ? 4 * (lane & 1) + 8 * ((lane >> 3) & 1) : 4 * (lane & 1);
+    if (TROWS == 16) {
+        sums += (ulong)(2 * tile + ((lane >> 3) & 1)) * gpr * 8 + 4 * (lane & 1);
+    } else {
+        sums += (ulong)tile * gpr * 8 + t0;
+    }
+    uint2 wn[NJ];
+    ushort sn[NJ], bn[NJ];
+    auto load = [&](uint g) {
+        FOR_UNROLL (int j = 0; j < NJ; ++j) {
+            wn[j] = *(device const uint2 *)(wp[j] + g * 8);
+            sn[j] = sp[j][g];
+            bn[j] = bp[j][g];
+        }
+    };
+    if (PF && g0 < g1) load(g0);
+    for (uint g = g0; g < g1; ++g) {
+        if (!PF) load(g);
+        uint2 wv[NJ];
+        ushort sc[NJ], bc[NJ];
+        FOR_UNROLL (int j = 0; j < NJ; ++j) wv[j] = wn[j], sc[j] = sn[j], bc[j] = bn[j];
+        if (PF && g + 1 < g1) load(g + 1);
+        FOR_UNROLL (int j = 0; j < NJ; ++j) {
+            FOR_UNROLL (int jb = 0; jb < 4; ++jb) {
+                const uint u = ((jb >> 1 ? wv[j].y : wv[j].x) >> (4 * (jb & 1))) & 0x0F0F0F0Fu;
+                const int i = (j >> 1) * 32 + jb * 8 + (j & 1) * 4;
+                Lw[i] = uchar(u);
+                Lw[i + 1] = uchar(u >> 8);
+                Lw[i + 2] = uchar(u >> 16);
+                Lw[i + 3] = uchar(u >> 24);
+            }
+        }
+        auto Rx = tX.template slice<64, TROWS>(g * 64, 0);
+        auto d = op.template get_destination_cooperative_tensor<decltype(Lw), decltype(Rx), float>();
+        op.run(Lw, Rx, d);
+        const float4 sx = *(device const float4 *)(sums + g * 8);
+        FOR_UNROLL (int j = 0; j < NJ; ++j) {
+            const float s = as_type<float>(uint(sc[j]) << 16), b = as_type<float>(uint(bc[j]) << 16);
+            FOR_UNROLL (int kk = 0; kk < 4; ++kk) acc[j * 4 + kk] = fma(s, d[j * 4 + kk], fma(b, sx[kk], acc[j * 4 + kk]));
+        }
+    }
+    // Fixed-order sum of the k-slices (SIMD group 0 adds 1, 2, ... in turn).
+    if (p.ks > 1) {
+        // A lane holds NT / 2 outputs either way: a pair's second tile fills the lanes an 8-row tile pads.
+        constexpr uint cap = NT / 2;
+        if (sg) {
+            FOR_UNROLL (uint i = 0; i < cap; ++i) red[((sg - 1) * cap + i) * 32 + lane] = acc[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg) return;
+        for (uint j = 1; j < p.ks; ++j) {
+            FOR_UNROLL (uint i = 0; i < cap; ++i) acc[i] += red[((j - 1) * cap + i) * 32 + lane];
+        }
+    }
+    if (TROWS == 8 && ((lane >> 3) & 1)) return;  // padding rows of an 8-row tile
+    FOR_UNROLL (int j = 0; j < NJ; ++j) {
+        const uint n = n0 + r + 8 * j;
+        if (n >= p.n) continue;
+        FOR_UNROLL (int kk = 0; kk < 4; ++kk) {
+            const uint t = TROWS * tile + t0 + kk;
+            if (t < p.m) Y[(ulong)t * p.y_stride + n] = acc[j * 4 + kk];
+        }
+    }
+}
+#define MLX_QMM8T(NAME, NT, PF, TROWS)                                                                         \
+kernel void NAME(constant MlxQmm8tArgs & p [[buffer(4)]], device const char * w [[buffer(0)]],               \
+                 device const half * T [[buffer(1)]], device const float * sums [[buffer(2)]],               \
+                 device float * Y [[buffer(3)]], uint tg [[threadgroup_position_in_grid]],                    \
+                 uint ntgs [[threadgroups_per_grid]], uint sg [[simdgroup_index_in_threadgroup]],             \
+                 uint lane [[thread_index_in_simdgroup]]) {                                                   \
+    threadgroup float red[7 * (NT / 2) * 32];                                                                 \
+    mlx_qmm8t_impl<NT, PF, 8, TROWS>(p, w, T, sums, Y, red, tg, sg, lane, ntgs);                             \
+}
+MLX_QMM8T(h_mlx_qmm8t_nt16, 16, 1, 8)
+MLX_QMM8T(h_mlx_qmm8t_nt32, 32, 1, 8)
+MLX_QMM8T(h_mlx_qmm8t2_nt16, 16, 1, 16)
+MLX_QMM8T(h_mlx_qmm8t2_nt32, 32, 1, 16)

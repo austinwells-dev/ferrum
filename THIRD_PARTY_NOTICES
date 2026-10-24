@@ -13,7 +13,11 @@ Files adapted from Kapitsa, Apache-2.0 only (not dual-licensed); each file's hea
 what changed:
 
 - src/metal/shaders/hybrid_mlx.metal: the MLX affine 4-bit decode GEMV, adapted from src/kernels/qmv.metal (qmv3_impl)
-  and src/kernels/quant.h (load_x, dot_row): the shift-free dequantization and the per-group epilogue.
+  and src/kernels/quant.h (load_x, dot_row): the shift-free dequantization and the per-group epilogue; and the
+  verify-width GEMMs on the matrix units, adapted from src/kernels/tensor/verify8t.metal (qmm8t_impl, qmm8t2_impl):
+  integer codes as exact tensor_ops operands with an fp32 group epilogue, in 8-row tiles and 16-row tile pairs, and the
+  T-table operand layout they read (from src/kernels/verify8.metal, v8t_input_of_slot).
+- src/hybrid/engine.rs, HybridModel::project_mlx_tiles: the tiling rule of src/model/qwen35_v8.cpp (v8t_plan).
 
 Ideas taken from Kapitsa's code and documentation without copying code, credited where they are used:
 
