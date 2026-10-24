@@ -227,3 +227,97 @@ depth 7 bit-identical on 240/240 chain-path nodes.
 **Decisions:** best-first is the default tree search (`--draft-tree-search
 siblings` keeps Experiment 4's trees), with waves of 3 and, unless
 `--draft-max` says otherwise, 7 MTP steps deep (5 for sibling trees).
+
+## Experiment 6 — block-drafter trees from the candidate lattice
+
+A block drafter already scores every depth of its block in one pass, so a
+tree costs no extra drafter passes (the idea behind Kapitsa's KFlash). Each
+of DFlash, DFlash2 and DSpark now implements `Drafter::draft_tree`: the
+block pass takes each depth's top candidates (`h_topk_blocks`, as MTP does),
+and `lattice_best_first` (`speculative.rs`) grows the tree best first by the
+probability of the whole path, the product of per-depth conditionals
+normalized over each depth's candidates:
+
+- **DFlash2**: its selector's top-16 per depth, with the path selector's
+  score (logit plus the bilinear predecessor/successor term the chain's
+  greedy walk already uses) as the conditional on the parent's token. The
+  chain is the tree's greedy path.
+- **DSpark**: the top 16 of each slot's logits before the Markov bias, plus
+  the chain's own pick; the conditional adds `w2[token] · w1[parent]`. The
+  candidates' Markov rows are gathered on the GPU once per step (one small
+  extra command buffer, +3 ms); the confidence cut-off still bounds the
+  depth.
+- **DFlash** (z-lab): no selector, so depths are independent and each
+  node's children are the next depth's marginals.
+
+**Gate.** `hybrid_spec --baseline --sweep 0,8,15`, 8 chat prompts × 128
+tokens on Swift 27B: DFlash2 (`z-lab/Qwen3.8-27B-DFlash2`) and DSpark
+(`RedHatAI/Qwen3.8-27B-speculator.dspark`) 0 greedy mismatches in all 48
+speculative runs, every tree output equal to its chain's; with
+`FERRUM_HYBRID_EXACT=1 FERRUM_HYBRID_REFERENCE_ATTENTION=1`, 3 prompts × 64
+tokens, likewise 0 for both. On the 8-prompt gate DFlash2 runs 16.55 tok/s
+as a chain (4.29 per pass), 17.52 at 8 nodes (4.65) and 18.29 at 15 (5.14,
+3.00× plain); DSpark 16.64, 17.08 and 17.34 (4.10, 4.33, 4.68).
+
+**Against chains and MTP**, Swift 27B, 192 tokens, two interleaved rounds,
+best (other). Block drafters draft their trained block (7 for DFlash2, 8 for
+DSpark); MTP runs 7 deep, as with `--draft-tree`.
+
+| Coding | tok/s | per pass | draft ms | verify ms |
+|---|---|---|---|---|
+| MTP chain, 7 drafts | 11.96 (11.92) | 3.43 | 78 | 206 |
+| MTP best first, 15 nodes | 14.61 (14.57) | 4.24 | 62 | 227 |
+| DFlash2 chain | 18.69 (18.64) | 4.47 | 29 | 204 |
+| DFlash2 tree, 8 nodes | **20.08** (19.84) | 4.92 | 30 | 211 |
+| DFlash2 tree, 12 nodes | 18.26 (18.22) | 4.68 | 30 | 222 |
+| DFlash2 tree, 15 nodes | 19.76 (19.48) | 5.19 | 30 | 230 |
+| DSpark chain | **17.24** (17.12) | 4.27 | 32 | 211 |
+| DSpark tree, 8 nodes | 16.86 (16.58) | 4.27 | 34 | 215 |
+| DSpark tree, 12 nodes | 16.98 (16.82) | 4.47 | 34 | 224 |
+| DSpark tree, 15 nodes | 16.92 (16.74) | 4.57 | 35 | 231 |
+
+| Prose | tok/s | per pass | draft ms | verify ms |
+|---|---|---|---|---|
+| MTP chain, 7 drafts | 12.55 (12.53) | 3.56 | 75 | 205 |
+| MTP best first, 15 nodes | 13.69 (13.67) | 4.00 | 62 | 227 |
+| DFlash2 chain | 16.43 (16.37) | 3.92 | 29 | 205 |
+| DFlash2 tree, 8 nodes | **18.05** (18.01) | 4.47 | 29 | 213 |
+| DFlash2 tree, 12 nodes | 17.80 (17.79) | 4.57 | 29 | 222 |
+| DFlash2 tree, 15 nodes | 17.88 (17.87) | 4.68 | 29 | 228 |
+| DSpark chain | 14.78 (14.76) | 3.62 | 31 | 209 |
+| DSpark tree, 8 nodes | 14.88 (14.82) | 3.77 | 34 | 214 |
+| DSpark tree, 12 nodes | 15.54 (15.59) | 4.09 | 34 | 222 |
+| DSpark tree, 15 nodes | **15.65** (15.59) | 4.17 | 34 | 227 |
+
+DFlash2 trees beat its chain by 6% (code) and 9% (prose) at 15 nodes and by
+7% and 10% at 8; KFlash reports +6% and +16% on the same 27B. Drafting
+costs nothing extra, so the gain is acceptance (+16–19% per pass at 15
+nodes) less the wider verify (+12%). The trees hit their limit at the
+block's depth: at 15 nodes the first two depths are accepted 90–94% and
+82–84% of the time, and further nodes mostly add third and fourth guesses.
+Between 8 and 15 nodes the ranking flips with the prompt set (8 wins these
+two by 1–2%, 15 wins the 8-prompt gate by 4%), and 12 dips on code (a
+different trajectory, 4.68 per pass against 8 nodes' 4.92). DFlash2 with a
+tree of 15 is the fastest configuration measured on this Mac, 1.35× MTP's
+best-first trees on code and 1.31× on prose.
+
+DSpark gains less: +6% on prose at 15 nodes, and −2% on code, where trees
+add only 0.3 tokens per pass. Its candidates are taken before the Markov
+bias, so the bias reorders but cannot bring in tokens outside the unbiased
+top 16 (only the chain's own pick is added); building candidates from the
+biased rows of every candidate parent would need a projection per parent.
+
+**MoE targets.** On Tiel-Coder-35B-A3B (IQ4_XS) with
+`z-lab/Qwen3.6-35B-A3B-DFlash` (the independent-depth case; MoE targets draft
+2 deep), trees of 1–3 nodes match plain decoding, and trees of 8 and 15
+diverge on 4–6 of 8 prompts, at top-2 margins 0.04–0.43. An 8-draft chain
+(also 9 verify rows, no tree) diverges at the same tokens with the same
+margins, and every tree output equals that chain's: this is Phase 10's
+single- versus multi-row rounding on MoE, not the trees. Trees are also slow
+there (verify 32 → 66 ms at 8 nodes, 0.91× plain), since every verify row
+routes to its own experts: MoE targets stay on 2-draft chains.
+
+**Decisions:** `--draft-tree N` now gives trees for DFlash, DFlash2 and
+DSpark as well as MTP; defaults are unchanged (chains unless
+`--draft-tree`). For a dense target, `--draft DFlash2 --draft-tree 15` is
+the recommended configuration; DSpark trees help prose only.
