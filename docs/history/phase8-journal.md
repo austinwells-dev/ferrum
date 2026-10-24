@@ -1,5 +1,7 @@
 # Phase 8 journal — large hybrid models
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 Hardware: Apple M5 (10-core GPU), 32 GB unified memory, 24 GiB GPU working set
 (`iogpu.wired_limit_mb=24576`), macOS 27. Reference: Homebrew llama.cpp 687e77892 (build 10330).
 Goals and architecture notes are in the [Phase 8 plan](phase8-plan.md).

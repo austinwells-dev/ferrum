@@ -1,5 +1,7 @@
 # Phase 3: official Qwen inference
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 Ferrum generates text from **Qwen/Qwen2.5-0.5B-Instruct entirely through Rust and its own synchronous Metal kernels**, with BF16 checkpoint/activation storage and F32 kernel arithmetic. This phase adds production integration and measurement, not kernel/execution optimization.
 
 Measured 2026-09-20, Apple M5, arm64 macOS 27.0, Rust 1.96.0. Branch: `codex/phase3-real-model`, based directly on immutable Phase 2 `cdf400c0fa3b9160d7340e0325adfc28fb4fcb8e`. The Phase 1 and Phase 2 commits are unchanged. Baseline verification before edits passed all 20 tests, release build, and transformer smoke: 41 intermediate comparisons, maximum error 4.76837158e-7, cached error zero. Initial unsafe audit found four blocks plus framework linkage.
@@ -20,7 +22,7 @@ cargo run --release -- run --model "$FERRUM_QWEN_MODEL" \
 cargo test --release --test real_model -- --ignored --nocapture
 ```
 
-Ferrum accepts any local directory containing those five files, never downloads or contacts the Hub, and does not infer a revision from directory names. Users are responsible for supplying the pinned official snapshot. `hf cache verify` verified all five present files; its five-missing-files warning refers to intentionally omitted repository files. See [checksum verification](measurements/phase3/checkpoint-verification.txt). No `special_tokens_map.json` exists in this revision. Tokenizer vocabulary/merges are self-contained in tokenizer.json; separate vocab.json and merges.txt are unnecessary. Weights, caches, reference virtualenv, and Cargo output are ignored by Git.
+Ferrum accepts any local directory containing those five files, never downloads or contacts the Hub, and does not infer a revision from directory names. Users are responsible for supplying the pinned official snapshot. `hf cache verify` verified all five present files; its five-missing-files warning refers to intentionally omitted repository files. See [checksum verification](../measurements/phase3/checkpoint-verification.txt). No `special_tokens_map.json` exists in this revision. Tokenizer vocabulary/merges are self-contained in tokenizer.json; separate vocab.json and merges.txt are unnecessary. Weights, caches, reference virtualenv, and Cargo output are ignored by Git.
 
 ## Inspected configuration
 
@@ -52,7 +54,7 @@ Ferrum accepts any local directory containing those five files, never downloads 
 
 ## Exact tensor mapping and orientation
 
-The inspected safetensors archive contains **290 BF16 tensors, 494,032,768 elements, 988,065,536 payload bytes** (about 0.920 GiB). Full names/shapes/bytes for all layers are recorded in [tensors.tsv](measurements/phase3/tensors.tsv).
+The inspected safetensors archive contains **290 BF16 tensors, 494,032,768 elements, 988,065,536 payload bytes** (about 0.920 GiB). Full names/shapes/bytes for all layers are recorded in [tensors.tsv](../measurements/phase3/tensors.tsv).
 
 | Official tensor | Phase 2 canonical name | Shape |
 |---|---|---|
@@ -93,7 +95,7 @@ Checkpoint linear matrices already use Phase 2's `[output,input]`, `Y=XWᵀ` con
 | Process maximum RSS, separate one-token run | 3,053,092,864 |
 | Process peak memory footprint, same run | 3,055,192,920 |
 
-Retained weight accounting now sums actual tensors instead of reconstructing expected shapes. The extra tied LM transpose is intentional Phase 2 behavior. Source storage is dropped after construction. The loader's file byte vector is dropped before transposition. These payload measures exclude allocator/driver overhead and process libraries. A separate `/usr/bin/time -l target/release/ferrum run ... --max-new-tokens 1` run reported maximum RSS 3,053,092,864 bytes and peak memory footprint 3,055,192,920 bytes, with zero swaps; see [process memory](measurements/phase3/process-memory.txt). These process-lifetime peaks include loading, construction, library/driver/allocator retention and prefill, and must not be equated with live tensor payload. Allocation counters count successful Metal allocations and cumulative physical bytes, not peak live bytes or DRAM traffic. KV appends allocate/copy active history and retain no capacity arena. The generated terminal EOS (or final token at the limit) is not fed back into the cache.
+Retained weight accounting now sums actual tensors instead of reconstructing expected shapes. The extra tied LM transpose is intentional Phase 2 behavior. Source storage is dropped after construction. The loader's file byte vector is dropped before transposition. These payload measures exclude allocator/driver overhead and process libraries. A separate `/usr/bin/time -l target/release/ferrum run ... --max-new-tokens 1` run reported maximum RSS 3,053,092,864 bytes and peak memory footprint 3,055,192,920 bytes, with zero swaps; see [process memory](../measurements/phase3/process-memory.txt). These process-lifetime peaks include loading, construction, library/driver/allocator retention and prefill, and must not be equated with live tensor payload. Allocation counters count successful Metal allocations and cumulative physical bytes, not peak live bytes or DRAM traffic. KV appends allocate/copy active history and retain no capacity arena. The generated terminal EOS (or final token at the limit) is not fed back into the cache.
 
 ## Tokenizer, template, generation, and sampling
 
@@ -122,13 +124,13 @@ For Hello, the exact 21 prompt IDs are:
 
 Generation prefills once, explicitly extracts row `sequence-1` from `[sequence,vocab]` with the existing checked copy kernel, selects a token on CPU, and feeds only that token through `forward_decode` and Phase 2's KV cache. Tests deliberately put larger values in earlier rows to catch incorrect logit selection. Empty prompts, prompt overflow, checked prompt+max-new overflow, invalid EOS/selection IDs, and malformed options return errors. The reservation check conservatively requires `prompt + max_new <= context`, although the final sampled token is not cached. `--max-new-tokens 0` returns without running prefill. Default is 32; EOS is excluded from displayed text.
 
-Sampling was added after greedy bring-up. Default `temperature=0` uses finite-logit argmax with lowest-ID tie breaking. Positive temperature uses stable F64 CPU probabilities, top-k (`0` disables), then nucleus top-p (`1` disables), then a ChaCha8 RNG seeded with `--seed` (default 0). Invalid temperature/top-p fails; top-k above vocabulary simply keeps all candidates. Same model/prompt/settings/seed and runtime produces the same sequence. Tests cover filters, approximate uniform sampling, extremes, and deterministic repeats. Two independent real-model processes with temperature=.7, top-k=20, top-p=.8, seed=42 returned identical ten IDs; see [repeatability](measurements/phase3/sampling-repeatability.txt). Checkpoint generation defaults, including repetition_penalty=1.1, are **not adopted**: Ferrum exposes the specified small sampler and uses generation_config only for stop/BOS/PAD policy. Reference calls likewise do not apply generation processors.
+Sampling was added after greedy bring-up. Default `temperature=0` uses finite-logit argmax with lowest-ID tie breaking. Positive temperature uses stable F64 CPU probabilities, top-k (`0` disables), then nucleus top-p (`1` disables), then a ChaCha8 RNG seeded with `--seed` (default 0). Invalid temperature/top-p fails; top-k above vocabulary simply keeps all candidates. Same model/prompt/settings/seed and runtime produces the same sequence. Tests cover filters, approximate uniform sampling, extremes, and deterministic repeats. Two independent real-model processes with temperature=.7, top-k=20, top-p=.8, seed=42 returned identical ten IDs; see [repeatability](../measurements/phase3/sampling-repeatability.txt). Checkpoint generation defaults, including repetition_penalty=1.1, are **not adopted**: Ferrum exposes the specified small sampler and uses generation_config only for stop/BOS/PAD policy. Reference calls likewise do not apply generation processors.
 
 The CLI streams using tokenizers' incremental decoder, which buffers incomplete UTF-8 fragments. At termination it reconciles with full decode and flushes any final incomplete sequence using the tokenizer's replacement policy. A multi-byte `Hello 世界 🌙 café!` stream/full comparison passes. Model/runtime diagnostics go to stderr; stdout contains generated text. No inference engine, Python subprocess, networking, server, or UI is invoked by the production executable.
 
 ## Reference validation and investigated disagreement
 
-Validation-only environment: CPU **PyTorch 2.8.0, Transformers 4.57.6**, eager full attention, four CPU threads, local files only, model.eval(), inference_mode(), no sampling processors. [tools/reference_qwen.py](../tools/reference_qwen.py) and its [locked requirements](../tools/reference-requirements.txt) are external diagnostics, never runtime dependencies. Reproduction:
+Validation-only environment: CPU **PyTorch 2.8.0, Transformers 4.57.6**, eager full attention, four CPU threads, local files only, model.eval(), inference_mode(), no sampling processors. [tools/reference_qwen.py](../../tools/reference_qwen.py) and its [locked requirements](../../tools/reference-requirements.txt) are external diagnostics, never runtime dependencies. Reproduction:
 
 ```sh
 uv venv .venv-reference
@@ -152,13 +154,13 @@ First token (BF16): **9707, `Hello`**, both engines. Selected logits:
 | 151643 | 2.96875 | 2.859375 |
 | 151645 | -5.90625 | -5.750 |
 
-First-token top-10 candidate sets match. Ferrum's first three are `(9707,24.875), (13048,18.75), (4340,17.25)`; reference: `(9707,24.625), (13048,18.5), (4340,17.25)`. Full lists and subsequent steps are retained in [Ferrum probe](measurements/phase3/ferrum-probe.json) and [reference BF16](measurements/phase3/reference-bf16.json).
+First-token top-10 candidate sets match. Ferrum's first three are `(9707,24.875), (13048,18.75), (4340,17.25)`; reference: `(9707,24.625), (13048,18.5), (4340,17.25)`. Full lists and subsequent steps are retained in [Ferrum probe](../measurements/phase3/ferrum-probe.json) and [reference BF16](../measurements/phase3/reference-bf16.json).
 
 BF16 tokens agree for the first five: `[9707,0,2585,646,358]` = `Hello! How can I`. At token six, reference ties `help` (1492) and `assist` (7789) at 25.75 and chooses the lower ID. Ferrum has 25.625 versus 25.75, choosing `assist`. This is a real cross-engine continuation difference, not hidden by a tolerance or asserted token equality. Both then generate `you today`; Ferrum's complete response terminates at EOS.
 
 Investigation checked exact names/shapes/biases, tied embedding, template/BOS, final row, split-half RoPE and positions, GQA index groups, epsilon/theta, and rounding. Upstream BF16 and Ferrum differ at several arithmetic boundaries: Ferrum rounds matmul before separate bias addition, multiplies RMSNorm weight before its final BF16 store, and computes RoPE trigonometry/products in F32 before a single BF16 store. Upstream can fuse bias, rounds normalized values before norm weight multiplication, and rounds cos/sin and rotation products to BF16. Reduction order and BF16 rounding perturbations can accumulate through 24 blocks. A diagnostic reference mode matching those three operation boundaries still exhibits some BF16 differences; it is supporting evidence, not the authoritative reference.
 
-To rule out a structural error, **temporary in-memory F32 diagnostic weights** were used only by `qwen_probe --diagnostic-f32`, compared with Transformers float32 loaded from the same BF16 checkpoint. No F32 checkpoint was saved and production loading remains BF16-only. All eight greedy IDs and every ordered top-10 list matched; maximum recorded selected/top-10 logit absolute error was **7.8201294e-5**. See [comparison](measurements/phase3/reference-comparison.txt), [Ferrum F32](measurements/phase3/ferrum-probe-f32.json), [reference F32](measurements/phase3/reference-f32.json). This validates the architecture independently of BF16 near-tie instability. It does not promise cross-engine BF16 token identity.
+To rule out a structural error, **temporary in-memory F32 diagnostic weights** were used only by `qwen_probe --diagnostic-f32`, compared with Transformers float32 loaded from the same BF16 checkpoint. No F32 checkpoint was saved and production loading remains BF16-only. All eight greedy IDs and every ordered top-10 list matched; maximum recorded selected/top-10 logit absolute error was **7.8201294e-5**. See [comparison](../measurements/phase3/reference-comparison.txt), [Ferrum F32](../measurements/phase3/ferrum-probe-f32.json), [reference F32](../measurements/phase3/reference-f32.json). This validates the architecture independently of BF16 near-tie instability. It does not promise cross-engine BF16 token identity.
 
 The real-model test checks finite full vocabulary logits at every generated step, exact first-five BF16 reference tokens, recorded selected/top-10 values within 0.5 logit units, valid IDs, cached step counts/bytes, EOS and decodable output. The 0.5 comparison is an empirical BF16 regression check, not a universal numerical bound; the separate F32 diagnosis and explicit near-tie accounting are essential evidence. Phase 1/2 tolerances were unchanged.
 
@@ -191,7 +193,7 @@ The first warmed baseline was captured **before adding opt-in profiling**. No op
 
 The final exact Cargo CLI demonstration (without `--warmup`) also produced the same 32 Rust tokens: prefill 810.741 ms / 28.369 tok/s, first-token latency 811.378 ms, and median cached decode 789.555 ms / 1.267 tok/s. It is a separate run, not a replacement for the first warmed baseline.
 
-Each decode grows active KV by 12,288 bytes, but allocation volume grows by 144,000 bytes/step due to the decomposed attention copies and score tensors. Counters exclude CPU vectors/tokenizer/RNG allocations. Prefill wall excludes final-row copy/readback; first-token latency includes it plus argmax. Decode step wall includes copy/readback and excludes CPU sampling, text decoding/printing, previous output destruction, loading, and tokenization. These definitions must be preserved for Phase 4 comparisons. Full per-step wall times/counters are in [first baseline](measurements/phase3/hello-baseline.txt) and [Rust demo](measurements/phase3/rust-demo.txt).
+Each decode grows active KV by 12,288 bytes, but allocation volume grows by 144,000 bytes/step due to the decomposed attention copies and score tensors. Counters exclude CPU vectors/tokenizer/RNG allocations. Prefill wall excludes final-row copy/readback; first-token latency includes it plus argmax. Decode step wall includes copy/readback and excludes CPU sampling, text decoding/printing, previous output destruction, loading, and tokenization. These definitions must be preserved for Phase 4 comparisons. Full per-step wall times/counters are in [first baseline](../measurements/phase3/hello-baseline.txt) and [Rust demo](../measurements/phase3/rust-demo.txt).
 
 Observed prompt fixtures (greedy BF16, max-new=32):
 
@@ -206,7 +208,7 @@ These are verbatim model outputs, not claims about factual correctness or model 
 
 ## Profile and Phase 4 priorities
 
-`--profile --warmup` enables aggregate measurements with no tensor retention and no logging inside operations. Timers separately capture operation wall, output allocation/zeroing, command submission, synchronized dispatch, and Metal GPU timestamps. Disabled profiling adds only checks; it does not change math, waits, allocation strategy, or command buffers. ID-carrier allocation and final tensor destruction are outside individual operation timers. JSON records and the [summary](measurements/phase3/profile-summary.json) are generated with `tools/summarize_profile.py`.
+`--profile --warmup` enables aggregate measurements with no tensor retention and no logging inside operations. Timers separately capture operation wall, output allocation/zeroing, command submission, synchronized dispatch, and Metal GPU timestamps. Disabled profiling adds only checks; it does not change math, waits, allocation strategy, or command buffers. ID-carrier allocation and final tensor destruction are outside individual operation timers. JSON records and the [summary](../measurements/phase3/profile-summary.json) are generated with `tools/summarize_profile.py`.
 
 Separate Hello profile: 21-token prefill, eight generated tokens, seven measured cached steps. Means across those seven steps (not the initial baseline's medians):
 
@@ -274,8 +276,8 @@ reduction timings varied in both GPU and host time despite identical shaders.
 The investigation did not establish a systematic runtime regression attributable
 to the disabled profiler. Residual desktop variance and small overhead remain
 measurement limitations; the raw flagged run is preserved rather than discarded.
-See [Phase 2 control](measurements/phase3/phase2-control-benchmark.txt) and
-[Phase 3 control](measurements/phase3/phase3-control-benchmark.txt).
+See [Phase 2 control](../measurements/phase3/phase2-control-benchmark.txt) and
+[Phase 3 control](../measurements/phase3/phase3-control-benchmark.txt).
 
 ## Validation, safety, and limitations
 
@@ -283,15 +285,15 @@ Normal tests never download/load ~1 GB. Seven new ordinary suites cover config/r
 
 The only changes to primitive/runtime infrastructure are opt-in timing aggregation, actual weight-memory accounting, contextual weight errors, and safe construction-time name remapping. No shader, GEMM, RoPE, attention, normalization math, queue, wait, buffer ownership, or cache strategy was optimized. The primitive benchmark was rerun because profiling touches the public operation wrapper.
 
-Unsafe audit remains **four blocks plus one framework-linkage declaration, all in src/metal/mod.rs**. No new unsafe code, Send/Sync impl, Arc conversion, asynchronous work, or background Metal execution was added. `Rc`, immutable published tensors, and completion-before-return are unchanged. See [audit](measurements/phase3/unsafe-audit.txt).
+Unsafe audit remains **four blocks plus one framework-linkage declaration, all in src/metal/mod.rs**. No new unsafe code, Send/Sync impl, Arc conversion, asynchronous work, or background Metal execution was added. `Rc`, immutable published tensors, and completion-before-return are unchanged. See [audit](../measurements/phase3/unsafe-audit.txt).
 
 All required gates passed: **27 ordinary tests**, one intentionally ignored real-model test in ordinary runs, **9 Phase 1 + 8 Phase 2 suites with both Metal validation layers**, and the explicit BF16 real-model test. Formatting, warning-denying Clippy, release build, device info, both smoke commands, all 13 primitive benchmark cases, and the final Cargo CLI demonstration passed. Raw evidence:
 
-- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, `cargo build --release`, `info`, `smoke`, `transformer-smoke`: [quality gates](measurements/phase3/quality-gates.txt).
-- Both Phase 1 and Phase 2 Metal API/shader validation suites: [Metal validation](measurements/phase3/metal-validation.txt).
-- Explicit release real-model integration: [real model](measurements/phase3/real-model-test.txt).
-- Primitive regression benchmark: [benchmark](measurements/phase3/primitive-benchmark.txt).
-- Final exact Cargo command: [final CLI demonstration](measurements/phase3/final-cli-demo.txt); final repeat of [real-model test](measurements/phase3/real-model-test-final.txt).
-- Real CLI fixtures, tokenizer diagnostic and seeded repeatability: [measurement directory](measurements/phase3/).
+- `cargo fmt --check`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo test`, `cargo build --release`, `info`, `smoke`, `transformer-smoke`: [quality gates](../measurements/phase3/quality-gates.txt).
+- Both Phase 1 and Phase 2 Metal API/shader validation suites: [Metal validation](../measurements/phase3/metal-validation.txt).
+- Explicit release real-model integration: [real model](../measurements/phase3/real-model-test.txt).
+- Primitive regression benchmark: [benchmark](../measurements/phase3/primitive-benchmark.txt).
+- Final exact Cargo command: [final CLI demonstration](../measurements/phase3/final-cli-demo.txt); final repeat of [real-model test](../measurements/phase3/real-model-test-final.txt).
+- Real CLI fixtures, tokenizer diagnostic and seeded repeatability: [measurement directory](../measurements/phase3/).
 
 Known limits: only this dense target is production-validated; exact pinned chat-template policy; single system/user turn; synchronous allocations/copies; no long-context performance or accuracy validation beyond the existing synthetic position-2048/2049 tests; CPU sampling; tensor payload accounting distinct from measured process RSS; BF16 arithmetic can change near-tie greedy choices compared with Transformers. F32 accumulation is intentional despite BF16 storage, and intermediate BF16 stores remain visible numerical boundaries. Small desktop measurements have scheduling/thermal variance. Phase 3 stops after validation and commit; Phase 4 optimization is not part of this result.

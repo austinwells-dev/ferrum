@@ -23,7 +23,7 @@ cargo build --release --features legacy-engine   # also the general engine
 
 The general engine (`ferrum run`, `smoke`, `transformer-smoke`, `profile`, the integration tests in `tests/`, `benches/` and the non-hybrid examples) is behind the `legacy-engine` feature, off by default. The TUI, server and CLI don't use it.
 
-`.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=15.0` because the Metal compile options Ferrum uses need macOS 15. The release profile keeps build-time proc-macro dylibs unstripped, because macOS 27's dyld rejects some stripped ones ([Phase 1 results](phase1-results.md) has the details).
+`.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=15.0` because the Metal compile options Ferrum uses need macOS 15. The release profile keeps build-time proc-macro dylibs unstripped, because macOS 27's dyld rejects some stripped ones ([Phase 1 results](history/phase1-results.md) has the details).
 
 ## Developer subcommands
 

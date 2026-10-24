@@ -153,7 +153,7 @@ Both engines accept the same share of drafts (within two points), so the differe
 | Ferrum, Q4_K_XL GGUF | 14.6–19.0 | 12.7–17.5 |
 | Plain decoding, Kapitsa / Ferrum (MLX) | 7.66–7.72 / 7.42–7.84 | |
 
-On MLX, Ferrum reaches 82–91% of Kapitsa greedy and 75–93% at T 0.6. Kapitsa drafts and builds its trees on the GPU, while Ferrum builds them on the CPU. The [Phase 11 journal](docs/phase11-journal.md) breaks the gap down.
+On MLX, Ferrum reaches 82–91% of Kapitsa greedy and 75–93% at T 0.6. Kapitsa drafts and builds its trees on the GPU, while Ferrum builds them on the CPU. The [Phase 11 journal](docs/history/phase11-journal.md) breaks the gap down.
 
 Accuracy is measured as KL divergence over llama-perplexity's text chunks: on Swift, Ferrum matches llama.cpp to a mean KLD of 1.2×10⁻⁴ (99.5% same top token); on Tiel, both are about as close to a high-precision Ferrum reference (0.0074 for Ferrum, 0.0068 for llama.cpp). Small models (under 1B) ran at 0.6–1.0× llama.cpp's speed when last measured (Phase 7), because fixed per-kernel overhead dominates at that size. Full methodology and raw logs are in the [engineering journals](docs/README.md) and [docs/measurements/verification-2026-10](docs/measurements/verification-2026-10/README.md).
 

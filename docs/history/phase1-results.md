@@ -1,5 +1,7 @@
 # Phase 1 completion report
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 Measured locally on 2026-09-20. Phase 1 is implemented and validated; Phase 2 has not begun.
 
 ## Device and environment
@@ -135,7 +137,7 @@ MTL_DEBUG_LAYER=1 MTL_SHADER_VALIDATION=1 cargo test --test correctness -- --tes
 cargo test --test correctness -- --nocapture --test-threads=1
 ```
 
-Raw logs: [quality gates](measurements/quality-gates.txt), [device](measurements/device.txt), [smoke](measurements/smoke.txt), [correctness](measurements/correctness.txt), [Metal validation](measurements/metal-validation.txt), [benchmarks](measurements/benchmark.txt). Criterion JSON remains in `target/criterion` as generated output.
+Raw logs: [quality gates](../measurements/quality-gates.txt), [device](../measurements/device.txt), [smoke](../measurements/smoke.txt), [correctness](../measurements/correctness.txt), [Metal validation](../measurements/metal-validation.txt), [benchmarks](../measurements/benchmark.txt). Criterion JSON remains in `target/criterion` as generated output.
 
 ## Limits and Phase 2 handoff
 

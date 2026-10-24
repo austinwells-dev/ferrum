@@ -1,5 +1,7 @@
 # Phase 9 — Speculative decoding
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 Phase 8 made Swift 27B and Tiel 35B-A3B fast and stable without speculation.
 Phase 9 adds three drafters and a lossless verify path, on the same M5 (32 GB,
 24 GiB GPU working set).

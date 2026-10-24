@@ -1,5 +1,7 @@
 # Phase 11 — Tree speculative decoding
 
+> **History.** Phase 11 is still in progress, so this file is still being written; earlier entries are not revised. The current docs start at [docs/README.md](../README.md).
+
 Phase 9's drafters propose a chain: the target verifies `[anchor, d1..dk]`
 in one forward, and the first wrong guess discards everything after it.
 Phase 11 lets a drafter also propose its next-best guesses where it is

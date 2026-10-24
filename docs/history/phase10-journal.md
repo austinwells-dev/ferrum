@@ -1,9 +1,11 @@
 # Phase 10 journal — long-context attention
 
+> **History.** Written as this phase's work happened and not updated since, so it may describe code or limits that have changed. The current docs start at [docs/README.md](../README.md).
+
 Hardware: Apple M5 (10-core GPU), 32 GB unified memory, macOS 27. Target:
 Tiel-Coder 35B-A3B IQ4_XS (GGUF name `Ornith-1.5-35B`; 40 trunk layers, 10 of
 them gated attention with 16 query / 2 KV heads × 256). Raw logs are in
-[`measurements/phase10/`](measurements/phase10/).
+[`measurements/phase10/`](../measurements/phase10/).
 
 The starting complaint: TUI generation speed on Tiel fell from 40–50 tok/s to
 about 20 tok/s past 32K tokens of context. Two things grow with context. Every
