@@ -8,7 +8,7 @@
 #![forbid(unsafe_code)]
 use super::{
     engine::{HybridModel, Params, SpecGeometry, page},
-    speculative::Drafter,
+    speculative::{DraftTree, Drafter, chain_with_siblings},
     weights::{MtpWeights, load_mtp},
 };
 use crate::{DType, Error, MetalDevice, Result, Tensor, loader::gguf::GgufFile};
@@ -33,6 +33,9 @@ pub struct Mtp {
     h_out: Tensor,
     drafts: Tensor,
     logits: Tensor,
+    /// `[max_drafts, blocks * 64]`: each draft step's top logits per
+    /// 1,024-token block (`h_topk_blocks`), for draft trees.
+    candidates: Tensor,
     /// `prev_h` at recurrent-snapshot positions, for rewinds.
     saved: Vec<(usize, Vec<f32>)>,
     /// Draft LM head: a prefix of the target's (see `DraftOptions::vocab`).
@@ -57,7 +60,14 @@ pub fn mtp_state_bytes(
         + 2 * page(c.hidden * 4)
         + page(max_drafts * 4)
         + page(c.vocab * 4)
+        + page(max_drafts * c.vocab.div_ceil(1024) * 64 * 4)
 }
+
+/// Per draft step, its top (token, logit) candidates.
+type StepCandidates = Vec<Vec<(u32, f32)>>;
+
+/// Alternatives a draft tree may add beside each MTP step's own pick.
+const TREE_SIBLINGS: usize = 3;
 
 /// Bytes of the MTP block's weights in `file`.
 pub fn mtp_weight_bytes(file: &GgufFile, c: &super::HybridConfig) -> usize {
@@ -107,6 +117,7 @@ impl Mtp {
             h_out: f(&[1, c.hidden])?,
             drafts: f(&[max_drafts])?,
             logits: f(&[1, head_rows])?,
+            candidates: f(&[max_drafts, head_rows.div_ceil(1024) * 64])?,
             saved: Vec::new(),
             head: target.weights.output.prefix_rows(head_rows),
         })
@@ -118,7 +129,8 @@ impl Mtp {
 
     /// One MTP pass over `m` rows at `pos..`: `ids` (m token ids) and `h`
     /// (m hidden rows). With `out`, the last row's argmax goes to `out.0`
-    /// and its hidden state to `out.1`.
+    /// and its hidden state to `out.1`, and with `top`, its top logits per
+    /// block to `top`.
     #[allow(clippy::too_many_arguments)]
     fn run(
         &self,
@@ -129,6 +141,7 @@ impl Mtp {
         pos: usize,
         m: usize,
         out: Option<(&Tensor, &Tensor)>,
+        top: Option<&Tensor>,
     ) -> Result<()> {
         let c = &t.config;
         let hd = c.hidden;
@@ -176,9 +189,110 @@ impl Mtp {
                 [1024, 1, 1],
                 0,
             )?;
+            if let Some(top) = top {
+                d.dispatch_hybrid(
+                    "h_topk_blocks",
+                    &[self.logits.binding()],
+                    &[top.binding()],
+                    &Params::default().u(self.head.rows)?.0,
+                    [self.head.rows.div_ceil(1024), 1, 1],
+                    [256, 1, 1],
+                    0,
+                )?;
+            }
             copy_rows(d, &last, h_out, 1, hd)?;
         }
         Ok(())
+    }
+
+    /// Draft up to `max` tokens after `anchor` at `pos` (the target's length)
+    /// as one submission; with `top`, also every step's top candidates
+    /// (token, logit).
+    fn draft_steps(
+        &mut self,
+        d: &MetalDevice,
+        t: &HybridModel,
+        pos: usize,
+        anchor: u32,
+        max: usize,
+        top: bool,
+    ) -> Result<(Vec<u32>, StepCandidates)> {
+        let max = max.min(self.max_drafts);
+        if max == 0 {
+            return Ok(Default::default());
+        }
+        if pos != self.len + self.staged.len() {
+            return Err(Error::Cache(format!(
+                "MTP draft at {pos} but its sequence ends at {}",
+                self.len + self.staged.len()
+            )));
+        }
+        if pos + max > self.capacity {
+            return Ok(Default::default());
+        }
+        let hd = t.config.hidden;
+        if self.staged.len() + 1 > t.chunk() {
+            self.flush(d, t)?;
+        }
+        let at = self.staged.len();
+        let mut ids = self.staged.clone();
+        ids.push(anchor);
+        let m = ids.len();
+        let ids = ids_tensor(d, &ids)?;
+        let width = self.candidates.numel() / self.max_drafts;
+        let top_row = |i: usize| -> Result<Option<Tensor>> {
+            top.then(|| self.candidates.view(i * width, [width]))
+                .transpose()
+        };
+        let e = d.execution_with_shared_encoder(true)?;
+        copy_rows(d, &self.prev_h, &self.h_in.view(at * hd, [1, hd])?, 1, hd)?;
+        let first = self.drafts.view(0, [1])?;
+        self.run(
+            d,
+            t,
+            &ids,
+            &self.h_in.view(0, [m, hd])?,
+            self.len,
+            m,
+            Some((&first, &self.h_out)),
+            top_row(0)?.as_ref(),
+        )?;
+        for i in 1..max {
+            let prev = self.drafts.view(i - 1, [1])?;
+            let next = self.drafts.view(i, [1])?;
+            self.run(
+                d,
+                t,
+                &prev,
+                &self.h_out,
+                pos + i,
+                1,
+                Some((&next, &self.h_out)),
+                top_row(i)?.as_ref(),
+            )?;
+        }
+        e.finish()?;
+        // The staged rows are committed; the anchor and draft rows are not.
+        self.len += at;
+        self.staged.clear();
+        let chain = self.drafts.to_f32()[..max]
+            .iter()
+            .map(|v| v.to_bits())
+            .collect();
+        let candidates = if top {
+            self.candidates.to_f32()[..max * width]
+                .chunks(width)
+                .map(|row| {
+                    row.chunks_exact(2)
+                        .filter(|pair| pair[0].is_finite())
+                        .map(|pair| (pair[1].to_bits(), pair[0]))
+                        .collect()
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok((chain, candidates))
     }
 
     /// Run the staged rows (no output) and commit them.
@@ -196,6 +310,7 @@ impl Mtp {
             &self.h_in.view(0, [m, t.config.hidden])?,
             self.len,
             m,
+            None,
             None,
         )?;
         e.finish()?;
@@ -301,61 +416,27 @@ impl Drafter for Mtp {
         anchor: u32,
         max: usize,
     ) -> Result<Vec<u32>> {
-        let max = max.min(self.max_drafts);
-        if max == 0 {
-            return Ok(Vec::new());
-        }
-        if pos != self.len + self.staged.len() {
-            return Err(Error::Cache(format!(
-                "MTP draft at {pos} but its sequence ends at {}",
-                self.len + self.staged.len()
-            )));
-        }
-        if pos + max > self.capacity {
-            return Ok(Vec::new());
-        }
-        let hd = t.config.hidden;
-        if self.staged.len() + 1 > t.chunk() {
-            self.flush(d, t)?;
-        }
-        let at = self.staged.len();
-        let mut ids = self.staged.clone();
-        ids.push(anchor);
-        let m = ids.len();
-        let ids = ids_tensor(d, &ids)?;
-        let e = d.execution_with_shared_encoder(true)?;
-        copy_rows(d, &self.prev_h, &self.h_in.view(at * hd, [1, hd])?, 1, hd)?;
-        let first = self.drafts.view(0, [1])?;
-        self.run(
-            d,
-            t,
-            &ids,
-            &self.h_in.view(0, [m, hd])?,
-            self.len,
-            m,
-            Some((&first, &self.h_out)),
-        )?;
-        for i in 1..max {
-            let prev = self.drafts.view(i - 1, [1])?;
-            let next = self.drafts.view(i, [1])?;
-            self.run(
-                d,
-                t,
-                &prev,
-                &self.h_out,
-                pos + i,
-                1,
-                Some((&next, &self.h_out)),
-            )?;
-        }
-        e.finish()?;
-        // The staged rows are committed; the anchor and draft rows are not.
-        self.len += at;
-        self.staged.clear();
-        Ok(self.drafts.to_f32()[..max]
-            .iter()
-            .map(|v| v.to_bits())
-            .collect())
+        Ok(self.draft_steps(d, t, pos, anchor, max, false)?.0)
+    }
+
+    /// The chain of up to `max` MTP picks, with each pick's siblings (the
+    /// step's next-best tokens) as leaves, best first up to `budget` nodes.
+    fn draft_tree(
+        &mut self,
+        d: &MetalDevice,
+        t: &HybridModel,
+        pos: usize,
+        anchor: u32,
+        max: usize,
+        budget: usize,
+    ) -> Result<DraftTree> {
+        let (chain, candidates) = self.draft_steps(d, t, pos, anchor, max, true)?;
+        Ok(chain_with_siblings(
+            &chain,
+            &candidates,
+            budget,
+            TREE_SIBLINGS,
+        ))
     }
 
     fn rewind(&mut self, d: &MetalDevice, t: &HybridModel, len: usize) -> Result<()> {

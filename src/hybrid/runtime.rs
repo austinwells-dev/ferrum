@@ -74,7 +74,7 @@ const MAX_TREE_NODES: usize = 31;
 #[derive(Debug, Clone)]
 pub struct SpecOptions {
     pub source: DraftSource,
-    /// Drafts per step (None: 3 for MTP; the trained block for dense
+    /// Drafts per step (None: 3 for MTP, 5 with trees; the trained block for dense
     /// targets and 2 for MoE targets, whose verify cost grows with the
     /// number of distinct experts).
     pub max_drafts: Option<usize>,
@@ -147,6 +147,8 @@ impl SpecOptions {
     fn drafts(&self, target: &HybridConfig, trained: usize) -> usize {
         self.max_drafts
             .unwrap_or(match (&self.source, target.variant) {
+                // Trees measured best at five MTP steps, chains at three.
+                (DraftSource::Mtp, _) if self.tree.is_some() => 5,
                 (DraftSource::Mtp, _) => 3,
                 (DraftSource::Lookup, _) => LOOKUP_DRAFTS,
                 (_, Variant::Moe | Variant::Flint) => trained.min(2),
