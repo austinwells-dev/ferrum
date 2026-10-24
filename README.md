@@ -45,7 +45,7 @@ This builds an optimized release and puts four binaries on your `PATH` (in `~/.c
 | `ferrum-tui` | Full-screen launcher: chat, coding agent, server and benchmarks |
 | `ferrum-cli` | Plain terminal chat |
 | `ferrum-server` | OpenAI- and Anthropic-compatible HTTP server |
-| `ferrum` | Developer tool: device info, smoke tests, small-model runner |
+| `ferrum` | Developer tool: device info and a one-shot hybrid-engine runner (smoke tests and the small-model runner need `--features legacy-engine`) |
 
 If you'd rather not install, `cargo build --release` puts the same binaries in `target/release/`.
 
@@ -189,7 +189,7 @@ The design is covered in [docs/architecture.md](docs/architecture.md). How it wa
 
 ## Other supported models
 
-The developer binary `ferrum run` has a second, general transformer engine that runs smaller checkpoints. Each was validated against reference logits:
+The developer binary `ferrum run` has a second, general transformer engine that runs smaller checkpoints. None of the apps use it, so it is behind a cargo feature that is off by default; install with `cargo install --path . --features legacy-engine` to get it. Each checkpoint was validated against reference logits:
 
 | Family | Validated checkpoints |
 |---|---|
@@ -222,7 +222,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - One request at a time (batch size 1).
-- The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint and Spark. Other architectures go through the developer runner.
+- The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint and Spark. Other architectures go through the developer runner, built with `--features legacy-engine`.
 - Vision supports the Qwen3-VL projector only (no video).
 - No training and no language bindings.
 

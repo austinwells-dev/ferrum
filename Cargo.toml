@@ -30,12 +30,115 @@ thiserror = "2.0.20"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 unicode-width = "0.2"
 
+[features]
+# The general transformer engine (`model`, `ops`, `nn`, ...) behind `ferrum run`.
+# The TUI, server and CLI run only the hybrid engine and do not need it.
+legacy-engine = []
+
 [dev-dependencies]
 criterion = "0.8.2"
 
 [[bench]]
 name = "runtime"
 harness = false
+required-features = ["legacy-engine"]
+
+# Integration tests and probes of the general engine.
+[[test]]
+name = "correctness"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "fusion_parity"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "granite"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "granite_moe"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "lfm2"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "lfm2_moe"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "lfm2_moe_gguf"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "loading"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "olmo2"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "qwen"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "qwen3"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "qwen3_gguf"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "real_model"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "runtime_optimization"
+required-features = ["legacy-engine"]
+
+[[test]]
+name = "transformer"
+required-features = ["legacy-engine"]
+
+[[example]]
+name = "phase55_bench"
+required-features = ["legacy-engine"]
+
+[[example]]
+name = "phase5_matrix"
+required-features = ["legacy-engine"]
+
+[[example]]
+name = "projection_bench"
+required-features = ["legacy-engine"]
+
+[[example]]
+name = "qwen_probe"
+required-features = ["legacy-engine"]
+
+[[example]]
+name = "qwen_quant_quality"
+required-features = ["legacy-engine"]
+
+[[example]]
+name = "reduction_bench"
+required-features = ["legacy-engine"]
+
+[[example]]
+name = "rounding_probe"
+required-features = ["legacy-engine"]
+
+[[example]]
+name = "runtime_matrix"
+required-features = ["legacy-engine"]
+
+[[example]]
+name = "token_probe"
+required-features = ["legacy-engine"]
 
 # macOS 27's dyld rejects some stripped proc-macro dylibs (LINKEDIT alignment).
 # Build-time tools are not shipped; keeping them unstripped avoids E0463 at release build.

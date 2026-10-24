@@ -1,7 +1,11 @@
 mod hybrid_cli;
+#[cfg(feature = "legacy-engine")]
 mod run;
+#[cfg(feature = "legacy-engine")]
 mod transformer_smoke;
-use ferrum::{DType, MetalDevice, Result, Tensor, reference as cpu};
+#[cfg(feature = "legacy-engine")]
+use ferrum::{DType, Tensor, reference as cpu};
+use ferrum::{MetalDevice, Result};
 fn main() -> Result<()> {
     let device = MetalDevice::new()?;
     match std::env::args().nth(1).as_deref().unwrap_or("info") {
@@ -16,9 +20,12 @@ fn main() -> Result<()> {
                 device.apple_families()
             );
         }
+        #[cfg(feature = "legacy-engine")]
         "run" | "profile" => run::run(&device)?,
         "hybrid" => hybrid_cli::run(&device)?,
+        #[cfg(feature = "legacy-engine")]
         "transformer-smoke" => transformer_smoke::run(&device)?,
+        #[cfg(feature = "legacy-engine")]
         "smoke" => {
             println!("Metal device: {}", device.name());
             let start = std::time::Instant::now();
@@ -57,8 +64,13 @@ fn main() -> Result<()> {
             println!("Phase 1 Metal smoke test: PASS");
         }
         other => {
+            let commands = if cfg!(feature = "legacy-engine") {
+                "info, smoke, transformer-smoke, run, profile or hybrid"
+            } else {
+                "info or hybrid (smoke, transformer-smoke, run and profile need --features legacy-engine)"
+            };
             return Err(ferrum::Error::Parameter(format!(
-                "unknown command {other}; use info, smoke, transformer-smoke, run, profile or hybrid"
+                "unknown command {other}; use {commands}"
             )));
         }
     }

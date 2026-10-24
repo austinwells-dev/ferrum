@@ -14,6 +14,7 @@ impl Tokenizer {
             .map(|t| Self(t, None))
             .map_err(|e| Error::Tokenizer(e.to_string()))
     }
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn from_gguf_bpe(
         tokens: &[String],
         merges: &[String],
@@ -23,6 +24,7 @@ impl Tokenizer {
         Self::from_gguf_bpe_with_pattern(tokens, merges, token_types, QWEN_REGEX)
     }
     /// GPT-2 byte-level BPE from GGUF arrays with the model's split pattern.
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn from_gguf_bpe_with_pattern(
         tokens: &[String],
         merges: &[String],
@@ -183,4 +185,5 @@ impl Tokenizer {
         self.0.get_vocab_size(true)
     }
 }
+#[cfg(feature = "legacy-engine")]
 pub mod qwen;

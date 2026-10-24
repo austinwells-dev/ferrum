@@ -11,11 +11,11 @@ Ferrum is a single Rust crate with two inference engines that share one Metal ba
 | Front ends | `src/bin/ferrum-tui`, `ferrum-cli`, `ferrum-server` | TUI, terminal chat, OpenAI/Anthropic HTTP server |
 | Chat runtime | `hybrid::runtime`, `hybrid::chat` | GGUF chat templates, streaming split into reasoning / content / tool calls |
 | Large-model engine | `hybrid::{plan, engine, session, weights, draft, mtp, speculative}` | Qwen3.5-family hybrids: memory planning, forward pass, sessions, speculative decoding |
-| General engine | `model`, `nn`, `generation` | Dense, MoE and short-conv transformers (Qwen2.5/3, Granite, OLMo 2, LFM2) |
+| General engine | `model`, `nn`, `ops`, `generation`, `sampling`, `quantization`, `metal::legacy` | Dense, MoE and short-conv transformers (Qwen2.5/3, Granite, OLMo 2, LFM2). Behind the `legacy-engine` cargo feature; no front end uses it |
 | Vision | `vision` | Qwen3-VL image encoder that feeds the hybrid engine |
-| Core | `tensor`, `ops`, `loader`, `quantization`, `tokenizer` | Tensors, operations, safetensors/GGUF parsing, GGML block formats |
+| Core | `tensor`, `loader`, `tokenizer` | Tensors, safetensors/GGUF parsing, tokenizers |
 | Backend | `metal` (+ `metal/shaders/*.metal`) | Device, pipeline cache, command batching, residency, the only `unsafe` code |
-| Oracles | `reference` | CPU implementations used only by tests |
+| Oracles | `reference` | CPU implementations used only by the general engine's tests (feature-gated) |
 
 ### The hybrid engine
 
