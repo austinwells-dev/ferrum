@@ -27,6 +27,7 @@ Ferrum was built in phases, with each phase's experiments recorded as they happe
 | 8 | Large hybrid models (27B dense, 35B MoE), memory planner, server | [Plan](phase8-plan.md), [journal](phase8-journal.md) |
 | 9 | Lossless speculative decoding: MTP, DFlash, DSpark | [Plan](phase9-plan.md), [journal](phase9-journal.md) |
 | 10 | Long-context attention: Q8 K/V cache, TensorOps verify and staged prompt attention | [Journal](phase10-journal.md) |
+| 11 | Tree speculative decoding: tree-masked verify, path commit, MTP draft trees | [Plan](phase11-plan.md), [journal](phase11-journal.md) |
 | — | Image input (Qwen3-VL projector) | [vision.md](vision.md) |
 | — | Re-check of every documented claim against llama.cpp build 11669 (October 2026) | [Record](measurements/verification-2026-10/README.md) |
 

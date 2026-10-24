@@ -82,7 +82,7 @@ python3 tools/check_phase4_probe.py
 cargo bench --bench runtime -- --noplot
 ```
 
-The `examples/hybrid_*` programs measure the hybrid engine: `hybrid_bench` (prefill and decode), `hybrid_kld` (KL divergence against llama.cpp logits), `hybrid_spec` (speculative decoding, `--depth N --filler FILE` for long context), `hybrid_verify_cost` (verify cost against block width), `hybrid_attention` and `hybrid_prefill_attention` (attention kernels alone, per query width and K/V format), `hybrid_plan` (memory plan per K/V format) and `hybrid_needle` (long-context retrieval).
+The `examples/hybrid_*` programs measure the hybrid engine: `hybrid_bench` (prefill and decode), `hybrid_kld` (KL divergence against llama.cpp logits), `hybrid_spec` (speculative decoding, `--depth N --filler FILE` for long context, `--sweep 0,4,8,15` for draft-tree budgets), `hybrid_verify_cost` (verify cost against block width), `hybrid_tree_check` (draft-tree verify and path commit against plain decoding and a chain, with oracle trees), `hybrid_tree_cost` (tree verify and commit cost against a chain's), `hybrid_attention` and `hybrid_prefill_attention` (attention kernels alone, per query width and K/V format), `hybrid_plan` (memory plan per K/V format) and `hybrid_needle` (long-context retrieval).
 
 To check that a drafter (or a kernel change) keeps plain decoding's answers, run the benchmark's `≈` answer check headless. It asks the 30 bundled math questions with and without the drafter and fails if the drafter loses more than one net answer:
 
