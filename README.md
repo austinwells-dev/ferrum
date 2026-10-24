@@ -13,12 +13,11 @@ Ferrum runs 27B–35B language models on a 32 GB Mac, at llama.cpp's speed on th
 
 You give it a model file and then either chat in the terminal, use the full-screen TUI (chat, a sandboxed coding agent, and a benchmarking tool), or run a local server that speaks the **OpenAI** and **Anthropic** APIs, so existing clients and coding agents work with it unchanged.
 
-> **Experimental.** Several recent additions are not production-ready, and their flags and behaviour may change:
-> - **Flint and Spark.** Flint (unsloth's `flint-GGUF`) and Spark-X2.6-4B are each checked against llama.cpp on one quant only, and their tool-call parsing is new.
+> **Experimental branch.** Two additions here are not on `main` yet and are not production-ready; their flags and behaviour may change:
 > - **MLX checkpoints.** MLX 4-bit Qwen3.5-family checkpoint directories load, but only the 27B is validated.
 > - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets, 16-row DFlash2 blocks, and sampled output identical to plain decoding.
 >
-> GGUF Qwen3.5-family models without these flags behave as before. Details and known gaps: [docs/experimental.md](docs/experimental.md).
+> GGUF models without these flags behave as on `main`. Details and known gaps: [docs/experimental.md](docs/experimental.md#mlx-4-bit-checkpoints).
 
 ## Highlights
 
