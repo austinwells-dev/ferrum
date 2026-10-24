@@ -87,9 +87,11 @@ pub(crate) struct RopePlan {
     /// Per-row (time, height, width) positions when the chunk holds image
     /// tokens or draft-tree nodes.
     pub table: Option<Tensor>,
-    /// Draft-tree verify: per row, the rows it sees and its depth (see
-    /// `tree_rows`).
+    /// Draft tree: the nodes each row sees and their depths (see
+    /// `tree_plan_rows`).
     pub tree: Option<Tensor>,
+    /// Cache position of the tree's root, the lowest position any row sits at.
+    pub tree_root: usize,
 }
 
 /// Most rows a draft-tree verify takes: a row's ancestors are one `u32` mask.
@@ -98,32 +100,69 @@ pub(crate) const TREE_MAX_ROWS: usize = 32;
 /// Plan of a draft-tree verify whose root sits at rotary position `base`:
 /// node i is stored at the i-th new cache position but sits at `base +
 /// depth(i)`, through the position table with all three axes equal.
-pub(crate) fn tree_plan(d: &MetalDevice, base: i32, parents: &[Option<usize>]) -> Result<RopePlan> {
-    let rows = tree_rows(parents)?;
+pub(crate) fn tree_plan(
+    d: &MetalDevice,
+    pos: usize,
+    base: i32,
+    parents: &[Option<usize>],
+) -> Result<RopePlan> {
+    tree_plan_rows(d, pos, base, parents, 0..parents.len())
+}
+
+/// Plan of a forward over nodes `rows` of the draft tree with `parents`,
+/// whose root sits at cache position `root` and rotary position `base`
+/// (the forward starts at `root + rows.start`): earlier nodes were stored by
+/// earlier forwards. The tree buffer
+/// holds `rows.start`, then every node's mask and depth (`KeyMask` in
+/// `hybrid.metal`). A forward of the root alone needs no tree.
+pub(crate) fn tree_plan_rows(
+    d: &MetalDevice,
+    root: usize,
+    base: i32,
+    parents: &[Option<usize>],
+    rows: std::ops::Range<usize>,
+) -> Result<RopePlan> {
+    let nodes = tree_rows(parents)?;
+    if rows.is_empty() || rows.end > nodes.len() {
+        return Err(Error::Parameter(format!(
+            "tree rows {rows:?} of a {}-node tree",
+            nodes.len()
+        )));
+    }
     let mut table = Vec::with_capacity(rows.len() * 3 * 4);
-    let mut tree = Vec::with_capacity(rows.len() * 2 * 4);
-    for &(mask, depth) in &rows {
+    for &(_, depth) in &nodes[rows.clone()] {
         let p = base + depth as i32;
         for v in [p, p, p] {
             table.extend_from_slice(&v.to_le_bytes());
         }
+    }
+    let table = Tensor::from_le_bytes(d, [rows.len() * 3], DType::F32, &table)?;
+    if rows == (0..1) {
+        return Ok(RopePlan {
+            delta: 0,
+            table: Some(table),
+            tree: None,
+            tree_root: root,
+        });
+    }
+    let mut tree = Vec::with_capacity((rows.end + 1) * 2 * 4);
+    for v in [rows.start as u32, 0] {
+        tree.extend_from_slice(&v.to_le_bytes());
+    }
+    for &(mask, depth) in &nodes[..rows.end] {
         tree.extend_from_slice(&mask.to_le_bytes());
         tree.extend_from_slice(&depth.to_le_bytes());
     }
     Ok(RopePlan {
         delta: 0,
-        table: Some(Tensor::from_le_bytes(
-            d,
-            [rows.len() * 3],
-            DType::F32,
-            &table,
-        )?),
+        table: Some(table),
         tree: Some(Tensor::from_le_bytes(
             d,
-            [rows.len() * 2],
+            [(rows.end + 1) * 2],
             DType::F32,
             &tree,
         )?),
+        tree_root: root,
     })
 }
 
@@ -353,6 +392,7 @@ impl HybridState {
             delta: 0,
             table: Some(Tensor::from_le_bytes(d, [m * 3], DType::F32, &table)?),
             tree: None,
+            tree_root: 0,
         })
     }
     /// Rotary positions and visibility for a draft-tree verify of the nodes
@@ -374,7 +414,7 @@ impl HybridState {
         }
         let base = i32::try_from(rope_position(&self.media, pos))
             .map_err(|_| Error::Cache("rotary position exceeds i32".into()))?;
-        tree_plan(d, base, parents)
+        tree_plan(d, pos, base, parents)
     }
     /// Recurrent tensors (conv windows then delta-rule matrices) in a fixed order.
     pub(crate) fn recurrent(&self) -> impl Iterator<Item = &Tensor> {
@@ -597,7 +637,7 @@ fn copy(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
 /// Attention options of `layer`. Layers past the trunk (the MTP block) use the
 /// Qwen3.5 layout: full window, RoPE, gated, no sinks.
 /// `dst[r] = src[idx[r]]` for `n` rows of `width` (`src` rows `src_stride` apart).
-fn gather_rows(
+pub(crate) fn gather_rows(
     d: &MetalDevice,
     src: &Tensor,
     idx: &Tensor,
@@ -1870,7 +1910,7 @@ impl HybridModel {
             spec,
             a.sinks.as_ref(),
             ring,
-            rope.tree.as_ref(),
+            rope.tree.as_ref().map(|t| (t, rope.tree_root)),
         )?;
         if let Some(gate) = &a.head_gate {
             let logits = rows(&s.head_gate, 0, m, c.heads)?;
@@ -1895,7 +1935,8 @@ impl HybridModel {
     /// sigmoid(gate) from `qg`; `spec.window` masks keys out of range, and
     /// `sinks` (per-head logits) join the softmax denominator. With `tree`
     /// (`RopePlan::tree`) the rows are draft-tree nodes that see only their
-    /// ancestors among the new rows.
+    /// ancestors among the tree's rows, stored from cache position `root`
+    /// (the second member) on.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn flash_attention(
         &self,
@@ -1912,15 +1953,19 @@ impl HybridModel {
         spec: AttnSpec,
         sinks: Option<&Tensor>,
         ring: usize,
-        tree: Option<&Tensor>,
+        tree: Option<(&Tensor, usize)>,
     ) -> Result<()> {
         let c = &self.config;
         let group = c.heads / c.kv_heads;
+        let (tree, tree_root) = (tree.map(|t| t.0), tree.map_or(pos, |t| t.1));
         let rows = m * group;
         let window = spec.window.unwrap_or(0);
-        // No query reads keys before the window of the first query. A ring
-        // starts at a multiple of 64 so tensor-op tiles never wrap.
-        let first_key = spec.window.map_or(0, |w| (pos + 1).saturating_sub(w));
+        // No query reads keys before the window of the first query (of the
+        // tree's root, which sits lowest). A ring starts at a multiple of 64
+        // so tensor-op tiles never wrap.
+        let first_key = spec
+            .window
+            .map_or(0, |w| (pos.min(tree_root) + 1).saturating_sub(w));
         let first_key = if ring > 0 {
             first_key / 64 * 64
         } else {
@@ -1942,8 +1987,8 @@ impl HybridModel {
                     .into(),
             ));
         }
-        // A one-row tree is the anchor alone, which plain decode covers.
-        let tree = tree.filter(|_| m > 1);
+        // A one-row forward with a tree is a node whose ancestors earlier
+        // forwards stored; it runs on the verify kernels, not decode.
         if tree.is_some() && (legacy || m > TREE_MAX_ROWS) {
             return Err(Error::Config(format!(
                 "a draft-tree verify takes at most {TREE_MAX_ROWS} rows on the TensorOps \
@@ -2068,7 +2113,7 @@ impl HybridModel {
                 0,
             )
         };
-        if m == 1 && group <= 8 && !flags().simd_attention {
+        if m == 1 && group <= 8 && !flags().simd_attention && tree.is_none() {
             let target = DECODE_SPLIT_TARGET;
             let min_keys = DECODE_SPLIT_MIN_KEYS;
             let splits = (target / c.kv_heads)

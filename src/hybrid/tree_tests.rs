@@ -348,8 +348,8 @@ enum Kernel {
     Staged,
 }
 
-/// Run one kernel with `tree` (its `_tree` variant) or without, and return
-/// its output.
+/// Run one kernel over the case's rows `rows` with `tree` (its `_tree`
+/// variant, rows `rows` of the tree) or without, and return its output.
 fn run(
     d: &MetalDevice,
     c: Case,
@@ -357,8 +357,16 @@ fn run(
     cache: &Cache,
     kernel: Kernel,
     tree: Option<&Tensor>,
+    rows: std::ops::Range<usize>,
 ) -> Vec<f32> {
-    let (heads, kv_heads, dim, m, pos) = (c.heads, c.kv_heads, c.dim, c.m, c.pos);
+    let (heads, kv_heads, dim) = (c.heads, c.kv_heads, c.dim);
+    let (m, pos) = (rows.len(), c.pos + rows.start);
+    let q =
+        x.q.view(rows.start * heads * dim, [m, heads * dim])
+            .unwrap();
+    let qg =
+        x.qg.view(rows.start * 2 * heads * dim, [m, 2 * heads * dim])
+            .unwrap();
     let group = heads / kv_heads;
     let stride = kv_heads * dim;
     let q8 = cache.kv == KvCache::Q8;
@@ -369,8 +377,8 @@ fn run(
         (true, _) => "_q8_d128",
     };
     let tree_on = usize::from(tree.is_some());
-    let tree_t = tree.unwrap_or(&x.qg);
-    let sinks_t = if c.sinks { &x.sinks } else { &x.qg };
+    let tree_t = tree.unwrap_or(&qg);
+    let sinks_t = if c.sinks { &x.sinks } else { &qg };
     let out = Tensor::zeros(d, [m, heads * dim], DType::F32).unwrap();
     let e = d.execution_with_shared_encoder(true).unwrap();
     if kernel == Kernel::Reference {
@@ -391,10 +399,10 @@ fn run(
         d.dispatch_hybrid(
             "h_attention",
             &[
-                x.q.binding(),
+                q.binding(),
                 cache.k_seen.binding(),
                 cache.v_seen.binding(),
-                x.qg.binding(),
+                qg.binding(),
                 sinks_t.binding(),
                 tree_t.binding(),
             ],
@@ -410,8 +418,9 @@ fn run(
     }
     // As `flash_attention` routes them: keys from the anchor's window start,
     // aligned to 64 in a ring.
+    // From the window of the tree's root (the case's first row), the lowest.
     let first_key = if c.window > 0 {
-        (pos + 1).saturating_sub(c.window)
+        (c.pos + 1).saturating_sub(c.window)
     } else {
         0
     };
@@ -460,7 +469,7 @@ fn run(
                 q.binding(),
                 cache.k.binding(),
                 cache.v.binding(),
-                x.qg.binding(),
+                qg.binding(),
                 sinks_t.binding(),
                 tree_t.binding(),
             ];
@@ -479,7 +488,7 @@ fn run(
         Kernel::Verify(_) => {
             d.dispatch_hybrid(
                 "h_q_by_kv_head",
-                &[x.q.binding()],
+                &[q.binding()],
                 &[qk.binding()],
                 &args.0,
                 [(m * heads * dim).div_ceil(256), 1, 1],
@@ -508,7 +517,7 @@ fn run(
             };
             bind(
                 name.to_owned(),
-                &x.q,
+                &q,
                 &[&out],
                 [m.div_ceil(64), heads, 1],
                 64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
@@ -525,7 +534,7 @@ fn run(
             &[
                 partial.binding(),
                 ml.binding(),
-                x.qg.binding(),
+                qg.binding(),
                 sinks_t.binding(),
             ],
             &[out.binding()],
@@ -570,15 +579,15 @@ fn tree_attention_matches_the_cpu_and_a_chain_matches_causal_rows() {
             let causal = cpu_attention(c, &x, &cache, None);
             for &kernel in &kernels {
                 let label = format!("{c:?} {} ring {} {kernel:?}", cache.kv, cache.ring);
-                let off = run(&d, c, &x, &cache, kernel, None);
+                let off = run(&d, c, &x, &cache, kernel, None, 0..c.m);
                 let err = worst(&off, &causal);
                 assert!(err < TOLERANCE, "{label} causal: max error {err}");
                 worst_causal = worst_causal.max(err);
                 for (seed, shape) in shapes.iter().enumerate() {
                     let parents = tree(shape, c.m, seed as u64 + 11);
                     let rows = tree_rows(&parents).unwrap();
-                    let plan = tree_plan(&d, c.pos as i32, &parents).unwrap();
-                    let got = run(&d, c, &x, &cache, kernel, plan.tree.as_ref());
+                    let plan = tree_plan(&d, c.pos, c.pos as i32, &parents).unwrap();
+                    let got = run(&d, c, &x, &cache, kernel, plan.tree.as_ref(), 0..c.m);
                     if *shape == "chain" {
                         let same = got
                             .iter()
@@ -591,6 +600,32 @@ fn tree_attention_matches_the_cpu_and_a_chain_matches_causal_rows() {
                     assert!(err < TOLERANCE, "{label} {shape} tree: max error {err}");
                     worst_tree = worst_tree.max(err);
                     checked += 1;
+                    // The later half of the nodes alone, as a drafter
+                    // expanding a tree in waves runs them: earlier nodes'
+                    // K/V are already cached, siblings stay hidden.
+                    // The later nodes alone, as a drafter expanding a tree in
+                    // waves runs them: earlier nodes' K/V are already cached,
+                    // and siblings stay hidden. Half the nodes, and the last.
+                    let splits: &[usize] = if c.m >= 4 { &[c.m / 2, c.m - 1] } else { &[] };
+                    for &split in splits.iter().filter(|_| kernel != Kernel::Staged) {
+                        let plan = super::engine::tree_plan_rows(
+                            &d,
+                            c.pos,
+                            c.pos as i32,
+                            &parents,
+                            split..c.m,
+                        )
+                        .unwrap();
+                        let got = run(&d, c, &x, &cache, kernel, plan.tree.as_ref(), split..c.m);
+                        let row = c.heads * c.dim;
+                        let err = worst(&got, &want[split * row..]);
+                        assert!(
+                            err < TOLERANCE,
+                            "{label} {shape} tree rows {split}..: max error {err}"
+                        );
+                        worst_tree = worst_tree.max(err);
+                        checked += 1;
+                    }
                 }
             }
         }
@@ -612,7 +647,7 @@ fn tree_rotary_positions_are_plain_rope_at_depth() {
     let (m, pos) = (12usize, 300usize);
     let parents = tree("deep", m, 3);
     let rows = tree_rows(&parents).unwrap();
-    let plan = tree_plan(&d, pos as i32, &parents).unwrap();
+    let plan = tree_plan(&d, pos, pos as i32, &parents).unwrap();
     let kv_width = kv_heads * dim;
     let kv_rows = pos + m;
     let qg = random(m * heads * 2 * dim, 1);

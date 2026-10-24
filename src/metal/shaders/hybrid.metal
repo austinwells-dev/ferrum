@@ -1567,10 +1567,10 @@ kernel void h_gdn_conv(constant ConvArgs & p [[buffer(4)]],
     state[2 * p.channels + c] = s2;
 }
 
-// Parent of draft-tree node t (see KeyMask): its latest ancestor, or -1 for
-// the root.
+// Parent of draft-tree node t (see KeyMask; the verify's rows are the whole
+// tree, so row t is node t): its latest ancestor, or -1 for the root.
 inline int tree_parent(device const uint * tree, uint t) {
-    const uint ancestors = tree[2 * t] & ~(1u << t);
+    const uint ancestors = tree[2 + 2 * t] & ~(1u << t);
     return ancestors == 0 ? -1 : int(31 - clz(ancestors));
 }
 
@@ -1782,27 +1782,34 @@ inline device const half * kv_scales(device const half * cache, uint kv_rows, ui
 }
 
 // Which keys a query row sees. Without a tree, row t sits at position + t and
-// sees every key up to its own. In a draft-tree verify (the `_tree` kernels),
-// row t is node t of a tree listed parents first, with its K/V at cache
-// position position + t: tree[2t] has bit s set iff node s is t or one of its
-// ancestors, and tree[2t + 1] is t's depth. A node's position (for the
-// window, as for RoPE) is position + depth.
+// sees every key up to its own. With a draft tree (the `_tree` kernels), the
+// rows are nodes `offset..` of a tree listed parents first, whose node s has
+// its K/V at cache position base + s (base = position - offset), so earlier
+// nodes may come from previous forwards. tree[0] is `offset`; tree[2 + 2s]
+// has bit r set iff node r is s or one of its ancestors, and tree[3 + 2s] is
+// s's depth. A node's position (for the window, as for RoPE) is base + depth.
 struct KeyMask {
-    uint position;
+    uint base;  // cache position of tree node 0 (or of row 0 without a tree)
     uint window;
     uint qpos;  // position of the query row
-    uint bits;  // tree rows it sees, already limited to its window
+    uint bits;  // tree nodes it sees, already limited to its window
 };
+
+inline uint tree_offset(device const uint * tree) { return tree[0]; }
+inline uint tree_mask(device const uint * tree, uint node) { return tree[2 + 2 * node]; }
+inline uint tree_depth(device const uint * tree, uint node) { return tree[3 + 2 * node]; }
 
 template <bool TREE>
 inline KeyMask key_mask(device const uint * tree, uint position, uint window, uint t) {
     KeyMask k = {position, window, position + t, 0};
     if (TREE) {
-        k.qpos = position + tree[2 * t + 1];
+        const uint node = tree_offset(tree) + t;
+        k.base = position - tree_offset(tree);
+        k.qpos = k.base + tree_depth(tree, node);
         // Resolve the window on tree keys here, so testing a key reads no memory.
-        for (uint seen = tree[2 * t]; seen != 0; seen &= seen - 1) {
+        for (uint seen = tree_mask(tree, node); seen != 0; seen &= seen - 1) {
             const uint s = ctz(seen);
-            if (window == 0 || position + tree[2 * s + 1] + window > k.qpos) k.bits |= 1u << s;
+            if (window == 0 || k.base + tree_depth(tree, s) + window > k.qpos) k.bits |= 1u << s;
         }
     }
     return k;
@@ -1810,8 +1817,8 @@ inline KeyMask key_mask(device const uint * tree, uint position, uint window, ui
 
 template <bool TREE>
 inline bool key_visible(thread const KeyMask & k, uint key) {
-    if (TREE && key >= k.position) {
-        const uint s = key - k.position;
+    if (TREE && key >= k.base) {
+        const uint s = key - k.base;
         return s < 32 && ((k.bits >> s) & 1u) != 0;
     }
     return key <= k.qpos && (k.window == 0 || key + k.window > k.qpos);
@@ -1823,9 +1830,10 @@ inline bool key_visible(thread const KeyMask & k, uint key) {
 template <bool TREE>
 inline uint lowest_query_position(device const uint * tree, uint position, uint t_begin, uint t_end) {
     if (!TREE) return position + t_begin;
+    const uint offset = tree_offset(tree);
     uint depth = 0xffffffffu;
-    for (uint t = t_begin; t <= t_end; t++) depth = min(depth, tree[2 * t + 1]);
-    return position + depth;
+    for (uint t = t_begin; t <= t_end; t++) depth = min(depth, tree_depth(tree, offset + t));
+    return position - offset + depth;
 }
 
 // Store one element per thread; with Q8 the 32 lanes of a SIMD group hold one
