@@ -26,7 +26,7 @@ pub use gguf::{check_tokenizer, is_dflash};
 use super::{
     HybridConfig,
     engine::{HybridModel, Params, SpecGeometry, page},
-    speculative::Drafter,
+    speculative::{DraftTree, Drafter, lattice_best_first, log_softmax},
     weights::{Format, Matrix, gguf_matrix},
 };
 use crate::{
@@ -318,6 +318,13 @@ impl Default for DraftOptions {
         }
     }
 }
+
+/// Candidates per depth in a DFlash or DSpark draft tree (DFlash2 keeps its
+/// selector's top-k).
+const TREE_CANDIDATES: usize = 16;
+
+/// Per draft row, (token, logit) candidates best first.
+type Candidates = Vec<Vec<(u32, f32)>>;
 
 /// Safetensors index over one file (BF16 tensors are read on demand).
 struct Safetensors {
@@ -656,6 +663,8 @@ struct Buffers {
     w1p: Tensor,
     bias: Tensor,
     conf: Tensor,
+    /// DSpark trees: gathered Markov rows, `[2 * block * (TREE_CANDIDATES + 1) + 1, rank]`.
+    lattice: Tensor,
 }
 
 /// A drafter's weights, `bytes` of device memory.
@@ -852,6 +861,7 @@ impl DraftModel {
             w1p: f(&[block, rank])?,
             bias: f(&[1, vocab])?,
             conf: f(&[block])?,
+            lattice: f(&[2 * block * (TREE_CANDIDATES + 1) + 1, rank])?,
         };
         let mut kc = Vec::new();
         let mut vc = Vec::new();
@@ -1151,36 +1161,104 @@ impl DraftModel {
         HybridModel::project(d, &self.head, &out, n, &b.logits.view(0, [n, self.vocab])?)
     }
 
-    /// Greedy DFlash2 path through each row's top-k candidates.
-    fn walk(
+    /// Top (logit, id) pairs per 1,024-token block of logit rows `0..rows`.
+    fn top_blocks(&self, d: &MetalDevice, rows: usize) -> Result<()> {
+        d.dispatch_hybrid(
+            "h_topk_blocks",
+            &[self.b.logits.binding()],
+            &[self.b.candidates.binding()],
+            &Params::default().u(self.vocab)?.0,
+            [self.vocab.div_ceil(1024), rows, 1],
+            [256, 1, 1],
+            0,
+        )
+    }
+
+    /// The best `keep` (token, logit) pairs of candidate rows `0..rows`,
+    /// best first (ties to lower ids).
+    fn read_candidates(&self, rows: usize, keep: usize) -> Candidates {
+        let width = self.vocab.div_ceil(1024) * 64;
+        self.b.candidates.to_f32()[..rows * width]
+            .chunks(width)
+            .map(|row| {
+                let mut all: Vec<(u32, f32)> = row
+                    .chunks_exact(2)
+                    .filter(|p| p[0].is_finite())
+                    .map(|p| (p[1].to_bits(), p[0]))
+                    .collect();
+                all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+                all.truncate(keep);
+                all
+            })
+            .collect()
+    }
+
+    /// One DFlash2 block: each draft row's top-k candidates and its
+    /// selector gate (`[max, rank]`).
+    fn dflash2_lattice(
         &self,
+        d: &MetalDevice,
+        t: &HybridModel,
+        pos: usize,
         anchor: u32,
-        candidates: &[Vec<(u32, f32)>],
-        gates: &[f32],
-        rank: usize,
-    ) -> Vec<u32> {
+        max: usize,
+    ) -> Result<(Candidates, Vec<f32>)> {
+        let c = &self.config;
+        let Kind::DFlash2 { top_k, rank } = c.kind else {
+            unreachable!("a DFlash2 lattice needs DFlash2")
+        };
+        let mut tokens = vec![c.mask_token; max + 1];
+        tokens[0] = anchor;
+        let b = &self.b;
         let sel = self.selector.as_ref().expect("DFlash2 has a selector");
+        let e = d.execution_with_shared_encoder(true)?;
+        self.block(d, t, &tokens, pos, 1)?;
+        self.top_blocks(d, max)?;
+        let out = b.hn.view(c.hidden, [max, c.hidden])?;
+        HybridModel::project(d, &sel.hidden, &out, max, &b.sel_gate.view(0, [max, rank])?)?;
+        e.finish()?;
+        let mut gates = b.sel_gate.to_f32();
+        gates.truncate(max * rank);
+        Ok((self.read_candidates(max, top_k), gates))
+    }
+
+    /// DFlash2 path scores of `cands` after `prev`, for a row whose selector
+    /// gate is `gate`: the drafter's logit plus the selector's bilinear term.
+    fn path_scores(&self, prev: u32, cands: &[(u32, f32)], gate: &[f32]) -> Vec<(u32, f32)> {
+        let sel = self.selector.as_ref().expect("DFlash2 has a selector");
+        let rank = gate.len();
         fn row(book: &[u16], token: u32, rank: usize) -> impl Iterator<Item = f32> + '_ {
             let start = token as usize * rank;
             book[start..start + rank]
                 .iter()
                 .map(|&v| f32::from_bits(u32::from(v) << 16))
         }
-        let mut out = Vec::with_capacity(candidates.len());
-        let mut prev = anchor;
-        for (i, cands) in candidates.iter().enumerate() {
-            let gate = &gates[i * rank..(i + 1) * rank];
-            let cond: Vec<f32> = row(&sel.prev, prev, rank)
-                .zip(gate)
-                .map(|(p, g)| p * g)
-                .collect();
-            let mut best = (f32::NEG_INFINITY, 0u32);
-            for &(token, logit) in cands {
-                let score: f32 = row(&sel.next, token, rank)
+        let cond: Vec<f32> = row(&sel.prev, prev, rank)
+            .zip(gate)
+            .map(|(p, g)| p * g)
+            .collect();
+        cands
+            .iter()
+            .map(|&(token, logit)| {
+                let score = row(&sel.next, token, rank)
                     .zip(&cond)
                     .map(|(s, c)| s * c)
                     .sum::<f32>()
                     + logit;
+                (token, score)
+            })
+            .collect()
+    }
+
+    /// Greedy DFlash2 path through each row's top-k candidates.
+    fn walk(&self, anchor: u32, candidates: &[Vec<(u32, f32)>], gates: &[f32]) -> Vec<u32> {
+        let rank = gates.len() / candidates.len().max(1);
+        let mut out = Vec::with_capacity(candidates.len());
+        let mut prev = anchor;
+        for (i, cands) in candidates.iter().enumerate() {
+            let gate = &gates[i * rank..(i + 1) * rank];
+            let mut best = (f32::NEG_INFINITY, 0u32);
+            for (token, score) in self.path_scores(prev, cands, gate) {
                 if score > best.0 {
                     best = (score, token);
                 }
@@ -1189,6 +1267,189 @@ impl DraftModel {
             prev = best.1;
         }
         out
+    }
+
+    /// One DSpark block and its Markov chain: up to `max` drafts, cut where
+    /// the confidence head falls below the threshold. With `lattice`, the
+    /// candidate rows first take each slot's top logits before the Markov
+    /// bias (and the logit rows keep the chain's biased ones).
+    fn dspark_chain(
+        &self,
+        d: &MetalDevice,
+        t: &HybridModel,
+        pos: usize,
+        anchor: u32,
+        max: usize,
+        lattice: bool,
+    ) -> Result<Vec<u32>> {
+        let c = &self.config;
+        let Kind::DSpark { rank, .. } = c.kind else {
+            unreachable!("a DSpark chain needs DSpark")
+        };
+        let vocab = self.vocab;
+        // Slot i predicts position pos + i + 1.
+        let mut tokens = vec![c.mask_token; max];
+        tokens[0] = anchor;
+        let e = d.execution_with_shared_encoder(true)?;
+        self.block(d, t, &tokens, pos, 0)?;
+        if lattice {
+            self.top_blocks(d, max)?;
+        }
+        let markov = self.markov.as_ref().expect("DSpark has a Markov head");
+        let b = &self.b;
+        // Token ids are uint bit patterns: never route them through float ops.
+        let anchor_t = Tensor::from_le_bytes(d, [1], DType::F32, &anchor.to_le_bytes())?;
+        for i in 0..max {
+            let prev = if i == 0 {
+                anchor_t.clone()
+            } else {
+                b.ids.view(i - 1, [1])?
+            };
+            let w1p = b.w1p.view(i * rank, [1, rank])?;
+            HybridModel::get_rows(d, &markov.w1, &prev, &w1p)?;
+            HybridModel::project(d, &markov.w2_head, &w1p, 1, &b.bias.view(0, [1, vocab])?)?;
+            let row = b.logits.view(i * vocab, [1, vocab])?;
+            d.dispatch_hybrid(
+                "h_accumulate",
+                &[b.bias.binding()],
+                &[row.binding()],
+                &Params::default().u(vocab)?.0,
+                [vocab.div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )?;
+            d.dispatch_hybrid(
+                "h_argmax",
+                &[row.binding()],
+                &[b.ids.view(i, [1])?.binding()],
+                &Params::default().u(vocab)?.0,
+                [1, 1, 1],
+                [1024, 1, 1],
+                0,
+            )?;
+            if let Some((w, bias)) = &markov.confidence {
+                d.dispatch_hybrid(
+                    "d_confidence",
+                    &[
+                        b.hn.view(i * c.hidden, [1, c.hidden])?.binding(),
+                        w1p.binding(),
+                        w.binding(),
+                    ],
+                    &[b.conf.view(i, [1])?.binding()],
+                    &Params::default().u(c.hidden)?.u(rank)?.f(*bias).0,
+                    [1, 1, 1],
+                    [256, 1, 1],
+                    0,
+                )?;
+            }
+        }
+        e.finish()?;
+        let ids = b.ids.to_f32();
+        let conf = b.conf.to_f32();
+        let mut out = Vec::with_capacity(max);
+        for i in 0..max {
+            if markov.confidence.is_some() && conf[i] < self.confidence_min {
+                break;
+            }
+            out.push(ids[i].to_bits());
+        }
+        Ok(out)
+    }
+
+    /// DSpark's lattice after `dspark_chain(.., lattice = true)` drafted
+    /// `chain`: per depth, the slot's top tokens before the Markov bias (and
+    /// the chain's pick) with those logits, and each depth's conditional
+    /// log-probabilities after a given previous token, base logit plus
+    /// `w2[token] . w1[prev]`, normalized over the depth's candidates.
+    #[allow(clippy::type_complexity)]
+    fn dspark_lattice(
+        &self,
+        d: &MetalDevice,
+        anchor: u32,
+        chain: &[u32],
+    ) -> Result<(Vec<Vec<u32>>, Box<dyn Fn(usize, u32) -> Vec<f64> + '_>)> {
+        let Kind::DSpark { rank, .. } = self.config.kind else {
+            unreachable!("a DSpark lattice needs DSpark")
+        };
+        let markov = self.markov.as_ref().expect("DSpark has a Markov head");
+        let depth = chain.len();
+        let vocab = self.vocab;
+        let mut cands = self.read_candidates(depth, TREE_CANDIDATES);
+        // The chain's pick may lie outside the slot's unbiased top tokens:
+        // its base logit is its biased one less the bias, found below.
+        let mut missing = Vec::new();
+        for (i, (row, &pick)) in cands.iter_mut().zip(chain).enumerate() {
+            if !row.iter().any(|c| c.0 == pick) {
+                let biased = self.b.logits.view(i * vocab + pick as usize, [1])?.to_f32()[0];
+                missing.push((i, row.len()));
+                row.push((pick, biased));
+            }
+        }
+        // Rows to gather: w1 of every possible previous token (the anchor,
+        // then each depth's candidates but the last), w2 of every candidate.
+        let prevs: Vec<u32> = std::iter::once(anchor)
+            .chain(cands[..depth - 1].iter().flatten().map(|c| c.0))
+            .collect();
+        let nexts: Vec<u32> = cands.iter().flatten().map(|c| c.0).collect();
+        let ids = |v: &[u32]| {
+            Tensor::from_le_bytes(
+                d,
+                [v.len()],
+                DType::F32,
+                &v.iter().flat_map(|t| t.to_le_bytes()).collect::<Vec<_>>(),
+            )
+        };
+        let w1 = self.b.lattice.view(0, [prevs.len(), rank])?;
+        let w2 = self
+            .b
+            .lattice
+            .view(prevs.len() * rank, [nexts.len(), rank])?;
+        let e = d.execution_with_shared_encoder(true)?;
+        HybridModel::get_rows(d, &markov.w1, &ids(&prevs)?, &w1)?;
+        HybridModel::get_rows(d, &markov.w2_head, &ids(&nexts)?, &w2)?;
+        e.finish()?;
+        let (w1, w2) = (w1.to_f32(), w2.to_f32());
+        // Rows by (depth, previous token) and the first w2 row of each depth.
+        let mut prev_row = HashMap::new();
+        prev_row.insert((0, anchor), 0);
+        let mut next_start = Vec::with_capacity(depth);
+        let mut n = 0;
+        for (i, row) in cands.iter().enumerate() {
+            next_start.push(n);
+            if i + 1 < depth {
+                for c in row {
+                    prev_row.entry((i + 1, c.0)).or_insert(1 + n);
+                    n += 1;
+                }
+            } else {
+                n += row.len();
+            }
+        }
+        let dot = move |p: usize, q: usize| -> f32 {
+            w1[p * rank..(p + 1) * rank]
+                .iter()
+                .zip(&w2[q * rank..(q + 1) * rank])
+                .map(|(a, b)| a * b)
+                .sum()
+        };
+        for (i, j) in missing {
+            let prev = if i == 0 { anchor } else { chain[i - 1] };
+            cands[i][j].1 -= dot(prev_row[&(i, prev)], next_start[i] + j);
+        }
+        let tokens = cands
+            .iter()
+            .map(|r| r.iter().map(|c| c.0).collect())
+            .collect();
+        let cond = move |i: usize, prev: u32| -> Vec<f64> {
+            let p = prev_row[&(i, prev)];
+            let scored: Vec<(u32, f32)> = cands[i]
+                .iter()
+                .enumerate()
+                .map(|(j, &(token, base))| (token, base + dot(p, next_start[i] + j)))
+                .collect();
+            log_softmax(&scored).into_iter().map(|c| c.1).collect()
+        };
+        Ok((tokens, Box::new(cond)))
     }
 }
 
@@ -1311,6 +1572,7 @@ fn state_bytes(c: &DraftConfig, t: &HybridConfig, ring: usize, chunk: usize) -> 
         + f(block + 1)
         + f(t.vocab)
         + f(block)
+        + f((2 * block * (TREE_CANDIDATES + 1) + 1) * rank)
 }
 
 impl DraftModel {
@@ -1454,80 +1716,8 @@ impl Drafter for DraftModel {
         if max == 0 {
             return Ok(Vec::new());
         }
-        let vocab = self.vocab;
         match c.kind {
-            Kind::DSpark { rank, .. } => {
-                // Slot i predicts position pos + i + 1.
-                let mut tokens = vec![c.mask_token; max];
-                tokens[0] = anchor;
-                let e = d.execution_with_shared_encoder(true)?;
-                self.block(d, t, &tokens, pos, 0)?;
-                let markov = self.markov.as_ref().expect("DSpark has a Markov head");
-                let b = &self.b;
-                // Token ids are uint bit patterns: never route them through float ops.
-                let anchor_t = Tensor::from_le_bytes(d, [1], DType::F32, &anchor.to_le_bytes())?;
-                for i in 0..max {
-                    let prev = if i == 0 {
-                        anchor_t.clone()
-                    } else {
-                        b.ids.view(i - 1, [1])?
-                    };
-                    let w1p = b.w1p.view(i * rank, [1, rank])?;
-                    HybridModel::get_rows(d, &markov.w1, &prev, &w1p)?;
-                    HybridModel::project(
-                        d,
-                        &markov.w2_head,
-                        &w1p,
-                        1,
-                        &b.bias.view(0, [1, vocab])?,
-                    )?;
-                    let row = b.logits.view(i * vocab, [1, vocab])?;
-                    d.dispatch_hybrid(
-                        "h_accumulate",
-                        &[b.bias.binding()],
-                        &[row.binding()],
-                        &Params::default().u(vocab)?.0,
-                        [vocab.div_ceil(256), 1, 1],
-                        [256, 1, 1],
-                        0,
-                    )?;
-                    d.dispatch_hybrid(
-                        "h_argmax",
-                        &[row.binding()],
-                        &[b.ids.view(i, [1])?.binding()],
-                        &Params::default().u(vocab)?.0,
-                        [1, 1, 1],
-                        [1024, 1, 1],
-                        0,
-                    )?;
-                    if let Some((w, bias)) = &markov.confidence {
-                        d.dispatch_hybrid(
-                            "d_confidence",
-                            &[
-                                b.hn.view(i * c.hidden, [1, c.hidden])?.binding(),
-                                w1p.binding(),
-                                w.binding(),
-                            ],
-                            &[b.conf.view(i, [1])?.binding()],
-                            &Params::default().u(c.hidden)?.u(rank)?.f(*bias).0,
-                            [1, 1, 1],
-                            [256, 1, 1],
-                            0,
-                        )?;
-                    }
-                }
-                e.finish()?;
-                let ids = b.ids.to_f32();
-                let conf = b.conf.to_f32();
-                let mut out = Vec::with_capacity(max);
-                for i in 0..max {
-                    if markov.confidence.is_some() && conf[i] < self.confidence_min {
-                        break;
-                    }
-                    out.push(ids[i].to_bits());
-                }
-                Ok(out)
-            }
+            Kind::DSpark { .. } => self.dspark_chain(d, t, pos, anchor, max, false),
             Kind::DFlash => {
                 let mut tokens = vec![c.mask_token; max + 1];
                 tokens[0] = anchor;
@@ -1537,7 +1727,7 @@ impl Drafter for DraftModel {
                     "h_argmax",
                     &[self.b.logits.binding()],
                     &[self.b.ids.binding()],
-                    &Params::default().u(vocab)?.0,
+                    &Params::default().u(self.vocab)?.0,
                     [max, 1, 1],
                     [1024, 1, 1],
                     0,
@@ -1548,43 +1738,82 @@ impl Drafter for DraftModel {
                     .map(|v| v.to_bits())
                     .collect())
             }
-            Kind::DFlash2 { top_k, rank } => {
-                let mut tokens = vec![c.mask_token; max + 1];
-                tokens[0] = anchor;
-                let b = &self.b;
-                let sel = self.selector.as_ref().expect("DFlash2 has a selector");
+            Kind::DFlash2 { .. } => {
+                let (candidates, gates) = self.dflash2_lattice(d, t, pos, anchor, max)?;
+                Ok(self.walk(anchor, &candidates, &gates))
+            }
+        }
+    }
+
+    /// A tree of up to `budget` nodes, at most `max` deep, from the one
+    /// block pass a chain takes: each depth's top candidates, joined by
+    /// DFlash2's selector or DSpark's Markov bias (independent for DFlash),
+    /// grown best first.
+    fn draft_tree(
+        &mut self,
+        d: &MetalDevice,
+        t: &HybridModel,
+        pos: usize,
+        anchor: u32,
+        max: usize,
+        budget: usize,
+    ) -> Result<DraftTree> {
+        let c = &self.config;
+        let max = max.min(self.max_drafts);
+        if max == 0 || budget == 0 {
+            return Ok(DraftTree::default());
+        }
+        let tokens = |cands: &[Vec<(u32, f32)>]| -> Vec<Vec<u32>> {
+            cands
+                .iter()
+                .map(|r| r.iter().map(|c| c.0).collect())
+                .collect()
+        };
+        let probs = |scored: &[(u32, f32)]| -> Vec<f64> {
+            log_softmax(scored).into_iter().map(|c| c.1).collect()
+        };
+        match c.kind {
+            Kind::DSpark { .. } => {
+                // The chain's confidence cut bounds the depth.
+                let chain = self.dspark_chain(d, t, pos, anchor, max, true)?;
+                if chain.is_empty() {
+                    return Ok(DraftTree::default());
+                }
+                let (lattice, cond) = self.dspark_lattice(d, anchor, &chain)?;
+                Ok(lattice_best_first(anchor, &lattice, budget, cond))
+            }
+            Kind::DFlash => {
+                let mut ids = vec![c.mask_token; max + 1];
+                ids[0] = anchor;
                 let e = d.execution_with_shared_encoder(true)?;
-                self.block(d, t, &tokens, pos, 1)?;
-                let blocks = vocab.div_ceil(1024);
-                d.dispatch_hybrid(
-                    "h_topk_blocks",
-                    &[b.logits.binding()],
-                    &[b.candidates.binding()],
-                    &Params::default().u(vocab)?.0,
-                    [blocks, max, 1],
-                    [256, 1, 1],
-                    0,
-                )?;
-                let out = b.hn.view(c.hidden, [max, c.hidden])?;
-                HybridModel::project(d, &sel.hidden, &out, max, &b.sel_gate.view(0, [max, rank])?)?;
+                self.block(d, t, &ids, pos, 1)?;
+                self.top_blocks(d, max)?;
                 e.finish()?;
-                let raw = b.candidates.to_f32();
-                let candidates: Vec<Vec<(u32, f32)>> = raw
-                    .chunks(blocks * 64)
-                    .take(max)
-                    .map(|row| {
-                        let mut all: Vec<(u32, f32)> = row
-                            .chunks_exact(2)
-                            .filter(|p| p[0].is_finite())
-                            .map(|p| (p[1].to_bits(), p[0]))
-                            .collect();
-                        all.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-                        all.truncate(top_k);
-                        all
-                    })
-                    .collect();
-                let gates = b.sel_gate.to_f32();
-                Ok(self.walk(anchor, &candidates, &gates[..max * rank], rank))
+                let cands = self.read_candidates(max, TREE_CANDIDATES);
+                let marginals: Vec<Vec<f64>> = cands.iter().map(|r| probs(r)).collect();
+                Ok(lattice_best_first(
+                    anchor,
+                    &tokens(&cands),
+                    budget,
+                    |i, _| marginals[i].clone(),
+                ))
+            }
+            Kind::DFlash2 { rank, .. } => {
+                let (cands, gates) = self.dflash2_lattice(d, t, pos, anchor, max)?;
+                let mut memo: HashMap<(usize, u32), Vec<f64>> = HashMap::new();
+                Ok(lattice_best_first(
+                    anchor,
+                    &tokens(&cands),
+                    budget,
+                    |i, prev| {
+                        memo.entry((i, prev))
+                            .or_insert_with(|| {
+                                let gate = &gates[i * rank..(i + 1) * rank];
+                                probs(&self.path_scores(prev, &cands[i], gate))
+                            })
+                            .clone()
+                    },
+                ))
             }
         }
     }

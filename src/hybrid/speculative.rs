@@ -230,6 +230,54 @@ pub fn chain_with_siblings(
     tree
 }
 
+/// A draft tree of at most `budget` nodes from a block drafter's candidate
+/// lattice: `candidates[i]` are the tokens one drafting pass proposes at
+/// depth i + 1, and `cond(i, prev)` their log-probabilities (aligned with
+/// `candidates[i]`) after `prev`, the parent's token (the anchor at depth 0).
+/// Nodes are taken best first by the probability of the whole path, the
+/// product of its conditionals; a node's children open when it is taken, so
+/// parents come before children. With conditionals that ignore `prev` the
+/// positions are independent.
+pub fn lattice_best_first(
+    anchor: u32,
+    candidates: &[Vec<u32>],
+    budget: usize,
+    mut cond: impl FnMut(usize, u32) -> Vec<f64>,
+) -> DraftTree {
+    let mut tree = DraftTree::default();
+    // Frontier entries: (path log-probability, depth, candidate index, parent).
+    let mut frontier: Vec<(f64, usize, usize, Option<usize>)> = Vec::new();
+    let mut open = |frontier: &mut Vec<(f64, usize, usize, Option<usize>)>,
+                    depth: usize,
+                    prev: u32,
+                    parent: Option<usize>,
+                    base: f64| {
+        if depth < candidates.len() {
+            for (j, lp) in cond(depth, prev).into_iter().enumerate() {
+                frontier.push((base + lp, depth, j, parent));
+            }
+        }
+    };
+    open(&mut frontier, 0, anchor, None, 0.);
+    while tree.len() < budget {
+        // Likeliest first; ties to shallower nodes, then the drafter's ranking.
+        let Some(best) = (0..frontier.len()).max_by(|&a, &b| {
+            let (x, y) = (frontier[a], frontier[b]);
+            x.0.total_cmp(&y.0).then(y.1.cmp(&x.1)).then(y.2.cmp(&x.2))
+        }) else {
+            break;
+        };
+        let (score, depth, j, parent) = frontier.swap_remove(best);
+        if score == f64::NEG_INFINITY {
+            break;
+        }
+        let token = candidates[depth][j];
+        let node = tree.push(token, parent);
+        open(&mut frontier, depth + 1, token, Some(node), score);
+    }
+    tree
+}
+
 /// Acceptance statistics of one generation.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SpecStats {
@@ -324,6 +372,47 @@ mod tests {
         );
         // Budget beyond every candidate: all of them, parents first.
         let tree = chain_with_siblings(&chain, &candidates, 20, 2);
+        assert_eq!(tree.len(), 6);
+        assert!(
+            tree.parents
+                .iter()
+                .enumerate()
+                .all(|(i, p)| p.is_none_or(|p| p < i))
+        );
+    }
+
+    #[test]
+    fn lattice_trees_follow_the_conditionals() {
+        let ln = f64::ln;
+        // Independent positions: depth 1 splits 5 / 6 at 0.6 / 0.4, depth 2
+        // is 7 at 0.9 whatever comes first.
+        let candidates = vec![vec![5, 6], vec![7, 8]];
+        let independent = |i: usize, _| match i {
+            0 => vec![ln(0.6), ln(0.4)],
+            _ => vec![ln(0.9), ln(0.1)],
+        };
+        // 5 (0.6), 7 under 5 (0.54), 6 (0.4), 7 under 6 (0.36).
+        let tree = lattice_best_first(1, &candidates, 4, independent);
+        assert_eq!(tree.tokens, vec![5, 7, 6, 7]);
+        assert_eq!(tree.parents, vec![None, Some(0), None, Some(2)]);
+        // Conditionals: after 6 the drafter is sure of 8; after 5 it splits.
+        let conditional = |i: usize, prev: u32| match (i, prev) {
+            (0, 1) => vec![ln(0.6), ln(0.4)],
+            (1, 5) => vec![ln(0.5), ln(0.5)],
+            (1, 6) => vec![ln(0.01), ln(0.99)],
+            _ => unreachable!("only the anchor, 5 and 6 have children"),
+        };
+        // 5 (0.6), 6 (0.4), 8 under 6 (0.396), 7 under 5 (0.3), 8 under 5 (0.3).
+        let tree = lattice_best_first(1, &candidates, 5, conditional);
+        assert_eq!(tree.tokens, vec![5, 6, 8, 7, 8]);
+        assert_eq!(tree.parents, vec![None, None, Some(1), Some(0), Some(0)]);
+        // The chain's next node can lose to a sibling of its first.
+        let tree = lattice_best_first(1, &candidates, 2, conditional);
+        assert_eq!(tree.tokens, vec![5, 6]);
+        let chain = lattice_best_first(1, &candidates, 2, independent);
+        assert_eq!(chain, DraftTree::chain(&[5, 7]));
+        // Budget beyond the lattice: every path, parents first.
+        let tree = lattice_best_first(1, &candidates, 20, conditional);
         assert_eq!(tree.len(), 6);
         assert!(
             tree.parents
