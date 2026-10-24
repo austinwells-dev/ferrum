@@ -78,13 +78,84 @@ pub fn rope_position(media: &[ImageSpan], index: usize) -> usize {
             .sum::<usize>()
 }
 
-/// How rotary positions differ from cache positions for one forward chunk.
+/// How rotary positions differ from cache positions for one forward chunk,
+/// and, in a draft-tree verify, which rows each row sees.
 #[derive(Default)]
 pub(crate) struct RopePlan {
     /// Added to the cache position (non-positive: images compress positions).
     pub delta: i32,
-    /// Per-row (time, height, width) positions when the chunk holds image tokens.
+    /// Per-row (time, height, width) positions when the chunk holds image
+    /// tokens or draft-tree nodes.
     pub table: Option<Tensor>,
+    /// Draft-tree verify: per row, the rows it sees and its depth (see
+    /// `tree_rows`).
+    pub tree: Option<Tensor>,
+}
+
+/// Most rows a draft-tree verify takes: a row's ancestors are one `u32` mask.
+pub(crate) const TREE_MAX_ROWS: usize = 32;
+
+/// Plan of a draft-tree verify whose root sits at rotary position `base`:
+/// node i is stored at the i-th new cache position but sits at `base +
+/// depth(i)`, through the position table with all three axes equal.
+// Reached from the tree verify, which lands in a later phase; tested now.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn tree_plan(d: &MetalDevice, base: i32, parents: &[Option<usize>]) -> Result<RopePlan> {
+    let rows = tree_rows(parents)?;
+    let mut table = Vec::with_capacity(rows.len() * 3 * 4);
+    let mut tree = Vec::with_capacity(rows.len() * 2 * 4);
+    for &(mask, depth) in &rows {
+        let p = base + depth as i32;
+        for v in [p, p, p] {
+            table.extend_from_slice(&v.to_le_bytes());
+        }
+        tree.extend_from_slice(&mask.to_le_bytes());
+        tree.extend_from_slice(&depth.to_le_bytes());
+    }
+    Ok(RopePlan {
+        delta: 0,
+        table: Some(Tensor::from_le_bytes(
+            d,
+            [rows.len() * 3],
+            DType::F32,
+            &table,
+        )?),
+        tree: Some(Tensor::from_le_bytes(
+            d,
+            [rows.len() * 2],
+            DType::F32,
+            &tree,
+        )?),
+    })
+}
+
+/// Rows of a draft-tree verify, from each node's parent (`None` for the
+/// root, row 0; parents come before their children). Returns per row the
+/// mask of rows it sees (itself and its ancestors) and its depth, the layout
+/// of `KeyMask` in `hybrid.metal`.
+// Reached from the tree verify, which lands in a later phase; tested now.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn tree_rows(parents: &[Option<usize>]) -> Result<Vec<(u32, u32)>> {
+    if parents.is_empty() || parents.len() > TREE_MAX_ROWS {
+        return Err(Error::Parameter(format!(
+            "a draft tree has 1..={TREE_MAX_ROWS} rows, got {}",
+            parents.len()
+        )));
+    }
+    let mut rows: Vec<(u32, u32)> = Vec::with_capacity(parents.len());
+    for (i, parent) in parents.iter().enumerate() {
+        let row = match (i, *parent) {
+            (0, None) => (1, 0),
+            (_, Some(p)) if i > 0 && p < i => (rows[p].0 | 1 << i, rows[p].1 + 1),
+            _ => {
+                return Err(Error::Parameter(format!(
+                    "draft tree row {i}: only row 0 is the root and parents precede children"
+                )));
+            }
+        };
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// Conversation state: K/V (F16 or Q8) for attention layers and F32 recurrent state
@@ -248,7 +319,10 @@ impl HybridState {
             .iter()
             .any(|s| s.start < pos + m && s.end() > pos)
         {
-            return Ok(RopePlan { delta, table: None });
+            return Ok(RopePlan {
+                delta,
+                ..Default::default()
+            });
         }
         let mut table = Vec::with_capacity(m * 3 * 4);
         for index in pos..pos + m {
@@ -278,6 +352,7 @@ impl HybridState {
         Ok(RopePlan {
             delta: 0,
             table: Some(Tensor::from_le_bytes(d, [m * 3], DType::F32, &table)?),
+            tree: None,
         })
     }
     /// Recurrent tensors (conv windows then delta-rule matrices) in a fixed order.
@@ -1544,6 +1619,7 @@ impl HybridModel {
             spec,
             a.sinks.as_ref(),
             ring,
+            rope.tree.as_ref(),
         )?;
         if let Some(gate) = &a.head_gate {
             let logits = rows(&s.head_gate, 0, m, c.heads)?;
@@ -1566,7 +1642,9 @@ impl HybridModel {
     /// Causal attention of `m` new queries against the cache (format `kv`),
     /// written to `att`. With `spec.gated` the output is multiplied by
     /// sigmoid(gate) from `qg`; `spec.window` masks keys out of range, and
-    /// `sinks` (per-head logits) join the softmax denominator.
+    /// `sinks` (per-head logits) join the softmax denominator. With `tree`
+    /// (`RopePlan::tree`) the rows are draft-tree nodes that see only their
+    /// ancestors among the new rows.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn flash_attention(
         &self,
@@ -1583,6 +1661,7 @@ impl HybridModel {
         spec: AttnSpec,
         sinks: Option<&Tensor>,
         ring: usize,
+        tree: Option<&Tensor>,
     ) -> Result<()> {
         let c = &self.config;
         let group = c.heads / c.kv_heads;
@@ -1612,9 +1691,19 @@ impl HybridModel {
                     .into(),
             ));
         }
+        // A one-row tree is the anchor alone, which plain decode covers.
+        let tree = tree.filter(|_| m > 1);
+        if tree.is_some() && (legacy || m > TREE_MAX_ROWS) {
+            return Err(Error::Config(format!(
+                "a draft-tree verify takes at most {TREE_MAX_ROWS} rows on the TensorOps \
+                 or reference attention kernels"
+            )));
+        }
         let sinks_on = usize::from(sinks.is_some());
-        // Bound (and ignored) when the layer has no sinks.
+        let tree_on = usize::from(tree.is_some());
+        // Bound (and ignored) when the layer has no sinks or the rows no tree.
         let sinks_t = sinks.unwrap_or(qg);
+        let tree_t = tree.unwrap_or(qg);
         if flags().reference_attention {
             let args = Params::default()
                 .u(m)?
@@ -1627,7 +1716,8 @@ impl HybridModel {
                 .u(window)?
                 .u(usize::from(spec.gated))?
                 .u(sinks_on)?
-                .u(ring)?;
+                .u(ring)?
+                .u(tree_on)?;
             return d.dispatch_hybrid(
                 "h_attention",
                 &[
@@ -1636,6 +1726,7 @@ impl HybridModel {
                     vc.binding(),
                     qg.binding(),
                     sinks_t.binding(),
+                    tree_t.binding(),
                 ],
                 &[att.binding()],
                 &args.0,
@@ -1663,23 +1754,42 @@ impl HybridModel {
                 .u(ring)?
                 .0)
         };
-        // Sinks ride as the fifth input; the legacy kernels predate them.
+        // Sinks ride as the fifth input; the legacy kernels predate them. The
+        // `_tree` variants take the tree as the sixth.
         let base = [q.binding(), kc.binding(), vc.binding(), qg.binding()];
         let sink_inputs = [base[0], base[1], base[2], base[3], sinks_t.binding()];
+        let tree_inputs = [
+            base[0],
+            base[1],
+            base[2],
+            base[3],
+            sinks_t.binding(),
+            tree_t.binding(),
+        ];
         if m >= MPP_ATTENTION_MIN_TOKENS && !flags().simd_attention {
             let args = fa(0, 1)?;
-            let name = match (q8, legacy, wide) {
-                (true, _, true) => "h_flash_attn_mpp_q8",
-                (true, _, false) => "h_flash_attn_mpp_q8_d128",
-                (false, false, true) => "h_flash_attn_mpp_staged",
-                (false, false, false) => "h_flash_attn_mpp_staged_d128",
-                (false, true, _) => "h_flash_attn_mpp",
+            let name = match (q8, legacy, wide, tree.is_some()) {
+                (true, _, true, false) => "h_flash_attn_mpp_q8",
+                (true, _, false, false) => "h_flash_attn_mpp_q8_d128",
+                (false, false, true, false) => "h_flash_attn_mpp_staged",
+                (false, false, false, false) => "h_flash_attn_mpp_staged_d128",
+                (false, true, _, _) => "h_flash_attn_mpp",
+                (true, _, true, true) => "h_flash_attn_mpp_q8_tree",
+                (true, _, false, true) => "h_flash_attn_mpp_q8_d128_tree",
+                (false, false, true, true) => "h_flash_attn_mpp_staged_tree",
+                (false, false, false, true) => "h_flash_attn_mpp_staged_d128_tree",
             };
             // K/V staged through threadgroup memory measured 15-20% faster
             // than reading the cache as a device tensor.
             return d.dispatch_hybrid(
                 name,
-                if legacy { &base } else { &sink_inputs },
+                if legacy {
+                    &base
+                } else if tree.is_some() {
+                    &tree_inputs
+                } else {
+                    &sink_inputs
+                },
                 &[att.binding()],
                 &args,
                 [m.div_ceil(64), c.heads, 1],
@@ -1768,23 +1878,29 @@ impl HybridModel {
             } else {
                 br * 64 * 4 + br * 64 * 2 + 3 * br * 4
             };
-            let name = match (q8, wide) {
-                (false, true) => "h_attn_verify_mpp_32",
-                (true, true) => "h_attn_verify_mpp_32_q8",
-                (false, false) => "h_attn_verify_mpp_32_d128",
-                (true, false) => "h_attn_verify_mpp_32_q8_d128",
+            let name = match (q8, wide, tree.is_some()) {
+                (false, true, false) => "h_attn_verify_mpp_32",
+                (true, true, false) => "h_attn_verify_mpp_32_q8",
+                (false, false, false) => "h_attn_verify_mpp_32_d128",
+                (true, false, false) => "h_attn_verify_mpp_32_q8_d128",
+                (false, true, true) => "h_attn_verify_mpp_32_tree",
+                (true, true, true) => "h_attn_verify_mpp_32_q8_tree",
+                (false, false, true) => "h_attn_verify_mpp_32_d128_tree",
+                (true, false, true) => "h_attn_verify_mpp_32_q8_d128_tree",
             };
+            let qk_inputs = [
+                qk.binding(),
+                kc.binding(),
+                vc.binding(),
+                qg.binding(),
+                sinks_t.binding(),
+                tree_t.binding(),
+            ];
             d.dispatch_hybrid(
                 // F16 reads K/V directly: staging only pays off for prompt
                 // chunks. Q8 must stage to dequantize.
                 name,
-                &[
-                    qk.binding(),
-                    kc.binding(),
-                    vc.binding(),
-                    qg.binding(),
-                    sinks_t.binding(),
-                ],
+                &qk_inputs[..if tree.is_some() { 6 } else { 5 }],
                 &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
                 &args,
                 [row_blocks, c.kv_heads, splits],
@@ -2798,7 +2914,9 @@ mod tests {
                 .u(0)
                 .unwrap()
                 .u(0)
-                .unwrap(); // ring
+                .unwrap()
+                .u(0)
+                .unwrap(); // ring, tree
             {
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
@@ -2807,6 +2925,7 @@ mod tests {
                         q.binding(),
                         kc.binding(),
                         vc.binding(),
+                        qg.binding(),
                         qg.binding(),
                         qg.binding(),
                     ],
@@ -3336,7 +3455,9 @@ mod tests {
                     .u(sinks_on)
                     .unwrap()
                     .u(0)
-                    .unwrap(); // ring
+                    .unwrap()
+                    .u(0)
+                    .unwrap(); // ring, tree
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
                     "h_attention",
@@ -3346,6 +3467,7 @@ mod tests {
                         vr.binding(),
                         qg.binding(),
                         sink_arg.binding(),
+                        qg.binding(),
                     ],
                     &[reference.binding()],
                     &args.0,
@@ -3801,7 +3923,9 @@ mod tests {
                     .u(0)
                     .unwrap()
                     .u(0)
-                    .unwrap(); // ring
+                    .unwrap()
+                    .u(0)
+                    .unwrap(); // ring, tree
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
                     "h_attention",
@@ -3809,6 +3933,7 @@ mod tests {
                         q.binding(),
                         kr.binding(),
                         vr.binding(),
+                        qg.binding(),
                         qg.binding(),
                         qg.binding(),
                     ],

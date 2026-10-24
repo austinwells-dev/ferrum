@@ -17,6 +17,8 @@ pub mod plan;
 pub mod runtime;
 pub mod session;
 pub mod speculative;
+#[cfg(test)]
+mod tree_tests;
 pub mod weights;
 
 pub use config::{AttnSpec, HybridConfig, KvCache, Variant};

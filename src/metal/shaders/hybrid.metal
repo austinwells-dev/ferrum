@@ -1683,6 +1683,53 @@ inline device const half * kv_scales(device const half * cache, uint kv_rows, ui
     return (device const half *)((device const char *)cache + (ulong)kv_rows * stride);
 }
 
+// Which keys a query row sees. Without a tree, row t sits at position + t and
+// sees every key up to its own. In a draft-tree verify (the `_tree` kernels),
+// row t is node t of a tree listed parents first, with its K/V at cache
+// position position + t: tree[2t] has bit s set iff node s is t or one of its
+// ancestors, and tree[2t + 1] is t's depth. A node's position (for the
+// window, as for RoPE) is position + depth.
+struct KeyMask {
+    uint position;
+    uint window;
+    uint qpos;  // position of the query row
+    uint bits;  // tree rows it sees, already limited to its window
+};
+
+template <bool TREE>
+inline KeyMask key_mask(device const uint * tree, uint position, uint window, uint t) {
+    KeyMask k = {position, window, position + t, 0};
+    if (TREE) {
+        k.qpos = position + tree[2 * t + 1];
+        // Resolve the window on tree keys here, so testing a key reads no memory.
+        for (uint seen = tree[2 * t]; seen != 0; seen &= seen - 1) {
+            const uint s = ctz(seen);
+            if (window == 0 || position + tree[2 * s + 1] + window > k.qpos) k.bits |= 1u << s;
+        }
+    }
+    return k;
+}
+
+template <bool TREE>
+inline bool key_visible(thread const KeyMask & k, uint key) {
+    if (TREE && key >= k.position) {
+        const uint s = key - k.position;
+        return s < 32 && ((k.bits >> s) & 1u) != 0;
+    }
+    return key <= k.qpos && (k.window == 0 || key + k.window > k.qpos);
+}
+
+// Lowest query position of rows t_begin..=t_end, which bounds the window
+// start of a tile holding them. Tree rows are not in position order; a node's
+// ancestors still come before it, so the last row bounds the keys.
+template <bool TREE>
+inline uint lowest_query_position(device const uint * tree, uint position, uint t_begin, uint t_end) {
+    if (!TREE) return position + t_begin;
+    uint depth = 0xffffffffu;
+    for (uint t = t_begin; t <= t_end; t++) depth = min(depth, tree[2 * t + 1]);
+    return position + depth;
+}
+
 // Store one element per thread; with Q8 the 32 lanes of a SIMD group hold one
 // 32-element block (callers align blocks to SIMD groups).
 template <bool Q8>
@@ -1809,28 +1856,34 @@ struct AttnArgs {
     uint gated;
     uint sinks;
     uint ring;         // see kv_row
+    uint tree;         // rows are draft-tree nodes (see KeyMask)
 };
 
 // Reference-grade attention: one threadgroup (head_dim threads) per (query, head),
 // online softmax over keys. Sinks seed the running max with unit mass; the
-// window, output gate and sinks follow the FaArgs semantics.
-kernel void h_attention(constant AttnArgs & p [[buffer(6)]],
+// window, output gate, sinks and tree follow the FaArgs semantics.
+kernel void h_attention(constant AttnArgs & p [[buffer(7)]],
                         device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],
                         device const half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],
-                        device const float * sinks [[buffer(4)]], device float * out [[buffer(5)]],
+                        device const float * sinks [[buffer(4)]], device const uint * tree [[buffer(5)]],
+                        device float * out [[buffer(6)]],
                         uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float scratch[8];
     const uint h = group.x, t = group.y;
     const uint kvh = h / (p.heads / p.kv_heads);
     const float qv = float(q[((ulong)t * p.heads + h) * p.head_dim + tid]);
+    const KeyMask mask = p.tree != 0 ? key_mask<true>(tree, p.position, p.window, t)
+                                     : key_mask<false>(tree, p.position, p.window, t);
+    // A node's ancestors come before it, so no row sees past its own key.
     const uint keys = p.position + t + 1;
-    const uint lo = p.window != 0 && keys > p.window ? keys - p.window : 0;
+    const uint lo = p.window != 0 && mask.qpos + 1 > p.window ? mask.qpos + 1 - p.window : 0;
     float m = -INFINITY, l = 0.f, acc = 0.f;
     if (p.sinks != 0) {
         m = sinks[h];
         l = 1.f;
     }
     for (uint j = lo; j < keys; j++) {
+        if (!(p.tree != 0 ? key_visible<true>(mask, j) : key_visible<false>(mask, j))) continue;
         const ulong base = (ulong)kv_row(j, p.ring) * p.cache_stride + kvh * p.head_dim + tid;
         const float s = block_sum(qv * float(kc[base]), scratch, tid, p.head_dim);
         const float m_new = max(m, s);
@@ -2515,12 +2568,12 @@ inline void stage_kv_half(threadgroup half * Hs, device const half * cache, devi
 // Q8) into threadgroup memory 128 dims at a time (S = Q Kᵀ accumulates over the
 // halves of D; O is one 64x128 cooperative tensor per half). The staging buffer
 // aliases the score tile, which is only live between the K and V phases. Keys
-// start at the first one the tile's first row sees (sliding windows).
+// start at the first one the tile's lowest-positioned row sees (sliding windows).
 // grid (ceil(tokens/64), heads); threads 128; 64*64*4 + 64*64*2 + 3*64*4 bytes.
-template <bool Q8, int D>
+template <bool Q8, int D, bool TREE>
 void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device half * kc,
                                 device half * vc, device const float * qg, device const float * sinks,
-                                device float * out, threadgroup char * shared, threadgroup uint & rescale,
+                                device const uint * tree, device float * out, threadgroup char * shared, threadgroup uint & rescale,
                                 uint2 tgpig, ushort tid) {
     constexpr int W = D < 128 ? D : 128, NH = D / W, BR = 64, BC = 64;
     threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
@@ -2535,7 +2588,7 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
     const int rows = min(BR, int(p.tokens) - t0);
     const uint total_keys = p.position + p.tokens;
     const uint last_key = p.position + uint(t0 + rows - 1);
-    const uint first_row_key = p.position + uint(t0);
+    const uint first_row_key = lowest_query_position<TREE>(tree, p.position, uint(t0), uint(t0 + rows - 1));
     const uint lo = (p.window == 0 || first_row_key + 1 <= p.window) ? 0 : first_row_key + 1 - p.window;
     const int q_stride = int(p.heads) * D;
     const ulong head_off = (ulong)kvh * D;
@@ -2569,7 +2622,8 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
 
     const int my_row = tid / 2;
     const int c0 = (tid % 2) * 32;
-    const uint row_last_key = p.position + uint(t0 + my_row);
+    // Threads past the last row only feed masked scores; give them a valid row.
+    const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, min(uint(t0 + my_row), p.tokens - 1));
     for (uint j0 = lo / BC * BC; j0 < total_keys && j0 <= last_key; j0 += BC) {
         for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
         stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, total_keys, p.cache_stride, head_off, 0, tid, p.ring);
@@ -2588,8 +2642,7 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
         float mx = -INFINITY;
         for (int c = 0; c < 32; c++) {
             const uint key = j0 + uint(c0 + c);
-            const bool ok = my_row < rows && key < total_keys && key <= row_last_key &&
-                            (p.window == 0 || key + p.window > row_last_key);
+            const bool ok = my_row < rows && key < total_keys && key_visible<TREE>(mask, key);
             s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
             mx = max(mx, s[c]);
         }
@@ -2662,12 +2715,31 @@ kernel void name(constant FaArgs & p [[buffer(6)]],                             
                  uint2 tgpig [[threadgroup_position_in_grid]],                                  \
                  ushort tid [[thread_index_in_threadgroup]]) {                                  \
     threadgroup uint rescale;                                                                   \
-    flash_attn_mpp_staged_impl<q8, D>(p, q, kc, vc, qg, sinks, out, shared, rescale, tgpig, tid); \
+    flash_attn_mpp_staged_impl<q8, D, false>(p, q, kc, vc, qg, sinks, nullptr, out, shared,     \
+                                             rescale, tgpig, tid);                              \
+}
+// Draft-tree verify: the tree (see KeyMask) rides after the sinks.
+#define FLASH_MPP_STAGED_TREE(name, q8, D)                                                      \
+kernel void name(constant FaArgs & p [[buffer(7)]],                                             \
+                 device half * q [[buffer(0)]], device half * kc [[buffer(1)]],                 \
+                 device half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],         \
+                 device const float * sinks [[buffer(4)]], device const uint * tree [[buffer(5)]], \
+                 device float * out [[buffer(6)]],                                              \
+                 threadgroup char * shared [[threadgroup(0)]],                                  \
+                 uint2 tgpig [[threadgroup_position_in_grid]],                                  \
+                 ushort tid [[thread_index_in_threadgroup]]) {                                  \
+    threadgroup uint rescale;                                                                   \
+    flash_attn_mpp_staged_impl<q8, D, true>(p, q, kc, vc, qg, sinks, tree, out, shared,         \
+                                            rescale, tgpig, tid);                               \
 }
 FLASH_MPP_STAGED(h_flash_attn_mpp_staged, false, 256)
 FLASH_MPP_STAGED(h_flash_attn_mpp_q8, true, 256)
 FLASH_MPP_STAGED(h_flash_attn_mpp_staged_d128, false, 128)
 FLASH_MPP_STAGED(h_flash_attn_mpp_q8_d128, true, 128)
+FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_staged_tree, false, 256)
+FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_q8_tree, true, 256)
+FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_staged_d128_tree, false, 128)
+FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_q8_d128_tree, true, 128)
 
 // Copy F16 queries [tokens][heads][head_dim] to KV-head-major rows
 // [kv_heads][tokens * group][head_dim] (row t*group + g), so each KV head's query
@@ -2683,13 +2755,12 @@ kernel void h_q_by_kv_head(constant FaArgs & p [[buffer(2)]], device const half 
 
 // Online-softmax step shared by the TensorOps verify kernels: thread tid owns
 // row tid / TPR and CPT columns of the [BR][BC] score tile; scores of keys
-// outside [.., key_end), past the row's causal limit or before its window start
-// are masked. Writes P (F16) and updates the running max / sum / correction rows.
-template <int BR, int BC>
+// outside [.., key_end) or that the row does not see (`mask`) are masked. Writes P (F16) and updates the running max / sum / correction rows.
+template <int BR, int BC, bool TREE>
 inline void verify_softmax(threadgroup const float * Ss, threadgroup half * Ps,
                            threadgroup float * corr, threadgroup float * mrow,
                            threadgroup float * lrow, threadgroup uint & rescale,
-                           int rows, uint j0, uint key_end, uint row_last_key, uint window, ushort tid) {
+                           int rows, uint j0, uint key_end, thread const KeyMask & mask, ushort tid) {
     constexpr int TPR = 128 / BR, CPT = BC / TPR;
     const int my_row = tid / TPR;
     const int c0 = (tid % TPR) * CPT;
@@ -2697,8 +2768,7 @@ inline void verify_softmax(threadgroup const float * Ss, threadgroup half * Ps,
     float mx = -INFINITY;
     for (int c = 0; c < CPT; c++) {
         const uint key = j0 + uint(c0 + c);
-        const bool ok = my_row < rows && key < key_end && key <= row_last_key &&
-                        (window == 0 || key + window > row_last_key);
+        const bool ok = my_row < rows && key < key_end && key_visible<TREE>(mask, key);
         s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
         mx = max(mx, s[c]);
     }
@@ -2764,11 +2834,11 @@ inline void verify_seed(constant FaArgs & p, device const float * sinks, uint kv
 // one key split; S = Q Kᵀ and O += P V run as matmul2d on 64-key blocks read
 // straight from the F16 cache, with the online softmax in threadgroup memory.
 // grid (row_blocks, kv_heads, splits); threads 128; BR*64*4 + BR*64*2 + 3*BR*4 bytes.
-template <int BR, int D>
+template <int BR, int D, bool TREE>
 void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * kc,
                           device half * vc, device const float * qg, device const float * sinks,
-                          device float * out, device float * po, device float * pml, threadgroup char * shared,
-                          threadgroup uint & rescale, uint3 tgpig, ushort tid) {
+                          device const uint * tree, device float * out, device float * po, device float * pml,
+                          threadgroup char * shared, threadgroup uint & rescale, uint3 tgpig, ushort tid) {
     constexpr int BC = 64;
     threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
     threadgroup half  * Ps = (threadgroup half *)(Ss + BR * BC);          // [BR][BC]
@@ -2786,7 +2856,8 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
     // Blocks before the tile's first row's window start are never visited.
     uint j_begin = key_begin;
     if (p.window != 0) {
-        const uint first_pos = p.position + uint(r0) / p.group;
+        const uint first_pos = lowest_query_position<TREE>(tree, p.position, uint(r0) / p.group,
+                                                           uint(r0 + rows - 1) / p.group);
         const uint lo = first_pos + 1 > p.window ? first_pos + 1 - p.window : 0;
         j_begin = max(j_begin, lo / BC * BC);
     }
@@ -2813,13 +2884,15 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
     if (tid < BR) verify_seed(p, sinks, kvh, uint(r0) + tid, int(tid) < rows, mrow, lrow, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint row_last_key = p.position + uint(r0 + int(tid / (128 / BR))) / p.group;
+    // Threads past the last row only feed masked scores; give them a valid row.
+    const uint my_t = min(uint(r0 + int(tid / (128 / BR))) / p.group, p.tokens - 1);
+    const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, my_t);
     for (uint j0 = j_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
         auto mK = tK.slice(0, int(kv_row(j0, p.ring)));
         mm_s.run(tQ, mK, cS);
         cS.store(tS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        verify_softmax<BR, BC>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, row_last_key, p.window, tid);
+        verify_softmax<BR, BC, TREE>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, mask, tid);
         if (rescale) {
             for (uint i = 0; i < cO.get_capacity(); i++) {
                 if (cO.is_valid_element(i)) {
@@ -2848,10 +2921,11 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
 // into threadgroup memory 128 dims at a time (as h_flash_attn_mpp_staged);
 // the staging buffer aliases S.
 // shared bytes max(64*128*2, BR*64*4) + BR*64*2 + 3*BR*4.
-template <int BR, bool Q8, int D>
+template <int BR, bool Q8, int D, bool TREE>
 void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device half * kc,
                              device half * vc, device const float * qg, device const float * sinks,
-                             device float * out, device float * po, device float * pml, threadgroup char * shared,
+                             device const uint * tree, device float * out, device float * po, device float * pml,
+                             threadgroup char * shared,
                              threadgroup uint & rescale, uint3 tgpig, ushort tid) {
     constexpr int W = D < 128 ? D : 128, NH = D / W, BC = 64;
     constexpr int SBYTES = (BC * W * 2 > BR * BC * 4) ? BC * W * 2 : BR * BC * 4;
@@ -2871,7 +2945,8 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
     const uint last_key = p.position + uint(r0 + rows - 1) / p.group;
     uint j_begin = key_begin;
     if (p.window != 0) {
-        const uint first_pos = p.position + uint(r0) / p.group;
+        const uint first_pos = lowest_query_position<TREE>(tree, p.position, uint(r0) / p.group,
+                                                           uint(r0 + rows - 1) / p.group);
         const uint lo = first_pos + 1 > p.window ? first_pos + 1 - p.window : 0;
         j_begin = max(j_begin, lo / BC * BC);
     }
@@ -2900,7 +2975,9 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
     if (tid < BR) verify_seed(p, sinks, kvh, uint(r0) + tid, int(tid) < rows, mrow, lrow, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint row_last_key = p.position + uint(r0 + int(tid / (128 / BR))) / p.group;
+    // Threads past the last row only feed masked scores; give them a valid row.
+    const uint my_t = min(uint(r0 + int(tid / (128 / BR))) / p.group, p.tokens - 1);
+    const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, my_t);
     for (uint j0 = j_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
         for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
         stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, key_end, p.cache_stride, head_off, 0, tid, p.ring);
@@ -2915,7 +2992,7 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
         }
         cS.store(tS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        verify_softmax<BR, BC>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, row_last_key, p.window, tid);
+        verify_softmax<BR, BC, TREE>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, mask, tid);
         if (rescale) {
             for (uint i = 0; i < cO0.get_capacity(); i++) {
                 if (cO0.is_valid_element(i)) {
@@ -2960,12 +3037,30 @@ kernel void name(constant FaArgs & p [[buffer(8)]],                             
                  uint3 tgpig [[threadgroup_position_in_grid]],                                  \
                  ushort tid [[thread_index_in_threadgroup]]) {                                  \
     threadgroup uint rescale;                                                                   \
-    call(p, qk, kc, vc, qg, sinks, out, po, pml, shared, rescale, tgpig, tid);                  \
+    call(p, qk, kc, vc, qg, sinks, nullptr, out, po, pml, shared, rescale, tgpig, tid);         \
 }
-ATTN_VERIFY_MPP(h_attn_verify_mpp_32, (attn_verify_mpp_impl<32, 256>))
-ATTN_VERIFY_MPP(h_attn_verify_mpp_32_q8, (attn_verify_mpp_staged_impl<32, true, 256>))
-ATTN_VERIFY_MPP(h_attn_verify_mpp_32_d128, (attn_verify_mpp_impl<32, 128>))
-ATTN_VERIFY_MPP(h_attn_verify_mpp_32_q8_d128, (attn_verify_mpp_staged_impl<32, true, 128>))
+// Draft-tree verify: the tree (see KeyMask) rides after the sinks.
+#define ATTN_VERIFY_MPP_TREE(name, call)                                                         \
+kernel void name(constant FaArgs & p [[buffer(9)]],                                             \
+                 device half * qk [[buffer(0)]], device half * kc [[buffer(1)]],                \
+                 device half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],         \
+                 device const float * sinks [[buffer(4)]], device const uint * tree [[buffer(5)]], \
+                 device float * out [[buffer(6)]],                                              \
+                 device float * po [[buffer(7)]], device float * pml [[buffer(8)]],             \
+                 threadgroup char * shared [[threadgroup(0)]],                                  \
+                 uint3 tgpig [[threadgroup_position_in_grid]],                                  \
+                 ushort tid [[thread_index_in_threadgroup]]) {                                  \
+    threadgroup uint rescale;                                                                   \
+    call(p, qk, kc, vc, qg, sinks, tree, out, po, pml, shared, rescale, tgpig, tid);            \
+}
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32, (attn_verify_mpp_impl<32, 256, false>))
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32_q8, (attn_verify_mpp_staged_impl<32, true, 256, false>))
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32_d128, (attn_verify_mpp_impl<32, 128, false>))
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32_q8_d128, (attn_verify_mpp_staged_impl<32, true, 128, false>))
+ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_tree, (attn_verify_mpp_impl<32, 256, true>))
+ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_q8_tree, (attn_verify_mpp_staged_impl<32, true, 256, true>))
+ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_d128_tree, (attn_verify_mpp_impl<32, 128, true>))
+ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_q8_d128_tree, (attn_verify_mpp_staged_impl<32, true, 128, true>))
 
 // Gathers `N` consecutive cached values (N = 8 or 4) from element e, unscaled.
 template <bool Q8, int N>

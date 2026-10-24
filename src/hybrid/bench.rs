@@ -205,6 +205,7 @@ impl HybridModel {
                     spec,
                     None,
                     0,
+                    None,
                 )?;
             }
             e.finish()?;
@@ -262,6 +263,7 @@ impl HybridModel {
                     spec,
                     None,
                     0,
+                    None,
                 )?;
             }
             e.finish()?;
