@@ -62,8 +62,13 @@ speculative decoding (lossless; off by default):
                             spans from the context; no drafter model), a DFlash /
                             DFlash2 / DSpark checkpoint directory (or its HF cache
                             entry), or a DFlash / DFlash2 GGUF
-  --draft-max N             drafts per step (default: 3 for MTP and lookup; the
-                            trained block for dense targets, 2 for MoE targets)
+  --draft-max N             drafts per step, and draft-tree depth (default: 3 for MTP
+                            and lookup, 7 for MTP trees; the trained block for dense
+                            targets, 2 for MoE targets)
+  --draft-tree N            draft trees of up to N guesses for greedy requests
+                            (1-31; 15 recommended)
+  --draft-tree-search best-first|siblings
+                            how MTP grows trees (default best-first)
   --draft-quant q4_0|q8_0   draft weight precision (default q4_0)
   --draft-context N         context slots for drafts without a sliding window (8192)
   --draft-p-min P           DSpark: stop drafting below this confidence (0)

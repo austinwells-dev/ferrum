@@ -7,7 +7,8 @@
 //!            [--max-tokens N] [--no-think] [--reasoning-effort LEVEL]
 //!            [--reasoning-budget N] [--hide-thinking]
 //!            [--draft mtp|lookup|DIR|FILE.gguf] [--draft-max N] [--draft-quant q8_0|q4_0]
-//!            [--draft-context N] [--draft-p-min P]
+//!            [--draft-context N] [--draft-p-min P] [--draft-tree N]
+//!            [--draft-tree-search best-first|siblings]
 //!            [--mmproj FILE|auto|none] [--image-tokens N] [--image-min-tokens N]
 //!
 //! Commands: /reset, /think on|off, /image PATH, /stats, /exit. End a line with `\` to
