@@ -97,15 +97,27 @@ fn synthetic(d: &MetalDevice, config: VisionConfig, seed: u64) -> VisionModel {
         })
         .collect();
     let merged = h * 4;
+    let merger = |rng: &mut ChaCha8Rng, post_shuffle: bool| {
+        let norm = if post_shuffle { merged } else { h };
+        Merger {
+            norm: (vec(rng, norm, 1.), vec(rng, norm, 0.)),
+            fc1: (mat(rng, merged, merged), vec(rng, merged, 0.)),
+            fc2: (
+                mat(rng, config.out_dim, merged),
+                vec(rng, config.out_dim, 0.),
+            ),
+            post_shuffle,
+        }
+    };
+    let output = merger(&mut rng, false);
+    let deepstack = (0..config.layers)
+        .map(|l| (l, merger(&mut rng, true)))
+        .collect();
     VisionModel {
         patch: (mat(&mut rng, h, config.patch_len()), vec(&mut rng, h, 0.)),
         position: rand_vec(&mut rng, config.table * config.table * h, 0.5),
-        post: (vec(&mut rng, h, 1.), vec(&mut rng, h, 0.)),
-        merge1: (mat(&mut rng, merged, merged), vec(&mut rng, merged, 0.)),
-        merge2: (
-            mat(&mut rng, config.out_dim, merged),
-            vec(&mut rng, config.out_dim, 0.),
-        ),
+        merger: output,
+        deepstack,
         zero: Tensor::zeros(d, [1], DType::F32).unwrap(),
         layers,
         config,
@@ -116,7 +128,31 @@ fn synthetic(d: &MetalDevice, config: VisionConfig, seed: u64) -> VisionModel {
     }
 }
 
-fn reference(m: &VisionModel, image: &Prepared) -> Vec<f32> {
+/// A merger on CPU over `x` (`n` patch rows of `h`, block order).
+fn merge_reference(
+    m: &Merger,
+    x: &[f32],
+    n: usize,
+    h: usize,
+    eps: f32,
+    out_dim: usize,
+) -> Vec<f32> {
+    let w = |t: &(Tensor, Tensor)| (t.0.to_f32(), t.1.to_f32());
+    let (g, b) = w(&m.norm);
+    // Per-patch and post-shuffle norms differ only in the width normalised.
+    let xn = layernorm(x, &g, &b, if m.post_shuffle { 4 * h } else { h }, eps);
+    let rows = n / 4;
+    let (w1, b1) = w(&m.fc1);
+    let mid: Vec<f32> = linear(&xn, &w1, &b1, rows, 4 * h, 4 * h)
+        .into_iter()
+        .map(gelu_erf)
+        .collect();
+    let (w2, b2) = w(&m.fc2);
+    linear(&mid, &w2, &b2, rows, out_dim, 4 * h)
+}
+
+/// The output rows and the DeepStack features.
+fn reference(m: &VisionModel, image: &Prepared) -> (Vec<f32>, Vec<Vec<f32>>) {
     let c = &m.config;
     let (gh, gw) = (image.height / c.patch, image.width / c.patch);
     let (n, h, hd) = (gh * gw, c.hidden, c.head_dim());
@@ -127,7 +163,8 @@ fn reference(m: &VisionModel, image: &Prepared) -> Vec<f32> {
         *a += b;
     }
     let (cos, sin) = rope_tables(gh, gw, c.merge, hd);
-    for layer in &m.layers {
+    let mut deepstack = Vec::new();
+    for (index, layer) in m.layers.iter().enumerate() {
         let (g1, b1) = w(&layer.ln1);
         let xn = layernorm(&x, &g1, &b1, h, c.eps);
         let (qw, qb) = w(&layer.qkv);
@@ -189,17 +226,14 @@ fn reference(m: &VisionModel, image: &Prepared) -> Vec<f32> {
         for (a, b) in x.iter_mut().zip(linear(&hid, &dw, &db, n, h, c.ffn)) {
             *a += b;
         }
+        for (_, merger) in m.deepstack.iter().filter(|(l, _)| *l == index) {
+            deepstack.push(merge_reference(merger, &x, n, h, c.eps, c.out_dim));
+        }
     }
-    let (pg, pbias) = w(&m.post);
-    let xn = layernorm(&x, &pg, &pbias, h, c.eps);
-    let rows = n / 4;
-    let (w1, b1) = w(&m.merge1);
-    let mid: Vec<f32> = linear(&xn, &w1, &b1, rows, 4 * h, 4 * h)
-        .into_iter()
-        .map(gelu_erf)
-        .collect();
-    let (w2, b2) = w(&m.merge2);
-    linear(&mid, &w2, &b2, rows, c.out_dim, 4 * h)
+    (
+        merge_reference(&m.merger, &x, n, h, c.eps, c.out_dim),
+        deepstack,
+    )
 }
 
 fn test_image(width: usize, height: usize, seed: u64) -> Prepared {
@@ -232,7 +266,7 @@ fn encoder_matches_cpu_reference() {
     let mut model = synthetic(&d, tiny_config(), 7);
     for (width, height) in [(16, 16), (32, 24), (24, 40)] {
         let image = test_image(width, height, (width * height) as u64);
-        let want = reference(&model, &image);
+        let (want, want_deepstack) = reference(&model, &image);
         for score_bytes in [SCORE_BYTES, 1] {
             model.score_bytes = score_bytes;
             let got = model.encode_prepared(&d, &image).unwrap();
@@ -242,6 +276,10 @@ fn encoder_matches_cpu_reference() {
                 &got.rows.to_f32(),
                 &want,
             );
+            assert_eq!(got.deepstack.len(), want_deepstack.len());
+            for (i, (g, w)) in got.deepstack.iter().zip(&want_deepstack).enumerate() {
+                compare(&format!("{width}x{height} deepstack {i}"), &g.to_f32(), w);
+            }
         }
     }
 }
@@ -334,4 +372,39 @@ fn request_budgets_stay_within_the_projector_cap() {
         ..Default::default()
     };
     assert_eq!(fill.or(budget(Some(2), Some(3))), budget(Some(1), Some(3)));
+}
+
+#[test]
+fn safetensors_names_follow_transformers() {
+    for (gguf, hf) in [
+        ("v.patch_embd.bias", "patch_embed.proj.bias"),
+        ("v.position_embd.weight", "pos_embed.weight"),
+        ("v.blk.3.ln1.weight", "blocks.3.norm1.weight"),
+        ("v.blk.3.ln2.bias", "blocks.3.norm2.bias"),
+        ("v.blk.26.attn_qkv.weight", "blocks.26.attn.qkv.weight"),
+        ("v.blk.0.attn_out.bias", "blocks.0.attn.proj.bias"),
+        ("v.blk.1.ffn_up.weight", "blocks.1.mlp.linear_fc1.weight"),
+        ("v.blk.1.ffn_down.weight", "blocks.1.mlp.linear_fc2.weight"),
+        ("v.post_ln.weight", "merger.norm.weight"),
+        ("mm.0.weight", "merger.linear_fc1.weight"),
+        ("mm.2.bias", "merger.linear_fc2.bias"),
+        (
+            "v.deepstack.2.norm.weight",
+            "deepstack_merger_list.2.norm.weight",
+        ),
+        (
+            "v.deepstack.0.fc1.bias",
+            "deepstack_merger_list.0.linear_fc1.bias",
+        ),
+        (
+            "v.deepstack.1.fc2.weight",
+            "deepstack_merger_list.1.linear_fc2.weight",
+        ),
+    ] {
+        assert_eq!(
+            transformers_name("model.visual.", gguf),
+            format!("model.visual.{hf}"),
+            "{gguf}"
+        );
+    }
 }

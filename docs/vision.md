@@ -25,7 +25,9 @@ its frame for the temporal conv, so the two patch-embedding taps are summed into
 The learned 48x48 position table is resized bilinearly (corners aligned, as in the reference
 implementation). Weights are kept F16 (BF16/F32 files are converted at load); activations are F32 and GEMMs stage
 half-precision tiles with F32 accumulation. Attention runs as strided batched GEMMs through an F32 score
-buffer, in head groups that bound its size. DeepStack projectors are rejected at load.
+buffer, in head groups that bound its size. GGUF projectors with DeepStack layers are rejected at load; the image
+pipeline loads the same tower from Qwen-Image's text-encoder safetensors with its DeepStack mergers
+([architecture](architecture.md#image-generation)).
 
 ## Validation
 
@@ -49,5 +51,5 @@ to speed this up.
 
 ## Not covered
 
-Video, other projector types (Gemma, LLaVA, Pixtral), DeepStack layers, remote image URLs, and images on
+Video, other projector types (Gemma, LLaVA, Pixtral), DeepStack layers in chat, remote image URLs, and images on
 the shared-transformer models (Qwen2.5/3, Granite, OLMo, LFM2).

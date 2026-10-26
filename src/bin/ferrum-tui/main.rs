@@ -23,6 +23,8 @@ mod evalui;
 mod fields;
 mod highlight;
 mod home;
+mod imagetab;
+mod imagetool;
 mod layout;
 mod models;
 mod pick;
@@ -110,6 +112,7 @@ pub enum Screen {
     Serve,
     Bench,
     Models,
+    Image,
 }
 
 /// Why the editor is open: decides what launching does.
@@ -165,6 +168,7 @@ pub enum Editing {
     RenameFav(usize),
     SearchUrl,
     SearchKey,
+    ImagePrompt,
 }
 
 pub struct App {
@@ -201,10 +205,11 @@ pub struct App {
     pub chat: Option<Chat>,
     pub serve: Option<Serve>,
     pub bench: Option<BenchState>,
+    pub image: imagetab::ImageTab,
     /// Chat workers that were told to stop and may still be unloading.
     pub closing: Vec<std::thread::JoinHandle<()>>,
-    /// The kitty-protocol image currently on screen.
-    pub gfx: preview::Kitty,
+    /// The pictures the terminal shows (kitty or iTerm2 protocol).
+    pub gfx: preview::Gfx,
     /// Split sizes and widths (Settings › Layout).
     pub prefs: Prefs,
     /// Saved measurements per model, refreshed every few seconds.
@@ -249,11 +254,13 @@ impl App {
         if self.bench.is_some() {
             self.bench_tick();
         }
+        self.image.pump();
     }
 
     pub fn poll_interval(&self) -> Duration {
         let busy = self.chat.is_some()
             || self.serve.is_some()
+            || self.image.running()
             || self
                 .bench
                 .as_ref()
@@ -280,6 +287,7 @@ impl App {
             Screen::Serve => self.draw_serve(f, body, footer),
             Screen::Bench => self.draw_bench(f, body, footer),
             Screen::Models => self.draw_models_tab(f, body, footer),
+            Screen::Image => self.draw_image(f, body, footer),
         }
         self.draw_overlay(f);
         if self.picker.is_some() {
@@ -299,6 +307,7 @@ impl App {
                 &self.buffer,
             ),
             Editing::RenameFav(_) => input_popup(f, "Rename favorite", "new name", &self.buffer),
+            Editing::ImagePrompt => imagetab::prompt_popup(f, &self.buffer),
             Editing::SearchUrl => input_popup(
                 f,
                 "Search URL",
@@ -349,6 +358,7 @@ impl App {
             Screen::Serve => self.serve_key(key),
             Screen::Bench => self.bench_key(key),
             Screen::Models => self.models_key(key),
+            Screen::Image => self.image_key(key),
         }
     }
 
@@ -414,15 +424,24 @@ impl App {
     }
 }
 
+/// The picture placements the last draw asked for.
+fn wants(app: &App) -> Vec<preview::Want> {
+    match (app.screen, app.chat.as_ref()) {
+        (Screen::Chat, Some(c)) => c.wants.take(),
+        (Screen::Image, _) => app.image.wants.take(),
+        _ => Vec::new(),
+    }
+}
+
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.quit {
         app.tick();
         terminal.draw(|f| app.draw(f))?;
-        let wants = match (app.screen, app.chat.as_ref()) {
-            (Screen::Chat, Some(c)) => c.wants.take(),
-            _ => Vec::new(),
-        };
-        app.gfx.sync(terminal.backend_mut(), &wants)?;
+        if app.gfx.sync(terminal.backend_mut(), &wants(app))? {
+            terminal.clear()?;
+            terminal.draw(|f| app.draw(f))?;
+            app.gfx.sync(terminal.backend_mut(), &wants(app))?;
+        }
         if event::poll(app.poll_interval())? {
             loop {
                 match event::read()? {

@@ -1,0 +1,73 @@
+# Re-timed with the display on (pmset shows no display-off event after 14:21:06 UTC; an earlier set of timings taken 12:18-14:21 with the display off was discarded).
+# Apple M5, 32 GB, caffeinate -dims, PHASE7A_PREFLIGHT_IGNORE=dasd. Image runs: ferrum-cli image -m <Turbo snapshot> -p 'a red fox in snow' --seed 7 (GGUF runs: model dir = base configs + Turbo encoder/VAE).
+# A = 16c1463 (before the F16 GEMMs), B = 486b038+uncommitted text-encoder GGUF; hybrid_bench main = 155a899.
+# The machine runs hotter later in a session: absolute numbers drift, so compare within an A-B-B-A group.
+
+# start 14:27:00 UTC
+## Turbo, 512x512, BF16 transformer and encoder: before (16c1463) A, after (HEAD) B, ordered A B B A
+-- A
+512x512, seed 7, 25.3 s (load 7.2, encode 0.7, denoise 16.6, decode 0.7)
+-- B
+512x512, seed 7, 19.9 s (load 6.5, encode 0.8, denoise 11.8, decode 0.7)
+-- B
+512x512, seed 7, 20.2 s (load 6.5, encode 0.7, denoise 12.3, decode 0.7)
+-- A
+512x512, seed 7, 24.9 s (load 6.5, encode 0.7, denoise 16.8, decode 0.8)
+## Turbo, 1024x1024, BF16 transformer, Q8_0 encoder: A B B A
+-- A
+1024x1024, seed 7, 83.5 s (load 7.1, encode 0.2, denoise 73.2, decode 3.0)
+-- B
+1024x1024, seed 7, 68.0 s (load 7.0, encode 0.2, denoise 57.6, decode 3.0)
+-- B
+1024x1024, seed 7, 67.9 s (load 6.9, encode 0.2, denoise 57.7, decode 2.9)
+-- A
+1024x1024, seed 7, 82.0 s (load 6.9, encode 0.2, denoise 71.7, decode 3.0)
+## Turbo, 512x512, Q4_K_XL GGUF encoder (HEAD)
+-- enc-gguf
+512x512, seed 7, 18.0 s (load 4.2, encode 0.1, denoise 12.8, decode 0.8)
+## base GGUF transformer, 512x512, 40 steps (HEAD)
+-- Q8_0
+512x512, seed 7, 63.8 s (load 5.7, encode 0.2, denoise 57.1, decode 0.7)
+-- Q4_K_M
+512x512, seed 7, 61.4 s (load 4.9, encode 0.2, denoise 55.4, decode 0.8)
+-- Q4_K_M+Q4_K_XL
+512x512, seed 7, 59.4 s (load 1.9, encode 0.2, denoise 56.5, decode 0.7)
+## hybrid_bench A-B-B-A x2, Spark 4B Q4_K_M: main 155a899 vs HEAD
+== main
+| Dense F32 | pp512 | 1215.33 ± 3.45 |
+| Dense F32 | pp2048 | 1107.25 ± 33.71 |
+| Dense F32 | tg128 | 38.27 ± 1.17 |
+== branch
+| Dense F32 | pp512 | 1162.67 ± 4.09 |
+| Dense F32 | pp2048 | 1079.46 ± 8.38 |
+| Dense F32 | tg128 | 37.60 ± 2.20 |
+== branch
+| Dense F32 | pp512 | 1118.90 ± 6.91 |
+| Dense F32 | pp2048 | 1045.24 ± 3.22 |
+| Dense F32 | tg128 | 26.93 ± 1.65 |
+== main
+| Dense F32 | pp512 | 899.50 ± 28.08 |
+| Dense F32 | pp2048 | 833.36 ± 12.83 |
+| Dense F32 | tg128 | 25.94 ± 1.09 |
+== main
+| Dense F32 | pp512 | 993.48 ± 7.48 |
+| Dense F32 | pp2048 | 867.77 ± 29.31 |
+| Dense F32 | tg128 | 26.78 ± 1.50 |
+== branch
+| Dense F32 | pp512 | 926.95 ± 41.17 |
+| Dense F32 | pp2048 | 909.85 ± 27.21 |
+| Dense F32 | tg128 | 32.35 ± 2.47 |
+== branch
+| Dense F32 | pp512 | 1105.20 ± 0.36 |
+| Dense F32 | pp2048 | 1048.60 ± 3.06 |
+| Dense F32 | tg128 | 35.27 ± 0.68 |
+== main
+| Dense F32 | pp512 | 1141.74 ± 2.70 |
+| Dense F32 | pp2048 | 1073.04 ± 0.58 |
+| Dense F32 | tg128 | 36.27 ± 0.08 |
+# end 14:40:36 UTC
+DONE
+
+# Summary of the hybrid_bench group (Spark 4B Q4_K_M; the machine throttles during the group: pp512 falls from 1215 to 900 on main alone)
+# Mean over the A-B-B-A positions: main pp512 1062, pp2048 970, tg128 31.8; branch pp512 1078, pp2048 1021, tg128 33.0 (branch is not slower; best-of favours main only because main ran first, cold).
+# Image runs, A-B-B-A mean: 512x512 before 25.1 s, after 20.0 s; 1024x1024 before 82.8 s, after 68.0 s.

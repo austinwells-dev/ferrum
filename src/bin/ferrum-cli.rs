@@ -11,6 +11,9 @@
 //!            [--draft-tree-search best-first|siblings] [--draft-block N] [--draft-vocab N]
 //!            [--mmproj FILE|auto|none] [--image-tokens N] [--image-min-tokens N]
 //!
+//! ferrum-cli image --model DIR --prompt TEXT [--size WxH] [--seed N] [--out FILE.png]
+//!                  (text-to-image with Qwen-Image-2.1; see `ferrum-cli image --help`)
+//!
 //! Commands: /reset, /think on|off, /image PATH [low|high|auto|N],
 //! /detail low|high|auto|N, /stats, /exit. End a line with `\` to continue the
 //! message on the next line.
@@ -29,6 +32,9 @@ use ferrum::{
 };
 use serde_json::{Map, Value as Json, json};
 use std::io::{BufRead, Write};
+
+#[path = "ferrum-cli/image.rs"]
+mod image;
 
 struct Options {
     model: String,
@@ -143,6 +149,9 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if std::env::args().nth(1).as_deref() == Some("image") {
+        return image::run(std::env::args().skip(2));
+    }
     let o = parse()?;
     eprintln!("loading {} ...", o.model);
     let mmproj = ferrum::vision::resolve_projector(o.model.as_ref(), o.mmproj.as_deref())?;

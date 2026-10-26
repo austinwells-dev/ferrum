@@ -74,6 +74,16 @@ fn every_screen_draws_at_every_size() {
     }
     app.go_tab(Tab::Models);
     sweep(&app, "models", true);
+    app.go_tab(Tab::Image);
+    for state in 0..4 {
+        app.image.demo(state);
+        sweep(&app, "image", true);
+    }
+    app.image.demo(0);
+    app.buffer = app.image.prompt.repeat(6);
+    app.editing = Editing::ImagePrompt;
+    sweep(&app, "image prompt", false);
+    app.editing = Editing::No;
     for mode in [Mode::Chat, Mode::Agent, Mode::Serve] {
         app.open_pick(mode);
         sweep(&app, "setups", true);

@@ -1,0 +1,149 @@
+LLM regression check for the image-edit change (touches src/hybrid/engine.rs, runtime.rs,
+session.rs, weights.rs, src/vision): base = experimental 155a899 (labelled "main" below),
+branch = this change. Same machine and hygiene as timing-2026-10-26.txt (same session).
+Models: Spark-X2.6-4B-Q4_K_M (dense), Qwen3.6-35B-A3B IQ4_XS (MoE) with its F16 mmproj.
+Summary:
+  Greedy text: identical on both models. Greedy image chat (MoE + mmproj): identical.
+  Memory planner: measured vs predicted unchanged on both.
+  KLD vs llama.cpp: identical to the last digit (Spark 0.000153 / 99.56% top-1 / PPL 9.2048;
+  MoE 0.001584 / 98.43% / PPL 9.1259).
+  hybrid_bench best-of-4 (base vs branch):
+    Spark pp512 1225.66 vs 1214.42, pp2048 1140.35 vs 1130.37, tg128 40.06 vs 39.92
+      (base alone spans 1115.96-1225.66 at pp512).
+    MoE   pp512 958.78 vs 950.19, pp2048 918.79 vs 911.60, tg128 55.24 vs 55.10
+      (base spans 947.44-958.78, 908.47-918.79, 54.28-55.24).
+  Every branch best lies inside the base's own run-to-run spread: no slowdown shown.
+
+# start (see timing-2026-10-26.txt for preflight) 2026-10-26 UTC
+## greedy text: ferrum hybrid --model MODEL --raw --prompt 'The capital of France is' --max-new-tokens 48; main = 155a899, branch = this change
+== main Spark-X2.6-4B-Q4_K_M.gguf
+measured: weights+scratch 3496 MiB (predicted 3496), state 19960 MiB (predicted 19961)
+stdout md5 c7397fd44e4549e8896067519e9f9458 bytes      155
+== branch Spark-X2.6-4B-Q4_K_M.gguf
+measured: weights+scratch 3496 MiB (predicted 3496), state 19960 MiB (predicted 19961)
+stdout md5 c7397fd44e4549e8896067519e9f9458 bytes      155
+greedy output identical
+== main Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+measured: weights+scratch 18067 MiB (predicted 18069), state 5183 MiB (predicted 5184)
+stdout md5 eeb9fbbdd64dc08f033b98aaf794dee9 bytes      224
+== branch Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+measured: weights+scratch 18067 MiB (predicted 18069), state 5183 MiB (predicted 5184)
+stdout md5 eeb9fbbdd64dc08f033b98aaf794dee9 bytes      224
+greedy output identical
+## greedy image chat: ferrum-cli -m MoE --mmproj F16 --no-think --temperature 0 -n 60 <<< '/image fox.png' + 'Describe this picture in one sentence.'
+== main: loading /Users/austinwells/models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf ... sampling: temperature 0 top-p 0.95 top-k 20 min-p 0; /reset /think on|off /stats /exit > A majestic red fox sits alertly in a snowy landscape, 
+md5 c86ae0ee250725f19c8055752f9c1a9d
+== branch: loading /Users/austinwells/models/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf ... sampling: temperature 0 top-p 0.95 top-k 20 min-p 0; /reset /think on|off /stats /exit > A majestic red fox sits alertly in a snowy landscape, 
+md5 c86ae0ee250725f19c8055752f9c1a9d
+image chat output identical
+## KLD against llama.cpp (llama-perplexity version: 0.7.0 (build 11669, commit 620d2225c)), corpus = README.md + docs/*.md of this tree, -c 512, 8 chunks
+llama-perplexity exit 0 for Spark-X2.6-4B-Q4_K_M
+== main Spark-X2.6-4B-Q4_K_M
+chunk 0: ppl 23.2278 (llama.cpp 23.2052) mean KLD 0.000116 same top 99.22%
+chunk 1: ppl 19.0243 (llama.cpp 18.8786) mean KLD 0.000108 same top 99.41%
+chunk 2: ppl 13.3120 (llama.cpp 13.2319) mean KLD 0.000114 same top 99.22%
+chunk 3: ppl 9.6966 (llama.cpp 9.6649) mean KLD 0.000182 same top 99.31%
+chunk 4: ppl 8.4582 (llama.cpp 8.4326) mean KLD 0.000183 same top 99.45%
+chunk 5: ppl 10.2091 (llama.cpp 10.1739) mean KLD 0.000170 same top 99.54%
+chunk 6: ppl 9.4237 (llama.cpp 9.3969) mean KLD 0.000163 same top 99.61%
+chunk 7: ppl 9.2048 (llama.cpp 9.1806) mean KLD 0.000153 same top 99.56%
+positions 2040; Ferrum PPL 9.2048; llama.cpp PPL 9.1806; mean KLD 0.000153; median 0.000049; p99 0.000868; max 0.070800; same top-1 99.56%; 8.0 s
+== branch Spark-X2.6-4B-Q4_K_M
+chunk 0: ppl 23.2278 (llama.cpp 23.2052) mean KLD 0.000116 same top 99.22%
+chunk 1: ppl 19.0243 (llama.cpp 18.8786) mean KLD 0.000108 same top 99.41%
+chunk 2: ppl 13.3120 (llama.cpp 13.2319) mean KLD 0.000114 same top 99.22%
+chunk 3: ppl 9.6966 (llama.cpp 9.6649) mean KLD 0.000182 same top 99.31%
+chunk 4: ppl 8.4582 (llama.cpp 8.4326) mean KLD 0.000183 same top 99.45%
+chunk 5: ppl 10.2091 (llama.cpp 10.1739) mean KLD 0.000170 same top 99.54%
+chunk 6: ppl 9.4237 (llama.cpp 9.3969) mean KLD 0.000163 same top 99.61%
+chunk 7: ppl 9.2048 (llama.cpp 9.1806) mean KLD 0.000153 same top 99.56%
+positions 2040; Ferrum PPL 9.2048; llama.cpp PPL 9.1806; mean KLD 0.000153; median 0.000049; p99 0.000868; max 0.070800; same top-1 99.56%; 7.3 s
+llama-perplexity exit 0 for Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS
+== main Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS
+chunk 0: ppl 22.7815 (llama.cpp 22.6809) mean KLD 0.001349 same top 98.43%
+chunk 1: ppl 16.2115 (llama.cpp 16.1465) mean KLD 0.001856 same top 97.65%
+chunk 2: ppl 10.1209 (llama.cpp 10.0795) mean KLD 0.001788 same top 98.04%
+chunk 3: ppl 8.9270 (llama.cpp 8.8984) mean KLD 0.001454 same top 98.53%
+chunk 4: ppl 8.4074 (llama.cpp 8.3809) mean KLD 0.001403 same top 98.59%
+chunk 5: ppl 9.2744 (llama.cpp 9.2434) mean KLD 0.001538 same top 98.50%
+chunk 6: ppl 8.8695 (llama.cpp 8.8427) mean KLD 0.001533 same top 98.54%
+chunk 7: ppl 9.1259 (llama.cpp 9.1026) mean KLD 0.001584 same top 98.43%
+positions 2040; Ferrum PPL 9.1259; llama.cpp PPL 9.1026; mean KLD 0.001584; median 0.000459; p99 0.017332; max 0.079070; same top-1 98.43%; 14.1 s
+== branch Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS
+chunk 0: ppl 22.7815 (llama.cpp 22.6809) mean KLD 0.001349 same top 98.43%
+chunk 1: ppl 16.2115 (llama.cpp 16.1465) mean KLD 0.001856 same top 97.65%
+chunk 2: ppl 10.1209 (llama.cpp 10.0795) mean KLD 0.001788 same top 98.04%
+chunk 3: ppl 8.9270 (llama.cpp 8.8984) mean KLD 0.001454 same top 98.53%
+chunk 4: ppl 8.4074 (llama.cpp 8.3809) mean KLD 0.001403 same top 98.59%
+chunk 5: ppl 9.2744 (llama.cpp 9.2434) mean KLD 0.001538 same top 98.50%
+chunk 6: ppl 8.8695 (llama.cpp 8.8427) mean KLD 0.001533 same top 98.54%
+chunk 7: ppl 9.1259 (llama.cpp 9.1026) mean KLD 0.001584 same top 98.43%
+positions 2040; Ferrum PPL 9.1259; llama.cpp PPL 9.1026; mean KLD 0.001584; median 0.000459; p99 0.017332; max 0.079070; same top-1 98.43%; 14.1 s
+## hybrid_bench --pp 512,2048 --tg 128, A-B-B-A x2 (main = 155a899, branch = this change)
+### Spark-X2.6-4B-Q4_K_M.gguf
+-- main
+| Dense F32 | pp512 | 1225.66 ± 2.26 |
+| Dense F32 | pp2048 | 1140.35 ± 1.99 |
+| Dense F32 | tg128 | 40.06 ± 0.32 |
+-- branch
+| Dense F32 | pp512 | 1214.42 ± 3.26 |
+| Dense F32 | pp2048 | 1130.37 ± 3.28 |
+| Dense F32 | tg128 | 39.70 ± 0.65 |
+-- branch
+| Dense F32 | pp512 | 1206.54 ± 5.61 |
+| Dense F32 | pp2048 | 1102.33 ± 39.36 |
+| Dense F32 | tg128 | 35.55 ± 1.74 |
+-- main
+| Dense F32 | pp512 | 1115.96 ± 3.52 |
+| Dense F32 | pp2048 | 1046.21 ± 2.36 |
+| Dense F32 | tg128 | 39.66 ± 0.39 |
+-- main
+| Dense F32 | pp512 | 1192.75 ± 2.81 |
+| Dense F32 | pp2048 | 1114.19 ± 2.57 |
+| Dense F32 | tg128 | 39.92 ± 0.03 |
+-- branch
+| Dense F32 | pp512 | 1191.48 ± 4.28 |
+| Dense F32 | pp2048 | 1114.36 ± 1.92 |
+| Dense F32 | tg128 | 39.92 ± 0.02 |
+-- branch
+| Dense F32 | pp512 | 1192.57 ± 4.77 |
+| Dense F32 | pp2048 | 1113.18 ± 1.44 |
+| Dense F32 | tg128 | 38.86 ± 1.72 |
+-- main
+| Dense F32 | pp512 | 1189.61 ± 4.03 |
+| Dense F32 | pp2048 | 1098.81 ± 22.70 |
+| Dense F32 | tg128 | 39.83 ± 0.07 |
+### Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+-- main
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 958.78 ± 2.40 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 918.79 ± 5.35 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 55.24 ± 0.13 |
+-- branch
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 945.85 ± 8.21 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 909.43 ± 3.70 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 54.83 ± 0.40 |
+-- branch
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 947.02 ± 3.67 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 898.80 ± 7.97 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 54.83 ± 0.33 |
+-- main
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 947.95 ± 3.79 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 908.47 ± 3.49 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 54.28 ± 1.30 |
+-- main
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 947.44 ± 3.13 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 908.81 ± 3.08 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 54.31 ± 0.37 |
+-- branch
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 948.28 ± 2.85 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 908.88 ± 1.92 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 54.98 ± 0.15 |
+-- branch
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 950.19 ± 2.68 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 911.60 ± 3.22 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 55.10 ± 0.09 |
+-- main
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 951.30 ± 2.48 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 912.81 ± 2.97 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 55.21 ± 0.04 |
+# end 2026-10-26 18:00:32 UTC

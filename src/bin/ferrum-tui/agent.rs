@@ -80,11 +80,11 @@ impl ToolMode {
 pub fn needs_approval(name: &str) -> bool {
     matches!(
         name,
-        "bash" | "write_file" | "edit_file" | "fetch_url" | "web_search"
+        "bash" | "write_file" | "edit_file" | "fetch_url" | "web_search" | imagetool::NAME
     )
 }
 
-fn def(name: &str, description: &str, properties: Json, required: &[&str]) -> Json {
+pub fn def(name: &str, description: &str, properties: Json, required: &[&str]) -> Json {
     json!({
         "type": "function",
         "function": {
@@ -181,18 +181,19 @@ pub fn summary(name: &str, args: &Map<String, Json>) -> String {
         "bash" => s("command").lines().next().unwrap_or("").to_string(),
         "fetch_url" => s("url").to_string(),
         "web_search" => s("query").to_string(),
+        imagetool::NAME => s("prompt").to_string(),
         "list_dir" if s("path").is_empty() => ".".to_string(),
         _ => s("path").to_string(),
     }
 }
 
-fn arg_str<'a>(args: &'a Map<String, Json>, key: &str) -> Result<&'a str, String> {
+pub fn arg_str<'a>(args: &'a Map<String, Json>, key: &str) -> Result<&'a str, String> {
     args.get(key)
         .and_then(Json::as_str)
         .ok_or_else(|| format!("missing required argument {key}"))
 }
 
-fn arg_int(args: &Map<String, Json>, key: &str) -> Option<i64> {
+pub fn arg_int(args: &Map<String, Json>, key: &str) -> Option<i64> {
     args.get(key).and_then(|v| {
         v.as_i64()
             .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
@@ -361,8 +362,12 @@ impl Sandbox {
     }
 
     pub fn write_text(&self, path: &Path, text: &str) -> Result<(), String> {
+        self.write_bytes(path, text.as_bytes())
+    }
+
+    pub fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<(), String> {
         self.open(path, true)?
-            .write_all(text.as_bytes())
+            .write_all(bytes)
             .map_err(|e| format!("{}: {e}", self.rel(path)))
     }
 

@@ -1,0 +1,58 @@
+Image generation timings: text to image and edits, Qwen-Image-2.1-Turbo
+Machine: Apple M5, 32 GB, macOS 27.0.1. Run under caffeinate -dims, screen unlocked
+(IOConsoleLocked checked before every run; never Yes), one model in memory, after
+scripts/phase7a_cpu_preflight.py (PHASE7A_PREFLIGHT_IGNORE=dasd).
+A = ferrum-cli built at 30e6d67 (the PR head before the edit change); B = ferrum-cli
+built from this change (edits, audit fixes) on top of 30e6d67.
+Command: ferrum-cli image -m QWEN_IMAGE_DIR -p 'a red fox in snow' --seed 7 --size WxH
+  [--text-quantize q8_0] -o out.png
+Edits: ferrum-cli image -m QWEN_IMAGE_DIR --image fox.png (a 512x512 picture of a fox)
+  -p 'Make the fox wear a red knitted scarf.' --seed 42 --resolution R
+  --text-quantize q8_0 -o out.png
+Summary (best of N; spread in brackets):
+  1024x1024 Q8_0 encoder: A 66.6 s (66.6-69.0), B 67.3 s (67.3-69.3): within the spread.
+  512x512 BF16:           A 19.2 s (19.2-19.7), B 19.3 s (19.3-20.0): within the spread.
+  Edit at 512:  23.7 s (encode 2.3 s: vision tower + text encoder; denoise 14.0 s).
+  Edit at 1024: 91.3 s (encode 7.5 s; denoise 74.3 s: the DiT attends over the condition
+  latents too, so each step sees twice the image tokens of a 1024x1024 text-to-image run).
+
+# start 2026-10-26 17:37:47 UTC; 27.0.1; display/lock:       "IOConsoleLocked" = No
+## preflight
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 95.5% of one core; largest process 36.8% of one core.
+preflight exit 0
+## Turbo text to image 1024x1024, Q8_0 text encoder, BF16 transformer: A = 30e6d67 (PR head), B = this change; A B B A x2
+-- A
+bench-img.png: 1024x1024, seed 7, 69.0 s (load 6.8, encode 0.9, denoise 58.2, decode 3.0)
+-- B
+bench-img.png: 1024x1024, seed 7, 69.3 s (load 6.7, encode 0.2, denoise 59.4, decode 3.0)
+-- B
+bench-img.png: 1024x1024, seed 7, 68.6 s (load 6.7, encode 0.2, denoise 58.6, decode 3.0)
+-- A
+bench-img.png: 1024x1024, seed 7, 68.3 s (load 6.8, encode 0.2, denoise 58.2, decode 3.1)
+-- A
+bench-img.png: 1024x1024, seed 7, 67.5 s (load 6.8, encode 0.2, denoise 57.6, decode 2.9)
+-- B
+bench-img.png: 1024x1024, seed 7, 67.6 s (load 6.8, encode 0.2, denoise 57.7, decode 2.9)
+-- B
+bench-img.png: 1024x1024, seed 7, 67.3 s (load 6.8, encode 0.2, denoise 57.5, decode 2.9)
+-- A
+bench-img.png: 1024x1024, seed 7, 66.6 s (load 6.7, encode 0.2, denoise 56.7, decode 2.9)
+## Turbo text to image 512x512, BF16: A B B A
+-- A
+bench-img.png: 512x512, seed 7, 19.7 s (load 6.2, encode 0.5, denoise 12.3, decode 0.7)
+-- B
+bench-img.png: 512x512, seed 7, 20.0 s (load 6.2, encode 0.5, denoise 12.5, decode 0.7)
+-- B
+bench-img.png: 512x512, seed 7, 19.3 s (load 6.2, encode 0.5, denoise 11.8, decode 0.7)
+-- A
+bench-img.png: 512x512, seed 7, 19.2 s (load 6.2, encode 0.4, denoise 11.7, decode 0.7)
+## Edits (this change only), Q8_0 text encoder, condition image fox.png (512x512)
+-- edit --resolution 512
+bench-img.png: 512x512, seed 42, 23.7 s (load 6.7, encode 2.3, denoise 14.0, decode 0.7)
+-- edit --resolution 512
+bench-img.png: 512x512, seed 42, 23.8 s (load 6.7, encode 2.3, denoise 14.0, decode 0.7)
+-- edit --resolution 1024
+bench-img.png: 1024x1024, seed 42, 91.3 s (load 6.7, encode 7.5, denoise 74.3, decode 2.8)
+-- edit --resolution 1024
+bench-img.png: 1024x1024, seed 42, 91.5 s (load 6.8, encode 7.5, denoise 74.4, decode 2.8)

@@ -209,6 +209,9 @@ pub struct DispatchTiming {
 pub struct Counters {
     pub allocations: usize,
     pub allocated_bytes: usize,
+    /// Highest `allocated_bytes()` (Metal's own accounting) since the last
+    /// `reset_allocated_peak`.
+    pub allocated_peak: usize,
     pub dispatches: usize,
     pub command_buffers: usize,
     pub completion_waits: usize,
@@ -697,6 +700,12 @@ impl MetalDevice {
     pub fn allocated_bytes(&self) -> usize {
         self.raw.currentAllocatedSize()
     }
+    /// Restart the `allocated_peak` observation from the current allocation.
+    pub fn reset_allocated_peak(&self) {
+        let mut counters = self.counters.get();
+        counters.allocated_peak = self.allocated_bytes();
+        self.counters.set(counters);
+    }
     pub fn max_buffer_length(&self) -> usize {
         self.raw.maxBufferLength()
     }
@@ -725,6 +734,7 @@ impl MetalDevice {
         let mut counters = self.counters.get();
         counters.allocations += 1;
         counters.allocated_bytes += length;
+        counters.allocated_peak = counters.allocated_peak.max(self.allocated_bytes());
         counters.allocation_time += start.elapsed();
         self.counters.set(counters);
         Ok(MetalBuffer {
@@ -888,12 +898,27 @@ impl MetalDevice {
         if let Some(p) = self.builtins.borrow().get(name) {
             return Ok(p.clone());
         }
-        // The MLX kernels (Apache-2.0, adapted from Kapitsa) build on hybrid.metal's types.
-        const SOURCE: &str = concat!(
+        // The MLX kernels (Apache-2.0, adapted from Kapitsa) build on
+        // hybrid.metal's types. The image kernels (`i_`, `vae_`) build on both,
+        // and are compiled only with the kernels that use them: every
+        // kernel's first dispatch compiles its whole source, so the language
+        // models' startup does not pay for them.
+        const HYBRID: &str = concat!(
             include_str!("shaders/hybrid.metal"),
             include_str!("shaders/hybrid_mlx.metal")
         );
-        let p = self.compile_kernel_version(SOURCE, name, MTLLanguageVersion::Version4_0)?;
+        const IMAGE: &str = concat!(
+            include_str!("shaders/hybrid.metal"),
+            include_str!("shaders/hybrid_mlx.metal"),
+            include_str!("shaders/diffusion.metal"),
+            include_str!("shaders/diffusion_vae.metal")
+        );
+        let source = if name.starts_with("i_") || name.starts_with("vae_") {
+            IMAGE
+        } else {
+            HYBRID
+        };
+        let p = self.compile_kernel_version(source, name, MTLLanguageVersion::Version4_0)?;
         self.builtins.borrow_mut().insert(name, p.clone());
         Ok(p)
     }

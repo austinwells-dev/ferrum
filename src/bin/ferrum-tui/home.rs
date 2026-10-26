@@ -2,7 +2,7 @@
 use crate::*;
 
 /// (tab, icon, name, what it is for).
-const BUTTONS: [(Tab, &str, &str, &str); 6] = [
+const BUTTONS: [(Tab, &str, &str, &str); 7] = [
     (Tab::Chat, "◆", "Chat", "talk to a model right here"),
     (
         Tab::Agents,
@@ -16,6 +16,7 @@ const BUTTONS: [(Tab, &str, &str, &str); 6] = [
         "Serve",
         "OpenAI & Anthropic compatible API",
     ),
+    (Tab::Image, "◐", "Image", "text to image with Qwen-Image"),
     (
         Tab::Bench,
         "◷",
@@ -44,6 +45,7 @@ impl App {
             KeyCode::Char('c') => self.go_tab(Tab::Chat),
             KeyCode::Char('a') => self.go_tab(Tab::Agents),
             KeyCode::Char('s') => self.go_tab(Tab::Serve),
+            KeyCode::Char('i') => self.go_tab(Tab::Image),
             KeyCode::Char('b') => self.go_tab(Tab::Bench),
             KeyCode::Char('m') => self.go_tab(Tab::Models),
             KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
@@ -68,6 +70,7 @@ impl App {
                 .as_ref()
                 .filter(|s| s.exit.is_none())
                 .map(|s| (format!("● {}", s.port_label()), GOOD)),
+            Tab::Image => self.image.progress().map(|p| (format!("● {p}"), EMBER)),
             Tab::Bench => self
                 .bench
                 .as_ref()

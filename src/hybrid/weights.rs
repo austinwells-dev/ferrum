@@ -395,10 +395,31 @@ pub(crate) fn gguf_matrix(
 }
 
 pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Result<Weights> {
+    load_weights(device, file, c, true)
+}
+
+/// Like `load` for a model that is only run for its hidden states: the LM head
+/// (often the largest tensor) is not read and `output` is a one-row stand-in.
+pub(crate) fn load_without_head(
+    device: &MetalDevice,
+    file: &mut GgufFile,
+    c: &HybridConfig,
+) -> Result<Weights> {
+    load_weights(device, file, c, false)
+}
+
+fn load_weights(
+    device: &MetalDevice,
+    file: &mut GgufFile,
+    c: &HybridConfig,
+    head: bool,
+) -> Result<Weights> {
     let mut l = Loader { device, file };
     let embedding = l.matrix_or_bf16("token_embd.weight", c.vocab, c.hidden)?;
     let output_norm = l.vector("output_norm.weight", c.hidden)?;
-    let output = if l.file.tensors().contains_key("output.weight") {
+    let output = if !head {
+        Matrix::bf16_with(device, 1, c.hidden, |_| Ok(()))?
+    } else if l.file.tensors().contains_key("output.weight") {
         l.matrix_or_bf16("output.weight", c.vocab, c.hidden)?
     } else {
         l.matrix_or_bf16("token_embd.weight", c.vocab, c.hidden)?
@@ -614,6 +635,43 @@ pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> 
 }
 
 impl Matrix {
+    /// A BF16 `[rows, cols]` matrix kept in its stored encoding, filled by
+    /// `fill` straight into device memory (`Format::Bf16`).
+    pub(crate) fn bf16_with(
+        device: &MetalDevice,
+        rows: usize,
+        cols: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<Self> {
+        if !cols.is_multiple_of(16) {
+            return Err(Error::Shape(format!(
+                "BF16 matrix [{rows}, {cols}]: width is not a multiple of 16"
+            )));
+        }
+        let row_bytes = cols * 2;
+        let storage = PackedStorage::from_reader(device, rows * row_bytes, fill)?;
+        Ok(Matrix {
+            rows,
+            cols,
+            experts: 1,
+            format: Format::Bf16,
+            row_bytes,
+            storage,
+        })
+    }
+
+    /// Device bytes of a `[rows, cols]` matrix loaded from BF16 as `format`
+    /// (as stored, or quantized), page-rounded like its allocation.
+    pub(crate) fn bf16_stored_bytes(rows: usize, cols: usize, format: Option<Format>) -> usize {
+        let row = match format {
+            None | Some(Format::Bf16) => cols * 2,
+            Some(Format::Q8_0) => cols / 32 * 34,
+            Some(Format::Q4_0) => cols / 32 * 18,
+            Some(_) => cols * 4,
+        };
+        super::engine::page(rows * row)
+    }
+
     /// Quantize a row-major BF16 `[rows, cols]` matrix (little-endian bytes)
     /// into `format` (Q8_0, Q4_0 or F32), rows in parallel.
     pub(crate) fn from_bf16(
@@ -687,6 +745,57 @@ impl Matrix {
         })
     }
 
+    /// A `[rows, cols]` matrix from the raw payload of a GGML tensor of
+    /// `type_id`, in its stored encoding. `name` is for error messages.
+    pub(crate) fn from_ggml(
+        device: &MetalDevice,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        type_id: u32,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let fail = |message: String| Error::Weight {
+            name: name.into(),
+            message,
+        };
+        let format = match type_id {
+            30 => Format::Bf16,
+            t => Format::from_type(t)
+                .ok_or_else(|| fail(format!("GGML type {t} has no matrix kernel")))?,
+        };
+        let layout = block_layout(type_id)?;
+        let unit = if matches!(format, Format::F32 | Format::Bf16) {
+            layout.elements.max(16)
+        } else {
+            256
+        };
+        if !cols.is_multiple_of(unit) {
+            return Err(fail(format!(
+                "row width {cols} is not a whole number of blocks"
+            )));
+        }
+        let row_bytes = cols / layout.elements * layout.bytes;
+        if row_bytes * rows != bytes.len() {
+            return Err(fail(format!(
+                "{} bytes for {rows} rows of {row_bytes}",
+                bytes.len()
+            )));
+        }
+        let storage = PackedStorage::from_reader(device, bytes.len(), |dst| {
+            dst.copy_from_slice(bytes);
+            Ok(())
+        })?;
+        Ok(Matrix {
+            rows,
+            cols,
+            experts: 1,
+            format,
+            row_bytes,
+            storage,
+        })
+    }
+
     /// `experts` stacked slices of `rows` rows each, from raw packed bytes in
     /// `format`, for kernel tests.
     #[cfg(test)]
@@ -699,6 +808,9 @@ impl Matrix {
         bytes: &[u8],
     ) -> Result<Self> {
         let type_id = match format {
+            Format::Q4K => 12,
+            Format::Q5K => 13,
+            Format::Q6K => 14,
             Format::Iq3Xxs => 18,
             Format::Iq3S => 21,
             Format::Iq2S => 22,

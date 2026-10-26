@@ -39,7 +39,7 @@ pub struct Thinking {
 }
 
 pub fn thinking(body: &Json, server: &Server) -> Thinking {
-    let d = &server.defaults;
+    let d = &server.llm().defaults;
     let mut vars = d.template_vars.clone();
     if let Some(kwargs) = body.get("chat_template_kwargs").and_then(Json::as_object) {
         for (k, v) in kwargs {
@@ -116,7 +116,7 @@ pub fn thinking(body: &Json, server: &Server) -> Thinking {
 /// Sampling from the request over the server defaults; llama-server field
 /// names (`n_predict`, `repeat_penalty`, ...) are accepted too.
 pub fn sampling(body: &Json, server: &Server) -> Result<SamplingParams, String> {
-    let d = &server.defaults.sampling;
+    let d = &server.llm().defaults.sampling;
     let f = |keys: &[&str], default: f32| {
         keys.iter()
             .find_map(|k| body.get(*k).and_then(Json::as_f64))
@@ -214,7 +214,7 @@ pub fn max_tokens(body: &Json, keys: &[&str], server: &Server) -> usize {
     keys.iter()
         .find_map(|k| body.get(*k).and_then(Json::as_i64))
         .filter(|&v| v > 0)
-        .map_or(server.defaults.max_tokens, |v| v as usize)
+        .map_or(server.llm().defaults.max_tokens, |v| v as usize)
 }
 
 fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, bool), String> {

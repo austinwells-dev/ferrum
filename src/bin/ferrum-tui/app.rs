@@ -36,6 +36,7 @@ impl App {
             })
             .unwrap_or(0);
         let drafters = scan_drafters(&extra);
+        let image = imagetab::ImageTab::load(&extra);
         let favs = saved["favorites"]
             .as_array()
             .map(|a| {
@@ -89,6 +90,7 @@ impl App {
             chat: None,
             serve: None,
             bench: None,
+            image,
             closing: Vec::new(),
             gfx: Default::default(),
             prefs: Prefs::load(&saved["layout"]),

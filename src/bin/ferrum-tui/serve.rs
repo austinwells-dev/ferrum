@@ -543,7 +543,7 @@ fn healthy(addr: SocketAddr) -> bool {
     String::from_utf8_lossy(&head[..n]).contains(" 200")
 }
 
-fn fmt_dur(d: Duration) -> String {
+pub fn fmt_dur(d: Duration) -> String {
     let s = d.as_secs();
     if s >= 3600 {
         format!("{}h{:02}m", s / 3600, s % 3600 / 60)

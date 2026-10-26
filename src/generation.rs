@@ -84,6 +84,7 @@ pub fn counter_delta(
     crate::metal::Counters {
         allocations: b.allocations - a.allocations,
         allocated_bytes: b.allocated_bytes - a.allocated_bytes,
+        allocated_peak: b.allocated_peak,
         dispatches: b.dispatches - a.dispatches,
         command_buffers: b.command_buffers - a.command_buffers,
         completion_waits: b.completion_waits - a.completion_waits,

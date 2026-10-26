@@ -45,6 +45,8 @@ pub struct ChatOpts {
     /// `--image-min-tokens`); `/detail` lowers the cap per image.
     pub image_tokens: usize,
     pub image_min_tokens: usize,
+    /// The Image tab's model, offered as the `generate_image` tool.
+    pub image: Option<imagetool::ImageModel>,
 }
 
 pub struct AgentOpts {
@@ -180,6 +182,7 @@ impl ChatOpts {
             image_tokens: count("image_tokens").unwrap_or(ferrum::vision::DEFAULT_MAX_TOKENS),
             image_min_tokens: count("image_min_tokens")
                 .unwrap_or(ferrum::vision::DEFAULT_MIN_TOKENS),
+            image: app.image.tool_model(),
             agent: if app.mode == Mode::Agent {
                 let project = match app.value("project") {
                     "" => std::env::current_dir().map_err(|e| e.to_string())?,
@@ -208,6 +211,7 @@ enum ToWorker {
         tools: Vec<Json>,
     },
     Reset,
+    Image(Box<imagetool::Work>),
 }
 
 #[derive(Clone)]
@@ -242,12 +246,20 @@ enum FromWorker {
     Stage(String),
     Ready(Box<LoadInfo>),
     Failed(String),
-    Begin { prompt: usize, reused: usize },
+    Begin {
+        prompt: usize,
+        reused: usize,
+    },
     Prefill(usize, usize),
-    Delta { reasoning: bool, text: String },
+    Delta {
+        reasoning: bool,
+        text: String,
+    },
     Tokens(usize),
     Done(Box<TurnDone>),
     TurnFailed(String),
+    /// What the running `generate_image` call (its turn) is doing.
+    ToolProgress(usize, String),
 }
 
 struct Hooks<'a> {
@@ -279,16 +291,10 @@ impl ChatHooks for Hooks<'_> {
     }
 }
 
-fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel: Arc<AtomicBool>) {
-    let send = |m: FromWorker| {
-        let _ = tx.send(m);
-    };
-    send(FromWorker::Stage("loading weights".into()));
-    // A projector next to the model lets attached images reach it as pixels.
-    let mmproj = ferrum::vision::resolve_projector(&opts.model, None)
-        .ok()
-        .flatten();
-    let mut rt = match Runtime::load_multimodal(
+/// The chat model as configured, warmed up; `stage` hears what it is doing.
+fn load(opts: &ChatOpts, mmproj: Option<&Path>, stage: &dyn Fn(&str)) -> ferrum::Result<Runtime> {
+    stage("loading weights");
+    let mut rt = Runtime::load_multimodal(
         &opts.model,
         PlanOptions {
             context: opts.context,
@@ -296,19 +302,31 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
             ..Default::default()
         },
         opts.spec.as_ref(),
-        mmproj.as_deref(),
+        mmproj,
         opts.image_tokens,
-    ) {
-        Ok(rt) => rt,
-        Err(e) => return send(FromWorker::Failed(e.to_string())),
-    };
+    )?;
     if let Some(v) = rt.vision.as_mut() {
         v.model.min_tokens = opts.image_min_tokens;
     }
-    send(FromWorker::Stage("warming up kernels".into()));
-    if let Err(e) = rt.warmup() {
-        return send(FromWorker::Failed(e.to_string()));
-    }
+    stage("warming up kernels");
+    rt.warmup()?;
+    Ok(rt)
+}
+
+fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel: Arc<AtomicBool>) {
+    let send = |m: FromWorker| {
+        let _ = tx.send(m);
+    };
+    // A projector next to the model lets attached images reach it as pixels.
+    let mmproj = ferrum::vision::resolve_projector(&opts.model, None)
+        .ok()
+        .flatten();
+    let rt = match load(&opts, mmproj.as_deref(), &|s| {
+        send(FromWorker::Stage(s.into()))
+    }) {
+        Ok(rt) => rt,
+        Err(e) => return send(FromWorker::Failed(e.to_string())),
+    };
     let mut sampling = rt.default_sampling.clone();
     for (flag, v) in &opts.overrides {
         match *flag {
@@ -350,15 +368,57 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
             sampling.temperature, sampling.top_p, sampling.top_k, sampling.min_p
         ),
     })));
+    // `None` while a picture has the chat model's memory, or if loading it
+    // again afterwards failed (the next turn tries again).
+    let mut rt = Some(rt);
     while let Ok(msg) = rx.recv() {
         match msg {
-            ToWorker::Reset => rt.session.reset(),
+            ToWorker::Reset => {
+                if let Some(rt) = rt.as_mut() {
+                    rt.session.reset();
+                }
+            }
+            ToWorker::Image(work) => {
+                let started = Instant::now();
+                let progress = |text: String| {
+                    let _ = tx.send(FromWorker::ToolProgress(work.idx, text));
+                };
+                let result = match &opts.image {
+                    Some(model) => imagetool::run(model, &work, &mut || rt = None, &progress),
+                    None => Err("no Qwen-Image model is set up (see the Image tab)".into()),
+                };
+                let secs = started.elapsed().as_secs_f32();
+                if rt.is_none() {
+                    progress("loading the chat model again".into());
+                    match load(&opts, mmproj.as_deref(), &|_| {}) {
+                        Ok(loaded) => rt = Some(loaded),
+                        Err(e) => progress(format!("the chat model did not load again: {e}")),
+                    }
+                }
+                let (ok, text) = match result {
+                    Ok(text) => (true, text),
+                    Err(e) => (false, format!("error: {e}")),
+                };
+                let _ = work.reply.send((work.idx, ok, text, secs));
+            }
             ToWorker::Turn {
                 messages,
                 think,
                 tools,
             } => {
                 cancel.store(false, Ordering::SeqCst);
+                if rt.is_none() {
+                    match load(&opts, mmproj.as_deref(), &|_| {}) {
+                        Ok(loaded) => rt = Some(loaded),
+                        Err(e) => {
+                            send(FromWorker::TurnFailed(format!(
+                                "loading the chat model again: {e}"
+                            )));
+                            continue;
+                        }
+                    }
+                }
+                let rt = rt.as_mut().expect("loaded above");
                 let mut vars = Map::new();
                 vars.insert("enable_thinking".into(), Json::Bool(think));
                 if let Some(effort) = &opts.effort {
@@ -672,6 +732,8 @@ pub struct Chat {
     pub approval: Option<(usize, String, String, Map<String, Json>)>,
     exec_rx: Option<Receiver<(usize, bool, String, f32)>>,
     tool_cancel: Arc<AtomicBool>,
+    /// An image model is set up, so `generate_image` is offered.
+    image_tool: bool,
     aborted: bool,
     flash: Option<(String, bool, Instant)>,
     pub agent: Option<Agent>,
@@ -808,6 +870,7 @@ impl Chat {
         };
         let flag = cancel.clone();
         let sandbox_confined = opts.sandbox_confined;
+        let image_tool = opts.image.is_some();
         let handle = std::thread::Builder::new()
             .name("ferrum-chat".into())
             .spawn(move || worker(opts, wrx, wtx, flag))
@@ -855,6 +918,7 @@ impl Chat {
             approval: None,
             exec_rx: None,
             tool_cancel: Arc::new(AtomicBool::new(false)),
+            image_tool,
             aborted: false,
             flash: None,
             agent,
@@ -1019,16 +1083,22 @@ impl Chat {
 
     fn tool_defs(&self) -> Vec<Json> {
         if self.tools == ToolMode::Off {
-            Vec::new()
-        } else if let Some(a) = &self.agent {
-            let mut defs = coding::tool_defs(a.plan, self.network);
-            if !a.skills_text.is_empty() {
-                defs.push(coding::skill_def());
-            }
-            defs
-        } else {
-            agent::tool_defs(self.network)
+            return Vec::new();
         }
+        let mut defs = match &self.agent {
+            Some(a) => {
+                let mut defs = coding::tool_defs(a.plan, self.network);
+                if !a.skills_text.is_empty() {
+                    defs.push(coding::skill_def());
+                }
+                defs
+            }
+            None => agent::tool_defs(self.network),
+        };
+        if self.image_tool {
+            defs.push(imagetool::def_json());
+        }
+        defs
     }
 
     /// Send the history to the model and show an empty reply being written.
@@ -1101,6 +1171,11 @@ impl Chat {
                     }
                 }
                 FromWorker::Tokens(n) => self.gen_tokens = n,
+                FromWorker::ToolProgress(idx, text) => {
+                    if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
+                        t.output = text;
+                    }
+                }
                 FromWorker::Done(d) => self.finish(*d),
                 FromWorker::TurnFailed(e) => {
                     if let Some(t) = self.turns.last_mut() {
@@ -1257,6 +1332,19 @@ impl Chat {
                 return self.next_tool();
             }
         };
+        // Pictures are made on the chat model's thread, which can lend them
+        // the model's memory.
+        let image = (name == imagetool::NAME).then(|| match &self.agent {
+            Some(a) if a.plan => {
+                Err("plan mode is on, so nothing can be made. Finish the plan first.".to_string())
+            }
+            _ => imagetool::job(&sb, &args),
+        });
+        if let Some(Err(e)) = &image {
+            self.set_tool(idx, ToolState::Failed, e);
+            self.tool_message(idx, &format!("error: {e}"));
+            return self.next_tool();
+        }
         if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
             t.state = ToolState::Running;
             t.started = Some(Instant::now());
@@ -1264,6 +1352,15 @@ impl Chat {
         let (tx, rx) = channel();
         self.exec_rx = Some(rx);
         self.tool_cancel.store(false, Ordering::SeqCst);
+        if let Some(Ok(job)) = image {
+            let _ = self.tx.send(ToWorker::Image(Box::new(imagetool::Work {
+                idx,
+                job,
+                cancel: self.tool_cancel.clone(),
+                reply: tx,
+            })));
+            return;
+        }
         let cancel = self.tool_cancel.clone();
         let coder = self.agent.as_ref().map(|a| (a.shared.clone(), a.plan));
         std::thread::spawn(move || {

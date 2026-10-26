@@ -221,8 +221,9 @@ pub fn count_tokens(
     let result = convert(body, id).and_then(|(messages, tools)| {
         // Count the prompt `messages` would feed the model, thinking switch included.
         let mut vars = openai::thinking(body, server).vars;
-        normalize_thinking(server.template.source(), &mut vars);
+        normalize_thinking(server.llm().template.source(), &mut vars);
         server
+            .llm()
             .template
             .render(
                 &messages,
@@ -231,8 +232,8 @@ pub fn count_tokens(
                 &vars,
             )
             .and_then(|mut text| {
-                text.push_str(generation_prefix(&server.template, &vars));
-                server.tokenizer.encode(&text)
+                text.push_str(generation_prefix(&server.llm().template, &vars));
+                server.llm().tokenizer.encode(&text)
             })
             .map_err(|e| e.to_string())
     });

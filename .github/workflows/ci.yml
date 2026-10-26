@@ -34,7 +34,14 @@ jobs:
   check:
     # Hosted macOS runners are virtual machines without a real Apple GPU, so CI
     # builds, lints and compiles the tests; GPU tests run locally (docs/development.md).
-    runs-on: macos-15
+    # Set the repository variable CI_RUNS_ON to a JSON label list, e.g.
+    # ["self-hosted", "macOS", "ARM64"], to use a self-hosted runner; unset, the
+    # hosted runner is used. (Actions cannot probe for a runner being online: a
+    # job queued for an offline self-hosted runner waits, so unset the variable
+    # when it is gone.)
+    # Fork PRs always take the hosted runner: a self-hosted one must not run
+    # their code, and skipping them would let a required check pass unrun.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'macos-15' || fromJSON(vars.CI_RUNS_ON || '"macos-15"') }}
     steps:
       - uses: actions/checkout@v4
       # Pinned to the toolchain the code is developed on, so new lints don't break CI.

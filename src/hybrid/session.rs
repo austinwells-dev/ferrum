@@ -1201,6 +1201,7 @@ mod media_tests {
             start,
             grid,
             embedding: Rc::new(Tensor::zeros(d, [grid.0 * grid.1, 4], DType::F32).unwrap()),
+            deepstack: Vec::new(),
             hash,
         }
     }

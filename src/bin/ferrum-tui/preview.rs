@@ -2,8 +2,8 @@
 //! transcript and a full-screen viewer.
 //!
 //! Terminals that speak the kitty graphics protocol (kitty, Ghostty, WezTerm)
-//! get the real pixels; everywhere else the picture is drawn with `▀` half
-//! blocks in 24-bit colour. Stills and GIFs are decoded with the `image`
+//! or iTerm2's inline images get the real pixels; everywhere else the picture
+//! is drawn with `▀` half blocks in 24-bit colour. Stills and GIFs are decoded with the `image`
 //! crate (HEIC and TIFF through `sips`). Videos play through `ffmpeg` when it
 //! is installed, and otherwise show the Quick Look poster frame.
 use crate::*;
@@ -35,14 +35,18 @@ fn next_seq() -> u64 {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Graphics {
     Kitty,
+    /// iTerm2's `OSC 1337 File=` inline images.
+    Iterm,
     Blocks,
 }
 
-/// Which way pictures are drawn in this terminal. `FERRUM_GRAPHICS=kitty|blocks` overrides.
+/// Which way pictures are drawn in this terminal.
+/// `FERRUM_GRAPHICS=kitty|iterm|blocks` overrides.
 pub fn graphics() -> Graphics {
     let var = |k: &str| std::env::var(k).unwrap_or_default();
     match var("FERRUM_GRAPHICS").as_str() {
         "kitty" => return Graphics::Kitty,
+        "iterm" => return Graphics::Iterm,
         "blocks" | "off" => return Graphics::Blocks,
         _ => {}
     }
@@ -60,6 +64,8 @@ pub fn graphics() -> Graphics {
         || matches!(program.as_str(), "ghostty" | "wezterm")
     {
         Graphics::Kitty
+    } else if program == "iterm.app" || var("LC_TERMINAL") == "iTerm2" {
+        Graphics::Iterm
     } else {
         Graphics::Blocks
     }
@@ -83,34 +89,56 @@ pub fn previewable(path: &Path) -> bool {
 /// A decoded picture, ready to draw either way.
 pub struct Picture {
     img: RgbaImage,
-    /// Base64 PNG for the kitty protocol (only in kitty mode).
-    kitty: Option<Arc<str>>,
+    /// Base64 PNG for the terminal (kitty and iTerm2 modes).
+    encoded: Option<Arc<str>>,
     /// Changes whenever the pixels do.
     seq: u64,
     /// Half-block render cached for (cols, rows).
     blocks: RefCell<Option<(u16, u16, RgbaImage)>>,
+    /// iTerm2 cannot crop, so a partly visible picture sends these rows
+    /// (top, height) encoded on their own.
+    cropped: RefCell<Option<(Rows, Arc<str>)>>,
 }
 
 impl Picture {
     fn new(img: RgbaImage, mode: Graphics) -> Picture {
-        let kitty = (mode == Graphics::Kitty)
+        let encoded = (mode != Graphics::Blocks)
             .then(|| png_b64(&img))
             .flatten()
             .map(Arc::from);
-        Picture::with(img, kitty)
+        Picture::with(img, encoded)
     }
 
-    fn with(img: RgbaImage, kitty: Option<Arc<str>>) -> Picture {
+    fn with(img: RgbaImage, encoded: Option<Arc<str>>) -> Picture {
         Picture {
             img,
-            kitty,
+            encoded,
             seq: next_seq(),
             blocks: RefCell::new(None),
+            cropped: RefCell::new(None),
         }
+    }
+
+    /// Rows `(top, height)` of the picture as base64 PNG.
+    fn crop(&self, (top, height): (u32, u32)) -> Option<Arc<str>> {
+        let mut cache = self.cropped.borrow_mut();
+        if let Some((at, data)) = &*cache
+            && *at == (top, height)
+        {
+            return Some(data.clone());
+        }
+        let rows =
+            image::imageops::crop_imm(&self.img, 0, top, self.img.width(), height).to_image();
+        let data: Arc<str> = Arc::from(png_b64(&rows)?);
+        *cache = Some(((top, height), data.clone()));
+        Some(data)
     }
 }
 
-/// One image placement wanted this frame (kitty mode).
+/// Picture rows `(top, height)`.
+type Rows = (u32, u32);
+
+/// One image placement wanted this frame (kitty and iTerm2 modes).
 pub struct Want {
     id: u32,
     seq: u64,
@@ -141,16 +169,25 @@ pub fn render(
     let skip = (top - y) as u32;
     let vis = (bottom - top) as u32;
     match mode {
-        Graphics::Kitty => {
-            let Some(data) = &pic.kitty else { return };
+        Graphics::Kitty | Graphics::Iterm => {
+            let Some(data) = &pic.encoded else { return };
             let h = pic.img.height();
             let (y0, y1) = (skip * h / rows as u32, (skip + vis) * h / rows as u32);
+            let crop = (y0, (y1 - y0).max(1));
+            // Kitty crops on its side; iTerm2 gets the visible rows only.
+            let data = match mode {
+                Graphics::Iterm if crop != (0, h) => match pic.crop(crop) {
+                    Some(data) => data,
+                    None => return,
+                },
+                _ => data.clone(),
+            };
             wants.borrow_mut().push(Want {
                 id,
                 seq: pic.seq,
-                data: data.clone(),
+                data,
                 at: Rect::new(x, top as u16, cols, vis as u16),
-                crop: (y0, (y1 - y0).max(1)),
+                crop,
             });
         }
         Graphics::Blocks => {
@@ -517,20 +554,80 @@ fn clock() -> f32 {
     START.get_or_init(Instant::now).elapsed().as_secs_f32()
 }
 
-// ---- the kitty protocol ----
+// ---- terminal graphics ----
 
-/// Keeps the terminal's kitty images in step with what was drawn.
-#[derive(Default)]
-pub struct Kitty {
-    /// Image data the terminal holds: id → seq.
+/// Keeps the terminal's pictures in step with what was drawn.
+pub struct Gfx {
+    mode: Graphics,
+    /// Kitty: image data the terminal holds, id → seq.
     sent: HashMap<u32, u64>,
-    /// Placements on screen: id → (cells, crop).
-    shown: HashMap<u32, (Rect, (u32, u32))>,
+    /// Placements on screen: id → (cells, crop, seq).
+    shown: HashMap<u32, (Rect, (u32, u32), u64)>,
 }
 
-impl Kitty {
-    /// Call after every draw with the placements that frame wanted.
-    pub fn sync(&mut self, out: &mut impl Write, wants: &[Want]) -> std::io::Result<()> {
+impl Default for Gfx {
+    fn default() -> Self {
+        Gfx::new(graphics())
+    }
+}
+
+impl Gfx {
+    pub fn new(mode: Graphics) -> Self {
+        Gfx {
+            mode,
+            sent: HashMap::new(),
+            shown: HashMap::new(),
+        }
+    }
+
+    /// Call after every draw with the placements that frame wanted. `true`
+    /// asks for the screen to be cleared, drawn and synced again: an iTerm2
+    /// picture stays in its cells until they are overwritten, so one that
+    /// moved or went away has to be cleared off.
+    pub fn sync(&mut self, out: &mut impl Write, wants: &[Want]) -> std::io::Result<bool> {
+        match self.mode {
+            Graphics::Kitty => self.sync_kitty(out, wants).map(|()| false),
+            Graphics::Iterm => self.sync_iterm(out, wants),
+            Graphics::Blocks => Ok(false),
+        }
+    }
+
+    fn sync_iterm(&mut self, out: &mut impl Write, wants: &[Want]) -> std::io::Result<bool> {
+        let stale = self.shown.iter().any(|(id, (at, crop, _))| {
+            !wants
+                .iter()
+                .any(|w| w.id == *id && w.at == *at && w.crop == *crop)
+        });
+        if stale {
+            self.shown.clear();
+            return Ok(true);
+        }
+        let mut wrote = false;
+        for w in wants {
+            if self.shown.get(&w.id) == Some(&(w.at, w.crop, w.seq)) {
+                continue;
+            }
+            // New pixels in the same cells simply cover the old ones.
+            write!(
+                out,
+                "\x1b7\x1b[{};{}H\x1b]1337;File=inline=1;width={};height={};preserveAspectRatio=0:",
+                w.at.y + 1,
+                w.at.x + 1,
+                w.at.width,
+                w.at.height
+            )?;
+            out.write_all(w.data.as_bytes())?;
+            out.write_all(b"\x07\x1b8")?;
+            self.shown.insert(w.id, (w.at, w.crop, w.seq));
+            wrote = true;
+        }
+        if wrote {
+            out.flush()?;
+        }
+        Ok(false)
+    }
+
+    fn sync_kitty(&mut self, out: &mut impl Write, wants: &[Want]) -> std::io::Result<()> {
         let mut wrote = false;
         let gone: Vec<u32> = self
             .shown
@@ -550,7 +647,7 @@ impl Kitty {
                 self.shown.remove(&w.id);
                 wrote = true;
             }
-            if self.shown.get(&w.id) != Some(&(w.at, w.crop)) {
+            if self.shown.get(&w.id).map(|s| (s.0, s.1)) != Some((w.at, w.crop)) {
                 // Save the cursor, draw at the cell without moving it, restore.
                 write!(
                     out,
@@ -563,7 +660,7 @@ impl Kitty {
                     w.at.width,
                     w.at.height
                 )?;
-                self.shown.insert(w.id, (w.at, w.crop));
+                self.shown.insert(w.id, (w.at, w.crop, w.seq));
                 wrote = true;
             }
         }
@@ -733,7 +830,7 @@ fn gif(path: &Path, mode: Graphics, tx: &SyncSender<Msg>) -> Result<(), String> 
     let _ = tx.send(Msg::Info(format!("{w}×{h} · {} frames", frames.len())));
     loop {
         for (pic, delay) in &frames {
-            let pic = Picture::with(pic.img.clone(), pic.kitty.clone());
+            let pic = Picture::with(pic.img.clone(), pic.encoded.clone());
             if tx.send(Msg::Frame(Pic { pic, delay: *delay })).is_err() {
                 return Ok(());
             }
@@ -801,8 +898,8 @@ fn video(path: &Path, mode: Graphics, tx: &SyncSender<Msg>) -> Result<(), String
                 break;
             };
             // ffmpeg already wrote a PNG; send it as it is.
-            let kitty = (mode == Graphics::Kitty).then(|| Arc::from(base64(&png)));
-            let pic = Picture::with(img.to_rgba8(), kitty);
+            let encoded = (mode != Graphics::Blocks).then(|| Arc::from(base64(&png)));
+            let pic = Picture::with(img.to_rgba8(), encoded);
             if tx.send(Msg::Frame(Pic { pic, delay })).is_err() {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -903,11 +1000,11 @@ mod tests {
         let want = |y: u16| Want {
             id: 7,
             seq: pic.seq,
-            data: pic.kitty.clone().unwrap(),
+            data: pic.encoded.clone().unwrap(),
             at: Rect::new(2, y, 3, 2),
             crop: (0, 4),
         };
-        let mut k = Kitty::default();
+        let mut k = Gfx::new(Graphics::Kitty);
         let mut out = Vec::new();
         k.sync(&mut out, &[want(1)]).unwrap();
         let s = String::from_utf8(out).unwrap();
@@ -927,6 +1024,48 @@ mod tests {
         k.sync(&mut out, &[]).unwrap();
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("a=d,d=i,i=7") && s.contains("a=d,d=I,i=7"));
+    }
+
+    #[test]
+    fn iterm_draws_in_place_and_asks_for_a_clear_when_a_picture_moves() {
+        let pic = Picture::with(RgbaImage::new(4, 4), Some(Arc::from("AAAA")));
+        let want = |y: u16, seq: u64| Want {
+            id: 7,
+            seq,
+            data: pic.encoded.clone().unwrap(),
+            at: Rect::new(2, y, 3, 2),
+            crop: (0, 4),
+        };
+        let mut g = Gfx::new(Graphics::Iterm);
+        let mut out = Vec::new();
+        assert!(!g.sync(&mut out, &[want(1, 1)]).unwrap());
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("\x1b[2;3H\x1b]1337;File=inline=1;width=3;height=2;"));
+        assert!(s.ends_with("AAAA\x07\x1b8"));
+        // Same frame: nothing; a new frame in the same cells: drawn over.
+        let mut out = Vec::new();
+        assert!(!g.sync(&mut out, &[want(1, 1)]).unwrap());
+        assert!(out.is_empty());
+        assert!(!g.sync(&mut out, &[want(1, 2)]).unwrap());
+        assert!(!out.is_empty());
+        // Moved or gone: the screen has to be cleared, then all is drawn.
+        let mut out = Vec::new();
+        assert!(g.sync(&mut out, &[want(5, 2)]).unwrap());
+        assert!(!g.sync(&mut out, &[want(5, 2)]).unwrap());
+        assert!(String::from_utf8(out).unwrap().contains("\x1b[6;3H"));
+        assert!(g.sync(&mut Vec::new(), &[]).unwrap());
+        assert!(!g.sync(&mut Vec::new(), &[]).unwrap());
+    }
+
+    #[test]
+    fn iterm_sends_only_the_visible_rows() {
+        let mut img = RgbaImage::new(2, 8);
+        img.put_pixel(0, 7, image::Rgba([255, 0, 0, 255]));
+        let pic = Picture::new(img, Graphics::Iterm);
+        let cropped = pic.crop((4, 4)).unwrap();
+        assert_ne!(Some(&cropped), pic.encoded.as_ref());
+        // Cached for the same rows.
+        assert!(Arc::ptr_eq(&cropped, &pic.crop((4, 4)).unwrap()));
     }
 
     /// First frame from the worker, waiting up to 20 s.
@@ -967,7 +1106,7 @@ mod tests {
             );
             assert!(
                 p.pic
-                    .kitty
+                    .encoded
                     .as_deref()
                     .is_some_and(|k| k.starts_with("iVBOR")),
                 "{name}"
