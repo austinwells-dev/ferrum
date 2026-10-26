@@ -10,6 +10,7 @@ use ferrum::hybrid::{
     plan::PlanOptions,
     runtime::{ChatHooks, ChatRequest, Delta, Runtime, SpecOptions},
 };
+use ferrum::vision::ImageBudget;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -40,6 +41,10 @@ pub struct ChatOpts {
     pub sandbox_confined: bool,
     pub search: crate::search::Config,
     pub agent: Option<AgentOpts>,
+    /// Most and fewest tokens one image takes (`--image-tokens`,
+    /// `--image-min-tokens`); `/detail` lowers the cap per image.
+    pub image_tokens: usize,
+    pub image_min_tokens: usize,
 }
 
 pub struct AgentOpts {
@@ -172,6 +177,9 @@ impl ChatOpts {
             network: app.value("network") != "off",
             sandbox_confined: app.value("sandbox") != "off",
             search: app.search.clone(),
+            image_tokens: count("image_tokens").unwrap_or(ferrum::vision::DEFAULT_MAX_TOKENS),
+            image_min_tokens: count("image_min_tokens")
+                .unwrap_or(ferrum::vision::DEFAULT_MIN_TOKENS),
             agent: if app.mode == Mode::Agent {
                 let project = match app.value("project") {
                     "" => std::env::current_dir().map_err(|e| e.to_string())?,
@@ -289,11 +297,14 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
         },
         opts.spec.as_ref(),
         mmproj.as_deref(),
-        ferrum::vision::DEFAULT_MAX_TOKENS,
+        opts.image_tokens,
     ) {
         Ok(rt) => rt,
         Err(e) => return send(FromWorker::Failed(e.to_string())),
     };
+    if let Some(v) = rt.vision.as_mut() {
+        v.model.min_tokens = opts.image_min_tokens;
+    }
     send(FromWorker::Stage("warming up kernels".into()));
     if let Err(e) = rt.warmup() {
         return send(FromWorker::Failed(e.to_string()));
@@ -362,6 +373,7 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                     stop: Vec::new(),
                     reasoning_budget: opts.budget,
                     raw_reasoning: false,
+                    image_budget: Default::default(),
                 };
                 let hooks = Hooks {
                     tx: &tx,
@@ -490,6 +502,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/paste", "attach the clipboard (image, files or text)"),
     ("/screenshot", "drag out a screen region to attach"),
     ("/detach", "remove the attachments"),
+    (
+        "/detail ",
+        "image size for the next messages: low, high, auto or N tokens",
+    ),
     ("/preview", "view attached images and videos (ctrl-o)"),
     ("/previews off", "hide images and videos in the transcript"),
     ("/previews on", "show images and videos in the transcript"),
@@ -592,6 +608,10 @@ pub const AGENT_COMMANDS: &[(&str, &str)] = &[
     ("/attach ", "attach a file by path"),
     ("/paste", "attach the clipboard (image, files or text)"),
     ("/screenshot", "drag out a screen region to attach"),
+    (
+        "/detail ",
+        "image size for the next messages: low, high, auto or N tokens",
+    ),
     ("/preview", "view attached images and videos (ctrl-o)"),
     ("/help", "list the commands"),
     ("/exit", "leave the agent"),
@@ -665,6 +685,8 @@ pub struct Chat {
     pub wants: RefCell<Vec<preview::Want>>,
     /// Show images and videos inline (`/previews on|off`).
     pub inline: bool,
+    /// Token limits for the images of the next messages (`/detail`).
+    pub image_detail: ImageBudget,
     /// Display rows of finished turns, by turn index (see `turn_key`).
     rendered: RefCell<Vec<Option<Rendered>>>,
 }
@@ -844,6 +866,7 @@ impl Chat {
             thumbs: Default::default(),
             wants: RefCell::new(Vec::new()),
             inline: true,
+            image_detail: ImageBudget::default(),
         })
     }
 
@@ -1381,9 +1404,10 @@ impl Chat {
         for a in &attachments {
             if sees && a.kind == attach::Kind::Image {
                 match attach::image_bytes(a) {
-                    Ok(bytes) => {
-                        pictures.push(ferrum::vision::media::image_part_from_bytes(&bytes))
-                    }
+                    Ok(bytes) => pictures.push(ferrum::vision::media::image_part_with(
+                        &bytes,
+                        self.image_detail,
+                    )),
                     Err(e) => self.note(e),
                 }
             }
@@ -1819,6 +1843,27 @@ impl Chat {
                 Err(e) => self.note(e),
             },
             "/paste" => self.paste_clipboard(),
+            l if l == "/detail" || l.starts_with("/detail ") => {
+                let arg = l.trim_start_matches("/detail").trim();
+                if arg.is_empty() {
+                    let now = match self.image_detail.max_tokens {
+                        None => "auto".to_owned(),
+                        Some(usize::MAX) => "high".to_owned(),
+                        Some(n) => format!("up to {n} tokens"),
+                    };
+                    self.note(format!(
+                        "images are sent at {now}; /detail low|high|auto|N changes it"
+                    ));
+                } else {
+                    match ferrum::vision::media::parse_detail(arg) {
+                        Ok(budget) => {
+                            self.image_detail = budget;
+                            self.note(format!("images from now on: {arg}"));
+                        }
+                        Err(e) => self.flash(e.to_string(), false),
+                    }
+                }
+            }
             "/previews on" | "/previews off" => {
                 self.inline = line.trim().ends_with("on");
                 self.note(format!(

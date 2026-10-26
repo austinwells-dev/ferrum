@@ -164,6 +164,13 @@ impl Tokenizer {
             .decode(ids, false)
             .map_err(|e| Error::Tokenizer(e.to_string()))
     }
+    /// `decode` without the unknown-id check: ids with no token decode to
+    /// nothing, as in `tokenizers`' streaming decoder.
+    pub fn decode_lenient(&self, ids: &[u32]) -> Result<String> {
+        self.0
+            .decode(ids, false)
+            .map_err(|e| Error::Tokenizer(e.to_string()))
+    }
     pub fn decode_stream(
         &self,
     ) -> tokenizers::tokenizer::DecodeStream<

@@ -307,3 +307,31 @@ fn prepare_decodes_resizes_and_normalises() {
     assert!(p.pixels.iter().all(|v| (-1.0001..=1.0001).contains(v)));
     assert!(model.prepare(b"not an image").is_err());
 }
+
+#[test]
+fn request_budgets_stay_within_the_projector_cap() {
+    let d = MetalDevice::new().unwrap();
+    let mut model = synthetic(&d, tiny_config(), 1);
+    model.max_tokens = 64;
+    model.min_tokens = 16;
+    let budget = |min, max| ImageBudget {
+        min_tokens: min,
+        max_tokens: max,
+    };
+    assert_eq!(model.limits(ImageBudget::default()), (16, 64));
+    // A request may lower the cap, and the floor follows it down.
+    assert_eq!(model.limits(budget(None, Some(8))), (8, 8));
+    assert_eq!(model.limits(budget(Some(4), Some(32))), (4, 32));
+    // It may not raise the cap the memory plan was made for.
+    assert_eq!(model.limits(budget(Some(100), Some(1 << 20))), (64, 64));
+    // A large image shrinks to the request's cap (factor 8: one token per 8x8).
+    let (w, h) = model.target_size_with(640, 640, budget(None, Some(9)));
+    assert!((w / 8) * (h / 8) <= 9, "{w}x{h}");
+    let (w, h) = model.target_size(640, 640);
+    assert!((w / 8) * (h / 8) <= 64 && (w / 8) * (h / 8) > 9, "{w}x{h}");
+    let fill = ImageBudget {
+        min_tokens: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(fill.or(budget(Some(2), Some(3))), budget(Some(1), Some(3)));
+}

@@ -1,24 +1,35 @@
-//! The model thread: one `Runtime`, a FIFO job queue, per-request event
-//! channels, cancellation and live status for the HTTP threads.
+//! The model thread: one `Runtime` with `--parallel` sessions (slots), a FIFO
+//! job queue, per-request event channels, cancellation and live status for
+//! the HTTP threads.
+//!
+//! The model's types are single-threaded, so slots share the thread: every
+//! running request takes one step in turn (a prompt chunk, or one decode
+//! step), and their streams interleave. Each request goes to the slot whose
+//! cache holds the most of its prompt, so concurrent conversations keep their
+//! own caches.
 use crate::{debug, error, info, log::n, warn};
 use ferrum::{
     Error,
     hybrid::{
         plan::PlanOptions,
-        runtime::{ChatHooks, ChatRequest, ChatResult, Delta, Runtime, SpecOptions},
+        runtime::{ChatHooks, ChatRequest, ChatResult, Delta, Done, Runtime, SpecOptions, Turn},
         session::{Completion, SamplingParams, StopReason},
     },
 };
 use serde::Serialize;
 use std::{
+    collections::VecDeque,
     path::PathBuf,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{Receiver, Sender, channel},
+        mpsc::{Receiver, Sender, TryRecvError, channel},
     },
     time::{Duration, Instant},
 };
+
+/// Most `--parallel` slots.
+pub const MAX_PARALLEL: usize = 8;
 
 pub enum Work {
     Chat(Box<ChatRequest>),
@@ -60,12 +71,34 @@ pub struct Vision {
     pub min_tokens: usize,
 }
 
+/// Which slot a request asks for: llama-server's `id_slot`, or a cache key
+/// (OpenAI's `prompt_cache_key`) whose last slot it should return to.
+#[derive(Debug, Clone, Default)]
+pub struct Route {
+    pub slot: Option<usize>,
+    pub key: Option<String>,
+}
+
 pub struct Job {
     pub id: u64,
     pub work: Work,
+    pub route: Route,
     pub events: Sender<Event>,
     pub cancel: Arc<AtomicBool>,
     pub enqueued: Instant,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SlotStatus {
+    pub id: usize,
+    /// The request running here.
+    pub request: Option<u64>,
+    /// idle, prefill or generating.
+    pub phase: &'static str,
+    /// Tokens this slot's cache holds.
+    pub tokens: usize,
+    /// The cache key of the latest request here.
+    pub key: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize)]
@@ -73,12 +106,11 @@ pub struct Status {
     pub state: &'static str,
     pub load_error: Option<String>,
     pub model: String,
+    /// Context of each slot.
     pub context: usize,
     /// Requests may carry images (a vision projector is loaded).
     pub vision: bool,
-    pub busy_request: Option<u64>,
-    pub busy_phase: &'static str,
-    pub session_tokens: usize,
+    pub slots: Vec<SlotStatus>,
     pub requests: u64,
     pub cancelled: u64,
     pub failed: u64,
@@ -101,6 +133,17 @@ pub struct Status {
 pub struct Shared {
     pub status: Mutex<Status>,
     pub queued: AtomicUsize,
+}
+
+impl Status {
+    /// Slots running a request.
+    pub fn busy(&self) -> usize {
+        self.slots.iter().filter(|s| s.request.is_some()).count()
+    }
+    /// Tokens held by every slot's cache.
+    pub fn cached(&self) -> usize {
+        self.slots.iter().map(|s| s.tokens).sum()
+    }
 }
 
 impl Shared {
@@ -188,10 +231,10 @@ fn run(
         gib(plan.total()),
         gib(plan.budget),
         gib(plan.weights),
-        gib(plan.kv(plan.context)),
+        gib(plan.parallel * plan.kv(plan.context)),
         c.kv_cache,
         plan.kv_per_token / 1024.,
-        gib(plan.recurrent + plan.snapshots),
+        gib(plan.parallel * (plan.recurrent + plan.snapshots)),
         gib(plan.scratch)
     );
     let drafter = rt
@@ -231,6 +274,19 @@ fn run(
         d.top_k,
         d.min_p
     );
+    let parallel = rt.parallel();
+    if parallel > 1 {
+        info!(
+            None,
+            "{parallel} slots of {} tokens each{}",
+            n(plan.context),
+            if drafter.is_some() {
+                "; speculative decoding runs on slot 0 only"
+            } else {
+                ""
+            }
+        );
+    }
     shared.update(|s| {
         s.state = "ready";
         s.model = rt.model_name.clone();
@@ -239,14 +295,150 @@ fn run(
         s.memory_budget_bytes = plan.budget;
         s.memory_predicted_bytes = plan.total();
         s.drafter = drafter.map(|(name, _)| name).unwrap_or_default();
+        s.slots = (0..parallel)
+            .map(|id| SlotStatus {
+                id,
+                phase: "idle",
+                ..SlotStatus::default()
+            })
+            .collect();
     });
-    for job in jobs {
-        shared.queued.fetch_sub(1, Ordering::SeqCst);
-        if job.cancel.load(Ordering::SeqCst) {
-            info!(Some(job.id), "client left while queued; skipped");
-            shared.update(|s| s.cancelled += 1);
-            continue;
+    Scheduler {
+        rt,
+        shared,
+        slots: (0..parallel).map(|_| Slot::default()).collect(),
+        queue: VecDeque::new(),
+        clock: 0,
+    }
+    .run(jobs);
+}
+
+/// A request running on a slot.
+struct Active {
+    job: Job,
+    turn: Turn,
+    timing: Timing,
+}
+
+#[derive(Default)]
+struct Slot {
+    active: Option<Active>,
+    /// When it last took a request (0: never), for least-recently-used reuse.
+    used: u64,
+    key: Option<String>,
+}
+
+struct Scheduler {
+    rt: Runtime,
+    shared: Arc<Shared>,
+    slots: Vec<Slot>,
+    /// Jobs waiting for a slot, oldest first.
+    queue: VecDeque<Job>,
+    clock: u64,
+}
+
+impl Scheduler {
+    fn run(mut self, jobs: Receiver<Job>) {
+        loop {
+            // Wait only when nothing runs; otherwise just collect arrivals.
+            if self.queue.is_empty() && self.slots.iter().all(|s| s.active.is_none()) {
+                match jobs.recv() {
+                    Ok(job) => self.queue.push_back(job),
+                    Err(_) => return,
+                }
+            }
+            loop {
+                match jobs.try_recv() {
+                    Ok(job) => self.queue.push_back(job),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) if self.queue.is_empty() => {
+                        if self.slots.iter().all(|s| s.active.is_none()) {
+                            return;
+                        }
+                        break;
+                    }
+                    Err(TryRecvError::Disconnected) => break,
+                }
+            }
+            self.admit();
+            for i in 0..self.slots.len() {
+                if self.slots[i].active.is_some() {
+                    self.step(i);
+                }
+            }
         }
+    }
+
+    /// Start queued jobs on free slots, oldest first; a job pinned to a busy
+    /// slot waits without holding up the others.
+    fn admit(&mut self) {
+        let mut waiting = VecDeque::new();
+        while let Some(job) = self.queue.pop_front() {
+            if job.cancel.load(Ordering::SeqCst) {
+                self.shared.queued.fetch_sub(1, Ordering::SeqCst);
+                info!(Some(job.id), "client left while queued; skipped");
+                self.shared.update(|s| s.cancelled += 1);
+                continue;
+            }
+            if let Some(slot) = job.route.slot
+                && slot >= self.slots.len()
+            {
+                self.shared.queued.fetch_sub(1, Ordering::SeqCst);
+                let message = format!(
+                    "id_slot {slot} does not exist: the server has {} slot(s) (--parallel)",
+                    self.slots.len()
+                );
+                warn!(Some(job.id), "rejected: {message}");
+                self.shared.update(|s| s.failed += 1);
+                let _ = job.events.send(Event::Failed {
+                    status: 400,
+                    message,
+                });
+                continue;
+            }
+            let free = self.slots.iter().any(|s| s.active.is_none());
+            let pinned_busy = job
+                .route
+                .slot
+                .is_some_and(|i| self.slots[i].active.is_some());
+            if !free || pinned_busy {
+                waiting.push_back(job);
+                continue;
+            }
+            self.shared.queued.fetch_sub(1, Ordering::SeqCst);
+            self.start(job);
+        }
+        self.queue = waiting;
+    }
+
+    /// The free slot for a prompt: the one asked for; else the one whose
+    /// cache holds most of it, if that is at least half of what the slot
+    /// holds (so a shared system prompt does not evict another
+    /// conversation); else the slot the request's cache key last used; else
+    /// the least recently used (an empty one first).
+    fn choose(&self, route: &Route, shared: impl Fn(usize) -> usize) -> usize {
+        if let Some(slot) = route.slot {
+            return slot;
+        }
+        let free = || (0..self.slots.len()).filter(|&i| self.slots[i].active.is_none());
+        let best = free()
+            .map(|i| (shared(i), i))
+            .filter(|&(common, i)| common > 0 && 2 * common >= self.rt.slot(i).len())
+            .max_by_key(|&(common, i)| (common, std::cmp::Reverse(i)));
+        if let Some((_, i)) = best {
+            return i;
+        }
+        if let Some(key) = &route.key
+            && let Some(i) = free().find(|&i| self.slots[i].key.as_ref() == Some(key))
+        {
+            return i;
+        }
+        free()
+            .min_by_key(|&i| (self.slots[i].used, i))
+            .expect("a free slot")
+    }
+
+    fn start(&mut self, job: Job) {
         let waited = job.enqueued.elapsed();
         if waited > Duration::from_millis(250) {
             info!(
@@ -255,27 +447,37 @@ fn run(
                 waited.as_secs_f64()
             );
         }
-        shared.update(|s| {
-            s.busy_request = Some(job.id);
-            s.busy_phase = "prefill";
-        });
-        let hooks = Hooks::new(&job, &shared);
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match &job.work {
-            Work::Chat(request) => rt.chat(request, hooks).map(|r| Event::Chat(Box::new(r))),
+        let mut timing = Timing::new();
+        let shared = self.shared.clone();
+        let started = guarded(|| match &job.work {
+            Work::Chat(request) => {
+                let prompt = self.rt.chat_prompt(request)?;
+                let slot = self.choose_for(&job.route, &prompt.tokens, &prompt.spans);
+                let mut hooks = Hooks::new(&job, &shared, &mut timing, slot);
+                let turn = self.rt.start_chat(slot, request, prompt, &mut hooks)?;
+                Ok((slot, turn))
+            }
             Work::Complete {
                 prompt,
                 max_tokens,
                 sampling,
                 stop,
-            } => rt.complete(prompt, *max_tokens, sampling, stop, hooks).map(
-                |(completion, text, stopped)| Event::Completed {
-                    completion,
-                    text,
-                    stopped,
-                },
-            ),
-        }));
-        if let Some(v) = rt.vision.as_ref()
+            } => {
+                let tokens = self.rt.loaded.tokenizer.encode(prompt)?;
+                let slot = self.choose_for(&job.route, &tokens, &[]);
+                let mut hooks = Hooks::new(&job, &shared, &mut timing, slot);
+                let turn = self.rt.start_complete(
+                    slot,
+                    prompt,
+                    *max_tokens,
+                    sampling,
+                    stop,
+                    &mut hooks,
+                )?;
+                Ok((slot, turn))
+            }
+        });
+        if let Some(v) = self.rt.vision.as_ref()
             && !v.last_encode.is_zero()
         {
             info!(
@@ -284,65 +486,187 @@ fn run(
                 v.last_encode.as_secs_f64()
             );
         }
+        match started {
+            Ok((slot, turn)) => {
+                self.clock += 1;
+                let s = &mut self.slots[slot];
+                s.used = self.clock;
+                s.key = job.route.key.clone();
+                let key = s.key.clone();
+                self.shared.update(|st| {
+                    if let Some(status) = st.slots.get_mut(slot) {
+                        status.request = Some(job.id);
+                        status.phase = "prefill";
+                        status.key = key;
+                    }
+                });
+                self.slots[slot].active = Some(Active { job, turn, timing });
+            }
+            Err(failure) => {
+                // A request that failed before its session moved leaves every
+                // cache as it was; a panic may have, so it resets them all.
+                if failure.panicked {
+                    self.reset_all();
+                }
+                self.shared.update(|s| s.failed += 1);
+                let _ = job.events.send(failure.event(job.id));
+            }
+        }
+    }
+
+    fn choose_for(
+        &self,
+        route: &Route,
+        tokens: &[u32],
+        spans: &[ferrum::hybrid::engine::ImageSpan],
+    ) -> usize {
+        let slot = self.choose(route, |i| self.rt.slot(i).shared_prefix(tokens, spans));
+        if self.slots.len() > 1 {
+            debug!(
+                None,
+                "slot {slot}: shares {} of {} prompt tokens",
+                n(self.rt.slot(slot).shared_prefix(tokens, spans)),
+                n(tokens.len())
+            );
+        }
+        slot
+    }
+
+    /// One step of the request on `slot`; finishes it when it is done.
+    fn step(&mut self, slot: usize) {
+        let Some(mut active) = self.slots[slot].active.take() else {
+            return;
+        };
+        let rt = &mut self.rt;
+        let shared = &*self.shared;
+        let outcome = guarded(|| {
+            let mut hooks = Hooks::new(&active.job, shared, &mut active.timing, slot);
+            rt.advance(slot, &mut active.turn, &mut hooks)
+        });
         let event = match outcome {
-            Ok(Ok(event)) => {
+            Ok(None) => {
+                self.slots[slot].active = Some(active);
+                return;
+            }
+            Ok(Some(done)) => {
+                let event = match done {
+                    Done::Chat(result) => Event::Chat(result),
+                    Done::Completion(completion, text, stopped) => Event::Completed {
+                        completion,
+                        text,
+                        stopped,
+                    },
+                };
                 let completion = match &event {
                     Event::Chat(r) => &r.completion,
                     Event::Completed { completion, .. } => completion,
                     _ => unreachable!(),
                 };
-                record(&shared, &job, completion, &event, rt.session.len());
-                if let Some(summary) = rt.session.tree_rule_summary() {
-                    debug!(Some(job.id), "{summary}");
+                record(
+                    &self.shared,
+                    &active.job,
+                    slot,
+                    completion,
+                    &event,
+                    self.rt.slot(slot).len(),
+                );
+                if let Some(summary) = self.rt.slot(slot).tree_rule_summary() {
+                    debug!(Some(active.job.id), "{summary}");
                 }
                 event
             }
-            Ok(Err(e)) => {
-                let status = if matches!(e, Error::Parameter(_) | Error::Tokenizer(_)) {
-                    400
-                } else {
-                    500
-                };
-                if status == 400 {
-                    warn!(Some(job.id), "rejected: {e}");
-                } else {
-                    error!(Some(job.id), "failed: {e}");
+            Err(failure) => {
+                if failure.panicked {
+                    self.rt.slot_mut(slot).reset();
                 }
-                shared.update(|s| s.failed += 1);
-                Event::Failed {
-                    status,
-                    message: e.to_string(),
-                }
-            }
-            Err(panic) => {
-                let message = panic
-                    .downcast_ref::<String>()
-                    .cloned()
-                    .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
-                    .unwrap_or_else(|| "unknown panic".into());
-                error!(
-                    Some(job.id),
-                    "internal panic: {message}; conversation cache reset"
-                );
-                rt.session.reset();
-                shared.update(|s| s.failed += 1);
-                Event::Failed {
-                    status: 500,
-                    message: format!("internal error: {message}"),
-                }
+                self.shared.update(|s| s.failed += 1);
+                failure.event(active.job.id)
             }
         };
-        let _ = job.events.send(event);
-        let tokens = rt.session.len();
-        shared.update(|s| {
-            s.busy_request = None;
-            s.busy_phase = "idle";
-            s.session_tokens = tokens;
+        let _ = active.job.events.send(event);
+        let tokens = self.rt.slot(slot).len();
+        self.shared.update(|s| {
+            if let Some(status) = s.slots.get_mut(slot) {
+                status.request = None;
+                status.phase = "idle";
+                status.tokens = tokens;
+            }
         });
+    }
+
+    fn reset_all(&mut self) {
+        for i in 0..self.slots.len() {
+            if self.slots[i].active.is_none() {
+                self.rt.slot_mut(i).reset();
+            }
+        }
     }
 }
 
-fn record(shared: &Shared, job: &Job, c: &Completion, event: &Event, session_len: usize) {
+/// A request that failed: an error (400 for the client's, 500 otherwise) or
+/// a panic.
+struct Failure {
+    status: u16,
+    message: String,
+    panicked: bool,
+}
+
+impl Failure {
+    fn event(self, id: u64) -> Event {
+        if self.panicked {
+            error!(
+                Some(id),
+                "internal panic: {}; conversation cache reset", self.message
+            );
+        } else if self.status == 400 {
+            warn!(Some(id), "rejected: {}", self.message);
+        } else {
+            error!(Some(id), "failed: {}", self.message);
+        }
+        Event::Failed {
+            status: self.status,
+            message: if self.panicked {
+                format!("internal error: {}", self.message)
+            } else {
+                self.message
+            },
+        }
+    }
+}
+
+/// Run `f`, turning errors and panics into a `Failure`.
+fn guarded<T>(f: impl FnOnce() -> ferrum::Result<T>) -> Result<T, Failure> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(Failure {
+            status: if matches!(e, Error::Parameter(_) | Error::Tokenizer(_)) {
+                400
+            } else {
+                500
+            },
+            message: e.to_string(),
+            panicked: false,
+        }),
+        Err(panic) => Err(Failure {
+            status: 500,
+            message: panic
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| panic.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_else(|| "unknown panic".into()),
+            panicked: true,
+        }),
+    }
+}
+
+fn record(
+    shared: &Shared,
+    job: &Job,
+    slot: usize,
+    c: &Completion,
+    event: &Event,
+    session_len: usize,
+) {
     // A prefill cancelled part-way processed only what the session now holds.
     let prefilled = if c.stop == StopReason::Cancelled && c.tokens.is_empty() {
         session_len.saturating_sub(c.reused_tokens)
@@ -402,6 +726,10 @@ fn record(shared: &Shared, job: &Job, c: &Completion, event: &Event, session_len
     } else {
         format!("{:?}", c.stop).to_lowercase()
     };
+    let slots = shared.status().slots.len();
+    if slots > 1 {
+        detail.push_str(&format!(", slot {slot}"));
+    }
     info!(
         Some(job.id),
         "done ({stop}) in {:.2} s: prompt {} tok ({} cached), prefill {} tok in {:.2} s ({:.0} tok/s); generated {} tok in {:.2} s ({:.1} tok/s){detail}",
@@ -428,9 +756,8 @@ pub fn truncate(s: &str, max: usize) -> String {
     format!("{}… (+{} bytes)", &s[..end], s.len() - end)
 }
 
-struct Hooks<'a> {
-    job: &'a Job,
-    shared: &'a Shared,
+/// A request's progress-log state, kept across its steps.
+struct Timing {
     prefill_total: usize,
     prefill_start: Instant,
     last_log: Instant,
@@ -438,16 +765,32 @@ struct Hooks<'a> {
     disconnected: bool,
 }
 
-impl<'a> Hooks<'a> {
-    fn new(job: &'a Job, shared: &'a Shared) -> Self {
+impl Timing {
+    fn new() -> Self {
         Self {
-            job,
-            shared,
             prefill_total: 0,
             prefill_start: Instant::now(),
             last_log: Instant::now(),
             decode_start: None,
             disconnected: false,
+        }
+    }
+}
+
+struct Hooks<'a> {
+    job: &'a Job,
+    shared: &'a Shared,
+    t: &'a mut Timing,
+    slot: usize,
+}
+
+impl<'a> Hooks<'a> {
+    fn new(job: &'a Job, shared: &'a Shared, t: &'a mut Timing, slot: usize) -> Self {
+        Self {
+            job,
+            shared,
+            t,
+            slot,
         }
     }
     fn send(&mut self, event: Event) {
@@ -456,8 +799,8 @@ impl<'a> Hooks<'a> {
         }
     }
     fn gone(&mut self) {
-        if !self.disconnected {
-            self.disconnected = true;
+        if !self.t.disconnected {
+            self.t.disconnected = true;
             self.job.cancel.store(true, Ordering::SeqCst);
         }
     }
@@ -469,29 +812,35 @@ impl ChatHooks for Hooks<'_> {
         Ok(())
     }
     fn begin(&mut self, prompt: usize, reused: usize) {
-        self.prefill_total = prompt - reused;
-        self.prefill_start = Instant::now();
-        self.last_log = Instant::now();
+        self.t.prefill_total = prompt - reused;
+        self.t.prefill_start = Instant::now();
+        self.t.last_log = Instant::now();
+        let slots = self.shared.status().slots.len();
         info!(
             Some(self.job.id),
-            "prompt {} tok: {} reused from cache, {} to prefill",
+            "prompt {} tok: {} reused from cache, {} to prefill{}",
             n(prompt),
             n(reused),
-            n(prompt - reused)
+            n(prompt - reused),
+            if slots > 1 {
+                format!(" (slot {})", self.slot)
+            } else {
+                String::new()
+            }
         );
         self.send(Event::Started { prompt, reused });
     }
     fn prefill(&mut self, processed: usize, total: usize) -> bool {
         self.send(Event::Progress { processed, total });
-        if self.last_log.elapsed() > Duration::from_secs(5) && processed < total {
-            self.last_log = Instant::now();
+        if self.t.last_log.elapsed() > Duration::from_secs(5) && processed < total {
+            self.t.last_log = Instant::now();
             info!(
                 Some(self.job.id),
                 "prefill {}/{} tok ({:.0}%), {:.0} tok/s",
                 n(processed),
                 n(total),
                 100. * processed as f64 / total.max(1) as f64,
-                processed as f64 / self.prefill_start.elapsed().as_secs_f64().max(1e-9)
+                processed as f64 / self.t.prefill_start.elapsed().as_secs_f64().max(1e-9)
             );
         }
         let keep = !self.job.cancel.load(Ordering::SeqCst);
@@ -509,18 +858,24 @@ impl ChatHooks for Hooks<'_> {
     }
     fn generated(&mut self, tokens: usize) {
         let now = Instant::now();
-        let start = *self.decode_start.get_or_insert_with(|| {
-            self.shared.update(|s| s.busy_phase = "generating");
+        let slot = self.slot;
+        let t = &mut *self.t;
+        let start = *t.decode_start.get_or_insert_with(|| {
+            self.shared.update(|s| {
+                if let Some(status) = s.slots.get_mut(slot) {
+                    status.phase = "generating";
+                }
+            });
             debug!(
                 Some(self.job.id),
                 "first token {:.2} s after prefill began",
-                self.prefill_start.elapsed().as_secs_f64()
+                t.prefill_start.elapsed().as_secs_f64()
             );
-            self.last_log = now;
+            t.last_log = now;
             now
         });
-        if now.duration_since(self.last_log) > Duration::from_secs(10) {
-            self.last_log = now;
+        if now.duration_since(t.last_log) > Duration::from_secs(10) {
+            t.last_log = now;
             info!(
                 Some(self.job.id),
                 "generating: {} tok, {:.1} tok/s",

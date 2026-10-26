@@ -11,8 +11,13 @@
 //!            [--draft-tree-search best-first|siblings] [--draft-block N] [--draft-vocab N]
 //!            [--mmproj FILE|auto|none] [--image-tokens N] [--image-min-tokens N]
 //!
-//! Commands: /reset, /think on|off, /image PATH, /stats, /exit. End a line with `\` to
-//! continue the message on the next line.
+//! Commands: /reset, /think on|off, /image PATH [low|high|auto|N],
+//! /detail low|high|auto|N, /stats, /exit. End a line with `\` to continue the
+//! message on the next line.
+//!
+//! Image detail: `low` caps an image at 256 tokens, `high` at --image-tokens, `N`
+//! at N tokens; `/detail` sets it for the images that follow, and a size after
+//! `/image PATH` for that image only.
 use ferrum::{
     Error, Result,
     hybrid::{
@@ -20,6 +25,7 @@ use ferrum::{
         plan::PlanOptions,
         runtime::{ChatRequest, Delta, Runtime, SpecOptions},
     },
+    vision::{ImageBudget, media},
 };
 use serde_json::{Map, Value as Json, json};
 use std::io::{BufRead, Write};
@@ -154,7 +160,7 @@ fn run() -> Result<()> {
     if let Some(vision) = rt.vision.as_mut() {
         vision.model.min_tokens = o.image_min_tokens;
         eprintln!(
-            "vision: {} (up to {} tokens per image; /image PATH attaches one)",
+            "vision: {} (up to {} tokens per image; /image PATH [low|high|N] attaches one)",
             vision.path.display(),
             vision.model.max_tokens
         );
@@ -208,6 +214,7 @@ fn run() -> Result<()> {
     }
     let mut think = o.think;
     let mut attachments: Vec<Json> = Vec::new();
+    let mut detail = ImageBudget::default();
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
     let mut last_stats = String::from("no turns yet");
@@ -254,13 +261,27 @@ fn run() -> Result<()> {
             }
             _ => {}
         }
-        if let Some(path) = input.strip_prefix("/image ") {
-            let path = path.trim().trim_matches('\'');
+        if let Some(value) = input.strip_prefix("/detail ") {
+            match media::parse_detail(value) {
+                Ok(budget) => {
+                    detail = budget;
+                    eprintln!("(images from now on: {})", value.trim());
+                }
+                Err(e) => eprintln!("{e}"),
+            }
+            continue;
+        }
+        if let Some(arg) = input.strip_prefix("/image ") {
+            let (path, budget) = image_arg(arg);
             match std::fs::read(path) {
                 Ok(bytes) if rt.supports_vision() => {
-                    attachments.push(ferrum::vision::media::image_part_from_bytes(&bytes));
+                    attachments.push(media::image_part_with(&bytes, budget));
+                    let tokens = rt
+                        .vision
+                        .as_ref()
+                        .map_or(0, |v| v.model.limits(budget.or(detail)).1);
                     eprintln!(
-                        "(image attached: {} bytes; it goes with your next message)",
+                        "(image attached: {} bytes, up to {tokens} tokens; it goes with your next message)",
                         bytes.len()
                     );
                 }
@@ -290,6 +311,7 @@ fn run() -> Result<()> {
             stop: Vec::new(),
             reasoning_budget: o.reasoning_budget,
             raw_reasoning: false,
+            image_budget: detail,
         };
         let mut in_reasoning = false;
         let show = o.show_thinking;
@@ -356,4 +378,20 @@ fn run() -> Result<()> {
         }
         messages.push(reply);
     }
+}
+
+/// `/image`'s argument: a path, optionally followed by the image's detail
+/// (`low`, `high`, `auto` or a token cap) when the whole text is not a file.
+fn image_arg(arg: &str) -> (&str, ImageBudget) {
+    fn unquote(p: &str) -> &str {
+        p.trim().trim_matches('\'')
+    }
+    let arg = arg.trim();
+    if !std::path::Path::new(unquote(arg)).exists()
+        && let Some((path, size)) = arg.rsplit_once(' ')
+        && let Ok(budget) = media::parse_detail(size)
+    {
+        return (unquote(path), budget);
+    }
+    (unquote(arg), ImageBudget::default())
 }

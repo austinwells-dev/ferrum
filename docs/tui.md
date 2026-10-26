@@ -40,7 +40,7 @@ Each setup's **Model** group has *Context* and *KV cache*. *KV cache* `q8` store
 
 Chat runs the model inside the TUI with streaming markdown (syntax-highlighted code blocks for common languages, tables that wrap to the window, links and horizontal rules) and a separate reasoning view (`/thoughts` shows or hides it, `/think on|off` turns reasoning on or off).
 
-**Attachments.** You can attach files in three ways: with `/attach PATH`, by dropping them onto the terminal, or from the clipboard with Ctrl-V or `/paste` (files, screenshots or text). `/screenshot` lets you drag out a screen region. If the model has a vision projector next to it, images go to the model as pixels. Otherwise, macOS Vision reads the text in the image and that text is sent instead.
+**Attachments.** You can attach files in three ways: with `/attach PATH`, by dropping them onto the terminal, or from the clipboard with Ctrl-V or `/paste` (files, screenshots or text). `/screenshot` lets you drag out a screen region. If the model has a vision projector next to it, images go to the model as pixels. Otherwise, macOS Vision reads the text in the image and that text is sent instead. `/detail low|high|auto|N` sets how many tokens the images in the next messages may take (low is 256, high is the *Image tokens* setting), and the Model group's *Image tokens* and *Image min tokens* set the cap and floor (`--image-tokens`, `--image-min-tokens`) for Chat, Agents and Serve.
 
 **Previews.** Images and videos are shown inline: attachments waiting to be sent appear in a strip above the message box, and sent ones appear under your message (videos show their first frame). `/previews off` hides them. Ctrl-O or `/preview` opens the newest one full screen. `/preview N` opens the Nth one and `/preview PATH` opens any file. In the preview, ←/→ moves between them, space pauses, `o` opens the file in its default app and esc closes it. Terminals that support the kitty graphics protocol (kitty, Ghostty, WezTerm) show the real pixels; other terminals get a 24-bit colour half-block rendering. To choose the mode yourself, set `FERRUM_GRAPHICS=kitty` or `FERRUM_GRAPHICS=blocks`. Inside tmux the half-block mode is used. GIFs animate. Videos (`mp4`, `mov`, `m4v`, `webm`, `mkv`, `avi`, up to 512 MB) play through `ffmpeg` if it is installed. Without ffmpeg you get the Quick Look poster frame. Models can't see videos, so the model is only told that the file is in the workspace.
 
@@ -132,7 +132,7 @@ Every chat and agent session is saved after each reply to `~/.config/ferrum/sess
 
 ## Serve
 
-Serve starts `ferrum-server` with the chosen setup and shows its endpoint, routes and live log, with a traffic chart of each request's decode speed. The server keeps running on other tabs; `x` twice stops it. See the [server guide](server.md).
+Serve starts `ferrum-server` with the chosen setup and shows its endpoint, routes and live log, with a traffic chart of each request's decode speed. The server keeps running on other tabs; `x` twice stops it. *Parallel requests* (1–8) sets `--parallel`: each request gets a session with its own cache, and `auto` context shrinks so all of them fit. See the [server guide](server.md).
 
 ## Benchmark
 

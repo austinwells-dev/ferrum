@@ -222,7 +222,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 ## Limitations
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
-- One request at a time (batch size 1).
+- Batch size 1. `ferrum-server --parallel N` serves up to 8 requests at once in separate sessions that take turns on the GPU, so their streams interleave but total throughput is that of one request.
 - The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint and Spark. Other architectures go through the developer runner, built with `--features legacy-engine`.
 - Vision supports the Qwen3-VL projector only (no video).
 - No training and no language bindings.

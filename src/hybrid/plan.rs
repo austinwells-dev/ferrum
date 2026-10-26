@@ -30,6 +30,10 @@ pub struct PlanOptions {
     /// K/V cache format; Q8 roughly halves the per-token cost. Defaults to
     /// `FERRUM_KV_CACHE` (f16 or q8) when set, else F16.
     pub kv_cache: super::KvCache,
+    /// Sessions of `context` positions each (the server's `--parallel`):
+    /// every one has its own K/V cache, recurrent state and snapshots, and
+    /// they share the weights, scratch, drafter and projector.
+    pub parallel: usize,
 }
 
 /// Memory a speculative drafter adds: weights, verify and draft buffers,
@@ -53,6 +57,7 @@ impl Default for PlanOptions {
             draft: DraftMemory::default(),
             vision: 0,
             kv_cache: super::KvCache::from_env(),
+            parallel: 1,
         }
     }
 }
@@ -78,6 +83,8 @@ pub struct MemoryPlan {
     pub draft: DraftMemory,
     /// Vision projector (zero without one).
     pub vision: usize,
+    /// Sessions, each with `recurrent`, `snapshots` and `kv(context)`.
+    pub parallel: usize,
 }
 
 /// Measured on the M5: pipelines, command buffers and small per-forward
@@ -87,7 +94,10 @@ const RUNTIME_OVERHEAD: usize = 96 << 20;
 impl MemoryPlan {
     /// Total predicted bytes at the chosen context.
     pub fn total(&self) -> usize {
-        self.fixed() + self.kv(self.context) + self.draft_kv(self.context)
+        self.total_at(self.context)
+    }
+    fn total_at(&self, context: usize) -> usize {
+        self.fixed() + self.parallel * self.kv(context) + self.draft_kv(context)
     }
     /// Drafter bytes at `context` (weights, buffers and context-sized K/V).
     pub fn draft_total(&self, context: usize) -> usize {
@@ -106,8 +116,7 @@ impl MemoryPlan {
     fn fixed(&self) -> usize {
         self.weights
             + self.scratch
-            + self.recurrent
-            + self.snapshots
+            + self.parallel * (self.recurrent + self.snapshots)
             + self.overhead
             + self.draft.weights
             + self.draft.fixed
@@ -180,9 +189,10 @@ pub fn plan_for_weights(
         trained_context: c.trained_context,
         draft: options.draft,
         vision: options.vision,
+        parallel: options.parallel.max(1),
     };
-    let free = budget.saturating_sub(plan.fixed() + kv_ring);
-    let per_token = kv_per_token + options.draft.per_token;
+    let free = budget.saturating_sub(plan.fixed() + plan.parallel * kv_ring);
+    let per_token = plan.parallel as f64 * kv_per_token + options.draft.per_token;
     let fits = ((free as f64 / per_token) as usize / 256 * 256).min(c.trained_context);
     plan.max_context = fits;
     plan.context = match options.context {
@@ -195,7 +205,7 @@ pub fn plan_for_weights(
         Some(requested) if requested > fits => {
             return Err(Error::Config(format!(
                 "context {requested} needs {} MiB but the budget is {} MiB; the largest context that fits is {fits}",
-                (plan.fixed() + plan.kv(requested) + plan.draft_kv(requested)) >> 20,
+                plan.total_at(requested) >> 20,
                 budget >> 20
             )));
         }

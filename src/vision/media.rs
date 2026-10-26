@@ -1,11 +1,20 @@
 //! Images inside chat messages: finding them, decoding their payloads and
 //! replacing them with the placeholder the chat template understands.
 #![forbid(unsafe_code)]
+use super::{ImageBudget, LOW_DETAIL_TOKENS};
 use crate::{Error, Result};
 use serde_json::{Value as Json, json};
 
 /// Most images one request may carry.
 pub const MAX_IMAGES: usize = 16;
+
+/// One image of a request: its encoded bytes and the token limits its
+/// content part asked for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ImageInput {
+    pub bytes: Vec<u8>,
+    pub budget: ImageBudget,
+}
 
 /// Decode standard or URL-safe base64, ignoring whitespace and padding.
 pub fn base64_decode(text: &str) -> Result<Vec<u8>> {
@@ -54,6 +63,12 @@ pub fn base64_encode(data: &[u8]) -> String {
 
 /// A chat content part carrying `bytes` as an inline image.
 pub fn image_part_from_bytes(bytes: &[u8]) -> Json {
+    image_part_with(bytes, ImageBudget::default())
+}
+
+/// `image_part_from_bytes` asking for `budget` (as `min_tokens` and
+/// `max_tokens` next to the URL).
+pub fn image_part_with(bytes: &[u8], budget: ImageBudget) -> Json {
     let mime = match bytes {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xff, 0xd8, ..] => "image/jpeg",
@@ -62,7 +77,75 @@ pub fn image_part_from_bytes(bytes: &[u8]) -> Json {
         [b'B', b'M', ..] => "image/bmp",
         _ => "application/octet-stream",
     };
-    json!({"type": "image_url", "image_url": {"url": format!("data:{mime};base64,{}", base64_encode(bytes))}})
+    let mut url = json!({"url": format!("data:{mime};base64,{}", base64_encode(bytes))});
+    if let Some(n) = budget.min_tokens {
+        url["min_tokens"] = json!(n);
+    }
+    if let Some(n) = budget.max_tokens {
+        url["max_tokens"] = json!(n);
+    }
+    json!({"type": "image_url", "image_url": url})
+}
+
+/// Parse a per-image size setting: `low`, `high`, `auto` (OpenAI's
+/// `detail`), or a token cap.
+pub fn parse_detail(value: &str) -> Result<ImageBudget> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "auto" | "default" | "" => Ok(ImageBudget::default()),
+        "low" => Ok(ImageBudget {
+            min_tokens: None,
+            max_tokens: Some(LOW_DETAIL_TOKENS),
+        }),
+        // The projector's cap; `VisionModel::limits` clamps to it.
+        "high" => Ok(ImageBudget {
+            min_tokens: None,
+            max_tokens: Some(usize::MAX),
+        }),
+        n => match n.parse::<usize>() {
+            Ok(n) if n > 0 => Ok(ImageBudget {
+                min_tokens: None,
+                max_tokens: Some(n),
+            }),
+            _ => Err(Error::Parameter(format!(
+                "image detail must be low, high, auto or a token count, not {value:?}"
+            ))),
+        },
+    }
+}
+
+/// The token limits an image part asks for: OpenAI's `detail`, and Ferrum's
+/// `min_tokens` / `max_tokens`, on the part or inside its `image_url` /
+/// `source` object (the inner one wins).
+fn part_budget(part: &Json) -> Result<ImageBudget> {
+    let mut budget = ImageBudget::default();
+    let inner = ["image_url", "source", "image"]
+        .iter()
+        .filter_map(|k| part.get(*k).filter(|v| v.is_object()))
+        .collect::<Vec<_>>();
+    for obj in std::iter::once(part).chain(inner) {
+        if let Some(detail) = obj.get("detail") {
+            let detail = detail
+                .as_str()
+                .ok_or_else(|| Error::Parameter("image detail must be a string".into()))?;
+            budget = parse_detail(detail)?.or(budget);
+        }
+        for (key, slot) in [
+            ("min_tokens", &mut budget.min_tokens),
+            ("max_tokens", &mut budget.max_tokens),
+        ] {
+            if let Some(v) = obj.get(key) {
+                match v.as_u64() {
+                    Some(n) if n > 0 => *slot = Some(n as usize),
+                    _ => {
+                        return Err(Error::Parameter(format!(
+                            "image {key} must be a positive integer"
+                        )));
+                    }
+                }
+            }
+        }
+    }
+    Ok(budget)
 }
 
 /// The bytes of a `data:<type>;base64,<payload>` URL.
@@ -132,7 +215,7 @@ pub fn has_images(messages: &[Json]) -> bool {
 
 /// Replace every image part with `{"type": "image"}` (what chat templates
 /// look for) and return the decoded images in prompt order.
-pub fn take_images(messages: &[Json]) -> Result<(Vec<Json>, Vec<Vec<u8>>)> {
+pub fn take_images(messages: &[Json]) -> Result<(Vec<Json>, Vec<ImageInput>)> {
     let mut images = Vec::new();
     let mut out = Vec::with_capacity(messages.len());
     for message in messages {
@@ -145,7 +228,10 @@ pub fn take_images(messages: &[Json]) -> Result<(Vec<Json>, Vec<Vec<u8>>)> {
                             "at most {MAX_IMAGES} images per request"
                         )));
                     }
-                    images.push(bytes?);
+                    images.push(ImageInput {
+                        bytes: bytes?,
+                        budget: part_budget(part)?,
+                    });
                     *part = json!({"type": "image"});
                 }
             }
@@ -195,12 +281,61 @@ mod tests {
         ];
         assert!(has_images(&messages));
         let (clean, images) = take_images(&messages).unwrap();
-        assert_eq!(images, [b"foo".to_vec(), b"bar".to_vec(), b"baz".to_vec()]);
+        let bytes: Vec<&[u8]> = images.iter().map(|i| &i.bytes[..]).collect();
+        assert_eq!(bytes, [b"foo", b"bar", b"baz"]);
+        assert!(images.iter().all(|i| i.budget == ImageBudget::default()));
         assert_eq!(clean[1]["content"][0]["text"], "what is this?");
         assert_eq!(clean[1]["content"][1], json!({"type": "image"}));
         assert!(!has_images(&clean[..1]));
         // The input is untouched.
         assert!(messages[1]["content"][1].get("image_url").is_some());
+    }
+
+    #[test]
+    fn reads_per_image_detail_and_token_limits() {
+        let messages = [json!({"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,Zm9v", "detail": "low"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,Zm9v", "detail": "high"}},
+            {"type": "image_url", "detail": "low",
+             "image_url": {"url": "data:image/png;base64,Zm9v", "max_tokens": 100, "min_tokens": 50}},
+            {"type": "image", "max_tokens": 300,
+             "source": {"type": "base64", "media_type": "image/png", "data": "YmFy"}},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,Zm9v", "detail": "512"}},
+        ]})];
+        let (_, images) = take_images(&messages).unwrap();
+        let caps: Vec<_> = images
+            .iter()
+            .map(|i| (i.budget.min_tokens, i.budget.max_tokens))
+            .collect();
+        assert_eq!(
+            caps,
+            [
+                (None, Some(LOW_DETAIL_TOKENS)),
+                (None, Some(usize::MAX)),
+                (Some(50), Some(100)),
+                (None, Some(300)),
+                (None, Some(512)),
+            ]
+        );
+        for bad in [
+            json!({"detail": "huge"}),
+            json!({"max_tokens": 0}),
+            json!({"min_tokens": "x"}),
+        ] {
+            let mut url = json!({"url": "data:image/png;base64,Zm9v"});
+            url.as_object_mut()
+                .unwrap()
+                .extend(bad.as_object().unwrap().clone());
+            let m = [json!({"role": "user", "content": [{"type": "image_url", "image_url": url}]})];
+            assert!(take_images(&m).is_err(), "{m:?}");
+        }
+        // What the CLI and TUI send round-trips.
+        let budget = ImageBudget {
+            min_tokens: Some(8),
+            max_tokens: Some(64),
+        };
+        let m = [json!({"role": "user", "content": [image_part_with(b"foo", budget)]})];
+        assert_eq!(take_images(&m).unwrap().1[0].budget, budget);
     }
 
     #[test]

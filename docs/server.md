@@ -26,13 +26,28 @@ ferrum-server --model model.gguf --port 8080      # http://127.0.0.1:8080/v1
 | Anthropic | `/v1/messages`, `/v1/messages/count_tokens` |
 | Utility | `/health`, `/props`, `/slots`, `/metrics` (Prometheus), `/tokenize`, `/detokenize`, `/apply-template` |
 
-The model runs on its own thread behind a FIFO queue, and each connection gets a thread, so `/health` and `/metrics` respond while a request is generating. Requests are processed one at a time.
+The model runs on its own thread behind a FIFO queue, and each connection gets a thread, so `/health` and `/metrics` respond while a request is generating. By default requests are processed one at a time.
+
+### Parallel requests
+
+`--parallel N` (1–8, alias `-np`) serves up to N requests at once. Each runs in its own session (a *slot*) with its own K/V cache of the full context, its own recurrent state and its own snapshots; the slots share the weights, the scratch buffers, the drafter and the vision projector. With `--context auto` the planner fits the largest context that N slots hold together, so `--parallel 4` gives each slot roughly a quarter of the single-slot context (the Model line of the startup log shows it). With `--context N` each slot gets N tokens, and loading fails if N slots do not fit.
+
+The slots take turns on the GPU: every running request takes one step in turn (a prompt chunk of `--chunk` tokens, or one decode step), so their streams interleave and a short request is not stuck behind a long one. This does not batch the requests together, so total throughput stays about that of one request, split between the running ones. A request that arrives while every slot is busy waits in the queue.
+
+Speculative decoding runs on slot 0 only; the other slots decode without the drafter. `/slots` lists every slot (its request, phase, cached tokens and cache key), `/props` reports `total_slots`, and `/metrics` adds `ferrum_slots`, with `ferrum_requests_processing` counting the busy ones and `ferrum_cached_tokens` summing all slots.
 
 ### Conversation caching
 
-The server keeps the previous conversation. If the next request extends it, only the new tokens are processed, and `usage.prompt_tokens_details.cached_tokens` reports how many were reused. An identical retry reuses everything except the last token.
+Each slot keeps its previous conversation. If the next request extends it, only the new tokens are processed, and `usage.prompt_tokens_details.cached_tokens` reports how many were reused. An identical retry reuses everything except the last token.
 
-Hybrid models can't rewind their linear-attention state the way a KV cache can, so the session keeps recurrent-state snapshots (`--snapshots N`, default 2) to restore from when a request diverges.
+With several slots, a request goes to the free slot that suits its cache best, so concurrent conversations each keep their own:
+
+1. `id_slot: N` (llama-server's field; `-1` means any) pins the request to slot N, waiting for it if it is busy.
+2. Otherwise, the free slot whose cache shares the longest prefix with the prompt, provided the shared part is at least half of what that slot holds. A new conversation that only shares the system prompt does not take over another conversation's slot.
+3. Otherwise, the free slot that last served the same cache key: `prompt_cache_key` (OpenAI's field) or `session_id`, and for `/v1/messages` `metadata.user_id`.
+4. Otherwise, the least recently used free slot, empty ones first.
+
+Hybrid models can't rewind their linear-attention state the way a KV cache can, so each slot keeps recurrent-state snapshots (`--snapshots N`, default 2) to restore from when a request diverges.
 
 ### Thinking controls
 
@@ -67,7 +82,8 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 | `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY`. `FERRUM_API_KEY=KEY` does the same without putting the key in the process list |
 | `--cors ORIGIN` | localhost pages only | Let web pages from `ORIGIN` (e.g. `https://chat.example.com`) call the server; repeatable, `*` for any. Requests from other sites' pages get 403, so a site you visit can't use your model. Clients that aren't browsers (curl, SDKs, agents) send no `Origin` and are unaffected |
 | `--alias NAME` | file name | Model name reported to clients |
-| `-c`, `--context N\|auto` | `auto` | Context length |
+| `-np`, `--parallel N` | `1` | Requests served at once, one slot each (1–8). See [Parallel requests](#parallel-requests) |
+| `-c`, `--context N\|auto` | `auto` | Context length of each slot |
 | `--kv-cache f16\|q8` | `f16` | K/V cache format (also `-ctk`/`-ctv`). `q8` nearly halves K/V memory, so `auto` fits about twice the context, and decodes faster at long context. See [K/V cache format](#kv-cache-format) |
 | `--reserve-mib N` | `1024` | GPU memory left free for the system |
 | `--chunk N` | `512` | Prompt tokens per forward pass |
@@ -89,7 +105,7 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 ferrum-cli --model model.gguf     # --kv-cache q8 as for the server
 ```
 
-Commands: `/reset`, `/think on|off`, `/image PATH`, `/stats`, `/exit`. To continue a message on the next line, end the line with `\`.
+Commands: `/reset`, `/think on|off`, `/image PATH [low|high|auto|N]`, `/detail low|high|auto|N`, `/stats`, `/exit`. To continue a message on the next line, end the line with `\`. A size after `/image PATH` applies to that image; `/detail` sets it for the images that follow (see [Image size per request](#image-size-per-request)).
 
 ## Speculative decoding
 
@@ -146,4 +162,24 @@ The Qwen3.5-family models can read images once you load their vision projector (
 
 Send images inline, either as OpenAI `{"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}` parts or as Anthropic `{"type": "image", "source": {"type": "base64", ...}}` blocks. Ferrum decodes PNG, JPEG, GIF, WebP and BMP, and it rejects remote URLs rather than fetching them. `/props` reports `modalities.vision`, and sending images to a model without a projector returns a clear 400 error.
 
-Encoded images are cached, and the conversation cache keeps working across turns as long as the same pictures stay in the same places. [vision.md](vision.md) describes how the encoder works.
+Encoded images are cached for every slot, by content and size, and the conversation cache keeps working across turns as long as the same pictures, at the same sizes, stay in the same places.
+
+### Image size per request
+
+Each image can ask for its own token budget, and a request can set one for all its images. Fewer tokens encode faster and leave more context; more read fine detail better.
+
+| Where | Field | Effect |
+|---|---|---|
+| Image part (inside `image_url` or `source`, or on the part) | `detail: "low"` | At most 256 tokens (a 512x512 picture), as OpenAI's low detail |
+| | `detail: "high"` | Up to the server's `--image-tokens` |
+| | `detail: "auto"` | The server's defaults |
+| | `detail: "N"`, `max_tokens: N` | At most N tokens |
+| | `min_tokens: N` | Scale small images up to at least N tokens |
+| Request body | `image_detail`, `image_max_tokens`, `image_min_tokens` | The same, for every image that doesn't set its own |
+
+A request can lower the cap but never raise it past `--image-tokens`, because the memory plan reserves the encoder's activations for that size. A floor above the cap drops to the cap. Invalid values (`detail: "huge"`, `max_tokens: 0`) return 400.
+
+```json
+{"type": "image_url", "image_url": {"url": "data:image/png;base64,...", "detail": "low"}}
+{"type": "image", "max_tokens": 512, "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
+``` [vision.md](vision.md) describes how the encoder works.
