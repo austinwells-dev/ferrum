@@ -24,6 +24,7 @@ mod fields;
 mod highlight;
 mod home;
 mod imagetab;
+mod imagetool;
 mod layout;
 mod models;
 mod pick;
@@ -207,8 +208,8 @@ pub struct App {
     pub image: imagetab::ImageTab,
     /// Chat workers that were told to stop and may still be unloading.
     pub closing: Vec<std::thread::JoinHandle<()>>,
-    /// The kitty-protocol image currently on screen.
-    pub gfx: preview::Kitty,
+    /// The pictures the terminal shows (kitty or iTerm2 protocol).
+    pub gfx: preview::Gfx,
     /// Split sizes and widths (Settings › Layout).
     pub prefs: Prefs,
     /// Saved measurements per model, refreshed every few seconds.
@@ -423,16 +424,24 @@ impl App {
     }
 }
 
+/// The picture placements the last draw asked for.
+fn wants(app: &App) -> Vec<preview::Want> {
+    match (app.screen, app.chat.as_ref()) {
+        (Screen::Chat, Some(c)) => c.wants.take(),
+        (Screen::Image, _) => app.image.wants.take(),
+        _ => Vec::new(),
+    }
+}
+
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.quit {
         app.tick();
         terminal.draw(|f| app.draw(f))?;
-        let wants = match (app.screen, app.chat.as_ref()) {
-            (Screen::Chat, Some(c)) => c.wants.take(),
-            (Screen::Image, _) => app.image.wants.take(),
-            _ => Vec::new(),
-        };
-        app.gfx.sync(terminal.backend_mut(), &wants)?;
+        if app.gfx.sync(terminal.backend_mut(), &wants(app))? {
+            terminal.clear()?;
+            terminal.draw(|f| app.draw(f))?;
+            app.gfx.sync(terminal.backend_mut(), &wants(app))?;
+        }
         if event::poll(app.poll_interval())? {
             loop {
                 match event::read()? {

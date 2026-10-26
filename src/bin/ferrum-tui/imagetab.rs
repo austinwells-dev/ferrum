@@ -260,6 +260,15 @@ impl ImageTab {
         }
     }
 
+    /// The model and weights `generate_image` uses in chat: this tab's.
+    pub fn tool_model(&self) -> Option<crate::imagetool::ImageModel> {
+        let (_, dir) = self.models.get(self.model)?;
+        Some(crate::imagetool::ImageModel {
+            dir: dir.clone(),
+            settings: self.settings(),
+        })
+    }
+
     fn settings(&self) -> Settings {
         Settings {
             text: QUANTS[self.text_quant].1,

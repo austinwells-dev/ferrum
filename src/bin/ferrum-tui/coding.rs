@@ -246,6 +246,7 @@ pub fn needs_approval(name: &str, mode: ToolMode) -> bool {
                 | "web_search"
                 | "process_start"
                 | "check"
+                | crate::imagetool::NAME
         ),
         // `check` builds the project, which runs its code (build.rs, plugins).
         ToolMode::Edits => matches!(
