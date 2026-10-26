@@ -21,3 +21,12 @@ Sizes: transformer 7.1B parameters (14.2 GB BF16; unsloth's GGUFs are 4.2 GB at 
 `tools/imgref/dump_reference.py` runs the three stages one after another under diffusers (bfloat16, MPS) and saves everything Ferrum is compared against: prompt embeddings, the seeded noise (handed to the pipeline as `latents`, so Ferrum doesn't have to reproduce torch's RNG), the rotary tables, the shared modulation, block outputs at step 0 (prefill) and step 1 (cached), each step's prediction and latents, the VAE input and the image. The full 512² Turbo run (20 prompt tokens, 1,024 image tokens, 8 steps) takes about three minutes, 2–4 s per step.
 
 The image for `A red fox sitting in fresh snow, golden hour light.`, seed 42, is a plausible fox, which shows the harness reproduces the pipeline.
+
+## 2026-10-26 — the three stages match diffusers
+
+Each stage is checked against the harness dumps by `#[ignore]`d tests in `src/diffusion/reference_tests.rs`; the raw output is in [parity-2026-10-26.txt](../measurements/image-gen/parity-2026-10-26.txt).
+
+- **A bf16 reference is a loose ruler.** The first comparison, against the bf16 dump, showed the transformer's final latents 6.5% off (relative RMS) and the prompt embeddings 5.7% off. Running the same harness in fp16 and comparing the two dumps with each other gives 6.2% on the final latents and 4.8% on the embeddings, so those errors are the reference's own rounding, not ours. Against the fp16 dump: prompt embeddings 1.0%, transformer blocks 0.07–0.7%, final latents 0.9%, decoded image 0.065% (72.8 dB PSNR).
+- **Transformer.** 14.2 GB loads in about 2.5 s from the page cache; 8 steps at 512² took 14 s (about 1.75 s a step, text prefix included once). Not tuned yet.
+- **Text encoder.** The hybrid engine runs Qwen3-VL's language model as an attention-only model (the Flint geometry: head width 128, GQA, no recurrent layers), and the last layer's output is read from the speculative-decoding feature capture, which sits before the final norm. 34 prompt tokens take 0.2–0.6 s. Q8_0 layers halve it to 8.6 GB at 2.7% error against fp16.
+- **Decoder.** Convolutions are implicit GEMMs on TensorOps with the zero padding, 2× nearest upsampling and residuals fused. TensorOps gave wrong results for a GEMM operand with a non-unit inner stride (attention's V), so V goes through a small transpose first. 512² decodes in 0.7 s.
