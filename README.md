@@ -226,7 +226,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 - Batch size 1. `ferrum-server --parallel N` serves up to 8 requests at once in separate sessions that take turns on the GPU, so their streams interleave but total throughput is that of one request.
 - The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint and Spark. Other architectures go through the developer runner, built with `--features legacy-engine`.
 - Vision supports the Qwen3-VL projector only (no video).
-- Image generation (`ferrum-cli image`, `ferrum-server --image-model`, the TUI Image tab) supports Qwen-Image-2.1-Turbo from safetensors, and the base model's transformer from GGUF; a 1024² image takes about 77 s. See [experimental.md](docs/experimental.md#image-generation).
+- Image generation (`ferrum-cli image`, `ferrum-server --image-model`, the TUI Image tab) supports Qwen-Image-2.1-Turbo from safetensors, and the base model's transformer from GGUF; a 1024² image takes about 65 s. See [experimental.md](docs/experimental.md#image-generation).
 - No training and no language bindings.
 
 ## License

@@ -414,3 +414,58 @@ fn pipeline_generates_an_image() {
         std::fs::write(path, generated.png().unwrap()).unwrap();
     }
 }
+
+/// Per-kernel GPU time of one denoising step at `FERRUM_SIDE` (default 1024)
+/// pixels, on random inputs: the first thing to read before tuning the
+/// transformer. `FERRUM_DIT_QUANT` as for the pipeline test.
+#[test]
+#[ignore = "needs the Turbo checkpoint; prints a profile"]
+fn dit_step_profile() {
+    let d = MetalDevice::new().unwrap();
+    let model = ModelDir::open(dir("FERRUM_QWEN_IMAGE")).unwrap();
+    let quantize =
+        std::env::var("FERRUM_DIT_QUANT").map_or(None, |q| parse_quantization(&q).unwrap());
+    let ckpt = Checkpoint::open(model.path("transformer")).unwrap();
+    let dit = Dit::load(&d, &ckpt, &model.dit, quantize).unwrap();
+    let side = std::env::var("FERRUM_SIDE").map_or(1024, |s| s.parse::<usize>().unwrap()) / 16;
+    let (text, tokens) = (32, side * side);
+    let rope = Rope::new(&d, &model.dit, text, (side, side)).unwrap();
+    let scratch = Scratch::new(&d, &model.dit, text.max(tokens)).unwrap();
+    let noise = |rows: usize, cols: usize| {
+        let v: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i * 2654435761) % 1000) as f32 / 500. - 1.)
+            .collect();
+        Tensor::from_f32(&d, [rows, cols], DType::F32, &v).unwrap()
+    };
+    let prefix = dit
+        .prefill(&d, &scratch, &noise(text, model.dit.context), &rope, None)
+        .unwrap();
+    let latents = noise(tokens, 64);
+    let pred = Tensor::zeros(&d, [tokens, 64], DType::F32).unwrap();
+    let step = || {
+        dit.step(&d, &scratch, &prefix, &rope, &latents, 0.9, &pred, None)
+            .unwrap()
+    };
+    step(); // compile the kernels
+    d.set_profiling(true);
+    let started = std::time::Instant::now();
+    step();
+    let wall = started.elapsed();
+    let profile = d.take_profile();
+    d.set_profiling(false);
+    let mut rows: Vec<_> = profile.iter().collect();
+    rows.sort_by_key(|(_, e)| std::cmp::Reverse(e.gpu));
+    let total: f64 = rows.iter().map(|(_, e)| e.gpu.as_secs_f64()).sum();
+    eprintln!(
+        "step wall {:.2}s, kernel GPU time {total:.2}s",
+        wall.as_secs_f64()
+    );
+    for (name, e) in rows.iter().take(14) {
+        eprintln!(
+            "{name:>24}: {:>6.0} ms over {:>4} calls ({:.0}%)",
+            e.gpu.as_secs_f64() * 1e3,
+            e.calls,
+            e.gpu.as_secs_f64() / total * 100.
+        );
+    }
+}

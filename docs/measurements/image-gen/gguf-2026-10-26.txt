@@ -34,3 +34,8 @@ Q4_K_M: transformer predicted 4296.0 MiB, measured peak 4296.8 MiB
 
 ## DiT against the Turbo fp16 dump (dit_blocks / dit_sampling tests, run once with the Q8_0 GGUF patched in)
 final latents 35.6% off, as expected: the GGUF is the base model, not Turbo. The same test with the Turbo weights quantized to Q8_0 on load: prediction 0.47% (block 0 0.08%).
+
+## after the F16-activation GEMMs (see gemm-2026-10-26.txt); same commands
+Q8_0:   512x512, seed 42, 61.2 s (load 4.5, encode 0.2, denoise 55.7, decode 0.7)
+Q4_K_M: 512x512, seed 42, 60.5 s (load 4.8, encode 0.2, denoise 54.7, decode 0.7)
+The pictures match the ones above at 60.6 dB (Q8_0) and 61.0 dB (Q4_K_M); Q4_K_M against Q8_0 is still 32.0 dB.

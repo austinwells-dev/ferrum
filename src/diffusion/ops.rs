@@ -1,8 +1,17 @@
 //! Dispatch of the image transformer's kernels (`diffusion.metal`). Matrix
 //! products go through `HybridModel::project`, which serves every weight format.
-use crate::{MetalDevice, Result, Tensor, hybrid::engine::Params};
+use crate::{
+    Error, MetalDevice, Result, Tensor,
+    hybrid::{
+        engine::Params,
+        weights::{Format, Matrix},
+    },
+};
 
 const ELEMENTS_PER_GROUP: usize = 256;
+/// K values per GEMM step (`IMM_NK` in diffusion.metal): sets the tile's
+/// threadgroup memory.
+const GEMM_STEP_K: usize = 64;
 /// The kernels are written for 128-wide heads.
 pub(crate) const HEAD_DIM: usize = 128;
 
@@ -31,10 +40,10 @@ pub(crate) fn silu(d: &MetalDevice, x: &Tensor, y: &Tensor) -> Result<()> {
     flat(d, "i_silu", &[x], y, Params::default().u(n)?, n)
 }
 
-/// `y = silu(gate) * up`.
+/// `y = silu(gate) * up`, F32 in and F16 out.
 pub(crate) fn swiglu(d: &MetalDevice, gate: &Tensor, up: &Tensor, y: &Tensor) -> Result<()> {
     let n = y.numel();
-    flat(d, "h_swiglu", &[gate, up], y, Params::default().u(n)?, n)
+    flat(d, "i_swiglu", &[gate, up], y, Params::default().u(n)?, n)
 }
 
 pub(crate) fn gelu_tanh(d: &MetalDevice, x: &Tensor, y: &Tensor) -> Result<()> {
@@ -42,7 +51,7 @@ pub(crate) fn gelu_tanh(d: &MetalDevice, x: &Tensor, y: &Tensor) -> Result<()> {
     flat(d, "i_gelu_tanh", &[x], y, Params::default().u(n)?, n)
 }
 
-/// `y = layernorm(x) * (offset + scale)` for each of `rows` rows.
+/// `y = layernorm(x) * (offset + scale)` for each of `rows` rows, as F16.
 pub(crate) fn layernorm_scale(
     d: &MetalDevice,
     x: &Tensor,
@@ -142,7 +151,8 @@ pub(crate) struct KeyValues<'a> {
 
 /// Flash attention of `tokens` query rows over `keys` keys, the first
 /// `kv.prefix` from the cache and the rest from the current rows. `causal`
-/// masks keys after the row (the text prefill); image rows see every key.
+/// masks keys after the row (the text prefill); image rows see every key. The
+/// output is F16.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn attention(
     d: &MetalDevice,
@@ -174,5 +184,51 @@ pub(crate) fn attention(
         [tokens.div_ceil(64), heads, 1],
         [128, 1, 1],
         64 * 64 * 4 + 64 * 64 * 2 + 3 * 64 * 4,
+    )
+}
+
+/// `y = x · wᵀ` for `m` rows of F16 activations, with F32 accumulation and
+/// output: the transformer's matrix products, which are all wide enough for
+/// the TensorOps tiles. The hybrid engine's `project` reads F32 activations.
+pub(crate) fn project(d: &MetalDevice, w: &Matrix, x: &Tensor, m: usize, y: &Tensor) -> Result<()> {
+    let name = match w.format {
+        Format::Bf16 => "i_mm_bf16",
+        Format::Q8_0 => "i_mm_q8_0",
+        Format::Q4K => "i_mm_q4_k",
+        Format::Q5K => "i_mm_q5_k",
+        Format::Q6K => "i_mm_q6_k",
+        Format::Q4_0 => "i_mm_q4_0",
+        f => {
+            return Err(Error::Parameter(format!(
+                "the image transformer has no GEMM for {} weights",
+                f.name()
+            )));
+        }
+    };
+    if x.numel() != m * w.cols || y.numel() != m * w.rows {
+        return Err(Error::Shape(format!(
+            "projection [{m}, {}] x [{}, {}]ᵀ into {} values",
+            w.cols,
+            w.rows,
+            w.cols,
+            y.numel()
+        )));
+    }
+    let args = Params::default()
+        .u(w.cols)?
+        .u(w.rows)?
+        .u(m)?
+        .u(w.row_bytes)?
+        .u(w.cols)?
+        .u(w.rows)?
+        .0;
+    d.dispatch_hybrid(
+        name,
+        &[w.binding(), x.binding()],
+        &[y.binding()],
+        &args,
+        [m.div_ceil(128), w.rows.div_ceil(64), 1],
+        [128, 1, 1],
+        64 * GEMM_STEP_K * 2,
     )
 }

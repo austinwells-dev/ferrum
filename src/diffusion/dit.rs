@@ -181,25 +181,25 @@ impl Scratch {
         Ok(Self {
             rows,
             x: wide(DType::F32, h)?,
-            h: wide(DType::F32, h)?,
+            h: wide(DType::F16, h)?,
             q: wide(DType::F32, h)?,
             k: wide(DType::F32, h)?,
             v: wide(DType::F32, h)?,
-            att: wide(DType::F32, h)?,
+            att: wide(DType::F16, h)?,
             o: wide(DType::F32, h)?,
             qh: wide(DType::F16, h)?,
             kh: wide(DType::F16, h)?,
             vh: wide(DType::F16, h)?,
             gate: wide(DType::F32, f)?,
             up: wide(DType::F32, f)?,
-            act: wide(DType::F32, f)?,
+            act: wide(DType::F16, f)?,
         })
     }
 
     /// Device bytes for `rows` tokens (what `new` allocates).
     pub fn bytes(cfg: &DitConfig, rows: usize) -> usize {
         let (h, f) = (cfg.hidden(), cfg.ffn());
-        rows * (7 * h * 4 + 3 * h * 2 + 3 * f * 4)
+        rows * (5 * h * 4 + 5 * h * 2 + 2 * f * 4 + f * 2)
     }
 }
 
@@ -332,7 +332,7 @@ impl Dit {
         };
         // The text projection: norm, linear, GELU, linear.
         let at = |t: &Tensor| t.view(0, [rows, h]);
-        let (x, hid, mid, act) = (at(&s.x)?, at(&s.h)?, at(&s.q)?, at(&s.k)?);
+        let (x, hid, mid, act) = (at(&s.x)?, at(&s.v)?, at(&s.q)?, at(&s.k)?);
         d.dispatch_hybrid(
             "h_rmsnorm",
             &[embeds.binding(), self.txt_norm.binding()],
@@ -382,7 +382,7 @@ impl Dit {
         self.layers(d, s, rows, &cond, &rope.image, Pass::Use(prefix), probe)?;
         let hid = s.h.view(0, [rows, h])?;
         ops::layernorm_scale(d, &x, &cond.norm_scale, &hid, rows, self.cfg.eps, 1.)?;
-        HybridModel::project(d, &self.proj_out, &hid, rows, pred)
+        ops::project(d, &self.proj_out, &hid, rows, pred)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -412,9 +412,9 @@ impl Dit {
         let eps = self.cfg.eps;
         for (l, b) in self.blocks.iter().enumerate() {
             ops::layernorm_scale(d, &x, &scale1, &hid, rows, eps, 1.)?;
-            HybridModel::project(d, &b.q, &hid, rows, &q)?;
-            HybridModel::project(d, &b.k, &hid, rows, &k)?;
-            HybridModel::project(d, &b.v, &hid, rows, &v)?;
+            ops::project(d, &b.q, &hid, rows, &q)?;
+            ops::project(d, &b.k, &hid, rows, &k)?;
+            ops::project(d, &b.v, &hid, rows, &v)?;
             let (kd, vd, kc, vc, prefix, keys, causal) = match &pass {
                 Pass::Fill(p) => (p.k[l].clone(), p.v[l].clone(), None, None, 0, rows, true),
                 Pass::Use(p) => (
@@ -445,14 +445,14 @@ impl Dit {
                 v: &vd,
             };
             ops::attention(d, &qh, &values, &att, rows, heads, keys, causal)?;
-            HybridModel::project(d, &b.o, &att, rows, &o)?;
+            ops::project(d, &b.o, &att, rows, &o)?;
             ops::gate_add(d, &o, &gate1, &x)?;
 
             ops::layernorm_scale(d, &x, &scale2, &hid, rows, eps, 1.)?;
-            HybridModel::project(d, &b.gate, &hid, rows, &gate)?;
-            HybridModel::project(d, &b.up, &hid, rows, &up)?;
+            ops::project(d, &b.gate, &hid, rows, &gate)?;
+            ops::project(d, &b.up, &hid, rows, &up)?;
             ops::swiglu(d, &gate, &up, &act)?;
-            HybridModel::project(d, &b.down, &act, rows, &o)?;
+            ops::project(d, &b.down, &act, rows, &o)?;
             ops::gate_add(d, &o, &gate2, &x)?;
             if let Some(probe) = probe.as_mut() {
                 probe(l, &x);

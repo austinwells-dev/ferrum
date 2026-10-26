@@ -134,6 +134,6 @@ Against diffusers in fp16 at 512², with diffusers' own noise ([parity-2026-10-2
 - Seeds do not reproduce diffusers' images (ChaCha8 and Box-Muller, not torch's generator).
 - Transformer weights load from BF16 safetensors (quantized to Q8_0 or Q4_0 on load) or from an unsloth-style GGUF (`--transformer-file`; Q4_K, Q5_K, Q6_K, Q8_0, BF16, F32 tensors). F16 GGUFs and MLX-quantized checkpoints do not load, and the text encoder is safetensors only.
 - GGUF runs are validated by tensor mapping against Turbo's weights, memory estimates and pictures (Q4_K_M within 32.0 dB of Q8_0 at one seed), not against a diffusers dump of the base model: the 40-step base schedule is unchecked ([gguf-2026-10-26.txt](measurements/image-gen/gguf-2026-10-26.txt)).
-- Denoising is not tuned: about 8.6 s a step at 1024², roughly 6.6 TFLOPS.
+- Denoising takes about 6.9 s a step at 1024². The projections run at 14–15 TFLOPS, near the best the TensorOps tiles reached in a sweep, and attention at about 5 TFLOPS is the part left to tune ([gemm-2026-10-26.txt](measurements/image-gen/gemm-2026-10-26.txt)).
 - The decoder has no tiling, so very large images are bounded by memory.
 

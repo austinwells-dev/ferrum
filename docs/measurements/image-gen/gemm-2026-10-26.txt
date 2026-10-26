@@ -1,0 +1,27 @@
+# Image transformer GEMM and step profile, Apple M5 32 GB, Qwen-Image-2.1-Turbo 1024x1024 (4,096 image tokens, 32 text rows), BF16 weights unless noted
+# Commands: cargo test --release --lib diffusion::tests::half_gemm_speed -- --ignored --nocapture
+#           cargo test --release --lib diffusion::reference_tests::dit_step_profile -- --ignored --nocapture   (FERRUM_QWEN_IMAGE set)
+
+## GEMM, 4096 tokens x [12288, 4096] weights, GPU time of 4 runs (HybridModel::project = F32 activations; ops::project = F16 activations)
+bf16 f32 x: 10.4 TFLOPS   bf16 f16 x: 14.2 TFLOPS
+q8_0 f32 x: 12.6 TFLOPS   q8_0 f16 x: 14.6 TFLOPS
+q4_0 f32 x: 13.2 TFLOPS   q4_0 f16 x: 15.1 TFLOPS
+
+## Ceiling: a throwaway kernel reading both operands straight from device memory as F16 (no dequantization), same shape, tile = activation rows x weight rows x K step, simdgroups
+128x64x32, 4 sg: 11.3   128x64x64, 4 sg: 15.6   128x128x32, 4 sg: 10.2   128x128x32, 8 sg: 11.4
+128x128x64, 8 sg: 11.4  256x64x32, 8 sg: 4.8    64x64x32, 4 sg: 10.7     64x128x32, 4 sg: 5.0   (TFLOPS)
+The kernel is not kept in the tree. The shipped GEMM (128x64x64, 4 sg, weights dequantized into threadgroup memory) reaches 14.2-15.1.
+
+## One denoising step, kernel GPU time (set_profiling), before: F32 activations, staged attention
+step wall 8.19 s: h_mm_bf16 5687 ms (70%), i_attn 2015 ms (25%), h_swiglu 141, i_gate_add 93, i_qkv_prep 71, i_ln_mod 67
+
+## after F16 activations
+step wall 6.89 s: i_mm_bf16 4432 ms (65%), i_attn 2013 ms (30%), i_swiglu 118, i_gate_add 93, i_qkv_prep 72, i_ln_mod 51
+
+## after attention reads K/V from device memory
+step wall 6.59 s: i_mm_bf16 4428 ms (68%), i_attn 1716 ms (26%), i_swiglu 119, i_gate_add 94, i_qkv_prep 72, i_ln_mod 51
+Attention is 4 x 4128^2 x 128 x 32 heads x 32 layers = 8.9 TFLOP in 1.72 s, about 5.2 TFLOPS.
+
+## Parity after the change (fp16 dump, 512^2, same tests as parity-2026-10-26.txt)
+image block 31 step 0: 0.15%   prediction step 0: 0.12%   final latents: 0.87%   decoded image: 0.065%, 72.8 dB
+(before: 0.07-0.7% blocks, final latents 0.9%, decoded image 0.065%)

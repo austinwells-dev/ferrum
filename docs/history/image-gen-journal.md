@@ -43,3 +43,10 @@ Each stage is checked against the harness dumps by `#[ignore]`d tests in `src/di
 - The GGUF is the base model, not Turbo. Its tensors differ from Turbo's by about 0.6% relative RMS (Q8_0 rounding alone is about 0.1%), so the Turbo diffusers dump cannot be the reference; the mapping is checked by pairing tensors with Turbo's (the right gate/up order shows 0.6%, the wrong one 140%), and the base runs through the 40-step dynamic-shift schedule without guidance and gives clean pictures. Record: [gguf-2026-10-26.txt](../measurements/image-gen/gguf-2026-10-26.txt).
 - 512² at 40 steps: Q8_0 69 s, Q4_K_M 72 s (about 1.6 s a step, so the Q4_K kernels are not faster than Q8_0 here: denoising is compute-bound). Transformer memory 7.6 GB and 4.3 GB.
 
+## 2026-10-26 — F16 activations and device-direct attention
+
+- A per-kernel profile of one 1024² step ([gemm-2026-10-26.txt](../measurements/image-gen/gemm-2026-10-26.txt)) put 70% of the 8.2 s in the projections (10 TFLOPS) and 25% in attention (4.4 TFLOPS).
+- The hybrid engine's GEMM reads F32 activations. The transformer now keeps what a matrix product reads (layernorm, attention and SwiGLU outputs) in F16 and uses `i_mm_*`, the same tile with half-by-half products and a 64-wide K step: BF16 10.4 → 14.2 TFLOPS, Q8_0 12.6 → 14.6, Q4_0 13.2 → 15.1. A sweep of tile shapes with both operands read directly peaked at 15.6, so the projections are near what the matrix units give here.
+- Attention now reads the cached text K/V and the current rows' K/V straight from device memory, one segment at a time, instead of staging 64-key blocks through threadgroup memory: 2.0 → 1.7 s. It is still at about 5 TFLOPS; the scalar softmax and the score round trip through threadgroup memory are the likely cost, and the 32 KB threadgroup limit rules out wider key blocks with F32 scores.
+- A step takes 8.2 → 6.6 s; end to end ([speed-f16-gemm-2026-10-26.txt](../measurements/image-gen/speed-f16-gemm-2026-10-26.txt)) 512² is 23.0 → 19.4 s and 1024² 77.4 → 64.7 s. Parity with the fp16 dump is unchanged (final latents 0.87%, image 72.8 dB).
+

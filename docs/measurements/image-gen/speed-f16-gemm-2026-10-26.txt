@@ -1,0 +1,18 @@
+# After F16-activation GEMMs and device-direct attention. ferrum-cli image on Apple M5, 32 GB; Qwen-Image-2.1-Turbo; seed 7; screen unlocked, caffeinate -dims; compare speed-2026-10-26.txt (same commands, before)
+Mon Oct 26 14:08:43 GMT 2026
+
+## --size 512x512 --quantize bf16 --text-quantize bf16
+$ caffeinate -dims ./target/release/ferrum-cli image -m <snapshot> -p 'a red fox in snow' --size 512x512 --seed 7 --quantize bf16 --text-quantize bf16
+/private/tmp/claude-501/-Users-austinwells-orca-workspaces-ferrum-experimental/705d9052-16bf-4f1e-adac-42e93d7ca0e0/scratchpad/rec2.png: 512x512, seed 7, 19.4 s (load 5.4, encode 0.6, denoise 12.6, decode 0.7)
+
+## --size 512x512 --quantize q8_0 --text-quantize bf16
+$ caffeinate -dims ./target/release/ferrum-cli image -m <snapshot> -p 'a red fox in snow' --size 512x512 --seed 7 --quantize q8_0 --text-quantize bf16
+/private/tmp/claude-501/-Users-austinwells-orca-workspaces-ferrum-experimental/705d9052-16bf-4f1e-adac-42e93d7ca0e0/scratchpad/rec2.png: 512x512, seed 7, 19.1 s (load 6.7, encode 0.5, denoise 11.2, decode 0.7)
+
+## --size 1024x1024 --quantize bf16 --text-quantize q8_0
+$ caffeinate -dims ./target/release/ferrum-cli image -m <snapshot> -p 'a red fox in snow' --size 1024x1024 --seed 7 --quantize bf16 --text-quantize q8_0
+/private/tmp/claude-501/-Users-austinwells-orca-workspaces-ferrum-experimental/705d9052-16bf-4f1e-adac-42e93d7ca0e0/scratchpad/rec2.png: 1024x1024, seed 7, 64.7 s (load 6.7, encode 0.2, denoise 54.9, decode 2.8)
+
+## --size 1024x1024 --quantize q8_0 --text-quantize q8_0
+$ caffeinate -dims ./target/release/ferrum-cli image -m <snapshot> -p 'a red fox in snow' --size 1024x1024 --seed 7 --quantize q8_0 --text-quantize q8_0
+/private/tmp/claude-501/-Users-austinwells-orca-workspaces-ferrum-experimental/705d9052-16bf-4f1e-adac-42e93d7ca0e0/scratchpad/rec2.png: 1024x1024, seed 7, 62.2 s (load 7.3, encode 0.2, denoise 52.0, decode 2.8)

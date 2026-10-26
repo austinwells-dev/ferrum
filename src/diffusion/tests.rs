@@ -64,6 +64,15 @@ fn elementwise_kernels_match_the_cpu() {
         .collect();
     close(&acc.to_f32(), &want, 1e-6, "gate_add");
 
+    let (gt, ut) = (
+        tensor(&d, &[n], DType::F32, &x),
+        tensor(&d, &[n], DType::F32, &v),
+    );
+    let act = Tensor::zeros(&d, [n], DType::F16).unwrap();
+    ops::swiglu(&d, &gt, &ut, &act).unwrap();
+    let want: Vec<f32> = (0..n).map(|i| x[i] / (1. + (-x[i]).exp()) * v[i]).collect();
+    close(&act.to_f32(), &want, 2e-3, "swiglu");
+
     let acc = tensor(&d, &[n], DType::F32, &x);
     ops::euler(&d, &vt, &acc, -0.125).unwrap();
     let want: Vec<f32> = (0..n).map(|i| x[i] - 0.125 * v[i]).collect();
@@ -76,7 +85,7 @@ fn layernorm_scale_matches_the_cpu() {
     let (rows, n) = (7, 4096);
     let x: Vec<f32> = random(rows * n, 4).iter().map(|v| v * 3. + 0.5).collect();
     let scale = random(n, 5);
-    let y = Tensor::zeros(&d, [rows, n], DType::F32).unwrap();
+    let y = Tensor::zeros(&d, [rows, n], DType::F16).unwrap();
     let xt = tensor(&d, &[rows, n], DType::F32, &x);
     let st = tensor(&d, &[n], DType::F32, &scale);
     ops::layernorm_scale(&d, &xt, &st, &y, rows, 1e-6, 1.).unwrap();
@@ -95,7 +104,7 @@ fn layernorm_scale_matches_the_cpu() {
                 .map(|(&v, &s)| ((f64::from(v) - mean) * inv * (1. + f64::from(s))) as f32),
         );
     }
-    close(&y.to_f32(), &want, 2e-5, "layernorm");
+    close(&y.to_f32(), &want, 2e-3, "layernorm");
 }
 
 #[test]
@@ -243,7 +252,7 @@ fn attention_matches_the_cpu() {
         let (kp, vp) = (kv(0..prefix, &k), kv(0..prefix, &v));
         let (kc, vc) = (kv(prefix..keys, &k), kv(prefix..keys, &v));
         let qt = tensor(&d, &[tokens, width], DType::F16, &q);
-        let out = Tensor::zeros(&d, [tokens, width], DType::F32).unwrap();
+        let out = Tensor::zeros(&d, [tokens, width], DType::F16).unwrap();
         let values = KeyValues {
             prefix_k: &kp,
             prefix_v: &vp,
@@ -256,7 +265,7 @@ fn attention_matches_the_cpu() {
         close(
             &out.to_f32(),
             &want,
-            3e-3,
+            4e-3,
             &format!("attention tokens {tokens} prefix {prefix} causal {causal}"),
         );
     }
@@ -523,5 +532,95 @@ mod decoder_kernels {
             }
         }
         close(&out.to_f32(), &want_out, 4e-3, "weights x V");
+    }
+}
+
+/// The F16-activation GEMM against the hybrid engine's F32 one, on the weight
+/// encodings the transformer meets, with a row count that is not a multiple of
+/// the tile. Set `FERRUM_GEMM_BENCH` to time both at transformer size.
+#[test]
+fn half_gemm_matches_the_f32_gemm() {
+    use crate::hybrid::{
+        engine::HybridModel,
+        weights::{Format, Matrix},
+    };
+    let d = MetalDevice::new().unwrap();
+    let (m, k, n) = (200usize, 512usize, 192usize);
+    let w: Vec<u8> = random(n * k, 21)
+        .iter()
+        .flat_map(|&v| half::bf16::from_f32(v).to_le_bytes())
+        .collect();
+    let x = random(m * k, 22)
+        .iter()
+        .map(|&v| f16(v))
+        .collect::<Vec<_>>();
+    let x32 = tensor(&d, &[m, k], DType::F32, &x);
+    let x16 = tensor(&d, &[m, k], DType::F16, &x);
+    for format in [Format::Q8_0, Format::Q4_0] {
+        let w = Matrix::from_bf16(&d, n, k, &w, format).unwrap();
+        let want = Tensor::zeros(&d, [m, n], DType::F32).unwrap();
+        HybridModel::project(&d, &w, &x32, m, &want).unwrap();
+        let got = Tensor::zeros(&d, [m, n], DType::F32).unwrap();
+        super::ops::project(&d, &w, &x16, m, &got).unwrap();
+        close(&got.to_f32(), &want.to_f32(), 2e-3, format.name());
+    }
+    let w = Matrix::bf16_with(&d, n, k, |dst| {
+        dst.copy_from_slice(&w);
+        Ok(())
+    })
+    .unwrap();
+    let want = Tensor::zeros(&d, [m, n], DType::F32).unwrap();
+    HybridModel::project(&d, &w, &x32, m, &want).unwrap();
+    let got = Tensor::zeros(&d, [m, n], DType::F32).unwrap();
+    super::ops::project(&d, &w, &x16, m, &got).unwrap();
+    close(&got.to_f32(), &want.to_f32(), 2e-3, "bf16");
+}
+
+/// GPU time of the two GEMMs at the transformer's size (4,096 tokens through a
+/// 4,096 x 12,288 matrix), per weight encoding.
+#[test]
+#[ignore = "timing"]
+fn half_gemm_speed() {
+    use crate::hybrid::{
+        engine::HybridModel,
+        weights::{Format, Matrix},
+    };
+    let d = MetalDevice::new().unwrap();
+    let (m, k, n) = (4096usize, 4096usize, 12288usize);
+    let w: Vec<u8> = random(n * k, 21)
+        .iter()
+        .flat_map(|&v| half::bf16::from_f32(v / 64.).to_le_bytes())
+        .collect();
+    let x = random(m * k, 22);
+    let x32 = tensor(&d, &[m, k], DType::F32, &x);
+    let x16 = tensor(&d, &[m, k], DType::F16, &x);
+    let y = Tensor::zeros(&d, [m, n], DType::F32).unwrap();
+    let flops = 2. * (m * k * n) as f64;
+    let time = |what: &str, run: &dyn Fn()| {
+        run();
+        d.set_profiling(true);
+        for _ in 0..4 {
+            run();
+        }
+        let gpu: f64 = d.take_profile().values().map(|e| e.gpu.as_secs_f64()).sum();
+        d.set_profiling(false);
+        eprintln!("{what:>12}: {:.1} TFLOPS", flops * 4. / gpu / 1e12);
+    };
+    for format in [None, Some(Format::Q8_0), Some(Format::Q4_0)] {
+        let w = match format {
+            Some(f) => Matrix::from_bf16(&d, n, k, &w, f).unwrap(),
+            None => Matrix::bf16_with(&d, n, k, |dst| {
+                dst.copy_from_slice(&w);
+                Ok(())
+            })
+            .unwrap(),
+        };
+        let name = format.map_or("bf16", Format::name);
+        time(&format!("{name} f32 x"), &|| {
+            HybridModel::project(&d, &w, &x32, m, &y).unwrap()
+        });
+        time(&format!("{name} f16 x"), &|| {
+            super::ops::project(&d, &w, &x16, m, &y).unwrap()
+        });
     }
 }
