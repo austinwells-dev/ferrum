@@ -24,6 +24,7 @@ ferrum-server --model model.gguf --port 8080      # http://127.0.0.1:8080/v1
 |---|---|
 | OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/models` |
 | Anthropic | `/v1/messages`, `/v1/messages/count_tokens` |
+| Images | `/v1/images/generations` (needs `--image-model`; see [Image generation](#image-generation)) |
 | Utility | `/health`, `/props`, `/slots`, `/metrics` (Prometheus), `/tokenize`, `/detokenize`, `/apply-template` |
 
 The model runs on its own thread behind a FIFO queue, and each connection gets a thread, so `/health` and `/metrics` respond while a request is generating. By default requests are processed one at a time.
@@ -183,3 +184,26 @@ A request can lower the cap but never raise it past `--image-tokens`, because th
 {"type": "image_url", "image_url": {"url": "data:image/png;base64,...", "detail": "low"}}
 {"type": "image", "max_tokens": 512, "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
 ``` [vision.md](vision.md) describes how the encoder works.
+
+## Image generation
+
+Ferrum draws images with Qwen-Image-2.1 and its Turbo distillation (a Hugging Face directory with `model_index.json`, `transformer/`, `text_encoder/` and `vae/`). The text encoder, the transformer and the decoder run one after another and only one is in memory at a time, so it fits a 32 GB Mac. See [architecture](architecture.md#image-generation) for the design and [experimental.md](experimental.md#image-generation) for what is validated.
+
+```sh
+ferrum-cli image -m DIR -p "a red fox in snow" --size 1024x1024 --seed 7 -o fox.png
+ferrum-server --image-model DIR                    # image-only server
+ferrum-server --model model.gguf --image-model DIR # chat and images
+curl localhost:8080/v1/images/generations -d '{"prompt":"a lighthouse at dusk","size":"512x512","n":1}'
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--size WxH` (CLI), `size` (API) | `1024x1024` | Multiples of 32, 256 to 2048 |
+| `--seed N` | random, printed | Noise seed. Seeds do not reproduce diffusers' images (different random generator) |
+| `--steps N` | the checkpoint's schedule | Turbo ships 8 explicit sigmas |
+| `--quantize bf16\|q8_0\|q4_0` | `bf16` | Transformer matrices, quantized as they load |
+| `--text-quantize bf16\|q8_0\|q4_0` | `bf16` | Text encoder matrices, likewise |
+| `--image-model DIR`, `--image-alias NAME` | none | Server: the checkpoint and the name `/v1/models` reports |
+| `--image-quantize`, `--image-text-quantize` | `bf16` | Server: as `--quantize` and `--text-quantize` |
+
+The response follows OpenAI's shape with `b64_json` PNGs only; `n` is at most 4. A request that does not fit in memory gets 503, and a client that hangs up cancels the generation at the next step. With no `--model`, the chat routes return 404. Timings are in [speed-2026-10-26.txt](measurements/image-gen/speed-2026-10-26.txt): 512² takes about 21–23 s (about 15 s of it denoising) and 1024² about 77 s with a Q8_0 text encoder.

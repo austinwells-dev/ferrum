@@ -32,7 +32,7 @@ Every screen fills the window with panes, and one pane in each split takes whate
 
 They are saved in `~/.config/ferrum/tui.json` under `layout`. The key bar lists the keys for whatever is selected, and messages appear at its right end. Settings, the setup editor and Bench pin a short explanation of the selected row at the bottom of their pane.
 
-In a chat, typing goes to the message box. Esc on an empty box hands the keys to the conversation: ↑↓ scroll, the number keys switch tabs, and typing goes back to the box. ctrl-d there unloads the model.
+In a chat, typing goes to the message box. Esc on an empty box hands the keys to the conversation: ↑↓ scroll, the number keys (1–8) switch tabs, and typing goes back to the box. ctrl-d there unloads the model.
 
 Each setup's **Model** group has *Context* and *KV cache*. *KV cache* `q8` stores the attention cache in 8 bits, which nearly halves its memory (so `auto` context grows) and speeds up long conversations; `f16` (the default) is exact. It applies to Chat, Agents, Serve and the Benchmark tab, and is saved with favorites. See [K/V cache format](server.md#kv-cache-format).
 
@@ -125,6 +125,10 @@ Local models have small contexts, so the agent works to keep its context useful:
 | `/review` | Look for over-engineering in your uncommitted diff |
 | `/audit` | Look for code in the repo that doesn't need to exist |
 | `/debt` | List the shortcuts marked `ponytail:` |
+
+## Image
+
+The Image tab (key `7`, or `i` on Home) draws with a Qwen-Image checkpoint found in the usual model folders. `p` edits the prompt, ↑↓ pick a row (model, size, seed, transformer and encoder quantization), ←→ change it, `r` draws a new seed and `g` or enter generates. The picture appears in the pane (on terminals that show images) and is saved as a PNG in `$FERRUM_IMAGES`, default `~/Pictures/Ferrum`. `o` opens it, and esc stops a running generation. Chat models are unloaded first, since the three stages need most of the memory. The settings are kept in `~/.config/ferrum/image.json`. See [Image generation](server.md#image-generation).
 
 ## Sessions
 

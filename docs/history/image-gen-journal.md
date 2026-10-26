@@ -30,3 +30,10 @@ Each stage is checked against the harness dumps by `#[ignore]`d tests in `src/di
 - **Transformer.** 14.2 GB loads in about 2.5 s from the page cache; 8 steps at 512² took 14 s (about 1.75 s a step, text prefix included once). Not tuned yet.
 - **Text encoder.** The hybrid engine runs Qwen3-VL's language model as an attention-only model (the Flint geometry: head width 128, GQA, no recurrent layers), and the last layer's output is read from the speculative-decoding feature capture, which sits before the final norm. 34 prompt tokens take 0.2–0.6 s. Q8_0 layers halve it to 8.6 GB at 2.7% error against fp16.
 - **Decoder.** Convolutions are implicit GEMMs on TensorOps with the zero padding, 2× nearest upsampling and residuals fused. TensorOps gave wrong results for a GEMM operand with a non-unit inner stride (attention's V), so V goes through a small transpose first. 512² decodes in 0.7 s.
+
+## 2026-10-26 — pipeline, apps, speed
+
+- The staged pipeline, `ferrum-cli image`, the server's `/v1/images/generations` and the TUI Image tab are in. Speed and memory records: [speed-2026-10-26.txt](../measurements/image-gen/speed-2026-10-26.txt) (512² 20.6–23.0 s, 1024² with a Q8_0 encoder 77.4 s; about 8.6 s a step at 4,096 tokens).
+- Every hybrid kernel's first dispatch compiles the whole concatenated source, so the image kernels would have slowed LLM startup. They now join the source only when an `i_*` or `vae_*` kernel is requested; the decoder kernels were renamed from `v_*` because the vision kernels already use that prefix.
+- Two TUI tests that scan the real home directory block in `opendir` on this machine; they pass with an empty `HOME`.
+

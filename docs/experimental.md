@@ -120,3 +120,19 @@ Against Kapitsa through each server (same prompts): 82–91% of its greedy speed
 - MoE targets keep chains: every tree row routes to its own experts. Kapitsa's dynamic MoE trees were not ported.
 - Prompt lookup's trees stay a test vehicle and are not offered by the TUI.
 
+# Image generation
+
+Qwen-Image-2.1-Turbo (8 steps, no guidance) on a 32 GB M5, through `ferrum-cli image`, `ferrum-server --image-model` and the TUI Image tab. Usage: [server.md](server.md#image-generation).
+
+## Validation
+
+Against diffusers in fp16 at 512², with diffusers' own noise ([parity-2026-10-26.txt](measurements/image-gen/parity-2026-10-26.txt)): prompt embeddings 1.0% relative RMS (Q8_0 encoder 2.7%), transformer blocks 0.07–0.7%, final latents 0.9%, decoded image 0.065% (72.8 dB PSNR). A bf16 reference differs from the fp16 one by 4.8% and 6.2% on embeddings and latents, so it is the looser ruler. The encoder, transformer and decoder memory estimates match the measured peaks within 4 MiB ([speed-2026-10-26.txt](measurements/image-gen/speed-2026-10-26.txt)).
+
+## Known gaps
+
+- Only the Turbo schedule is validated. The base model's 40 steps with guidance and dynamic shift are implemented but not checked.
+- Seeds do not reproduce diffusers' images (ChaCha8 and Box-Muller, not torch's generator).
+- Weights load from safetensors only (BF16, quantized to Q8_0 or Q4_0 on load). GGUF and MLX-quantized image checkpoints are not supported yet.
+- Denoising is not tuned: about 8.6 s a step at 1024², roughly 6.6 TFLOPS.
+- The decoder has no tiling, so very large images are bounded by memory.
+
