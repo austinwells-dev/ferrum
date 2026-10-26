@@ -1,0 +1,231 @@
+//! Random access to the tensors of a diffusers safetensors directory: one
+//! file or several shards, each self-describing, so the index file isn't read.
+use crate::{
+    DType, Error, MetalDevice, Result, Tensor,
+    hybrid::weights::{Format, Matrix},
+};
+use serde::Deserialize;
+use std::{collections::BTreeMap, fs::File, os::unix::fs::FileExt, path::Path};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dtype {
+    F32,
+    F16,
+    Bf16,
+    /// A raw payload (the packed codes of MLX quantized weights).
+    U32,
+}
+
+impl Dtype {
+    fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "F32" => Self::F32,
+            "F16" => Self::F16,
+            "BF16" => Self::Bf16,
+            "U32" => Self::U32,
+            _ => return None,
+        })
+    }
+    pub fn bytes(self) -> usize {
+        match self {
+            Self::F32 | Self::U32 => 4,
+            Self::F16 | Self::Bf16 => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Entry {
+    pub dtype: Dtype,
+    pub shape: Vec<usize>,
+    shard: usize,
+    start: u64,
+    len: usize,
+}
+
+impl Entry {
+    pub fn numel(&self) -> usize {
+        self.shape.iter().product()
+    }
+}
+
+#[derive(Deserialize)]
+struct RawEntry {
+    dtype: String,
+    shape: Vec<usize>,
+    data_offsets: [u64; 2],
+}
+
+pub struct Checkpoint {
+    shards: Vec<File>,
+    tensors: BTreeMap<String, Entry>,
+}
+
+impl Checkpoint {
+    /// Every `*.safetensors` file in `dir`.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Self> {
+        let dir = dir.as_ref();
+        let fail = |what: String| Error::Safetensors(format!("{}: {what}", dir.display()));
+        let mut paths: Vec<_> = std::fs::read_dir(dir)
+            .map_err(|e| fail(e.to_string()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
+            .collect();
+        paths.sort();
+        if paths.is_empty() {
+            return Err(fail("no .safetensors files".into()));
+        }
+        let mut shards = Vec::new();
+        let mut tensors = BTreeMap::new();
+        for path in paths {
+            let file = File::open(&path).map_err(|e| fail(format!("{}: {e}", path.display())))?;
+            let size = file.metadata().map_err(|e| fail(e.to_string()))?.len();
+            let mut len = [0u8; 8];
+            file.read_exact_at(&mut len, 0)
+                .map_err(|e| fail(e.to_string()))?;
+            let header_len = u64::from_le_bytes(len);
+            if header_len > 100_000_000 || 8 + header_len > size {
+                return Err(fail(format!("{}: bad header length", path.display())));
+            }
+            let mut header = vec![0u8; header_len as usize];
+            file.read_exact_at(&mut header, 8)
+                .map_err(|e| fail(e.to_string()))?;
+            let raw: BTreeMap<String, serde_json::Value> = serde_json::from_slice(&header)
+                .map_err(|e| fail(format!("{}: {e}", path.display())))?;
+            let base = 8 + header_len;
+            for (name, value) in raw {
+                if name == "__metadata__" {
+                    continue;
+                }
+                let e: RawEntry = serde_json::from_value(value)
+                    .map_err(|e| fail(format!("tensor {name}: {e}")))?;
+                let dtype = Dtype::parse(&e.dtype).ok_or_else(|| Error::Weight {
+                    name: name.clone(),
+                    message: format!("unsupported dtype {}", e.dtype),
+                })?;
+                let [from, to] = e.data_offsets;
+                let entry = Entry {
+                    dtype,
+                    shard: shards.len(),
+                    start: base + from,
+                    len: (to - from) as usize,
+                    shape: e.shape,
+                };
+                if entry.len != entry.numel() * dtype.bytes() || base + to > size {
+                    return Err(Error::Weight {
+                        name,
+                        message: "byte range differs from shape and dtype".into(),
+                    });
+                }
+                if tensors.insert(name.clone(), entry).is_some() {
+                    return Err(Error::Weight {
+                        name,
+                        message: "tensor occurs in more than one shard".into(),
+                    });
+                }
+            }
+            shards.push(file);
+        }
+        Ok(Self { shards, tensors })
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.tensors.keys().map(String::as_str)
+    }
+
+    pub fn entry(&self, name: &str) -> Result<&Entry> {
+        self.tensors.get(name).ok_or_else(|| Error::Weight {
+            name: name.into(),
+            message: "missing tensor".into(),
+        })
+    }
+
+    /// `name`'s payload into `dst`, which must be exactly its length.
+    pub fn read_into(&self, name: &str, dst: &mut [u8]) -> Result<()> {
+        let e = self.entry(name)?;
+        if dst.len() != e.len {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: format!("read of {} bytes into {}", e.len, dst.len()),
+            });
+        }
+        self.shards[e.shard]
+            .read_exact_at(dst, e.start)
+            .map_err(|e| Error::Safetensors(format!("{name}: {e}")))
+    }
+
+    /// `name` as F32 values, whatever its stored float type.
+    pub fn read_f32(&self, name: &str) -> Result<Vec<f32>> {
+        let e = self.entry(name)?;
+        let mut bytes = vec![0u8; e.len];
+        self.read_into(name, &mut bytes)?;
+        Ok(match e.dtype {
+            Dtype::F32 => bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+            Dtype::F16 => bytes
+                .chunks_exact(2)
+                .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+                .collect(),
+            Dtype::Bf16 => bytes
+                .chunks_exact(2)
+                .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                .collect(),
+            Dtype::U32 => {
+                return Err(Error::Weight {
+                    name: name.into(),
+                    message: "packed integer tensor is not a float".into(),
+                });
+            }
+        })
+    }
+}
+
+impl Checkpoint {
+    /// A `[rows, cols]` BF16 matrix on the device, kept as stored or (for
+    /// `quantize` = Q8_0 or Q4_0) quantized row by row as it is read.
+    pub fn matrix(
+        &self,
+        device: &MetalDevice,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        quantize: Option<Format>,
+    ) -> Result<Matrix> {
+        let e = self.entry(name)?;
+        if e.dtype != Dtype::Bf16 || e.shape != [rows, cols] {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: format!(
+                    "expected a BF16 [{rows}, {cols}] matrix, found {:?} {:?}",
+                    e.dtype, e.shape
+                ),
+            });
+        }
+        match quantize {
+            None => Matrix::bf16_with(device, rows, cols, |dst| self.read_into(name, dst)),
+            Some(format) => {
+                let mut bytes = vec![0u8; e.len];
+                self.read_into(name, &mut bytes)?;
+                Matrix::from_bf16(device, rows, cols, &bytes, format)
+            }
+        }
+    }
+
+    /// A float vector of `len` values as F32, plus `add` to each (the
+    /// zero-centred norm weights store `scale - 1`).
+    pub fn vector(&self, device: &MetalDevice, name: &str, len: usize, add: f32) -> Result<Tensor> {
+        let mut v = self.read_f32(name)?;
+        if v.len() != len {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: format!("expected {len} values, found {}", v.len()),
+            });
+        }
+        for x in &mut v {
+            *x += add;
+        }
+        Tensor::from_f32(device, [len], DType::F32, &v)
+    }
+}

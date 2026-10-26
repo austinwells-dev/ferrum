@@ -11,8 +11,15 @@
 //! keys and values are the same at every step. The transformer computes them
 //! once, and each denoising step then runs only the image tokens.
 #![forbid(unsafe_code)]
+pub mod checkpoint;
 pub mod config;
+pub mod dit;
+pub(crate) mod ops;
+#[cfg(test)]
+mod reference_tests;
 pub mod rope;
 pub mod schedule;
+#[cfg(test)]
+mod tests;
 
 pub use config::{DitConfig, ModelDir, VaeConfig};

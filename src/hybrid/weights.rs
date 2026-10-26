@@ -614,6 +614,31 @@ pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> 
 }
 
 impl Matrix {
+    /// A BF16 `[rows, cols]` matrix kept in its stored encoding, filled by
+    /// `fill` straight into device memory (`Format::Bf16`).
+    pub(crate) fn bf16_with(
+        device: &MetalDevice,
+        rows: usize,
+        cols: usize,
+        fill: impl FnOnce(&mut [u8]) -> Result<()>,
+    ) -> Result<Self> {
+        if !cols.is_multiple_of(16) {
+            return Err(Error::Shape(format!(
+                "BF16 matrix [{rows}, {cols}]: width is not a multiple of 16"
+            )));
+        }
+        let row_bytes = cols * 2;
+        let storage = PackedStorage::from_reader(device, rows * row_bytes, fill)?;
+        Ok(Matrix {
+            rows,
+            cols,
+            experts: 1,
+            format: Format::Bf16,
+            row_bytes,
+            storage,
+        })
+    }
+
     /// Quantize a row-major BF16 `[rows, cols]` matrix (little-endian bytes)
     /// into `format` (Q8_0, Q4_0 or F32), rows in parallel.
     pub(crate) fn from_bf16(

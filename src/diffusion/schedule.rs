@@ -3,7 +3,7 @@
 //! Latents move from noise (`sigma = 1`) to the image (`sigma = 0`) along the
 //! velocity the transformer predicts: `x += (sigma_next - sigma) * v`. The
 //! transformer is conditioned on `sigma` directly.
-use crate::diffusion::config::SchedulerConfig;
+use crate::{MetalDevice, Result, Tensor, diffusion::config::SchedulerConfig, diffusion::ops};
 
 /// `steps + 1` sigmas, ending at 0.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +62,16 @@ impl Schedule {
     /// The Euler step size `sigma_next - sigma` of step `i`.
     pub fn delta(&self, i: usize) -> f32 {
         self.sigmas[i + 1] - self.sigmas[i]
+    }
+    /// Move `latents` along the predicted velocity for step `i`.
+    pub fn advance(
+        &self,
+        d: &MetalDevice,
+        i: usize,
+        pred: &Tensor,
+        latents: &Tensor,
+    ) -> Result<()> {
+        ops::euler(d, pred, latents, self.delta(i))
     }
 }
 
