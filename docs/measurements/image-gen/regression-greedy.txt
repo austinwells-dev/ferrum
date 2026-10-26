@@ -1,4 +1,4 @@
-# ferrum hybrid --raw --prompt 'The capital of France is' --max-new-tokens 48; main = 155a899, branch = a12bf78; M5 32 GB
+# ferrum hybrid --raw --prompt 'The capital of France is' --max-new-tokens 48; main = 155a899, branch = 486b038+uncommitted; M5 32 GB
 == main Spark-X2.6-4B-Q4_K_M.gguf
 measured: weights+scratch 3496 MiB (predicted 3496), state 19960 MiB (predicted 19961)
 stdout md5 c7397fd44e4549e8896067519e9f9458 bytes      155

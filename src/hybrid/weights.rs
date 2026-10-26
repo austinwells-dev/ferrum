@@ -395,10 +395,31 @@ pub(crate) fn gguf_matrix(
 }
 
 pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Result<Weights> {
+    load_weights(device, file, c, true)
+}
+
+/// Like `load` for a model that is only run for its hidden states: the LM head
+/// (often the largest tensor) is not read and `output` is a one-row stand-in.
+pub(crate) fn load_without_head(
+    device: &MetalDevice,
+    file: &mut GgufFile,
+    c: &HybridConfig,
+) -> Result<Weights> {
+    load_weights(device, file, c, false)
+}
+
+fn load_weights(
+    device: &MetalDevice,
+    file: &mut GgufFile,
+    c: &HybridConfig,
+    head: bool,
+) -> Result<Weights> {
     let mut l = Loader { device, file };
     let embedding = l.matrix_or_bf16("token_embd.weight", c.vocab, c.hidden)?;
     let output_norm = l.vector("output_norm.weight", c.hidden)?;
-    let output = if l.file.tensors().contains_key("output.weight") {
+    let output = if !head {
+        Matrix::bf16_with(device, 1, c.hidden, |_| Ok(()))?
+    } else if l.file.tensors().contains_key("output.weight") {
         l.matrix_or_bf16("output.weight", c.vocab, c.hidden)?
     } else {
         l.matrix_or_bf16("token_embd.weight", c.vocab, c.hidden)?

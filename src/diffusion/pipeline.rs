@@ -52,6 +52,9 @@ pub struct Settings {
     /// Take the transformer from this GGUF instead of the model directory,
     /// keeping the encoding it is stored in (so `transformer` must be unset).
     pub transformer_file: Option<PathBuf>,
+    /// Take the text encoder's language model from a Qwen3-VL GGUF, keeping
+    /// its encoding (so `text` must be unset).
+    pub text_file: Option<PathBuf>,
 }
 
 /// `bf16`, `q8_0` or `q4_0` (what the BF16 checkpoints can be quantized to
@@ -161,10 +164,11 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn open(dir: impl AsRef<Path>, settings: Settings) -> Result<Self> {
-        if settings.transformer_file.is_some() && settings.transformer.is_some() {
+        if (settings.transformer_file.is_some() && settings.transformer.is_some())
+            || (settings.text_file.is_some() && settings.text.is_some())
+        {
             return Err(Error::Parameter(
-                "a transformer GGUF keeps its own encoding; drop the transformer quantization"
-                    .into(),
+                "a GGUF keeps its own encoding; drop the quantization for the same model".into(),
             ));
         }
         let model = ModelDir::open(dir)?;
@@ -222,7 +226,10 @@ impl Pipeline {
         let cfg = &self.model.dit;
         let (ids, skip) = self.tokenize(&request.prompt)?;
         let text_rows = ids.len() - skip;
-        let text = TextEncoder::estimate_bytes(&self.model.text, ids.len(), self.settings.text);
+        let text = match &self.settings.text_file {
+            Some(path) => TextEncoder::estimate_bytes_gguf(&self.model.text, ids.len(), path)?,
+            None => TextEncoder::estimate_bytes(&self.model.text, ids.len(), self.settings.text),
+        };
         let weights = match &self.settings.transformer_file {
             Some(path) => GgufWeights::open(path)?.estimate_bytes(),
             None => Dit::estimate_bytes(cfg, self.settings.transformer),
@@ -271,9 +278,13 @@ impl Pipeline {
         let embeds = {
             stage(Stage::LoadEncoder)?;
             let started = Instant::now();
-            let ckpt = Checkpoint::open(self.model.path("text_encoder"))?;
-            let encoder =
-                TextEncoder::load(d, &ckpt, &self.model.text, ids.len(), self.settings.text)?;
+            let encoder = match &self.settings.text_file {
+                Some(path) => TextEncoder::load_gguf(d, path, &self.model.text, ids.len())?,
+                None => {
+                    let ckpt = Checkpoint::open(self.model.path("text_encoder"))?;
+                    TextEncoder::load(d, &ckpt, &self.model.text, ids.len(), self.settings.text)?
+                }
+            };
             timings.load += started.elapsed();
             stage(Stage::Encode)?;
             let started = Instant::now();

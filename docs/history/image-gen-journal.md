@@ -33,7 +33,7 @@ Each stage is checked against the harness dumps by `#[ignore]`d tests in `src/di
 
 ## 2026-10-26 — pipeline, apps, speed
 
-- The staged pipeline, `ferrum-cli image`, the server's `/v1/images/generations` and the TUI Image tab are in. Speed and memory records: [speed-2026-10-26.txt](../measurements/image-gen/speed-2026-10-26.txt) (512² 20.6–23.0 s, 1024² with a Q8_0 encoder 77.4 s; about 8.6 s a step at 4,096 tokens).
+- The staged pipeline, `ferrum-cli image`, the server's `/v1/images/generations` and the TUI Image tab are in. Timings: [retime-2026-10-26.txt](../measurements/image-gen/retime-2026-10-26.txt) (first taken with the display off and redone with it on).
 - Every hybrid kernel's first dispatch compiles the whole concatenated source, so the image kernels would have slowed LLM startup. They now join the source only when an `i_*` or `vae_*` kernel is requested; the decoder kernels were renamed from `v_*` because the vision kernels already use that prefix.
 - Two TUI tests that scan the real home directory block in `opendir` on this machine; they pass with an empty `HOME`.
 
@@ -48,5 +48,11 @@ Each stage is checked against the harness dumps by `#[ignore]`d tests in `src/di
 - A per-kernel profile of one 1024² step ([gemm-2026-10-26.txt](../measurements/image-gen/gemm-2026-10-26.txt)) put 70% of the 8.2 s in the projections (10 TFLOPS) and 25% in attention (4.4 TFLOPS).
 - The hybrid engine's GEMM reads F32 activations. The transformer now keeps what a matrix product reads (layernorm, attention and SwiGLU outputs) in F16 and uses `i_mm_*`, the same tile with half-by-half products and a 64-wide K step: BF16 10.4 → 14.2 TFLOPS, Q8_0 12.6 → 14.6, Q4_0 13.2 → 15.1. A sweep of tile shapes with both operands read directly peaked at 15.6, so the projections are near what the matrix units give here.
 - Attention now reads the cached text K/V and the current rows' K/V straight from device memory, one segment at a time, instead of staging 64-key blocks through threadgroup memory: 2.0 → 1.7 s. It is still at about 5 TFLOPS; the scalar softmax and the score round trip through threadgroup memory are the likely cost, and the 32 KB threadgroup limit rules out wider key blocks with F32 scores.
-- A step takes 8.2 → 6.6 s; end to end ([speed-f16-gemm-2026-10-26.txt](../measurements/image-gen/speed-f16-gemm-2026-10-26.txt)) 512² is 23.0 → 19.4 s and 1024² 77.4 → 64.7 s. Parity with the fp16 dump is unchanged (final latents 0.87%, image 72.8 dB).
+- Re-timed with the display on ([retime-2026-10-26.txt](../measurements/image-gen/retime-2026-10-26.txt), A-B-B-A): 512² 25.1 → 20.0 s and 1024² 82.8 → 68.0 s end to end (about 20% faster); the profiled step is 8.0 s on a warm machine. Parity with the fp16 dump is unchanged (final latents 0.87%, image 72.8 dB).
 
+
+## 2026-10-26 — text encoder from a GGUF, and a timing mishap
+
+- `--text-file` / `--image-text-file` take the encoder's language model from a Qwen3-VL GGUF (the hybrid engine's own GGUF loader, minus the LM head). With Unsloth's UD-Q4_K_XL (4.6 GB) the encoder stage needs 4.4 GB instead of 14.5 GB and loads in under a second. Its prompt embeddings are 26.5% from the fp16 dump (Q8_0 on-load 2.7%, Q4_0 on-load 33.4%), but the pictures stay clean (34.3 dB from the Q8_0-encoder picture), so the embedding error is mostly directions the transformer ignores. Record: [gguf-2026-10-26.txt](../measurements/image-gen/gguf-2026-10-26.txt).
+- With a Q4_K_M transformer and the Q4_K_XL encoder every stage peaks under 5 GB (1024²: 4.4, 5.0 and 1.9 GB), so a 32 GB Mac could keep them all resident; Ferrum still frees between stages.
+- The power log showed the display off from 12:18 to 14:21, covering the first set of timings, so all timings were retaken with it on. They came out about 25% slower on the warm machine; the before/after ratios held.

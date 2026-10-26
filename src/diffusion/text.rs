@@ -13,9 +13,11 @@ use crate::{
     hybrid::{
         AttnSpec, HybridConfig, HybridModel, HybridState, KvCache, Output, Variant,
         engine::SpecGeometry,
-        weights::{AttentionWeights, DenseFfn, Ffn, Format, Layer, Matrix, Mixer, Weights},
+        weights::{self, AttentionWeights, DenseFfn, Ffn, Format, Layer, Matrix, Mixer, Weights},
     },
+    loader::gguf::GgufFile,
 };
+use std::path::Path;
 
 fn hybrid_config(cfg: &TextConfig) -> Result<HybridConfig> {
     let config = HybridConfig {
@@ -119,6 +121,31 @@ impl TextEncoder {
             output: Matrix::bf16_with(d, 1, hidden, |_| Ok(()))?,
             layers,
         };
+        Self::with_weights(d, config, weights, cfg, max_tokens)
+    }
+
+    /// Load the language model from a Qwen3-VL GGUF (`blk.N.attn_q.weight`
+    /// and so on), keeping each tensor in the encoding it is stored in. The
+    /// vision tower and the LM head in the file are not read.
+    pub fn load_gguf(
+        d: &MetalDevice,
+        path: impl AsRef<Path>,
+        cfg: &TextConfig,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let config = hybrid_config(cfg)?;
+        let mut file = GgufFile::open(path)?;
+        let weights = weights::load_without_head(d, &mut file, &config)?;
+        Self::with_weights(d, config, weights, cfg, max_tokens)
+    }
+
+    fn with_weights(
+        d: &MetalDevice,
+        config: HybridConfig,
+        weights: Weights,
+        cfg: &TextConfig,
+        max_tokens: usize,
+    ) -> Result<Self> {
         let model = HybridModel::new(d, config, weights, max_tokens, 1)?;
         model.enable_speculation(
             d,
@@ -134,7 +161,7 @@ impl TextEncoder {
     /// Device bytes of an encoder for `max_tokens`-token prompts: weights,
     /// engine scratch, K/V cache and the feature capture.
     pub fn estimate_bytes(cfg: &TextConfig, max_tokens: usize, quantize: Option<Format>) -> usize {
-        use crate::hybrid::{engine::page, engine::scratch_bytes};
+        use crate::hybrid::engine::page;
         let stored = |rows, cols| Matrix::bf16_stored_bytes(rows, cols, quantize);
         let (h, q, kv) = (
             cfg.hidden,
@@ -149,9 +176,57 @@ impl TextEncoder {
             + 2 * page(h * 4)
             + 2 * page(cfg.head_dim * 4);
         let weights = Matrix::bf16_stored_bytes(cfg.vocab, h, None) + cfg.layers * layer;
+        weights + Self::runtime_bytes(cfg, max_tokens)
+    }
+
+    /// The same for a GGUF at `path`: the tensors `load_gguf` reads, as stored.
+    pub fn estimate_bytes_gguf(
+        cfg: &TextConfig,
+        max_tokens: usize,
+        path: impl AsRef<Path>,
+    ) -> Result<usize> {
+        use crate::hybrid::engine::page;
+        let file = GgufFile::open(path)?;
+        let loaded = |name: &str| {
+            let tail = name
+                .strip_prefix("blk.")
+                .map_or(name, |n| n.split_once('.').map_or(n, |(_, tail)| tail));
+            matches!(
+                tail,
+                "token_embd.weight"
+                    | "output_norm.weight"
+                    | "attn_q.weight"
+                    | "attn_k.weight"
+                    | "attn_v.weight"
+                    | "attn_output.weight"
+                    | "ffn_gate.weight"
+                    | "ffn_up.weight"
+                    | "ffn_down.weight"
+                    | "attn_norm.weight"
+                    | "ffn_norm.weight"
+                    | "attn_q_norm.weight"
+                    | "attn_k_norm.weight"
+            )
+        };
+        let weights: usize = file
+            .tensors()
+            .iter()
+            .filter(|(name, _)| loaded(name))
+            .map(|(_, t)| match t.dimensions.len() {
+                1 => page(t.dimensions[0] * 4),
+                _ => page(t.byte_len),
+            })
+            .sum();
+        Ok(weights + Self::runtime_bytes(cfg, max_tokens))
+    }
+
+    /// Engine scratch, K/V cache and feature capture.
+    fn runtime_bytes(cfg: &TextConfig, max_tokens: usize) -> usize {
+        use crate::hybrid::engine::{page, scratch_bytes};
+        let kv = cfg.kv_heads * cfg.head_dim;
         let config = hybrid_config(cfg).expect("a validated geometry");
         let kv_cache = cfg.layers * 2 * page(max_tokens.next_multiple_of(32) * kv * 2);
-        weights + scratch_bytes(&config, max_tokens, 1) + kv_cache + page(max_tokens.max(2) * h * 4)
+        scratch_bytes(&config, max_tokens, 1) + kv_cache + page(max_tokens.max(2) * cfg.hidden * 4)
     }
 
     /// Weight bytes on the device.

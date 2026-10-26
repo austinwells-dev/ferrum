@@ -290,6 +290,15 @@ fn meta() -> serde_json::Value {
 }
 
 fn encoder_error(quantize: Option<crate::hybrid::weights::Format>) -> f32 {
+    encoder_error_from(quantize, None)
+}
+
+/// The encoder's embeddings against the dump, from the checkpoint (quantized
+/// to `quantize` as it loads) or from a GGUF.
+fn encoder_error_from(
+    quantize: Option<crate::hybrid::weights::Format>,
+    gguf: Option<&std::path::Path>,
+) -> f32 {
     let d = MetalDevice::new().unwrap();
     let model = ModelDir::open(dir("FERRUM_QWEN_IMAGE")).unwrap();
     let dump = Checkpoint::open(dir("FERRUM_IMGREF")).unwrap();
@@ -303,8 +312,13 @@ fn encoder_error(quantize: Option<crate::hybrid::weights::Format>) -> f32 {
     let skip = meta["drop_idx"].as_u64().unwrap() as usize;
 
     let started = std::time::Instant::now();
-    let ckpt = Checkpoint::open(model.path("text_encoder")).unwrap();
-    let encoder = TextEncoder::load(&d, &ckpt, &model.text, 256, quantize).unwrap();
+    let encoder = match gguf {
+        Some(path) => TextEncoder::load_gguf(&d, path, &model.text, 256).unwrap(),
+        None => {
+            let ckpt = Checkpoint::open(model.path("text_encoder")).unwrap();
+            TextEncoder::load(&d, &ckpt, &model.text, 256, quantize).unwrap()
+        }
+    };
     eprintln!(
         "{quantize:?}: loaded {:.1} GB in {:.1}s",
         encoder.weight_bytes() as f64 / 1e9,
@@ -346,6 +360,26 @@ fn text_encoder_q8_stays_close_to_diffusers() {
     assert!(rel < bound(0.08, 0.05), "Q8_0 prompt embedding error {rel}");
 }
 
+/// Four-bit layers are the lowest the encoder offers; this reports the error
+/// the README's numbers rest on and only guards against a broken kernel.
+#[test]
+#[ignore = "needs the Turbo checkpoint and a tools/imgref dump"]
+fn text_encoder_q4_0_error_is_bounded() {
+    let rel = encoder_error(Some(crate::hybrid::weights::Format::Q4_0));
+    eprintln!("Q4_0 prompt embedding error {rel}");
+    assert!(rel < 0.5, "Q4_0 prompt embedding error {rel}");
+}
+
+/// A Qwen3-VL GGUF at `FERRUM_TEXT_GGUF` (the Unsloth UD-Q4_K_XL one is the
+/// reference case) against the fp16 dump.
+#[test]
+#[ignore = "needs the Turbo checkpoint, a tools/imgref dump and FERRUM_TEXT_GGUF"]
+fn text_encoder_gguf_stays_close_to_diffusers() {
+    let path = dir("FERRUM_TEXT_GGUF");
+    let rel = encoder_error_from(None, Some(&path));
+    assert!(rel < bound(0.12, 0.1), "GGUF prompt embedding error {rel}");
+}
+
 #[test]
 #[ignore = "needs the Turbo checkpoint and a tools/imgref dump"]
 fn template_tokenizes_like_diffusers() {
@@ -375,6 +409,7 @@ fn pipeline_generates_an_image() {
         transformer: std::env::var("FERRUM_DIT_QUANT")
             .map_or(None, |q| parse_quantization(&q).unwrap()),
         transformer_file: std::env::var_os("FERRUM_DIT_GGUF").map(PathBuf::from),
+        text_file: std::env::var_os("FERRUM_TEXT_GGUF").map(PathBuf::from),
     };
     let pipeline = Pipeline::open(dir("FERRUM_QWEN_IMAGE"), settings).unwrap();
     let side = std::env::var("FERRUM_SIDE").map_or(512, |s| s.parse().unwrap());

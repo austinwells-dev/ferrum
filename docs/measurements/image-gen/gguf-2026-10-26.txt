@@ -23,10 +23,8 @@ modulation.1.weight (16384, 4096) (16384, 4096) 0.0094627495855093 0.00042925262
 norm_out.linear.weight (4096, 4096) (4096, 4096) 0.005203039385378361 0.0012170352274551988 0.0012162304483354092
 proj_out.weight (64, 4096) (64, 4096) 0.008356457576155663 6.430732173612341e-05 6.460419535869732e-05
 
-## generation (ferrum-cli image --transformer-file; model dir = base configs + Turbo text_encoder/vae/processor)
-Q8_0:   512x512, seed 42, 69.1 s (load 5.6, encode 0.2, denoise 62.6, decode 0.7)
-Q4_K_M: 512x512, seed 42, 72.0 s (load 4.3, encode 0.2, denoise 66.8, decode 0.7)
-PSNR of the Q4_K_M image against the Q8_0 image: 32.0 dB (8-bit RGB)
+## generation
+Pictures: PSNR of the Q4_K_M image against the Q8_0 image is 32.0 dB (8-bit RGB, seed 42, 512x512, 40 steps); after the F16 GEMMs the pictures moved 60.6 dB (Q8_0) and 61.0 dB (Q4_K_M) from before. Timings: retime-2026-10-26.txt (Q8_0 63.8 s, Q4_K_M 61.4 s, Q4_K_M with the Q4_K_XL text GGUF 59.4 s with a 1.9 s load).
 
 ## memory estimates (pipeline_generates_an_image, FERRUM_DIT_GGUF)
 Q8_0:   transformer predicted 7577.8 MiB, measured peak 7578.7 MiB
@@ -35,7 +33,7 @@ Q4_K_M: transformer predicted 4296.0 MiB, measured peak 4296.8 MiB
 ## DiT against the Turbo fp16 dump (dit_blocks / dit_sampling tests, run once with the Q8_0 GGUF patched in)
 final latents 35.6% off, as expected: the GGUF is the base model, not Turbo. The same test with the Turbo weights quantized to Q8_0 on load: prediction 0.47% (block 0 0.08%).
 
-## after the F16-activation GEMMs (see gemm-2026-10-26.txt); same commands
-Q8_0:   512x512, seed 42, 61.2 s (load 4.5, encode 0.2, denoise 55.7, decode 0.7)
-Q4_K_M: 512x512, seed 42, 60.5 s (load 4.8, encode 0.2, denoise 54.7, decode 0.7)
-The pictures match the ones above at 60.6 dB (Q8_0) and 61.0 dB (Q4_K_M); Q4_K_M against Q8_0 is still 32.0 dB.
+## text encoder from a GGUF (unsloth Qwen3-VL-8B-Instruct-UD-Q4_K_XL, 4.6 GB), Turbo transformer, 512x512, seed 42
+Tensor mapping: tools-style check of blk.N tensors against the checkpoint's: norms identical, matrices 1.9-8.1% RMS apart (4-bit rounding), embedding 7.1%.
+Prompt embeddings against the fp16 dump: 26.5% relative RMS (Q8_0 on-load: 2.7%, Q4_0 on-load: 33.4%); the pictures differ from the Q8_0-encoder picture by 34.3 dB PSNR and show a clean fox.
+Memory (pipeline_generates_an_image with both GGUFs, Q4_K_M transformer): 512^2 encoder 4445.8 MiB predicted / 4446.8 measured, transformer 4256.0 / 4256.8, decoder 844.0 / 843.9; 1024^2 encoder 4445.8 / 4446.8, transformer 4976.0 / 4979.8, decoder 1924.0 / 1925.1.

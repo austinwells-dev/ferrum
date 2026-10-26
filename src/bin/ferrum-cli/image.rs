@@ -19,6 +19,7 @@ usage: ferrum-cli image --model DIR --prompt TEXT [options]
   --out, -o FILE         PNG to write (default ferrum-SEED.png)
   --quantize bf16|q8_0|q4_0       transformer matrices, quantized as they load (default bf16)
   --text-quantize bf16|q8_0|q4_0  text encoder matrices, likewise (default bf16)
+  --text-file FILE.gguf           take the text encoder from a Qwen3-VL GGUF (e.g. UD-Q4_K_XL) instead
   --transformer-file FILE.gguf    take the transformer from a GGUF (any quantization it holds)
         instead of the directory's safetensors; --model still supplies the encoder, decoder and schedule
 ";
@@ -67,6 +68,7 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options> {
             "--out" | "-o" => o.out = Some(value.clone()),
             "--quantize" => o.settings.transformer = parse_quantization(&value)?,
             "--text-quantize" => o.settings.text = parse_quantization(&value)?,
+            "--text-file" => o.settings.text_file = Some(value.clone().into()),
             "--transformer-file" => o.settings.transformer_file = Some(value.clone().into()),
             _ => {
                 return Err(Error::Parameter(format!(

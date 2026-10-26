@@ -203,10 +203,11 @@ curl localhost:8080/v1/images/generations -d '{"prompt":"a lighthouse at dusk","
 | `--steps N` | the checkpoint's schedule | Turbo ships 8 explicit sigmas |
 | `--quantize bf16\|q8_0\|q4_0` | `bf16` | Transformer matrices, quantized as they load |
 | `--text-quantize bf16\|q8_0\|q4_0` | `bf16` | Text encoder matrices, likewise |
+| `--text-file FILE.gguf` (CLI), `--image-text-file` (server) | none | Take the text encoder from a Qwen3-VL GGUF such as Unsloth's `Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf` (4.4 GB for the encoder stage instead of 14.5 GB; `--model` still supplies the tokenizer and config) |
 | `--transformer-file FILE.gguf` (CLI), `--image-transformer-file` (server) | none | Take the transformer from a GGUF (below) instead of the directory's safetensors |
 | `--image-model DIR`, `--image-alias NAME` | none | Server: the checkpoint and the name `/v1/models` reports |
 | `--image-quantize`, `--image-text-quantize` | `bf16` | Server: as `--quantize` and `--text-quantize` |
 
 **GGUF transformers.** The published `unsloth/Qwen-Image-2.1-GGUF` files (Q2_K to Q8_0; BF16 and F32 tensors also load) hold the denoiser only and keep their own encoding, so `--quantize` does not apply. They are the *base* model, which runs 40 steps with the dynamic-shift schedule, so give `--model` a directory with the base `Qwen/Qwen-Image-2.1` `model_index.json` and `scheduler/`, and the text encoder, `vae/` and `processor/` (the Turbo ones work). Q4_K_M needs 4.3 GB for the transformer (Q8_0 7.6 GB), measured in [gguf-2026-10-26.txt](measurements/image-gen/gguf-2026-10-26.txt).
 
-The response follows OpenAI's shape with `b64_json` PNGs only; `n` is at most 4. A request that does not fit in memory gets 503, and a client that hangs up cancels the generation at the next step. With no `--model`, the chat routes return 404. Timings are in [speed-f16-gemm-2026-10-26.txt](measurements/image-gen/speed-f16-gemm-2026-10-26.txt): 512² takes about 19 s (about 12 s of it denoising) and 1024² about 65 s with a Q8_0 text encoder.
+The response follows OpenAI's shape with `b64_json` PNGs only; `n` is at most 4. A request that does not fit in memory gets 503, and a client that hangs up cancels the generation at the next step. With no `--model`, the chat routes return 404. Timings are in [retime-2026-10-26.txt](measurements/image-gen/retime-2026-10-26.txt): 512² takes about 20 s (12 s of it denoising) and 1024² about 68 s with a Q8_0 text encoder.

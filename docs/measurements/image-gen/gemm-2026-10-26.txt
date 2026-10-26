@@ -1,27 +1,30 @@
-# Image transformer GEMM and step profile, Apple M5 32 GB, Qwen-Image-2.1-Turbo 1024x1024 (4,096 image tokens, 32 text rows), BF16 weights unless noted
+# Image transformer GEMM and step profile, Apple M5 32 GB, Qwen-Image-2.1-Turbo 1024x1024 (4,096 image tokens, 32 text rows), BF16 weights unless noted. Display on (see retime-2026-10-26.txt).
 # Commands: cargo test --release --lib diffusion::tests::half_gemm_speed -- --ignored --nocapture
 #           cargo test --release --lib diffusion::reference_tests::dit_step_profile -- --ignored --nocapture   (FERRUM_QWEN_IMAGE set)
 
-## GEMM, 4096 tokens x [12288, 4096] weights, GPU time of 4 runs (HybridModel::project = F32 activations; ops::project = F16 activations)
-bf16 f32 x: 10.4 TFLOPS   bf16 f16 x: 14.2 TFLOPS
-q8_0 f32 x: 12.6 TFLOPS   q8_0 f16 x: 14.6 TFLOPS
-q4_0 f32 x: 13.2 TFLOPS   q4_0 f16 x: 15.1 TFLOPS
+## GEMM, 4096 tokens x [12288, 4096] weights (HybridModel::project = F32 activations; ops::project = F16 activations), measured 14:41 UTC, display on (pmset: no display-off since 14:21:06)
+  bf16 f32 x: 8.1 TFLOPS
+  bf16 f16 x: 10.6 TFLOPS
+  q8_0 f32 x: 9.1 TFLOPS
+  q8_0 f16 x: 11.2 TFLOPS
+  q4_0 f32 x: 10.3 TFLOPS
+  q4_0 f16 x: 11.9 TFLOPS
 
-## Ceiling: a throwaway kernel reading both operands straight from device memory as F16 (no dequantization), same shape, tile = activation rows x weight rows x K step, simdgroups
-128x64x32, 4 sg: 11.3   128x64x64, 4 sg: 15.6   128x128x32, 4 sg: 10.2   128x128x32, 8 sg: 11.4
-128x128x64, 8 sg: 11.4  256x64x32, 8 sg: 4.8    64x64x32, 4 sg: 10.7     64x128x32, 4 sg: 5.0   (TFLOPS)
-The kernel is not kept in the tree. The shipped GEMM (128x64x64, 4 sg, weights dequantized into threadgroup memory) reaches 14.2-15.1.
+## One denoising step after the F16-activation GEMMs and device-direct attention, kernel GPU time (same run)
+step wall 8.00s, kernel GPU time 7.91s
+               i_mm_bf16:   5455 ms over  225 calls (69%)
+                  i_attn:   1992 ms over   32 calls (25%)
+                i_swiglu:    155 ms over   32 calls (2%)
+              i_gate_add:    128 ms over   64 calls (2%)
+              i_qkv_prep:    103 ms over   32 calls (1%)
+                i_ln_mod:     75 ms over   65 calls (1%)
+               h_mv_bf16:      3 ms over    4 calls (0%)
+               h_mm_bf16:      1 ms over    1 calls (0%)
+Attention is 4 x 4128^2 x 128 x 32 heads x 32 layers = 8.9 TFLOP; at 1.99 s that is 4.5 TFLOPS.
 
-## One denoising step, kernel GPU time (set_profiling), before: F32 activations, staged attention
-step wall 8.19 s: h_mm_bf16 5687 ms (70%), i_attn 2015 ms (25%), h_swiglu 141, i_gate_add 93, i_qkv_prep 71, i_ln_mod 67
+## Taken earlier with the display off (12:18-14:21 UTC), so only their ratios are used: the GEMM rates were 10.4 -> 14.2 (BF16), 12.6 -> 14.6 (Q8_0), 13.2 -> 15.1 (Q4_0) TFLOPS, F32 -> F16 activations (+37%, +16%, +14%; now +31%, +23%, +16%);
+the step before the change was 8.19 s with the projections at 5687 ms and attention at 2015 ms, and device-direct attention took attention from 2015 to 1716 ms. A throwaway sweep of tile shapes with both operands read directly as F16 (kernel not kept) peaked at 15.6 TFLOPS for 128x64x64 with 4 simdgroups, against 10-11 for 32-wide K steps and 5 for 256-row tiles; not re-measured.
 
-## after F16 activations
-step wall 6.89 s: i_mm_bf16 4432 ms (65%), i_attn 2013 ms (30%), i_swiglu 118, i_gate_add 93, i_qkv_prep 72, i_ln_mod 51
-
-## after attention reads K/V from device memory
-step wall 6.59 s: i_mm_bf16 4428 ms (68%), i_attn 1716 ms (26%), i_swiglu 119, i_gate_add 94, i_qkv_prep 72, i_ln_mod 51
-Attention is 4 x 4128^2 x 128 x 32 heads x 32 layers = 8.9 TFLOP in 1.72 s, about 5.2 TFLOPS.
-
-## Parity after the change (fp16 dump, 512^2, same tests as parity-2026-10-26.txt)
+## Parity after the change (fp16 dump, 512^2; not timing-dependent)
 image block 31 step 0: 0.15%   prediction step 0: 0.12%   final latents: 0.87%   decoded image: 0.065%, 72.8 dB
 (before: 0.07-0.7% blocks, final latents 0.9%, decoded image 0.065%)
