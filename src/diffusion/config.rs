@@ -95,6 +95,40 @@ impl VaeConfig {
     }
 }
 
+/// The text encoder's language model (the `text_config` of a
+/// `Qwen3VLForConditionalGeneration` checkpoint; its vision tower is unused).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct TextConfig {
+    #[serde(rename = "hidden_size")]
+    pub hidden: usize,
+    #[serde(rename = "num_hidden_layers")]
+    pub layers: usize,
+    #[serde(rename = "num_attention_heads")]
+    pub heads: usize,
+    #[serde(rename = "num_key_value_heads")]
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    #[serde(rename = "intermediate_size")]
+    pub ffn: usize,
+    #[serde(rename = "vocab_size")]
+    pub vocab: usize,
+    #[serde(rename = "rms_norm_eps", default = "default_eps")]
+    pub eps: f32,
+    pub rope_theta: f32,
+    #[serde(rename = "max_position_embeddings")]
+    pub context: usize,
+}
+
+impl TextConfig {
+    pub fn from_json(json: &str) -> Result<Self> {
+        let root: serde_json::Value = serde_json::from_str(json)
+            .map_err(|e| Error::Config(format!("text encoder config: {e}")))?;
+        let text = root.get("text_config").unwrap_or(&root);
+        serde_json::from_value(text.clone())
+            .map_err(|e| Error::Config(format!("text encoder config: {e}")))
+    }
+}
+
 /// The sampler settings of `scheduler/scheduler_config.json` that shape the
 /// sigma schedule.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -134,6 +168,7 @@ pub struct ModelDir {
     root: PathBuf,
     pub dit: DitConfig,
     pub vae: VaeConfig,
+    pub text: TextConfig,
     pub scheduler: SchedulerConfig,
     /// The checkpoint's own sampling sigmas (Turbo ships an 8-step list in
     /// `model_index.json`); the base model samples a linear grid instead.
@@ -168,6 +203,7 @@ impl ModelDir {
         Ok(Self {
             dit: DitConfig::from_json(&read("transformer/config.json")?)?,
             vae: VaeConfig::from_json(&read("vae/config.json")?)?,
+            text: TextConfig::from_json(&read("text_encoder/config.json")?)?,
             scheduler: serde_json::from_str(&read("scheduler/scheduler_config.json")?)
                 .map_err(|e| Error::Config(format!("scheduler config: {e}")))?,
             sample_sigmas,

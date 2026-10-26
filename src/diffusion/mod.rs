@@ -22,6 +22,7 @@ pub mod rope;
 pub mod schedule;
 #[cfg(test)]
 mod tests;
+pub mod text;
 pub mod vae;
 
-pub use config::{DitConfig, ModelDir, VaeConfig};
+pub use config::{DitConfig, ModelDir, TextConfig, VaeConfig};

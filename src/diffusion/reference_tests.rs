@@ -11,6 +11,7 @@ use super::{
     config::ModelDir,
     dit::{Dit, Rope, Scratch},
     schedule::Schedule,
+    text::TextEncoder,
     vae::Vae,
 };
 use crate::{DType, MetalDevice, Tensor};
@@ -275,4 +276,66 @@ fn vae_decodes_like_diffusers() {
         / got_cmp.len() as f64;
     eprintln!("PSNR {:.1} dB (on [0, 1])", -10. * mse.log10());
     assert!(rel < 0.05, "image error {rel}");
+}
+
+fn meta() -> serde_json::Value {
+    let path = dir("FERRUM_IMGREF").join("meta.json");
+    serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+fn encoder_error(quantize: Option<crate::hybrid::weights::Format>) -> f32 {
+    let d = MetalDevice::new().unwrap();
+    let model = ModelDir::open(dir("FERRUM_QWEN_IMAGE")).unwrap();
+    let dump = Checkpoint::open(dir("FERRUM_IMGREF")).unwrap();
+    let meta = meta();
+    let ids: Vec<u32> = meta["input_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap() as u32)
+        .collect();
+    let skip = meta["drop_idx"].as_u64().unwrap() as usize;
+
+    let started = std::time::Instant::now();
+    let ckpt = Checkpoint::open(model.path("text_encoder")).unwrap();
+    let encoder = TextEncoder::load(&d, &ckpt, &model.text, 256, quantize).unwrap();
+    eprintln!(
+        "{quantize:?}: loaded {:.1} GB in {:.1}s",
+        encoder.weight_bytes() as f64 / 1e9,
+        started.elapsed().as_secs_f32()
+    );
+    let started = std::time::Instant::now();
+    let got = encoder.encode(&d, &ids, skip).unwrap();
+    eprintln!(
+        "encoded {} tokens in {:.2}s",
+        ids.len(),
+        started.elapsed().as_secs_f32()
+    );
+    let want = dump.read_f32("prompt_embeds").unwrap();
+    compare(&format!("prompt embeds {quantize:?}"), &got.to_f32(), &want)
+}
+
+/// Error bound against a dump: a bf16 reference is itself 4.8% from the
+/// same model run in fp16 on these embeddings (docs/measurements), so it
+/// can only bound ours more loosely.
+fn bound(bf16: f32, f16: f32) -> f32 {
+    if meta()["dtype"] == "bfloat16" {
+        bf16
+    } else {
+        f16
+    }
+}
+
+#[test]
+#[ignore = "needs the Turbo checkpoint and a tools/imgref dump"]
+fn text_encoder_matches_diffusers() {
+    let rel = encoder_error(None);
+    assert!(rel < bound(0.08, 0.03), "prompt embedding error {rel}");
+}
+
+#[test]
+#[ignore = "needs the Turbo checkpoint and a tools/imgref dump"]
+fn text_encoder_q8_stays_close_to_diffusers() {
+    let rel = encoder_error(Some(crate::hybrid::weights::Format::Q8_0));
+    assert!(rel < bound(0.08, 0.05), "Q8_0 prompt embedding error {rel}");
 }
