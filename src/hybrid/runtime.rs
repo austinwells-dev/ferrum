@@ -735,6 +735,7 @@ impl Runtime {
                 start,
                 grid: image.grid,
                 embedding: image.rows.clone(),
+                deepstack: image.deepstack.clone(),
                 hash: image.hash,
             });
         }

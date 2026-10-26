@@ -39,9 +39,9 @@ jobs:
     # hosted runner is used. (Actions cannot probe for a runner being online: a
     # job queued for an offline self-hosted runner waits, so unset the variable
     # when it is gone.)
-    # Never run fork PRs here: a self-hosted runner must not execute their code.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '"macos-15"') }}
+    # Fork PRs always take the hosted runner: a self-hosted one must not run
+    # their code, and skipping them would let a required check pass unrun.
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) && 'macos-15' || fromJSON(vars.CI_RUNS_ON || '"macos-15"') }}
     steps:
       - uses: actions/checkout@v4
       # Pinned to the toolchain the code is developed on, so new lints don't break CI.

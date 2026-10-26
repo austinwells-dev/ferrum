@@ -1,6 +1,6 @@
 //! Convolution weights and dispatch for the image decoder (`diffusion_vae.metal`).
 //! Activations are F16 and NHWC: `[pixels, channels]` rows, pixels in raster order.
-use super::checkpoint::Checkpoint;
+use super::{checkpoint::Checkpoint, ops::expect};
 use crate::{DType, Error, MetalDevice, Result, Tensor, hybrid::engine::Params};
 
 /// A 1x1 or 3x3 convolution: F16 weights `[cout, taps * cin]` (tap-major,
@@ -23,6 +23,20 @@ impl Conv {
         cout: usize,
         k: usize,
     ) -> Result<Self> {
+        Self::load_padded(device, ckpt, name, cin, cin, cout, k)
+    }
+
+    /// `load` with the input channels zero-padded to `width` (the kernels
+    /// read 16 channels at a time; the encoder's input has four).
+    pub fn load_padded(
+        device: &MetalDevice,
+        ckpt: &Checkpoint,
+        name: &str,
+        cin: usize,
+        width: usize,
+        cout: usize,
+        k: usize,
+    ) -> Result<Self> {
         let (wn, bn) = (format!("{name}.weight"), format!("{name}.bias"));
         let e = ckpt.entry(&wn)?;
         if e.shape != [cout, cin, k, k] || !(k == 1 || k == 3) {
@@ -33,11 +47,11 @@ impl Conv {
         }
         let src = ckpt.read_f32(&wn)?;
         let taps = k * k;
-        let mut packed = vec![0f32; src.len()];
+        let mut packed = vec![0f32; cout * taps * width];
         for o in 0..cout {
             for c in 0..cin {
                 for t in 0..taps {
-                    packed[o * taps * cin + t * cin + c] = src[(o * cin + c) * taps + t];
+                    packed[o * taps * width + t * width + c] = src[(o * cin + c) * taps + t];
                 }
             }
         }
@@ -49,12 +63,17 @@ impl Conv {
             });
         }
         Ok(Self {
-            w: Tensor::from_f32(device, [cout, taps * cin], DType::F16, &packed)?,
+            w: Tensor::from_f32(device, [cout, taps * width], DType::F16, &packed)?,
             b: Tensor::from_f32(device, [cout], DType::F16, &bias)?,
-            cin,
+            cin: width,
             cout,
             taps,
         })
+    }
+
+    /// Device bytes of a `[cout, cin, k, k]` convolution (as `load` stores it).
+    pub fn bytes(cin: usize, cout: usize, k: usize) -> usize {
+        crate::hybrid::engine::page(cout * cin * k * k * 2) + crate::hybrid::engine::page(cout * 2)
     }
 
     /// A convolution from host values (`weight` in `[cout, cin, k, k]` order), for tests.
@@ -107,37 +126,82 @@ pub(crate) enum Residual<'a> {
     },
 }
 
-/// `y = conv(x) + residual`, `x` read at `(h / up, w / up)` with nearest upsampling.
+/// How a convolution's output grid relates to its input's.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Sample {
+    /// Same size, padding 1.
+    Same,
+    /// Input at half the size, read nearest (the decoder's upsampling).
+    Up,
+    /// Input at twice the size, stride 2, padded after the last row and
+    /// column only (the encoder's downsampling).
+    Down,
+}
+
+/// `y = conv(x) + residual` over an `h x w` output grid.
 pub(crate) fn conv(
     d: &MetalDevice,
     c: &Conv,
     x: &Tensor,
     y: &Tensor,
     (h, w): (usize, usize),
-    up: usize,
+    sample: Sample,
     res: Residual,
 ) -> Result<()> {
-    if !matches!(up, 1 | 2) || !h.is_multiple_of(up) || !w.is_multiple_of(up) {
-        return Err(Error::Parameter(format!("upsample {up} of {h} x {w}")));
+    let (up, down) = match sample {
+        Sample::Same => (1, 1),
+        Sample::Up => (2, 1),
+        Sample::Down => (1, 2),
+    };
+    if !h.is_multiple_of(up) || !w.is_multiple_of(up) || (down == 2 && c.taps != 9) {
+        return Err(Error::Parameter(format!(
+            "{sample:?} convolution of {h} x {w}"
+        )));
     }
-    if x.numel() != h / up * (w / up) * c.cin || y.numel() != h * w * c.cout {
+    let input_pixels = h * down / up * (w * down / up);
+    if x.numel() != input_pixels * c.cin || y.numel() != h * w * c.cout {
         return Err(Error::Shape(format!(
-            "conv {} -> {} over {h} x {w} (up {up}): {} input and {} output values",
+            "conv {} -> {} over {h} x {w} ({sample:?}): {} input and {} output values",
             c.cin,
             c.cout,
             x.numel(),
             y.numel()
         )));
     }
+    expect(x, DType::F16, x.numel(), "convolution input")?;
+    expect(y, DType::F16, y.numel(), "convolution output")?;
     let (mode, res_t, res_cin, frames, repeats) = match res {
         Residual::None => (0, &c.b, 0, 1, 1),
-        Residual::Same(t) => (1, t, 0, 1, 1),
+        Residual::Same(t) => {
+            expect(t, DType::F16, h * w * c.cout, "convolution residual")?;
+            (1, t, 0, 1, 1)
+        }
         Residual::Shuffled {
             src,
             channels,
             frames,
             repeats,
-        } => (2, src, channels, frames, repeats),
+        } => {
+            // The highest source channel the epilogue reads.
+            let last = (((c.cout - 1) * frames + frames - 1) * 2 + 1) * 2 + 1;
+            if repeats == 0
+                || last / repeats >= channels
+                || !h.is_multiple_of(2)
+                || !w.is_multiple_of(2)
+            {
+                return Err(Error::Shape(format!(
+                    "shuffled shortcut of {channels} channels (frames {frames}, repeats {repeats}) into {}",
+                    c.cout
+                )));
+            }
+            expect(
+                src,
+                DType::F16,
+                h / 2 * (w / 2) * channels,
+                "shuffled shortcut",
+            )?;
+            (2, src, channels, frames, repeats)
+        }
     };
     let args = Params::default()
         .u(h)?
@@ -146,6 +210,7 @@ pub(crate) fn conv(
         .u(c.cout)?
         .u(c.taps)?
         .u(up)?
+        .u(down)?
         .u(mode)?
         .u(res_cin)?
         .u(frames)?
@@ -168,6 +233,66 @@ pub(crate) fn conv(
     )
 }
 
+/// The encoder's averaged shortcut: `x` (`side*h x side*w` pixels of `cin`
+/// channels) to `h x w` pixels of `cout`, each the mean of a group of the
+/// space-to-depth stack; `frames` 2 counts a zero frame before the image.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn avg_down(
+    d: &MetalDevice,
+    x: &Tensor,
+    y: &Tensor,
+    (h, w): (usize, usize),
+    cin: usize,
+    cout: usize,
+    frames: usize,
+    side: usize,
+) -> Result<()> {
+    if !matches!(frames, 1 | 2)
+        || !matches!(side, 1 | 2)
+        || cout == 0
+        || !(cin * frames * side * side).is_multiple_of(cout)
+    {
+        return Err(Error::Shape(format!(
+            "averaged shortcut {cin} -> {cout} (frames {frames}, side {side})"
+        )));
+    }
+    expect(x, DType::F16, h * side * w * side * cin, "shortcut input")?;
+    expect(y, DType::F16, h * w * cout, "shortcut output")?;
+    let n = h * w * cout;
+    d.dispatch_hybrid(
+        "vae_avg_down",
+        &[x.binding()],
+        &[y.binding()],
+        &Params::default()
+            .u(h)?
+            .u(w)?
+            .u(cin)?
+            .u(cout)?
+            .u(frames)?
+            .u(side)?
+            .0,
+        [n.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
+}
+
+/// `y += x` for F16 tensors of the same size.
+pub(crate) fn add(d: &MetalDevice, x: &Tensor, y: &Tensor) -> Result<()> {
+    let n = y.numel();
+    expect(x, DType::F16, n, "addend")?;
+    expect(y, DType::F16, n, "sum")?;
+    d.dispatch_hybrid(
+        "vae_add",
+        &[x.binding()],
+        &[y.binding()],
+        &Params::default().u(n)?.0,
+        [n.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
+}
+
 /// `y = x / rms(x over channels) * gamma`, then SiLU if asked.
 pub(crate) fn channel_rms(
     d: &MetalDevice,
@@ -178,6 +303,9 @@ pub(crate) fn channel_rms(
     silu: bool,
 ) -> Result<()> {
     let channels = gamma.numel();
+    expect(gamma, DType::F32, channels, "channel norm weight")?;
+    expect(x, DType::F16, pixels * channels, "channel norm input")?;
+    expect(y, DType::F16, pixels * channels, "channel norm output")?;
     d.dispatch_hybrid(
         "vae_chan_rms",
         &[x.binding(), gamma.binding()],
@@ -202,6 +330,13 @@ pub(crate) fn denormalize(
     z: &Tensor,
 ) -> Result<()> {
     let n = x.numel();
+    let channels = mean.numel();
+    if channels == 0 || !n.is_multiple_of(channels) {
+        return Err(Error::Shape(format!("{n} latents of {channels} channels")));
+    }
+    expect(x, DType::F32, n, "latents")?;
+    expect(std, DType::F32, channels, "latent std")?;
+    expect(z, DType::F16, n, "denormalised latents")?;
     d.dispatch_hybrid(
         "vae_denorm",
         &[x.binding(), mean.binding(), std.binding()],
@@ -231,6 +366,20 @@ pub(crate) fn gemm(
     ldc: usize,
 ) -> Result<()> {
     let wide = c.dtype() == DType::F32;
+    // The last element each operand's (row, k) addressing reaches.
+    let reach = |o: &Operand| (o.rows - 1) * o.stride_row + (k - 1) * o.stride_k + 1;
+    if a.rows == 0 || b.rows == 0 || k == 0 || ldc < b.rows {
+        return Err(Error::Shape(format!(
+            "gemm [{}, {k}] x [{}, {k}] into rows of {ldc}",
+            a.rows, b.rows
+        )));
+    }
+    expect(a.t, DType::F16, reach(a), "gemm A")?;
+    expect(b.t, DType::F16, reach(b), "gemm B")?;
+    expect(c, c.dtype(), (a.rows - 1) * ldc + b.rows, "gemm C")?;
+    if !matches!(c.dtype(), DType::F32 | DType::F16) {
+        return Err(Error::DType);
+    }
     let args = Params::default()
         .u(a.rows)?
         .u(b.rows)?
@@ -259,6 +408,13 @@ pub(crate) fn transpose(
     cols: usize,
     ld: usize,
 ) -> Result<()> {
+    if rows == 0 || cols == 0 || ld < cols {
+        return Err(Error::Shape(format!(
+            "transpose of {rows} x {cols} rows of {ld}"
+        )));
+    }
+    expect(x, DType::F16, (rows - 1) * ld + cols, "transpose input")?;
+    expect(y, DType::F16, rows * cols, "transpose output")?;
     d.dispatch_hybrid(
         "vae_transpose",
         &[x.binding()],
@@ -279,6 +435,8 @@ pub(crate) fn softmax_rows(
     cols: usize,
     scale: f32,
 ) -> Result<()> {
+    expect(s, DType::F32, rows * cols, "scores")?;
+    expect(p, DType::F16, rows * cols, "softmax output")?;
     d.dispatch_hybrid(
         "vae_softmax_rows",
         &[s.binding()],

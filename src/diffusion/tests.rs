@@ -1,5 +1,9 @@
 //! The image transformer's kernels against straightforward CPU versions.
-use super::ops::{self, HEAD_DIM, KeyValues, QkvIn};
+use super::{
+    dit::key_limits,
+    ops::{self, HEAD_DIM, KeyValues, QkvIn},
+    rope::{Layout, Segment},
+};
 use crate::{DType, MetalDevice, Tensor};
 
 fn random(n: usize, seed: u64) -> Vec<f32> {
@@ -180,13 +184,13 @@ fn attention_reference(
     tokens: usize,
     keys: usize,
     heads: usize,
-    causal: bool,
+    limits: Option<&[f32]>,
 ) -> Vec<f32> {
     let width = heads * HEAD_DIM;
     let mut out = vec![0f32; tokens * width];
     for t in 0..tokens {
         for h in 0..heads {
-            let visible = if causal { t + 1 } else { keys };
+            let visible = limits.map_or(keys, |l| l[t] as usize);
             let qv = &q[t * width + h * HEAD_DIM..][..HEAD_DIM];
             let scores: Vec<f64> = (0..visible)
                 .map(|j| {
@@ -216,15 +220,31 @@ fn attention_matches_the_cpu() {
     let d = MetalDevice::new().unwrap();
     let heads = 2;
     let width = heads * HEAD_DIM;
-    // (query rows, cached prefix rows, causal): the text prefill, the image
-    // steps (with a ragged tail, and a single row), and an image-only pass.
-    for (tokens, prefix, causal) in [
-        (150usize, 0usize, true),
-        (37, 0, true),
-        (100, 37, false),
-        (64, 64, false),
-        (1, 20, false),
-        (130, 0, false),
+    // (query rows, cached prefix rows, mask): a text-only prefill, a prefill
+    // with condition images whose blocks straddle the 64-row tiles, the
+    // image steps (with a ragged tail, and a single row), and an image-only
+    // pass.
+    let edit = Layout {
+        prefix: vec![
+            Segment::Text(5),
+            Segment::Image(7, 9),
+            Segment::Text(3),
+            Segment::Image(9, 9),
+        ],
+        target: (1, 1),
+    };
+    for (tokens, prefix, limits) in [
+        (
+            150usize,
+            0usize,
+            Some(key_limits(&Layout::text_to_image(150, (1, 1)))),
+        ),
+        (37, 0, Some(key_limits(&Layout::text_to_image(37, (1, 1))))),
+        (edit.prefix_rows(), 0, Some(key_limits(&edit))),
+        (100, 37, None),
+        (64, 64, None),
+        (1, 20, None),
+        (130, 0, None),
     ] {
         let keys = prefix + tokens;
         let round = |x: Vec<f32>| -> Vec<f32> { x.iter().map(|&a| f16(a)).collect() };
@@ -260,13 +280,19 @@ fn attention_matches_the_cpu() {
             k: &kc,
             v: &vc,
         };
-        ops::attention(&d, &qt, &values, &out, tokens, heads, keys, causal).unwrap();
-        let want = attention_reference(&q, &k, &v, tokens, keys, heads, causal);
+        let mask = limits
+            .as_ref()
+            .map(|l| tensor(&d, &[tokens], DType::F32, l));
+        ops::attention(&d, &qt, &values, &out, tokens, heads, keys, mask.as_ref()).unwrap();
+        let want = attention_reference(&q, &k, &v, tokens, keys, heads, limits.as_deref());
         close(
             &out.to_f32(),
             &want,
             4e-3,
-            &format!("attention tokens {tokens} prefix {prefix} causal {causal}"),
+            &format!(
+                "attention tokens {tokens} prefix {prefix} masked {}",
+                limits.is_some()
+            ),
         );
     }
 }
@@ -288,26 +314,30 @@ impl Pad for Vec<f32> {
 
 mod decoder_kernels {
     use super::*;
-    use crate::diffusion::conv::{self, Conv, Operand, Residual};
+    use crate::diffusion::conv::{self, Conv, Operand, Residual, Sample};
 
     fn rounded(x: Vec<f32>) -> Vec<f32> {
         x.into_iter().map(f16).collect()
     }
 
-    /// One conv case: output `h x w`, input `h/up x w/up`, `k` x `k` kernel.
+    /// One conv case: output `h x w`, `k` x `k` kernel.
     struct Case {
         h: usize,
         w: usize,
         cin: usize,
         cout: usize,
         k: usize,
-        up: usize,
+        sample: Sample,
     }
 
     /// 0: none, 1: same-shape residual, 2: pixel-shuffled shortcut (frames 2, repeats 4).
     fn run(c: &Case, mode: u32) {
         let d = MetalDevice::new().unwrap();
-        let (ih, iw) = (c.h / c.up, c.w / c.up);
+        let (ih, iw) = match c.sample {
+            Sample::Same => (c.h, c.w),
+            Sample::Up => (c.h / 2, c.w / 2),
+            Sample::Down => (c.h * 2, c.w * 2),
+        };
         let x = rounded(random(ih * iw * c.cin, 1 + c.cin as u64));
         let wt = rounded(
             random(c.cout * c.cin * c.k * c.k, 2 + c.cout as u64)
@@ -340,7 +370,7 @@ mod decoder_kernels {
             },
             _ => Residual::None,
         };
-        conv::conv(&d, &conv_w, &xt, &yt, (c.h, c.w), c.up, res).unwrap();
+        conv::conv(&d, &conv_w, &xt, &yt, (c.h, c.w), c.sample, res).unwrap();
 
         let pad = (c.k / 2) as isize;
         let mut want = vec![0f32; c.h * c.w * c.cout];
@@ -350,14 +380,27 @@ mod decoder_kernels {
                     let mut acc = f64::from(bias[o]);
                     for ky in 0..c.k {
                         for kx in 0..c.k {
-                            let (iy, ix) = (
-                                yy as isize + ky as isize - pad,
-                                xx as isize + kx as isize - pad,
-                            );
-                            if iy < 0 || ix < 0 || iy >= c.h as isize || ix >= c.w as isize {
+                            // Stride 2 pads only after the last row and column.
+                            let (iy, ix, bound) = match c.sample {
+                                Sample::Down => (
+                                    2 * yy as isize + ky as isize,
+                                    2 * xx as isize + kx as isize,
+                                    (ih, iw),
+                                ),
+                                _ => (
+                                    yy as isize + ky as isize - pad,
+                                    xx as isize + kx as isize - pad,
+                                    (c.h, c.w),
+                                ),
+                            };
+                            if iy < 0 || ix < 0 || iy >= bound.0 as isize || ix >= bound.1 as isize
+                            {
                                 continue;
                             }
-                            let (sy, sx) = (iy as usize / c.up, ix as usize / c.up);
+                            let (sy, sx) = match c.sample {
+                                Sample::Up => (iy as usize / 2, ix as usize / 2),
+                                _ => (iy as usize, ix as usize),
+                            };
                             for ch in 0..c.cin {
                                 acc += f64::from(x[(sy * iw + sx) * c.cin + ch])
                                     * f64::from(wt[((o * c.cin + ch) * c.k + ky) * c.k + kx]);
@@ -383,29 +426,123 @@ mod decoder_kernels {
             &want,
             4e-3,
             &format!(
-                "conv {}x{} {}->{} k{} up{} mode{mode}",
-                c.h, c.w, c.cin, c.cout, c.k, c.up
+                "conv {}x{} {}->{} k{} {:?} mode{mode}",
+                c.h, c.w, c.cin, c.cout, c.k, c.sample
             ),
         );
     }
 
     #[test]
     fn convolutions_match_the_cpu() {
-        let case = |h, w, cin, cout, k, up| Case {
+        let case = |h, w, cin, cout, k, sample| Case {
             h,
             w,
             cin,
             cout,
             k,
-            up,
+            sample,
         };
-        run(&case(9, 13, 64, 70, 3, 1), 0);
-        run(&case(10, 6, 48, 20, 3, 1), 1);
-        run(&case(8, 12, 32, 64, 3, 2), 0);
-        run(&case(12, 10, 144, 33, 3, 2), 1);
-        run(&case(7, 7, 32, 16, 1, 1), 0);
-        run(&case(8, 8, 64, 32, 3, 1), 2);
-        run(&case(16, 16, 288, 144, 3, 1), 0);
+        run(&case(9, 13, 64, 70, 3, Sample::Same), 0);
+        run(&case(10, 6, 48, 20, 3, Sample::Same), 1);
+        run(&case(8, 12, 32, 64, 3, Sample::Up), 0);
+        run(&case(12, 10, 144, 33, 3, Sample::Up), 1);
+        run(&case(7, 7, 32, 16, 1, Sample::Same), 0);
+        run(&case(8, 8, 64, 32, 3, Sample::Same), 2);
+        run(&case(16, 16, 288, 144, 3, Sample::Same), 0);
+        // The encoder's stride-2 downsampling, on odd and ragged grids.
+        run(&case(5, 7, 96, 96, 3, Sample::Down), 0);
+        run(&case(9, 4, 48, 70, 3, Sample::Down), 1);
+    }
+
+    #[test]
+    fn rejects_mismatched_convolutions() {
+        let d = MetalDevice::new().unwrap();
+        let c = Conv::from_values(&d, &[0.; 16 * 16 * 9], &[0.; 16], 16, 16, 3).unwrap();
+        let x = Tensor::zeros(&d, [4 * 4, 16], DType::F16).unwrap();
+        let y = Tensor::zeros(&d, [4 * 4, 16], DType::F16).unwrap();
+        let small = Tensor::zeros(&d, [2 * 2, 16], DType::F16).unwrap();
+        let wide = Tensor::zeros(&d, [4 * 4, 16], DType::F32).unwrap();
+        assert!(conv::conv(&d, &c, &x, &y, (4, 4), Sample::Same, Residual::None).is_ok());
+        assert!(conv::conv(&d, &c, &x, &y, (4, 4), Sample::Down, Residual::None).is_err());
+        assert!(conv::conv(&d, &c, &small, &y, (4, 4), Sample::Same, Residual::None).is_err());
+        assert!(conv::conv(&d, &c, &wide, &y, (4, 4), Sample::Same, Residual::None).is_err());
+        assert!(conv::conv(&d, &c, &x, &y, (4, 4), Sample::Same, Residual::Same(&small)).is_err());
+        assert!(conv::conv(&d, &c, &x, &y, (3, 3), Sample::Up, Residual::None).is_err());
+    }
+
+    /// diffusers' `AvgDown3D` on one frame: pad a zero frame in front when
+    /// `frames` is 2, stack (channel, frame, row, column) and average groups.
+    fn avg_down_reference(
+        x: &[f32],
+        (h, w): (usize, usize),
+        cin: usize,
+        cout: usize,
+        frames: usize,
+        side: usize,
+    ) -> Vec<f32> {
+        let per_channel = frames * side * side;
+        let group = cin * per_channel / cout;
+        let mut y = vec![0f32; h * w * cout];
+        for yy in 0..h {
+            for xx in 0..w {
+                for o in 0..cout {
+                    let mut sum = 0f64;
+                    for j in o * group..(o + 1) * group {
+                        let (c, t) = (j / per_channel, j / (side * side) % frames);
+                        let (sy, sx) = (j / side % side, j % side);
+                        if frames == 2 && t == 0 {
+                            continue;
+                        }
+                        let p = (yy * side + sy) * w * side + xx * side + sx;
+                        sum += f64::from(x[p * cin + c]);
+                    }
+                    y[(yy * w + xx) * cout + o] = (sum / group as f64) as f32;
+                }
+            }
+        }
+        y
+    }
+
+    #[test]
+    fn averaged_shortcut_matches_the_cpu() {
+        let d = MetalDevice::new().unwrap();
+        // The encoder's five shortcuts, on a ragged grid.
+        for (cin, cout, frames, side) in [
+            (96usize, 96usize, 1usize, 2usize),
+            (96, 192, 2, 2),
+            (192, 384, 2, 2),
+            (384, 768, 2, 2),
+            (768, 768, 1, 1),
+        ] {
+            let (h, w) = (3, 5);
+            let x = rounded(random(h * side * w * side * cin, 30 + cin as u64));
+            let xt = tensor(&d, &[h * side * w * side, cin], DType::F16, &x);
+            let yt = Tensor::zeros(&d, [h * w, cout], DType::F16).unwrap();
+            conv::avg_down(&d, &xt, &yt, (h, w), cin, cout, frames, side).unwrap();
+            let want = avg_down_reference(&x, (h, w), cin, cout, frames, side);
+            close(
+                &yt.to_f32(),
+                &want,
+                2e-3,
+                &format!("avg down {cin}->{cout} frames {frames} side {side}"),
+            );
+        }
+        let x = Tensor::zeros(&d, [4, 96], DType::F16).unwrap();
+        let y = Tensor::zeros(&d, [1, 100], DType::F16).unwrap();
+        assert!(conv::avg_down(&d, &x, &y, (1, 1), 96, 100, 1, 2).is_err());
+    }
+
+    #[test]
+    fn add_matches_the_cpu() {
+        let d = MetalDevice::new().unwrap();
+        let (a, b) = (rounded(random(1000, 40)), rounded(random(1000, 41)));
+        let (at, bt) = (
+            tensor(&d, &[1000], DType::F16, &a),
+            tensor(&d, &[1000], DType::F16, &b),
+        );
+        conv::add(&d, &at, &bt).unwrap();
+        let want: Vec<f32> = a.iter().zip(&b).map(|(x, y)| x + y).collect();
+        close(&bt.to_f32(), &want, 1e-3, "add");
     }
 
     #[test]
@@ -574,6 +711,157 @@ fn half_gemm_matches_the_f32_gemm() {
     let got = Tensor::zeros(&d, [m, n], DType::F32).unwrap();
     super::ops::project(&d, &w, &x16, m, &got).unwrap();
     close(&got.to_f32(), &want.to_f32(), 2e-3, "bf16");
+}
+
+/// The K-quant GEMMs a GGUF transformer uses, against ggml's dequantization
+/// on the CPU, with token and output counts that are not whole tiles.
+#[test]
+fn k_quant_gemms_match_the_cpu_dequant() {
+    use crate::hybrid::weights::{Format, Matrix};
+    let d = MetalDevice::new().unwrap();
+    let (m, k, n) = (200usize, 512usize, 100usize);
+    let x: Vec<f32> = random(m * k, 31).iter().map(|&v| f16(v)).collect();
+    let x16 = tensor(&d, &[m, k], DType::F16, &x);
+    type Dequant = fn(&[u8]) -> Vec<f32>;
+    let kinds: [(Format, usize, Dequant); 3] = [
+        (Format::Q4K, 144, kquant::q4_k),
+        (Format::Q5K, 176, kquant::q5_k),
+        (Format::Q6K, 210, kquant::q6_k),
+    ];
+    for (format, block, dequant) in kinds {
+        let bytes = kquant::blocks(format, n * k / 256, block);
+        let w = Matrix::from_packed(&d, n, k, 1, format, &bytes).unwrap();
+        let dense: Vec<f32> = bytes.chunks_exact(block).flat_map(dequant).collect();
+        let want: Vec<f32> = (0..m)
+            .flat_map(|i| {
+                let (x, dense) = (&x, &dense);
+                (0..n).map(move |r| {
+                    (0..k)
+                        .map(|c| f64::from(x[i * k + c]) * f64::from(dense[r * k + c]))
+                        .sum::<f64>() as f32
+                })
+            })
+            .collect();
+        let got = Tensor::zeros(&d, [m, n], DType::F32).unwrap();
+        ops::project(&d, &w, &x16, m, &got).unwrap();
+        let scale = want.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let got = got.to_f32();
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(g, w)| (g - w).abs())
+            .fold(0f32, f32::max);
+        assert!(scale > 0.1, "{}: reference is vacuous", format.name());
+        assert!(
+            worst <= 2e-3 * scale,
+            "{}: worst error {worst} at scale {scale}",
+            format.name()
+        );
+    }
+}
+
+/// ggml's K-quant blocks of 256 weights, decoded as `dequantize_row_q*_K`.
+mod kquant {
+    fn f16_at(b: &[u8], at: usize) -> f32 {
+        half::f16::from_le_bytes([b[at], b[at + 1]]).to_f32()
+    }
+
+    /// Random blocks whose f16 scales are set to small finite values.
+    pub fn blocks(format: crate::hybrid::weights::Format, count: usize, block: usize) -> Vec<u8> {
+        use crate::hybrid::weights::Format;
+        let mut x = (block as u64 * 0x9E37_79B9_7F4A_7C15) | 1;
+        let mut bytes: Vec<u8> = (0..count * block)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 32) as u8
+            })
+            .collect();
+        for b in bytes.chunks_exact_mut(block) {
+            let scale =
+                |v: u8| half::f16::from_f32(0.002 + 0.002 * f32::from(v) / 255.).to_le_bytes();
+            let (s0, s1) = (scale(b[4]), scale(b[5]));
+            match format {
+                Format::Q6K => b[208..].copy_from_slice(&s0),
+                _ => {
+                    b[..2].copy_from_slice(&s0);
+                    b[2..4].copy_from_slice(&s1);
+                }
+            }
+        }
+        bytes
+    }
+
+    /// Sub-block `j`'s 6-bit scale and minimum.
+    fn scale_min(j: usize, q: &[u8]) -> (f32, f32) {
+        let (sc, m) = if j < 4 {
+            (q[j] & 63, q[j + 4] & 63)
+        } else {
+            (
+                (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4),
+                (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+            )
+        };
+        (f32::from(sc), f32::from(m))
+    }
+
+    /// Q4_K and Q5_K: `d`, `dmin`, 12 scale bytes, Q5_K's 32 high-bit bytes,
+    /// then 128 bytes of low nibbles.
+    fn q45_k(b: &[u8], high: bool) -> Vec<f32> {
+        let (d, dmin, scales) = (f16_at(b, 0), f16_at(b, 2), &b[4..16]);
+        let (qh, qs) = if high {
+            (&b[16..48], &b[48..])
+        } else {
+            (&b[..0], &b[16..])
+        };
+        let mut out = Vec::with_capacity(256);
+        for j in 0..4 {
+            let q = &qs[32 * j..32 * j + 32];
+            for half in 0..2 {
+                let (sc, m) = scale_min(2 * j + half, scales);
+                let bit = 1u8 << (2 * j + half);
+                out.extend(q.iter().enumerate().map(|(l, &v)| {
+                    let low = if half == 0 { v & 0xF } else { v >> 4 };
+                    let top = if high && qh[l] & bit != 0 { 16 } else { 0 };
+                    d * sc * f32::from(low + top) - dmin * m
+                }));
+            }
+        }
+        out
+    }
+
+    pub fn q4_k(b: &[u8]) -> Vec<f32> {
+        q45_k(b, false)
+    }
+
+    pub fn q5_k(b: &[u8]) -> Vec<f32> {
+        q45_k(b, true)
+    }
+
+    /// 128 bytes of low nibbles, 64 of high bit pairs, 16 signed scales, `d`.
+    pub fn q6_k(b: &[u8]) -> Vec<f32> {
+        let (ql, qh, sc, d) = (&b[..128], &b[128..192], &b[192..208], f16_at(b, 208));
+        let mut out = vec![0f32; 256];
+        for n in 0..2 {
+            let (ql, qh) = (&ql[64 * n..], &qh[32 * n..]);
+            let (y, sc) = (&mut out[128 * n..], &sc[8 * n..]);
+            for l in 0..32 {
+                let is = l / 16;
+                let q = [
+                    (ql[l] & 0xF) | ((qh[l] & 3) << 4),
+                    (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4),
+                    (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4),
+                    (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4),
+                ];
+                for (i, q) in q.into_iter().enumerate() {
+                    let scale = f32::from(sc[is + 2 * i] as i8);
+                    y[l + 32 * i] = d * scale * (f32::from(q) - 32.);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// GPU time of the two GEMMs at the transformer's size (4,096 tokens through a

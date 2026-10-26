@@ -4,18 +4,25 @@
 //! hidden state *before* the final norm, so the last layer's output is read
 //! from the engine's feature capture rather than from logits.
 //!
-//! Text-only prompts position every token with one index on all three
-//! multimodal rotary axes, which makes Qwen3-VL's interleaved RoPE plain
-//! RoPE. The vision tower is not loaded.
-use super::{checkpoint::Checkpoint, config::TextConfig};
+//! Condition images (editing) go through Qwen3-VL's vision tower, loaded
+//! separately by `load_vision`; their embeddings replace the `<|image_pad|>`
+//! rows, sit on a 2-D grid of the interleaved multimodal rotary axes, and
+//! bring DeepStack features the first layers add to them. Text-only prompts
+//! position every token with one index on all three axes, which makes the
+//! rotation plain RoPE.
+use super::{
+    checkpoint::Checkpoint,
+    config::{EncoderVision, TextConfig},
+};
 use crate::{
     DType, Error, MetalDevice, Result, Tensor,
     hybrid::{
         AttnSpec, HybridConfig, HybridModel, HybridState, KvCache, Output, Variant,
-        engine::SpecGeometry,
+        engine::{ImageSpan, SpecGeometry},
         weights::{self, AttentionWeights, DenseFfn, Ffn, Format, Layer, Matrix, Mixer, Weights},
     },
-    loader::gguf::GgufFile,
+    loader::gguf::{GgufFile, MetadataValue},
+    vision::VisionModel,
 };
 use std::path::Path;
 
@@ -43,7 +50,12 @@ fn hybrid_config(cfg: &TextConfig) -> Result<HybridConfig> {
         rope_dims: cfg.head_dim,
         rope_theta: cfg.rope_theta,
         swa_rope: None,
-        rope_sections: [0; 4],
+        rope_sections: [
+            cfg.mrope_sections[0],
+            cfg.mrope_sections[1],
+            cfg.mrope_sections[2],
+            0,
+        ],
         eps: cfg.eps,
         ffn: cfg.ffn,
         gelu_ffn: false,
@@ -135,6 +147,7 @@ impl TextEncoder {
     ) -> Result<Self> {
         let config = hybrid_config(cfg)?;
         let mut file = GgufFile::open(path)?;
+        check_gguf(&file, cfg)?;
         let weights = weights::load_without_head(d, &mut file, &config)?;
         Self::with_weights(d, config, weights, cfg, max_tokens)
     }
@@ -226,7 +239,10 @@ impl TextEncoder {
         let kv = cfg.kv_heads * cfg.head_dim;
         let config = hybrid_config(cfg).expect("a validated geometry");
         let kv_cache = cfg.layers * 2 * page(max_tokens.next_multiple_of(32) * kv * 2);
-        scratch_bytes(&config, max_tokens, 1) + kv_cache + page(max_tokens.max(2) * cfg.hidden * 4)
+        // The captured features, the rows `encode` copies out of them and
+        // the text rows the pipeline then takes from those.
+        let rows = 3 * page(max_tokens.max(2) * cfg.hidden * 4);
+        scratch_bytes(&config, max_tokens, 1) + kv_cache + rows
     }
 
     /// Weight bytes on the device.
@@ -235,8 +251,15 @@ impl TextEncoder {
     }
 
     /// The last layer's output (before the final norm) for `tokens`, dropping
-    /// the first `skip` rows: F32 `[tokens.len() - skip, hidden]`.
-    pub fn encode(&self, d: &MetalDevice, tokens: &[u32], skip: usize) -> Result<Tensor> {
+    /// the first `skip` rows: F32 `[tokens.len() - skip, hidden]`. `media`
+    /// places image embeddings over their pad tokens.
+    pub fn encode(
+        &self,
+        d: &MetalDevice,
+        tokens: &[u32],
+        skip: usize,
+        media: Vec<ImageSpan>,
+    ) -> Result<Tensor> {
         if tokens.len() > self.max_tokens || skip >= tokens.len() {
             return Err(Error::Parameter(format!(
                 "{} prompt tokens (skipping {skip}) for an encoder of {} tokens",
@@ -250,6 +273,7 @@ impl TextEncoder {
             tokens.len(),
             self.model.max_forward_rows(),
         )?;
+        state.set_media(media);
         self.model.forward(d, &mut state, tokens, Output::None)?;
         let spec = self.model.spec.borrow();
         let features = spec
@@ -260,5 +284,112 @@ impl TextEncoder {
         let rows = tokens.len() - skip;
         let kept = features.view(skip * hidden, [rows, hidden])?;
         Tensor::from_f32(d, [rows, hidden], DType::F32, &kept.to_f32())
+    }
+}
+
+/// The language model a GGUF holds must be Qwen3-VL's of this geometry.
+fn check_gguf(file: &GgufFile, cfg: &TextConfig) -> Result<()> {
+    let arch = match file.metadata_value("general.architecture") {
+        Some(MetadataValue::String(a)) => a.clone(),
+        _ => String::new(),
+    };
+    let uint = |key: &str| match file.metadata_value(&format!("{arch}.{key}")) {
+        Some(MetadataValue::Uint32(v)) => Some(*v as usize),
+        Some(MetadataValue::Uint64(v)) => Some(*v as usize),
+        _ => None,
+    };
+    if arch != "qwen3vl"
+        || uint("embedding_length") != Some(cfg.hidden)
+        || uint("block_count") != Some(cfg.layers)
+    {
+        return Err(Error::Config(format!(
+            "the text encoder GGUF is a {arch:?} model of width {:?} and {:?} layers, not Qwen3-VL's {} x {}",
+            uint("embedding_length"),
+            uint("block_count"),
+            cfg.hidden,
+            cfg.layers
+        )));
+    }
+    Ok(())
+}
+
+/// The encoder's vision tower from `text_encoder/model.safetensors`.
+pub fn load_vision(
+    d: &MetalDevice,
+    ckpt: &Checkpoint,
+    vision: &EncoderVision,
+) -> Result<VisionModel> {
+    VisionModel::load_safetensors(
+        d,
+        ckpt,
+        "model.visual.",
+        vision.config.clone(),
+        &vision.deepstack,
+        usize::MAX,
+    )
+}
+
+/// Device bytes `load_vision` and one image's encoding take: F16 matrices,
+/// the position table, and the activations and attention scores of
+/// `tokens` merged tokens.
+pub fn vision_bytes(vision: &EncoderVision, tokens: usize) -> usize {
+    let c = &vision.config;
+    let (h, merged) = (c.hidden, c.hidden * c.merge * c.merge);
+    let mergers = 1 + vision.deepstack.len();
+    let matrices = c.layers * (4 * h * h + 2 * h * c.ffn)
+        + h * 3 * c.patch * c.patch
+        + mergers * (merged * merged + c.out_dim * merged);
+    // What `encode_prepared` holds at once (its execution keeps every
+    // buffer until the end): per patch the pixels, rotary tables, position
+    // rows, the block's seven hidden-wide rows and its MLP row, and each
+    // merger's normed and middle rows; then the merged outputs, and the
+    // attention scores, which hold at least one head.
+    let patches = tokens * c.merge * c.merge;
+    let per_patch = 3 * c.patch * c.patch + h / c.heads + 8 * h + c.ffn + mergers * 2 * h;
+    let scores = crate::vision::SCORE_BYTES.max(patches * patches * 4);
+    let activations = patches * per_patch * 4 + scores + mergers * tokens * c.out_dim * 4;
+    matrices * 2 + c.table * c.table * h * 4 + activations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::diffusion::checkpoint::tests::{Meta, write};
+
+    #[test]
+    fn only_a_qwen3_vl_gguf_of_the_encoders_geometry_is_taken() {
+        let cfg = TextConfig::from_json(
+            r#"{"hidden_size":4096,"num_hidden_layers":36,"num_attention_heads":32,
+            "num_key_value_heads":8,"head_dim":128,"intermediate_size":12288,
+            "vocab_size":151936,"rope_theta":5000000,"max_position_embeddings":262144}"#,
+        )
+        .unwrap();
+        let path = std::env::temp_dir().join(format!("ferrum-te-{}.gguf", std::process::id()));
+        let check = |arch: &'static str, width, layers| {
+            let (w, l) = (
+                format!("{arch}.embedding_length"),
+                format!("{arch}.block_count"),
+            );
+            let meta = [
+                ("general.architecture", Meta::Str(arch)),
+                (w.as_str(), Meta::U32(width)),
+                (l.as_str(), Meta::U32(layers)),
+            ];
+            write(&path, &meta, &[]);
+            check_gguf(&GgufFile::open(&path).unwrap(), &cfg)
+        };
+        assert!(check("qwen3vl", 4096, 36).is_ok());
+        // Qwen3-8B has the same geometry but no image tokens or DeepStack.
+        assert!(check("qwen3", 4096, 36).is_err());
+        assert!(check("qwen3vl", 2560, 36).is_err());
+        assert!(check("qwen3vl", 4096, 28).is_err());
+        // No geometry to check is a refusal too.
+        write(
+            &path,
+            &[("general.architecture", Meta::Str("qwen3vl"))],
+            &[],
+        );
+        assert!(check_gguf(&GgufFile::open(&path).unwrap(), &cfg).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }

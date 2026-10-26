@@ -10,6 +10,7 @@ mod anthropic;
 mod http;
 mod images;
 mod log;
+mod multipart;
 mod openai;
 mod worker;
 
@@ -91,9 +92,9 @@ vision (images in chat requests as data: URLs / base64; Qwen3-VL style projector
                             Qwen-VL reads fine print and grounds better with 1024)
                             (requests may lower both per image: `detail` low|high|N,
                             `min_tokens`/`max_tokens`, or image_max_tokens per request)
-image generation (Qwen-Image-2.1 directories; each request needs about 15 GB free, 8 GB
-with --image-text-quantize q8_0, and models load for the request and are freed after it):
-  --image-model DIR         serve /v1/images/generations from this directory
+image generation (Qwen-Image-2.1 directories; models load for each request and are freed
+after it, so a request needs its largest stage's memory free: docs/server.md lists them):
+  --image-model DIR         serve /v1/images/generations and /v1/images/edits from this directory
   --image-alias NAME        model name reported for it (default: the directory name)
   --image-quantize bf16|q8_0|q4_0       quantize the transformer as it loads (default bf16)
   --image-text-quantize bf16|q8_0|q4_0  the same for the text encoder (default bf16)
@@ -111,7 +112,8 @@ thinking defaults (requests may override):
   --chat-template-kwargs J  JSON object of extra chat-template variables
 
 endpoints: /v1/chat/completions, /v1/completions, /v1/messages,
-  /v1/messages/count_tokens, /v1/images/generations, /v1/models, /health, /props,
+  /v1/messages/count_tokens, /v1/images/generations, /v1/images/edits, /v1/models,
+  /health, /props,
   /slots, /metrics, /tokenize, /detokenize, /apply-template
 ";
 
@@ -474,7 +476,7 @@ fn run(o: Options) -> Result<(), String> {
     });
     info!(
         None,
-        "listening on http://{}:{} (OpenAI: /v1/chat/completions, /v1/images/generations; Anthropic: /v1/messages){}",
+        "listening on http://{}:{} (OpenAI: /v1/chat/completions, /v1/images/generations, /v1/images/edits; Anthropic: /v1/messages){}",
         o.host,
         o.port,
         if chat { "; model loading…" } else { "" }
@@ -684,6 +686,17 @@ fn handle(
         }
         serde_json::from_slice(&r.body).map_err(|e| format!("invalid JSON body: {e}"))
     };
+    if path == "/v1/images/edits" {
+        return match r.method.as_str() {
+            "POST" => images::edits(server, stream, r, id, ka),
+            _ => http::json(
+                stream,
+                405,
+                &error_json("use POST", "invalid_request_error"),
+                ka,
+            ),
+        };
+    }
     if path == "/v1/images/generations" {
         return match (r.method.as_str(), body()) {
             ("POST", Ok(json_body)) => images::generations(server, stream, &json_body, id, ka),

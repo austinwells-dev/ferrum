@@ -74,6 +74,8 @@ impl DitConfig {
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct VaeConfig {
     pub z_dim: usize,
+    /// Channels of the encoder's first level.
+    pub base_dim: usize,
     pub decoder_base_dim: usize,
     pub dim_mult: Vec<usize>,
     pub num_res_blocks: usize,
@@ -81,7 +83,12 @@ pub struct VaeConfig {
     pub scale_factor_spatial: usize,
     pub latents_mean: Vec<f32>,
     pub latents_std: Vec<f32>,
+    /// Image channels in (RGBA) and out.
+    pub in_channels: usize,
     pub out_channels: usize,
+    /// Per encoder level, whether it halves frames (which, for one image,
+    /// only changes how its shortcut averages).
+    pub temperal_downsample: Vec<bool>,
 }
 
 impl VaeConfig {
@@ -91,12 +98,17 @@ impl VaeConfig {
         if c.latents_mean.len() != c.z_dim || c.latents_std.len() != c.z_dim {
             return Err(Error::Config("latent statistics do not match z_dim".into()));
         }
+        if c.temperal_downsample.len() + 1 != c.dim_mult.len() {
+            return Err(Error::Config(
+                "temperal_downsample needs one entry per downsampling level".into(),
+            ));
+        }
         Ok(c)
     }
 }
 
 /// The text encoder's language model (the `text_config` of a
-/// `Qwen3VLForConditionalGeneration` checkpoint; its vision tower is unused).
+/// `Qwen3VLForConditionalGeneration` checkpoint).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct TextConfig {
     #[serde(rename = "hidden_size")]
@@ -117,15 +129,99 @@ pub struct TextConfig {
     pub rope_theta: f32,
     #[serde(rename = "max_position_embeddings")]
     pub context: usize,
+    /// Rotary pairs of the (time, height, width) axes, interleaved; image
+    /// tokens are placed on a 2-D grid through them.
+    #[serde(skip)]
+    pub mrope_sections: [usize; 3],
 }
 
 impl TextConfig {
     pub fn from_json(json: &str) -> Result<Self> {
-        let root: serde_json::Value = serde_json::from_str(json)
-            .map_err(|e| Error::Config(format!("text encoder config: {e}")))?;
+        let fail = |e: serde_json::Error| Error::Config(format!("text encoder config: {e}"));
+        let root: serde_json::Value = serde_json::from_str(json).map_err(fail)?;
         let text = root.get("text_config").unwrap_or(&root);
-        serde_json::from_value(text.clone())
-            .map_err(|e| Error::Config(format!("text encoder config: {e}")))
+        let mut c: Self = serde_json::from_value(text.clone()).map_err(fail)?;
+        let section = ["rope_scaling", "rope_parameters"]
+            .iter()
+            .find_map(|k| text.get(k)?.get("mrope_section").cloned());
+        if let Some(section) = section {
+            c.mrope_sections = serde_json::from_value(section).map_err(fail)?;
+            if c.mrope_sections.iter().sum::<usize>() != c.head_dim / 2 {
+                return Err(Error::Config(format!(
+                    "mrope_section {:?} does not cover {} rotary pairs",
+                    c.mrope_sections,
+                    c.head_dim / 2
+                )));
+            }
+        }
+        Ok(c)
+    }
+}
+
+/// The text encoder's vision tower and the prompt's image tokens.
+#[derive(Debug, Clone)]
+pub struct EncoderVision {
+    pub config: crate::vision::VisionConfig,
+    /// Blocks whose outputs feed the DeepStack mergers.
+    pub deepstack: Vec<usize>,
+    pub image_token: u32,
+}
+
+#[derive(Deserialize)]
+struct RawVision {
+    depth: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+    num_heads: usize,
+    out_hidden_size: usize,
+    patch_size: usize,
+    spatial_merge_size: usize,
+    num_position_embeddings: usize,
+    #[serde(default)]
+    deepstack_visual_indexes: Vec<usize>,
+}
+
+impl EncoderVision {
+    /// From `text_encoder/config.json` and the image processor's settings
+    /// in `processor/processor_config.json`.
+    pub fn from_json(encoder: &str, processor: &str) -> Result<Self> {
+        let fail = |e: serde_json::Error| Error::Config(format!("vision config: {e}"));
+        let root: serde_json::Value = serde_json::from_str(encoder).map_err(fail)?;
+        let v: RawVision = serde_json::from_value(root["vision_config"].clone()).map_err(fail)?;
+        let image_token = root["image_token_id"]
+            .as_u64()
+            .ok_or_else(|| Error::Config("text encoder config has no image_token_id".into()))?;
+        let processor: serde_json::Value = serde_json::from_str(processor).map_err(fail)?;
+        let p = processor.get("image_processor").unwrap_or(&processor);
+        let stats = |key: &str| -> Result<[f32; 3]> {
+            serde_json::from_value(p[key].clone()).map_err(fail)
+        };
+        let table = (v.num_position_embeddings as f64).sqrt() as usize;
+        if table * table != v.num_position_embeddings
+            || p["patch_size"].as_u64() != Some(v.patch_size as u64)
+            || p["merge_size"].as_u64() != Some(v.spatial_merge_size as u64)
+        {
+            return Err(Error::Config(
+                "the vision tower and the image processor disagree on its geometry".into(),
+            ));
+        }
+        Ok(Self {
+            config: crate::vision::VisionConfig {
+                patch: v.patch_size,
+                hidden: v.hidden_size,
+                ffn: v.intermediate_size,
+                layers: v.depth,
+                heads: v.num_heads,
+                eps: 1e-6,
+                merge: v.spatial_merge_size,
+                out_dim: v.out_hidden_size,
+                table,
+                mean: stats("image_mean")?,
+                std: stats("image_std")?,
+            },
+            deepstack: v.deepstack_visual_indexes,
+            image_token: image_token as u32,
+        })
     }
 }
 
@@ -169,6 +265,8 @@ pub struct ModelDir {
     pub dit: DitConfig,
     pub vae: VaeConfig,
     pub text: TextConfig,
+    /// The encoder's vision tower, which editing needs.
+    pub vision: Option<EncoderVision>,
     pub scheduler: SchedulerConfig,
     /// The checkpoint's own sampling sigmas (Turbo ships an 8-step list in
     /// `model_index.json`); the base model samples a linear grid instead.
@@ -204,6 +302,13 @@ impl ModelDir {
             dit: DitConfig::from_json(&read("transformer/config.json")?)?,
             vae: VaeConfig::from_json(&read("vae/config.json")?)?,
             text: TextConfig::from_json(&read("text_encoder/config.json")?)?,
+            vision: match read("processor/processor_config.json") {
+                Ok(processor) => Some(EncoderVision::from_json(
+                    &read("text_encoder/config.json")?,
+                    &processor,
+                )?),
+                Err(_) => None,
+            },
             scheduler: serde_json::from_str(&read("scheduler/scheduler_config.json")?)
                 .map_err(|e| Error::Config(format!("scheduler config: {e}")))?,
             sample_sigmas,

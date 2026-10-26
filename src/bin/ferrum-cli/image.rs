@@ -1,7 +1,8 @@
-//! `ferrum-cli image`: one text-to-image generation, written as a PNG.
+//! `ferrum-cli image`: one generation (or, with `--image`, one edit),
+//! written as a PNG.
 use ferrum::{
     Error, MetalDevice, Result,
-    diffusion::pipeline::{Pipeline, Request, Settings, Stage, parse_quantization},
+    diffusion::pipeline::{InputImage, Pipeline, Request, Settings, Stage, parse_quantization},
 };
 use std::{
     io::IsTerminal,
@@ -12,8 +13,11 @@ pub const USAGE: &str = "\
 usage: ferrum-cli image --model DIR --prompt TEXT [options]
 
   --model, -m DIR        a Qwen-Image-2.1 directory (config and safetensors, as on Hugging Face)
-  --prompt, -p TEXT      what to draw
-  --size WxH             image size, multiples of 32 from 256 to 2048 (default 1024x1024)
+  --prompt, -p TEXT      what to draw, or with --image the edit to make
+  --image FILE           edit: a condition image (PNG, JPEG, WebP ...); repeat for up to 4
+  --resolution N         edit: size condition images to about NxN pixels (default 1024)
+  --size WxH             image size, multiples of 32 from 256 to 2048 (default 1024x1024,
+                         or for an edit the last image's aspect ratio at the resolution)
   --seed N               noise seed (default: random, printed)
   --steps N              denoising steps (default: the checkpoint's own schedule)
   --out, -o FILE         PNG to write (default ferrum-SEED.png)
@@ -61,8 +65,14 @@ fn parse(args: impl Iterator<Item = String>) -> Result<Options> {
                     .split_once(['x', 'X'])
                     .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)))
                     .ok_or_else(|| Error::Parameter(format!("invalid --size {value} (WxH)")))?;
-                (o.request.width, o.request.height) = (w, h);
+                o.request.size = Some((w, h));
             }
+            "--image" => {
+                let bytes =
+                    std::fs::read(&value).map_err(|e| Error::Parameter(format!("{value}: {e}")))?;
+                o.request.images.push(InputImage::decode(&bytes)?);
+            }
+            "--resolution" => o.request.resolution = number()?,
             "--seed" => seed = Some(number()? as u64),
             "--steps" => o.request.steps = Some(number()?),
             "--out" | "-o" => o.out = Some(value.clone()),
@@ -97,6 +107,7 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     let tty = std::io::stderr().is_terminal();
     let started = std::time::Instant::now();
     let generated = pipeline.generate(&device, &o.request, &mut |stage| match stage {
+        Stage::EncodeImages => eprintln!("encoding the condition images ..."),
         Stage::LoadEncoder => eprintln!("loading the text encoder ..."),
         Stage::Encode => eprintln!("encoding the prompt ..."),
         Stage::LoadTransformer => eprintln!("loading the transformer ..."),

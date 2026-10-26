@@ -2,16 +2,18 @@
 //! text tokens followed by the image tokens, all modulated by one shared
 //! projection of the timestep.
 //!
-//! Text tokens are modulated from `t = 0` and attend causally, so every
-//! layer's text keys and values are the same at each step. `prefill` computes
-//! them once; `step` then runs only the image tokens, which attend to the
-//! cached text and bidirectionally to each other. That is the arithmetic of
-//! diffusers' KV-cached pipeline, whose first step also runs the text.
+//! Text and condition-image tokens (the prefix) are modulated from `t = 0`
+//! and attend block-causally: text causally, each condition image
+//! bidirectionally within itself. So every layer's prefix keys and values
+//! are the same at each step. `prefill` computes them once; `step` then runs
+//! only the target image's tokens, which attend to the whole prefix and
+//! bidirectionally to each other. That is the arithmetic of diffusers'
+//! KV-cached pipeline, whose first step also runs the prefix.
 use super::{
     checkpoint::Weights,
     config::DitConfig,
     ops::{self, HEAD_DIM, KeyValues, QkvIn},
-    rope::RopeTable,
+    rope::{Layout, RopeTable, Segment},
 };
 use crate::{
     DType, Error, MetalDevice, Result, Tensor,
@@ -72,7 +74,7 @@ impl Dit {
                 let n = |s: &str| format!("transformer_blocks.{i}.{s}.weight");
                 let b = |s: &str, rows, cols| ckpt.matrix(device, &n(s), rows, cols, quantize);
                 let (gate, up) = ckpt.mlp_in(device, i, f, h, quantize)?;
-                Ok(Block {
+                let block = Block {
                     q: b("attn.to_q", h, h)?,
                     k: b("attn.to_k", h, h)?,
                     v: b("attn.to_v", h, h)?,
@@ -82,9 +84,25 @@ impl Dit {
                     gate,
                     up,
                     down: b("img_mlp.out", h, f)?,
-                })
+                };
+                // A GGUF may hold an encoding the transformer's GEMM lacks:
+                // refuse it now rather than at the first step.
+                for (m, part) in [
+                    (&block.q, "to_q"),
+                    (&block.k, "to_k"),
+                    (&block.v, "to_v"),
+                    (&block.o, "to_out"),
+                    (&block.gate, "gate"),
+                    (&block.up, "up"),
+                    (&block.down, "out"),
+                ] {
+                    ops::check_projectable(m, &format!("transformer_blocks.{i}.{part}"))?;
+                }
+                Ok(block)
             })
             .collect::<Result<Vec<_>>>()?;
+        let proj_out = m("proj_out.weight", cfg.out_channels(), h)?;
+        ops::check_projectable(&proj_out, "proj_out.weight")?;
         Ok(Self {
             img_in: m("img_in.weight", h, cfg.in_channels)?,
             // The text norm stores `scale - 1`.
@@ -99,7 +117,7 @@ impl Dit {
             time_out: m("time_text_embed.timestep_embedder.linear_2.weight", h, h)?,
             modulation: m("modulation.1.weight", 4 * h, h)?,
             norm_out: m("norm_out.linear.weight", h, h)?,
-            proj_out: m("proj_out.weight", cfg.out_channels(), h)?,
+            proj_out,
             blocks,
             cfg: cfg.clone(),
         })
@@ -209,20 +227,15 @@ pub struct RopeRows {
     sin: Tensor,
 }
 
-/// Rotary tables of the prompt and of the image.
+/// Rotary tables of the prefix and of the target image.
 pub struct Rope {
-    text: RopeRows,
-    image: RopeRows,
+    prefix: RopeRows,
+    target: RopeRows,
 }
 
 impl Rope {
-    pub fn new(
-        d: &MetalDevice,
-        cfg: &DitConfig,
-        text: usize,
-        grid: (usize, usize),
-    ) -> Result<Self> {
-        let table = RopeTable::new(cfg, text, grid);
+    pub fn new(d: &MetalDevice, cfg: &DitConfig, layout: &Layout) -> Result<Self> {
+        let table = RopeTable::new(cfg, layout);
         let rows = |first: usize, n: usize| -> Result<RopeRows> {
             let pairs = table.pairs();
             let make = |x: &[f32]| Tensor::from_f32(d, [n, pairs], DType::F32, &x[..n * pairs]);
@@ -231,27 +244,44 @@ impl Rope {
                 sin: make(table.sin(first))?,
             })
         };
+        let prefix = layout.prefix_rows();
         Ok(Self {
-            text: rows(0, text)?,
-            image: rows(text, grid.0 * grid.1)?,
+            prefix: rows(0, prefix)?,
+            target: rows(prefix, layout.target_rows())?,
         })
     }
 }
 
-/// The text's keys and values in every layer, `[rows, hidden]` as F16.
-pub struct TextPrefix {
+/// The prefix's keys and values in every layer, `[rows, hidden]` as F16.
+pub struct Prefix {
     rows: usize,
     k: Vec<Tensor>,
     v: Vec<Tensor>,
 }
 
-impl TextPrefix {
+impl Prefix {
     pub fn rows(&self) -> usize {
         self.rows
     }
     pub fn bytes(cfg: &DitConfig, rows: usize) -> usize {
         cfg.layers * 2 * rows * cfg.hidden() * 2
     }
+}
+
+/// The key each prefix row stops before: the next row for text (causal),
+/// the end of its block for a condition image.
+pub(crate) fn key_limits(layout: &Layout) -> Vec<f32> {
+    let mut limits = Vec::with_capacity(layout.prefix_rows());
+    for segment in &layout.prefix {
+        let first = limits.len();
+        match *segment {
+            Segment::Text(n) => limits.extend((first + 1..=first + n).map(|k| k as f32)),
+            Segment::Image(h, w) => {
+                limits.extend(std::iter::repeat_n((first + h * w) as f32, h * w))
+            }
+        }
+    }
+    limits
 }
 
 /// The timestep's shared modulation (scale and gate of both sublayers) and
@@ -265,10 +295,11 @@ struct Conditioning {
 pub type Probe<'a> = Option<&'a mut dyn FnMut(usize, &Tensor)>;
 
 enum Pass<'a> {
-    /// Text rows: causal, writing their K/V into the prefix.
-    Fill(&'a TextPrefix),
-    /// Image rows: bidirectional, over the cached text and themselves.
-    Use(&'a TextPrefix),
+    /// Prefix rows: block-causal under `limits`, writing their K/V into the
+    /// prefix.
+    Fill(&'a Prefix, &'a Tensor),
+    /// Target rows: bidirectional, over the cached prefix and themselves.
+    Use(&'a Prefix),
 }
 
 impl Dit {
@@ -304,24 +335,37 @@ impl Dit {
         })
     }
 
-    /// Run the text through every layer, keeping each layer's keys and values.
+    /// Run the prefix through every layer, keeping each layer's keys and
+    /// values. `embeds` holds the encoder's rows for the text segments in
+    /// order (`[text rows, context]`), `conditions` the condition images'
+    /// latents in order (`[condition rows, in_channels]`, F32).
+    #[allow(clippy::too_many_arguments)]
     pub fn prefill(
         &self,
         d: &MetalDevice,
         s: &Scratch,
+        layout: &Layout,
         embeds: &Tensor,
+        conditions: Option<&Tensor>,
         rope: &Rope,
         probe: Probe,
-    ) -> Result<TextPrefix> {
-        let rows = embeds.shape().dimensions()[0];
+    ) -> Result<Prefix> {
+        let (rows, text) = (layout.prefix_rows(), layout.text_rows());
         let h = self.cfg.hidden();
-        if rows > s.rows || embeds.shape().dimensions() != [rows, self.cfg.context] {
+        let condition_values = layout.condition_rows() * self.cfg.in_channels;
+        if rows > s.rows
+            || embeds.shape().dimensions() != [text, self.cfg.context]
+            || conditions.map_or(0, |c| c.numel()) != condition_values
+        {
             return Err(Error::Shape(format!(
-                "{rows} text rows against scratch for {}",
+                "a prefix of {text} text and {} condition rows against {:?} embeddings, {} condition values and scratch for {}",
+                layout.condition_rows(),
+                embeds.shape().dimensions(),
+                conditions.map_or(0, |c| c.numel()),
                 s.rows
             )));
         }
-        let prefix = TextPrefix {
+        let prefix = Prefix {
             rows,
             k: (0..self.cfg.layers)
                 .map(|_| Tensor::zeros(d, [rows, h], DType::F16))
@@ -330,27 +374,60 @@ impl Dit {
                 .map(|_| Tensor::zeros(d, [rows, h], DType::F16))
                 .collect::<Result<_>>()?,
         };
-        // The text projection: norm, linear, GELU, linear.
-        let at = |t: &Tensor| t.view(0, [rows, h]);
-        let (x, hid, mid, act) = (at(&s.x)?, at(&s.v)?, at(&s.q)?, at(&s.k)?);
-        d.dispatch_hybrid(
-            "h_rmsnorm",
-            &[embeds.binding(), self.txt_norm.binding()],
-            &[hid.binding()],
-            &Params::default()
-                .u(self.cfg.context)?
-                .f(self.cfg.eps)
-                .u(rows)?
-                .0,
-            [rows, 1, 1],
-            [256, 1, 1],
-            0,
-        )?;
-        HybridModel::project(d, &self.txt_in, &hid, rows, &mid)?;
-        ops::gelu_tanh(d, &mid, &act)?;
-        HybridModel::project(d, &self.txt_out, &act, rows, &x)?;
+        // The text projection over all text rows (norm, linear, GELU), then
+        // each segment's last linear into its place in the sequence; the
+        // condition latents go through `img_in` into theirs.
+        let at = |t: &Tensor, n: usize| t.view(0, [n, h]);
+        let (hid, mid, act) = (at(&s.v, text)?, at(&s.q, text)?, at(&s.k, text)?);
+        if text > 0 {
+            d.dispatch_hybrid(
+                "h_rmsnorm",
+                &[embeds.binding(), self.txt_norm.binding()],
+                &[hid.binding()],
+                &Params::default()
+                    .u(self.cfg.context)?
+                    .f(self.cfg.eps)
+                    .u(text)?
+                    .0,
+                [text, 1, 1],
+                [256, 1, 1],
+                0,
+            )?;
+            HybridModel::project(d, &self.txt_in, &hid, text, &mid)?;
+            ops::gelu_tanh(d, &mid, &act)?;
+        }
+        let (mut row, mut text_row, mut condition_row) = (0, 0, 0);
+        for segment in &layout.prefix {
+            let n = segment.rows();
+            let x = s.x.view(row * h, [n, h])?;
+            match segment {
+                Segment::Text(_) => {
+                    let input = act.view(text_row * h, [n, h])?;
+                    HybridModel::project(d, &self.txt_out, &input, n, &x)?;
+                    text_row += n;
+                }
+                Segment::Image(..) => {
+                    let c = self.cfg.in_channels;
+                    let latents = conditions
+                        .expect("checked above")
+                        .view(condition_row * c, [n, c])?;
+                    HybridModel::project(d, &self.img_in, &latents, n, &x)?;
+                    condition_row += n;
+                }
+            }
+            row += n;
+        }
+        let limits = Tensor::from_f32(d, [rows], DType::F32, &key_limits(layout))?;
         let cond = self.condition(d, 0.)?;
-        self.layers(d, s, rows, &cond, &rope.text, Pass::Fill(&prefix), probe)?;
+        self.layers(
+            d,
+            s,
+            rows,
+            &cond,
+            &rope.prefix,
+            Pass::Fill(&prefix, &limits),
+            probe,
+        )?;
         Ok(prefix)
     }
 
@@ -361,7 +438,7 @@ impl Dit {
         &self,
         d: &MetalDevice,
         s: &Scratch,
-        prefix: &TextPrefix,
+        prefix: &Prefix,
         rope: &Rope,
         latents: &Tensor,
         sigma: f32,
@@ -379,7 +456,7 @@ impl Dit {
         let x = s.x.view(0, [rows, h])?;
         HybridModel::project(d, &self.img_in, latents, rows, &x)?;
         let cond = self.condition(d, sigma)?;
-        self.layers(d, s, rows, &cond, &rope.image, Pass::Use(prefix), probe)?;
+        self.layers(d, s, rows, &cond, &rope.target, Pass::Use(prefix), probe)?;
         let hid = s.h.view(0, [rows, h])?;
         ops::layernorm_scale(d, &x, &cond.norm_scale, &hid, rows, self.cfg.eps, 1.)?;
         ops::project(d, &self.proj_out, &hid, rows, pred)
@@ -415,8 +492,16 @@ impl Dit {
             ops::project(d, &b.q, &hid, rows, &q)?;
             ops::project(d, &b.k, &hid, rows, &k)?;
             ops::project(d, &b.v, &hid, rows, &v)?;
-            let (kd, vd, kc, vc, prefix, keys, causal) = match &pass {
-                Pass::Fill(p) => (p.k[l].clone(), p.v[l].clone(), None, None, 0, rows, true),
+            let (kd, vd, kc, vc, prefix, keys, limits) = match &pass {
+                Pass::Fill(p, limits) => (
+                    p.k[l].clone(),
+                    p.v[l].clone(),
+                    None,
+                    None,
+                    0,
+                    rows,
+                    Some(*limits),
+                ),
                 Pass::Use(p) => (
                     at(&s.kh, h)?,
                     at(&s.vh, h)?,
@@ -424,7 +509,7 @@ impl Dit {
                     Some(&p.v[l]),
                     p.rows,
                     p.rows + rows,
-                    false,
+                    None,
                 ),
             };
             let input = QkvIn {
@@ -444,7 +529,7 @@ impl Dit {
                 k: &kd,
                 v: &vd,
             };
-            ops::attention(d, &qh, &values, &att, rows, heads, keys, causal)?;
+            ops::attention(d, &qh, &values, &att, rows, heads, keys, limits)?;
             ops::project(d, &b.o, &att, rows, &o)?;
             ops::gate_add(d, &o, &gate1, &x)?;
 

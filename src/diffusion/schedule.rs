@@ -3,7 +3,9 @@
 //! Latents move from noise (`sigma = 1`) to the image (`sigma = 0`) along the
 //! velocity the transformer predicts: `x += (sigma_next - sigma) * v`. The
 //! transformer is conditioned on `sigma` directly.
-use crate::{MetalDevice, Result, Tensor, diffusion::config::SchedulerConfig, diffusion::ops};
+use crate::{
+    Error, MetalDevice, Result, Tensor, diffusion::config::SchedulerConfig, diffusion::ops,
+};
 
 /// `steps + 1` sigmas, ending at 0.
 #[derive(Debug, Clone, PartialEq)]
@@ -23,7 +25,15 @@ impl Schedule {
     /// noise by an amount that grows with the image's token count (the base
     /// model's dynamic exponential shift), then stretched so the last sigma
     /// lands on `shift_terminal`.
-    pub fn dynamic(steps: usize, image_tokens: usize, c: &SchedulerConfig) -> Self {
+    pub fn dynamic(steps: usize, image_tokens: usize, c: &SchedulerConfig) -> Result<Self> {
+        // Stretching to a terminal sigma divides by how far the last step
+        // moved, which is nothing for a single step (diffusers gives NaN).
+        let fewest = if c.shift_terminal.is_some() { 2 } else { 1 };
+        if steps < fewest {
+            return Err(Error::Parameter(format!(
+                "this schedule needs at least {fewest} steps"
+            )));
+        }
         let slope =
             (c.max_shift - c.base_shift) / (c.max_image_seq_len - c.base_image_seq_len) as f32;
         let mu = image_tokens as f32 * slope + (c.base_shift - slope * c.base_image_seq_len as f32);
@@ -49,7 +59,7 @@ impl Schedule {
             }
         }
         sigmas.push(0.);
-        Self { sigmas }
+        Ok(Self { sigmas })
     }
 
     pub fn steps(&self) -> usize {
@@ -94,7 +104,7 @@ mod tests {
     /// Sigmas from diffusers' `FlowMatchEulerDiscreteScheduler`.
     #[test]
     fn the_base_schedule_shifts_with_image_size() {
-        let s = Schedule::dynamic(40, 1024, &base());
+        let s = Schedule::dynamic(40, 1024, &base()).unwrap();
         assert_eq!(s.steps(), 40);
         for (i, v) in [
             (0, 1.),
@@ -107,10 +117,27 @@ mod tests {
         }
         close(s.sigma(39), 0.02);
         close(s.sigma(40), 0.);
-        let large = Schedule::dynamic(40, 4096, &base());
+        let large = Schedule::dynamic(40, 4096, &base()).unwrap();
         for (i, v) in [(1, 0.986964), (2, 0.973593), (20, 0.656666), (38, 0.067881)] {
             close(large.sigma(i), v);
         }
+    }
+
+    #[test]
+    fn too_few_steps_are_an_error() {
+        assert!(Schedule::dynamic(0, 1024, &base()).is_err());
+        // The base model stretches to a terminal sigma, which one step can't.
+        assert!(base().shift_terminal.is_some());
+        assert!(Schedule::dynamic(1, 1024, &base()).is_err());
+        let two = Schedule::dynamic(2, 1024, &base()).unwrap();
+        assert!((0..=2).all(|i| two.sigma(i).is_finite()));
+        let plain = SchedulerConfig {
+            shift_terminal: None,
+            ..base()
+        };
+        let one = Schedule::dynamic(1, 1024, &plain).unwrap();
+        assert_eq!((one.steps(), one.sigma(1)), (1, 0.));
+        assert!(one.sigma(0).is_finite());
     }
 
     #[test]

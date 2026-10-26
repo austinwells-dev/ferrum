@@ -808,6 +808,9 @@ impl Matrix {
         bytes: &[u8],
     ) -> Result<Self> {
         let type_id = match format {
+            Format::Q4K => 12,
+            Format::Q5K => 13,
+            Format::Q6K => 14,
             Format::Iq3Xxs => 18,
             Format::Iq3S => 21,
             Format::Iq2S => 22,

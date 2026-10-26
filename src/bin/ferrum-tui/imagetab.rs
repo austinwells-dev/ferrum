@@ -1,14 +1,15 @@
 //! Image: write a prompt, generate with Qwen-Image-2.1 and look at the
-//! result. The pipeline runs on its own thread (loading one model at a time,
-//! so it needs the memory of the chat model and server released first) and
-//! saves each picture as a PNG.
+//! result, or edit the picture on screen with the prompt. The pipeline runs
+//! on its own thread (loading one model at a time, so it needs the memory of
+//! the chat model and server released first) and saves each picture as a
+//! PNG.
 use crate::layout::{self, pane};
 use crate::preview::{self, Slot, Thumbs, Want};
 use crate::serve::fmt_dur;
 use crate::*;
 use ferrum::{
     Error, MetalDevice,
-    diffusion::pipeline::{Observer, Pipeline, Request, Settings, Stage, Timings},
+    diffusion::pipeline::{InputImage, Observer, Pipeline, Request, Settings, Stage, Timings},
     hybrid::weights::Format,
 };
 use std::cell::RefCell;
@@ -40,6 +41,8 @@ const QUANTS: [(&str, Option<Format>); 3] = [
 #[derive(Clone, Copy, PartialEq)]
 enum Row {
     Prompt,
+    /// A new picture, or an edit of one.
+    Input,
     Model,
     Size,
     Seed,
@@ -47,8 +50,9 @@ enum Row {
     Encoder,
 }
 
-const ROWS: [Row; 6] = [
+const ROWS: [Row; 7] = [
     Row::Prompt,
+    Row::Input,
     Row::Model,
     Row::Size,
     Row::Seed,
@@ -95,6 +99,8 @@ pub struct ImageTab {
     models: Vec<(String, PathBuf)>,
     model: usize,
     pub prompt: String,
+    /// The picture to edit; `None` makes a new one.
+    input: Option<PathBuf>,
     size: usize,
     /// `None` draws a new seed for every picture; otherwise this one.
     seed: Option<u64>,
@@ -185,6 +191,7 @@ impl ImageTab {
             models,
             model,
             prompt: saved["prompt"].as_str().unwrap_or_default().to_string(),
+            input: None,
             size: saved["size"]
                 .as_u64()
                 .map_or(2, |v| (v as usize).min(SIZES.len() - 1)),
@@ -268,7 +275,24 @@ impl ImageTab {
             return;
         };
         let mut request = Request::new(self.prompt.trim());
-        (request.width, request.height) = SIZES[self.size];
+        match &self.input {
+            // An edit keeps the picture's shape, at the chosen size's area.
+            Some(path) => match fs::read(path)
+                .map_err(|e| format!("{}: {e}", tilde(path)))
+                .and_then(|b| InputImage::decode(&b).map_err(|e| e.to_string()))
+            {
+                Ok(image) => {
+                    let (w, h) = SIZES[self.size];
+                    request.resolution = ((w * h) as f64).sqrt().round() as usize;
+                    request.images.push(image);
+                }
+                Err(e) => {
+                    self.error = Some(e);
+                    return;
+                }
+            },
+            None => request.size = Some(SIZES[self.size]),
+        }
         request.seed = self.seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -298,6 +322,13 @@ impl ImageTab {
         let step = |v: usize, n: usize| (v + if forward { 1 } else { n - 1 }) % n;
         match ROWS[self.row] {
             Row::Prompt => {}
+            // New, or the picture on screen.
+            Row::Input => {
+                self.input = match (&self.input, &self.last) {
+                    (None, Some(last)) => Some(last.path.clone()),
+                    _ => None,
+                }
+            }
             Row::Model if !self.models.is_empty() => {
                 self.model = step(self.model, self.models.len())
             }
@@ -349,8 +380,9 @@ fn generate(
     })
 }
 
-fn stage_label(stage: Stage) -> String {
+pub fn stage_label(stage: Stage) -> String {
     match stage {
+        Stage::EncodeImages => "reading the picture to edit".into(),
         Stage::LoadEncoder => "loading the text encoder".into(),
         Stage::Encode => "encoding the prompt".into(),
         Stage::LoadTransformer => "loading the transformer".into(),
@@ -474,6 +506,20 @@ impl App {
                     clip(&tab.prompt, w.saturating_sub(12)),
                     Style::new().fg(TEXT),
                 ),
+                Row::Input => match &tab.input {
+                    None => ("new picture".into(), Style::new().fg(TEXT)),
+                    Some(path) => (
+                        clip(
+                            &format!(
+                                "edit {}",
+                                path.file_name()
+                                    .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+                            ),
+                            w.saturating_sub(12),
+                        ),
+                        Style::new().fg(TEXT),
+                    ),
+                },
                 Row::Model => match tab.models.get(tab.model) {
                     Some((name, _)) => (clip(name, w.saturating_sub(12)), Style::new().fg(TEXT)),
                     None => ("none found".into(), Style::new().fg(BAD)),
@@ -492,6 +538,7 @@ impl App {
         };
         let label = |row: Row| match row {
             Row::Prompt => "prompt",
+            Row::Input => "make",
             Row::Model => "model",
             Row::Size => "size",
             Row::Seed => "seed",
@@ -599,6 +646,7 @@ impl ImageTab {
             PathBuf::from("/models/qwen"),
         )];
         self.prompt = "A red fox sitting in fresh snow, golden hour light.".into();
+        self.input = None;
         self.run = None;
         self.error = None;
         self.last = None;
@@ -619,7 +667,8 @@ impl ImageTab {
                     seed: 42,
                     size: (1024, 1024),
                     timings: Timings::default(),
-                })
+                });
+                self.input = Some(PathBuf::from("/nonexistent/fox.png"));
             }
             _ => {}
         }

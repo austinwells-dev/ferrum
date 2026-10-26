@@ -122,18 +122,24 @@ Against Kapitsa through each server (same prompts): 82–91% of its greedy speed
 
 # Image generation
 
-Qwen-Image-2.1-Turbo (8 steps, no guidance) on a 32 GB M5, through `ferrum-cli image`, `ferrum-server --image-model` and the TUI Image tab. Usage: [server.md](server.md#image-generation).
+Qwen-Image-2.1-Turbo (8 steps, no guidance) on a 32 GB M5, drawing and editing, through `ferrum-cli image`, `ferrum-server --image-model`, the TUI Image tab and the chat and agent tool `generate_image`. Usage: [server.md](server.md#image-generation).
 
 ## Validation
 
-Against diffusers in fp16 at 512², with diffusers' own noise ([parity-2026-10-26.txt](measurements/image-gen/parity-2026-10-26.txt)): prompt embeddings 1.0% relative RMS (Q8_0 encoder 2.7%), transformer blocks 0.07–0.7%, final latents 0.9%, decoded image 0.065% (72.8 dB PSNR). A bf16 reference differs from the fp16 one by 4.8% and 6.2% on embeddings and latents, so it is the looser ruler. The encoder, transformer and decoder memory estimates match the measured peaks within 4 MiB ([gguf-2026-10-26.txt](measurements/image-gen/gguf-2026-10-26.txt), [parity-2026-10-26.txt](measurements/image-gen/parity-2026-10-26.txt)).
+All against diffusers at 512², with diffusers' own noise, and repeatable with the ignored tests in `src/diffusion/reference_tests.rs` ([edit-parity-2026-10-26.txt](measurements/image-gen/edit-parity-2026-10-26.txt)). Errors are relative RMS.
+
+- **Drawing**, against an fp16 run: prompt embeddings 1.0% (Q8_0 encoder 2.7%, Q4_0 33%, the UD-Q4_K_XL GGUF 26%), transformer blocks 0.05–0.7%, final latents 0.9%, decoded image 0.065% (the decoder alone, on diffusers' latents). A bf16 reference is itself 4.8% and 6.2% from the fp16 one on embeddings and latents, so it is the looser ruler.
+- **Editing**, one 512² condition image, against a bf16 run: the VAE encoder 0.36% from diffusers' in float32; the vision tower 2.0% and its DeepStack features 0.25–1.1% from Transformers' in float32 (diffusers' own bf16 tower is 5.4% from that); the text encoder's rows after the image 2.2%; the transformer's condition-image prefix 0.3–2.2% across its blocks, and the final latents 2.2%. The prompt tokenizes identically.
+- **Memory**: every stage's measured peak is within 4 MiB of the planner's prediction or below it, for drawing at 512² and 1024² and editing at 512² and 1024², and the tests fail otherwise.
+- The kernels the transformer's GGUF path adds (Q4_K, Q5_K and Q6_K matrix products with F16 activations) match ggml's dequantization on the CPU; the GGUF name mapping, the gate/up split and the refusal of unsupported types are unit-tested on synthetic files.
 
 ## Known gaps
 
-- Only the Turbo schedule is validated. The base model's 40 steps with guidance and dynamic shift are implemented but not checked.
+- Only the Turbo schedule is validated. The base model's 40-step dynamic-shift schedule runs, but has no guidance (no negative prompt or true CFG, which the base model is usually run with) and is not checked against diffusers.
 - Seeds do not reproduce diffusers' images (ChaCha8 and Box-Muller, not torch's generator).
-- Transformer weights load from BF16 safetensors (quantized to Q8_0 or Q4_0 on load) or from an unsloth-style GGUF (`--transformer-file`; Q4_K, Q5_K, Q6_K, Q8_0, BF16, F32 tensors). F16 GGUFs and MLX-quantized checkpoints do not load, and a text-encoder GGUF (`--text-file`) must be a Qwen3-VL-8B language-model file with the usual `blk.N` names.
-- GGUF runs are validated by tensor mapping against Turbo's weights, memory estimates and pictures (Q4_K_M within 32.0 dB of Q8_0 at one seed), not against a diffusers dump of the base model: the 40-step base schedule is unchecked ([gguf-2026-10-26.txt](measurements/image-gen/gguf-2026-10-26.txt)).
-- Denoising takes about 7 s a step at 1024². The projections run at 10–12 TFLOPS on a warm machine (14–15 cold, with F16 activations), near the best the TensorOps tiles reached in a sweep, and attention at about 4.5 TFLOPS is the part left to tune ([gemm-2026-10-26.txt](measurements/image-gen/gemm-2026-10-26.txt)).
+- Editing is checked with one condition image; two to four follow the same code but have no reference run.
+- Transformer weights load from BF16 safetensors (quantized to Q8_0 or Q4_0 on load) or from an unsloth-style GGUF (`--transformer-file`) whose block matrices are Q4_K, Q5_K, Q6_K, Q8_0, Q4_0 or BF16; other types are refused at load. A text-encoder GGUF (`--text-file`) must be a Qwen3-VL-8B language-model file with the usual `blk.N` names. MLX-quantized checkpoints do not load.
+- GGUF runs are validated by tensor mapping against Turbo's weights, memory estimates and pictures (Q4_K_M within 32.0 dB of Q8_0 at one seed), not against a diffusers dump of the base model ([gguf-2026-10-26.txt](measurements/image-gen/gguf-2026-10-26.txt)).
+- Denoising takes about 7 s a step at 1024². The projections run at 10–12 TFLOPS, near the best the TensorOps tiles reached in a sweep, and attention at about 4.5 TFLOPS is the part left to tune ([gemm-2026-10-26.txt](measurements/image-gen/gemm-2026-10-26.txt)).
+- Cancelling waits for the current denoising step to end, and decoding cannot be cancelled. With `n` above 1, a failure discards the pictures already made.
 - The decoder has no tiling, so very large images are bounded by memory.
-

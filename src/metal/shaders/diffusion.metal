@@ -4,6 +4,10 @@
 // matrix product reads (layernorm, attention and SwiGLU outputs) and Q, K and V
 // are F16.
 
+// F16 for a matrix product's input, saturated instead of overflowing to inf
+// (diffusers clips its fp16 activations to the same range).
+inline half to_half(float v) { return half(clamp(v, -65504.f, 65504.f)); }
+
 // out = silu(x)
 kernel void i_silu(constant EltArgs & a [[buffer(2)]], device const float * x [[buffer(0)]],
                    device float * y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
@@ -14,7 +18,7 @@ kernel void i_silu(constant EltArgs & a [[buffer(2)]], device const float * x [[
 kernel void i_swiglu(constant EltArgs & a [[buffer(3)]], device const float * g [[buffer(0)]],
                      device const float * u [[buffer(1)]], device half * y [[buffer(2)]],
                      uint i [[thread_position_in_grid]]) {
-    if (i < a.n) y[i] = half(g[i] / (1.f + exp(-g[i])) * u[i]);
+    if (i < a.n) y[i] = to_half(g[i] / (1.f + exp(-g[i])) * u[i]);
 }
 
 // out = gelu(x), tanh approximation
@@ -45,7 +49,7 @@ kernel void i_ln_mod(constant LnArgs & a [[buffer(3)]], device const float * x [
     }
     const float inv = rsqrt(block_sum(ss, scratch, tid, 256) / float(a.n) + a.eps);
     device half * yr = y + (ulong)row * a.n;
-    for (uint i = tid; i < a.n; i += 256) yr[i] = half((xr[i] - mean) * inv * (a.offset + scale[i]));
+    for (uint i = tid; i < a.n; i += 256) yr[i] = to_half((xr[i] - mean) * inv * (a.offset + scale[i]));
 }
 
 struct GateArgs { uint n; uint cols; };
@@ -92,27 +96,30 @@ kernel void i_qkv_prep(constant PrepArgs & a [[buffer(10)]], device const float 
     const bool even = (d & 1) == 0;
     const float qr = even ? qn * c - qp * s : qn * c + qp * s;
     const float kr = even ? kn * c - kp * s : kn * c + kp * s;
-    qo[at] = half(qr * a.q_scale);
-    ko[at] = half(kr);
-    vo[at] = half(v[at]);
+    qo[at] = to_half(qr * a.q_scale);
+    ko[at] = to_half(kr);
+    vo[at] = to_half(v[at]);
 }
 
-struct DitAttnArgs { uint tokens; uint heads; uint prefix; uint keys; uint causal; };
+struct DitAttnArgs { uint tokens; uint heads; uint prefix; uint keys; uint masked; };
 
 // Flash attention for the image transformer (h_flash_attn_mpp_staged_d128
 // without gates, sinks, windows or a ring): 64 query rows of one head per
 // threadgroup, keys in blocks of 64. Keys [0, prefix) come from the cached
-// text K/V, the rest from the current rows' own K/V; each is a segment of its
-// own, so a block never straddles the two and K and V are read straight from
-// device memory by the matrix units. `causal` masks key > row (the text
-// prefix); the image rows attend to every key. K, V and Q rows are
+// prefix K/V, the rest from the current rows' own K/V; each is a segment of
+// its own, so a block never straddles the two and K and V are read straight
+// from device memory by the matrix units. With `masked`, row r sees keys
+// [0, limit[r]) (`limit` holds F32 key counts): the block-causal prefill, where
+// text rows see up to themselves and an image block's rows see to the end of
+// their block. Otherwise every row sees every key. K, V and Q rows are
 // `heads * 128` wide (one K/V head per query head). Q is F16 and pre-scaled;
 // the output is F16.
-// grid (ceil(tokens/64), heads); threads 128; 64*64*4 + 64*64*2 + 3*64*4 bytes.
-kernel void i_attn(constant DitAttnArgs & p [[buffer(6)]], device half * q [[buffer(0)]],
+// grid (ceil(tokens/64), heads); threads 128; 64*64*4 + 64*64*2 + 4*64*4 bytes.
+kernel void i_attn(constant DitAttnArgs & p [[buffer(7)]], device half * q [[buffer(0)]],
                    device const half * kp [[buffer(1)]], device const half * vp [[buffer(2)]],
                    device const half * kc [[buffer(3)]], device const half * vc [[buffer(4)]],
-                   device half * out [[buffer(5)]], threadgroup char * shared [[threadgroup(0)]],
+                   device const float * limit [[buffer(5)]],
+                   device half * out [[buffer(6)]], threadgroup char * shared [[threadgroup(0)]],
                    uint2 tgpig [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     constexpr int D = 128, BR = 64, BC = 64;
     threadgroup uint rescale;
@@ -121,12 +128,17 @@ kernel void i_attn(constant DitAttnArgs & p [[buffer(6)]], device half * q [[buf
     threadgroup float * corr = (threadgroup float *)(Ps + BR * BC);       // [BR]
     threadgroup float * mrow = corr + BR;                                 // [BR]
     threadgroup float * lrow = mrow + BR;                                 // [BR]
+    threadgroup uint  * lim = (threadgroup uint *)(lrow + BR);            // [BR]
     const uint h = tgpig.y;
     const int t0 = int(tgpig.x) * BR;
     const int rows = min(BR, int(p.tokens) - t0);
     const int stride = int(p.heads) * D;
     const ulong head_off = (ulong)h * D;
-    const uint last_key = p.causal != 0 ? uint(t0 + rows - 1) : p.keys - 1;
+    if (tid < BR) lim[tid] = p.masked == 0 || int(tid) >= rows ? p.keys : min(uint(limit[t0 + tid]), p.keys);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Keys at or past the furthest any row of this tile sees are skipped.
+    uint key_end = 0;
+    for (int r = 0; r < rows; r++) key_end = max(key_end, lim[r]);
 
     auto tQ = tensor(q + (ulong)t0 * stride + h * D, dextents<int32_t, 2>(D, rows), array<int, 2>({1, stride}));
     auto tS = tensor(Ss, dextents<int32_t, 2>(BC, BR));
@@ -155,7 +167,7 @@ kernel void i_attn(constant DitAttnArgs & p [[buffer(6)]], device half * q [[buf
     for (int segment = 0; segment < 2; segment++) {
         const uint first = segment == 0 ? 0 : p.prefix;
         const uint length = segment == 0 ? p.prefix : p.keys - p.prefix;
-        for (uint j0 = 0; j0 < length && first + j0 <= last_key; j0 += BC) {
+        for (uint j0 = 0; j0 < length && first + j0 < key_end; j0 += BC) {
             for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
             auto mK = segment == 0 ? tKp.slice(0, j0) : tKc.slice(0, j0);
             mm_s.run(tQ, mK, cS);
@@ -167,7 +179,7 @@ kernel void i_attn(constant DitAttnArgs & p [[buffer(6)]], device half * q [[buf
             for (int c = 0; c < 32; c++) {
                 const uint at = j0 + uint(c0 + c);
                 const uint key = first + at;
-                const bool ok = my_row < rows && at < length && (p.causal == 0 || key <= uint(t0 + my_row));
+                const bool ok = my_row < rows && at < length && key < lim[my_row];
                 s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
                 mx = max(mx, s[c]);
             }

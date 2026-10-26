@@ -25,5 +25,6 @@ pub mod schedule;
 mod tests;
 pub mod text;
 pub mod vae;
+pub mod vae_encoder;
 
-pub use config::{DitConfig, ModelDir, TextConfig, VaeConfig};
+pub use config::{DitConfig, EncoderVision, ModelDir, TextConfig, VaeConfig};

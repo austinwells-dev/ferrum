@@ -45,6 +45,9 @@ pub struct ImageSpan {
     pub grid: (usize, usize),
     /// `[grid.0 * grid.1, hidden]` F32 embeddings in raster order.
     pub embedding: std::rc::Rc<Tensor>,
+    /// DeepStack features (Qwen3-VL): entry `i`, shaped like `embedding`, is
+    /// added to the image's rows after decoder layer `i`. Usually empty.
+    pub deepstack: Vec<std::rc::Rc<Tensor>>,
     /// Identity of the image content, for prefix reuse.
     pub hash: u64,
 }
@@ -1669,6 +1672,9 @@ impl HybridModel {
                 .map_or(&self.weights.output_norm, |l| &l.attn_norm);
             self.add_rmsnorm(d, cur, &mix, norm, next, &xn, m)?;
             std::mem::swap(&mut cur, &mut next);
+            if self.add_deepstack(d, state, i, cur, pos, m)? {
+                self.rmsnorm(d, cur, norm, &xn, m)?;
+            }
             self.dump(d, "l_out", i, cur)?;
             if let Some(sp) = spec
                 && let Some(features) = &sp.features
@@ -1777,6 +1783,50 @@ impl HybridModel {
             }
         };
         Ok(produced)
+    }
+
+    /// Add layer `layer`'s DeepStack features of the images in this chunk to
+    /// their rows of `x`. Whether any were added.
+    fn add_deepstack(
+        &self,
+        d: &MetalDevice,
+        state: &HybridState,
+        layer: usize,
+        x: &Tensor,
+        pos: usize,
+        m: usize,
+    ) -> Result<bool> {
+        let h = self.config.hidden;
+        let mut added = false;
+        for span in state
+            .media
+            .iter()
+            .filter(|sp| sp.start < pos + m && sp.end() > pos)
+        {
+            let Some(features) = span.deepstack.get(layer) else {
+                continue;
+            };
+            if features.numel() != span.len() * h || features.dtype() != DType::F32 {
+                return Err(Error::Shape(format!(
+                    "DeepStack features of {} values for an image of {} x {h}",
+                    features.numel(),
+                    span.len()
+                )));
+            }
+            let (from, to) = (span.start.max(pos), span.end().min(pos + m));
+            let n = (to - from) * h;
+            d.dispatch_hybrid(
+                "h_accumulate",
+                &[rows(features, from - span.start, to - from, h)?.binding()],
+                &[rows(x, from - pos, to - from, h)?.binding()],
+                &Params::default().u(n)?.0,
+                [n.div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )?;
+            added = true;
+        }
+        Ok(added)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3100,6 +3150,7 @@ mod tests {
             embedding: std::rc::Rc::new(
                 Tensor::zeros(&d, [grid.0 * grid.1, 4], DType::F32).unwrap(),
             ),
+            deepstack: Vec::new(),
             hash: 0,
         };
         // A 3x4 image at cache positions 5..17 advances rotary positions by 4.

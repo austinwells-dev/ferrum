@@ -304,6 +304,7 @@ pub struct GgufWeights {
 
 const GGUF_PREFIX: &str = "model.diffusion_model.";
 const GGML_F32: u32 = 0;
+const GGML_F16: u32 = 1;
 const GGML_BF16: u32 = 30;
 
 impl GgufWeights {
@@ -363,6 +364,10 @@ impl Weights for GgufWeights {
                 .chunks_exact(4)
                 .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
                 .collect(),
+            GGML_F16 => bytes
+                .chunks_exact(2)
+                .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+                .collect(),
             GGML_BF16 => bytes
                 .chunks_exact(2)
                 .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
@@ -395,5 +400,124 @@ impl Weights for GgufWeights {
             Matrix::from_ggml(device, &name, ffn, hidden, type_id, gate)?,
             Matrix::from_ggml(device, &name, ffn, hidden, type_id, up)?,
         ))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::diffusion::ops::check_projectable;
+
+    pub(crate) enum Meta {
+        U32(u32),
+        Str(&'static str),
+    }
+
+    /// A GGUF of `(name, ggml dims, type, bytes)` tensors, each name taken
+    /// as is. ComfyUI's transformers carry no metadata.
+    pub(crate) fn write(
+        path: &Path,
+        meta: &[(&str, Meta)],
+        tensors: &[(String, Vec<usize>, u32, Vec<u8>)],
+    ) {
+        let string = |b: &mut Vec<u8>, v: &str| {
+            b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            b.extend_from_slice(v.as_bytes());
+        };
+        let mut b = b"GGUF".to_vec();
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        b.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+        for (key, value) in meta {
+            string(&mut b, key);
+            match value {
+                Meta::U32(v) => {
+                    b.extend_from_slice(&4u32.to_le_bytes());
+                    b.extend_from_slice(&v.to_le_bytes());
+                }
+                Meta::Str(v) => {
+                    b.extend_from_slice(&8u32.to_le_bytes());
+                    string(&mut b, v);
+                }
+            }
+        }
+        let mut offset = 0u64;
+        for (name, dims, type_id, bytes) in tensors {
+            string(&mut b, name);
+            b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for &d in dims {
+                b.extend_from_slice(&(d as u64).to_le_bytes());
+            }
+            b.extend_from_slice(&type_id.to_le_bytes());
+            b.extend_from_slice(&offset.to_le_bytes());
+            offset += (bytes.len() as u64).div_ceil(32) * 32;
+        }
+        b.resize(b.len().div_ceil(32) * 32, 0);
+        for (_, _, _, bytes) in tensors {
+            b.extend_from_slice(bytes);
+            b.resize(b.len().div_ceil(32) * 32, 0);
+        }
+        std::fs::write(path, b).unwrap();
+    }
+
+    fn bf16(values: impl IntoIterator<Item = f32>) -> Vec<u8> {
+        values
+            .into_iter()
+            .flat_map(|v| half::bf16::from_f32(v).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn a_gguf_transformer_loads_by_diffusers_names_or_says_why_not() {
+        let d = MetalDevice::new().unwrap();
+        let path = std::env::temp_dir().join(format!("ferrum-dit-{}.gguf", std::process::id()));
+        let (hidden, ffn) = (64usize, 32usize);
+        let q = bf16((0..16 * hidden).map(|i| i as f32 / 64.));
+        // The stacked SwiGLU input: gate rows, then up rows.
+        let gate_up = bf16((0..2 * ffn * hidden).map(|i| if i < ffn * hidden { 1. } else { 2. }));
+        let norm: Vec<u8> = (0..hidden)
+            .flat_map(|i| half::f16::from_f32(i as f32).to_le_bytes())
+            .collect();
+        let tensors = [
+            ("blocks.q.weight", vec![hidden, 16], 30, q.clone()),
+            (
+                "transformer_blocks.0.img_mlp.gate_up.weight",
+                vec![hidden, 2 * ffn],
+                30,
+                gate_up,
+            ),
+            ("norm.weight", vec![hidden], 1, norm),
+            // Q8_0, a matrix encoding, where a float vector belongs.
+            ("scale", vec![32], 8, vec![0; 34]),
+            // F16 matrices have no kernel; IQ2_S has one, but not in the
+            // image transformer's GEMM.
+            ("f16.weight", vec![hidden, 2], 1, vec![0; 4 * hidden]),
+            ("iq2_s.weight", vec![256, 1], 22, vec![0; 82]),
+        ]
+        .map(|(name, dims, t, bytes)| (format!("{GGUF_PREFIX}{name}"), dims, t, bytes));
+        write(&path, &[], &tensors);
+        let w = GgufWeights::open(&path).unwrap();
+        let loaded = w.matrix(&d, "blocks.q.weight", 16, hidden, None).unwrap();
+        assert_eq!(loaded.format, Format::Bf16);
+        assert_eq!(loaded.packed_bytes(), q);
+        // Rows and columns swapped is a shape error, not a transposed load.
+        assert!(w.matrix(&d, "blocks.q.weight", hidden, 16, None).is_err());
+        assert!(w.matrix(&d, "missing.weight", 16, hidden, None).is_err());
+
+        let (gate, up) = w.mlp_in(&d, 0, ffn, hidden, None).unwrap();
+        assert_eq!(gate.packed_bytes(), bf16(vec![1.; ffn * hidden]));
+        assert_eq!(up.packed_bytes(), bf16(vec![2.; ffn * hidden]));
+
+        let norm = w.vector(&d, "norm.weight", hidden, 1.).unwrap().to_f32();
+        assert_eq!(norm, (0..hidden).map(|i| i as f32 + 1.).collect::<Vec<_>>());
+        assert!(w.vector(&d, "scale", 32, 0.).is_err());
+
+        assert!(w.matrix(&d, "f16.weight", 2, hidden, None).is_err());
+        let iq = w.matrix(&d, "iq2_s.weight", 1, 256, None).unwrap();
+        let message = check_projectable(&iq, "iq2_s.weight")
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("iq2_s.weight"), "{message}");
+        std::fs::remove_file(path).unwrap();
     }
 }

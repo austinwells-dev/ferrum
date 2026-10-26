@@ -11,7 +11,7 @@ kernel void vae_denorm(constant PrepArgs2 & a [[buffer(4)]], device const float 
                      device half * y [[buffer(3)]], uint i [[thread_position_in_grid]]) {
     if (i < a.n) {
         const uint c = i % a.channels;
-        y[i] = half(x[i] * stdev[c] + mean[c]);
+        y[i] = to_half(x[i] * stdev[c] + mean[c]);
     }
 }
 
@@ -37,15 +37,16 @@ kernel void vae_chan_rms(constant RmsArgs & a [[buffer(3)]], device const half *
     for (uint c = lane; c < a.channels; c += 32) {
         float v = float(xr[c]) * inv * gamma[c];
         if (a.silu != 0) v = v / (1.f + exp(-v));
-        yr[c] = half(v);
+        yr[c] = to_half(v);
     }
 }
 
 struct VaeConvArgs {
     uint h; uint w;          // output size
     uint cin; uint cout;
-    uint taps;               // 1 (pointwise) or 9 (3x3, padding 1)
+    uint taps;               // 1 (pointwise) or 9 (3x3)
     uint up;                 // input is (h/up, w/up) and read nearest
+    uint down;               // 1, or 2: input is (2h, 2w), stride 2, padded only after its last row and column
     uint res_mode;           // 0 none, 1 add res (same layout), 2 add the pixel-shuffled shortcut
     uint res_cin;            // mode 2: channels of the (h/2, w/2) shortcut source
     uint dup_t;              // mode 2: frame factor (the last frame is read) and channel repeats
@@ -54,7 +55,8 @@ struct VaeConvArgs {
 
 // Convolution as an implicit GEMM: the 128-pixel x NK-channel input tile of
 // each (tap, channel block) is gathered into threadgroup memory with zero
-// padding and optional nearest 2x upsampling, and multiplied by 64 output
+// padding and optional nearest 2x upsampling (the decoder) or stride 2 (the
+// encoder's downsampling), and multiplied by 64 output
 // channels of F16 weights `[cout][taps * cin]` (tap-major). The epilogue adds
 // the bias and a residual. grid (ceil(h*w/128), ceil(cout/64)); threads 128.
 template <int NK>
@@ -65,7 +67,8 @@ void conv_impl(constant VaeConvArgs & a, device half * x, device half * wt, devi
     const int p0 = int(tg.x) * NRB, n0 = int(tg.y) * NRA;
     const int K = int(a.taps * a.cin);
     const int nrows = min(NRA, int(a.cout) - n0);
-    const int in_w = int(a.w / a.up);
+    const int in_h = a.down == 2 ? int(a.h) * 2 : int(a.h / a.up);
+    const int in_w = a.down == 2 ? int(a.w) * 2 : int(a.w / a.up);
 
     auto tB = tensor(tb, dextents<int32_t, 2>(NK, NRB));
     auto tA = tensor(wt + (ulong)n0 * K, dextents<int32_t, 2>(K, nrows), array<int, 2>({1, K}));
@@ -78,15 +81,19 @@ void conv_impl(constant VaeConvArgs & a, device half * x, device half * wt, devi
 
     constexpr int UNITS = NRB * (NK / 8);
     for (int tap = 0; tap < int(a.taps); tap++) {
-        const int dy = a.taps == 9 ? tap / 3 - 1 : 0, dx = a.taps == 9 ? tap % 3 - 1 : 0;
+        // Stride 2 pads only after the last row and column, so its taps start at 0.
+        const int first = a.down == 2 ? 0 : -1;
+        const int dy = a.taps == 9 ? tap / 3 + first : 0, dx = a.taps == 9 ? tap % 3 + first : 0;
         for (int c0 = 0; c0 < int(a.cin); c0 += NK) {
             for (int u = tid; u < UNITS; u += 128) {
                 const int m = u / (NK / 8), cc = (u % (NK / 8)) * 8;
                 const int p = p0 + m;
                 half4 v0 = 0.h, v1 = 0.h;
                 if (p < pixels) {
-                    const int iy = p / int(a.w) + dy, ix = p % int(a.w) + dx;
-                    if (iy >= 0 && iy < int(a.h) && ix >= 0 && ix < int(a.w)) {
+                    const int oy = p / int(a.w), ox = p % int(a.w);
+                    const int iy = int(a.down) * oy + dy, ix = int(a.down) * ox + dx;
+                    const int bound_h = a.down == 2 ? in_h : int(a.h), bound_w = a.down == 2 ? in_w : int(a.w);
+                    if (iy >= 0 && iy < bound_h && ix >= 0 && ix < bound_w) {
                         const int sy = a.up == 2 ? iy >> 1 : iy, sx = a.up == 2 ? ix >> 1 : ix;
                         device const half4 * src = (device const half4 *)(x + ((ulong)sy * in_w + sx) * a.cin + c0 + cc);
                         v0 = src[0];
@@ -118,7 +125,7 @@ void conv_impl(constant VaeConvArgs & a, device half * x, device half * wt, devi
             const int src_c = j / int(a.dup_repeats);
             v += float(res[((ulong)(Y >> 1) * (a.w >> 1) + (X >> 1)) * a.res_cin + src_c]);
         }
-        y[(ulong)p * a.cout + n] = half(v);
+        y[(ulong)p * a.cout + n] = to_half(v);
     }
 }
 
@@ -212,4 +219,36 @@ struct TransposeArgs { uint rows; uint cols; uint ld; };
 kernel void vae_transpose(constant TransposeArgs & a [[buffer(2)]], device const half * x [[buffer(0)]],
                         device half * y [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {
     if (g.x < a.cols && g.y < a.rows) y[(ulong)g.x * a.rows + g.y] = x[(ulong)g.y * a.ld + g.x];
+}
+
+struct AvgDownArgs { uint h; uint w; uint cin; uint cout; uint frames; uint side; };
+
+// The encoder's averaged shortcut (`AvgDown3D` on a one-frame video): output
+// channel o at (y, x) is the mean of `group = cin * frames * side^2 / cout`
+// consecutive values of the space-to-depth stack of the (side*h, side*w)
+// input, channel-major over (channel, frame, row, column). With two frames the
+// first is the zero frame padded in front of the image, so it only dilutes
+// the mean. One thread per output value.
+kernel void vae_avg_down(constant AvgDownArgs & a [[buffer(2)]], device const half * x [[buffer(0)]],
+                         device half * y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i >= a.h * a.w * a.cout) return;
+    const uint p = i / a.cout, o = i % a.cout;
+    const uint Y = p / a.w, X = p % a.w;
+    const uint cell = a.side * a.side, per_channel = a.frames * cell;
+    const uint group = a.cin * per_channel / a.cout;
+    const uint in_w = a.w * a.side;
+    float sum = 0.f;
+    for (uint j = o * group; j < (o + 1) * group; j++) {
+        const uint c = j / per_channel, t = j / cell % a.frames;
+        if (a.frames == 2 && t == 0) continue;
+        const uint sy = j / a.side % a.side, sx = j % a.side;
+        sum += float(x[((ulong)(Y * a.side + sy) * in_w + X * a.side + sx) * a.cin + c]);
+    }
+    y[i] = to_half(sum / float(group));
+}
+
+// y += x, F16, one thread per value.
+kernel void vae_add(constant EltArgs & a [[buffer(2)]], device const half * x [[buffer(0)]],
+                    device half * y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i < a.n) y[i] = to_half(float(y[i]) + float(x[i]));
 }

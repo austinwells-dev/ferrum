@@ -9,14 +9,14 @@
 use super::{
     checkpoint::Checkpoint,
     config::VaeConfig,
-    conv::{self, Conv, Operand, Residual},
+    conv::{self, Conv, Operand, Residual, Sample},
 };
 use crate::hybrid::engine::page;
 use crate::{DType, Error, MetalDevice, Result, Tensor};
 
 /// Residual block: `x + conv2(silu(rms(conv1(silu(rms(x))))))`, with a 1x1
 /// convolution on the skip path when the channel count changes.
-struct Resnet {
+pub(super) struct Resnet {
     norm1: Tensor,
     conv1: Conv,
     norm2: Tensor,
@@ -25,7 +25,7 @@ struct Resnet {
 }
 
 /// Single-head self-attention over all pixels, as a residual.
-struct Attention {
+pub(super) struct Attention {
     norm: Tensor,
     qkv: Conv,
     proj: Conv,
@@ -60,7 +60,7 @@ pub struct Image {
     pub pixels: Vec<f32>,
 }
 
-fn gamma(d: &MetalDevice, c: &Checkpoint, name: &str, len: usize) -> Result<Tensor> {
+pub(super) fn gamma(d: &MetalDevice, c: &Checkpoint, name: &str, len: usize) -> Result<Tensor> {
     c.vector(d, &format!("{name}.gamma"), len, 0.)
 }
 
@@ -75,7 +75,26 @@ fn decoder_dims(cfg: &VaeConfig) -> Result<Vec<usize>> {
 }
 
 impl Resnet {
-    fn load(d: &MetalDevice, c: &Checkpoint, name: &str, cin: usize, cout: usize) -> Result<Self> {
+    /// Device bytes of a block from `cin` to `cout` channels.
+    pub(super) fn bytes(cin: usize, cout: usize) -> usize {
+        Conv::bytes(cin, cout, 3)
+            + Conv::bytes(cout, cout, 3)
+            + if cin == cout {
+                0
+            } else {
+                Conv::bytes(cin, cout, 1)
+            }
+            + page(cin * 4)
+            + page(cout * 4)
+    }
+
+    pub(super) fn load(
+        d: &MetalDevice,
+        c: &Checkpoint,
+        name: &str,
+        cin: usize,
+        cout: usize,
+    ) -> Result<Self> {
         Ok(Self {
             norm1: gamma(d, c, &format!("{name}.norm1"), cin)?,
             conv1: Conv::load(d, c, &format!("{name}.conv1"), cin, cout, 3)?,
@@ -87,13 +106,26 @@ impl Resnet {
         })
     }
 
-    fn forward(&self, d: &MetalDevice, x: &Tensor, (h, w): (usize, usize)) -> Result<Tensor> {
+    pub(super) fn forward(
+        &self,
+        d: &MetalDevice,
+        x: &Tensor,
+        (h, w): (usize, usize),
+    ) -> Result<Tensor> {
         let px = h * w;
         let (cin, cout) = (self.conv1.cin, self.conv1.cout);
         let act = Tensor::zeros(d, [px, cin], DType::F16)?;
         conv::channel_rms(d, x, &self.norm1, &act, px, true)?;
         let mid = Tensor::zeros(d, [px, cout], DType::F16)?;
-        conv::conv(d, &self.conv1, &act, &mid, (h, w), 1, Residual::None)?;
+        conv::conv(
+            d,
+            &self.conv1,
+            &act,
+            &mid,
+            (h, w),
+            Sample::Same,
+            Residual::None,
+        )?;
         drop(act);
         let act = Tensor::zeros(d, [px, cout], DType::F16)?;
         conv::channel_rms(d, &mid, &self.norm2, &act, px, true)?;
@@ -101,26 +133,47 @@ impl Resnet {
         let skip = match &self.shortcut {
             Some(s) => {
                 let t = Tensor::zeros(d, [px, cout], DType::F16)?;
-                conv::conv(d, s, x, &t, (h, w), 1, Residual::None)?;
+                conv::conv(d, s, x, &t, (h, w), Sample::Same, Residual::None)?;
                 Some(t)
             }
             None => None,
         };
         let out = Tensor::zeros(d, [px, cout], DType::F16)?;
         let res = Residual::Same(skip.as_ref().unwrap_or(x));
-        conv::conv(d, &self.conv2, &act, &out, (h, w), 1, res)?;
+        conv::conv(d, &self.conv2, &act, &out, (h, w), Sample::Same, res)?;
         Ok(out)
     }
 }
 
 impl Attention {
-    fn forward(&self, d: &MetalDevice, x: &Tensor, (h, w): (usize, usize)) -> Result<Tensor> {
+    pub(super) fn load(d: &MetalDevice, c: &Checkpoint, name: &str, dim: usize) -> Result<Self> {
+        Ok(Self {
+            norm: gamma(d, c, &format!("{name}.norm"), dim)?,
+            qkv: Conv::load(d, c, &format!("{name}.to_qkv"), dim, 3 * dim, 1)?,
+            proj: Conv::load(d, c, &format!("{name}.proj"), dim, dim, 1)?,
+        })
+    }
+
+    pub(super) fn forward(
+        &self,
+        d: &MetalDevice,
+        x: &Tensor,
+        (h, w): (usize, usize),
+    ) -> Result<Tensor> {
         let (p, dim) = (h * w, self.proj.cout);
         let row = 3 * dim;
         let normed = Tensor::zeros(d, [p, dim], DType::F16)?;
         conv::channel_rms(d, x, &self.norm, &normed, p, false)?;
         let qkv = Tensor::zeros(d, [p, row], DType::F16)?;
-        conv::conv(d, &self.qkv, &normed, &qkv, (h, w), 1, Residual::None)?;
+        conv::conv(
+            d,
+            &self.qkv,
+            &normed,
+            &qkv,
+            (h, w),
+            Sample::Same,
+            Residual::None,
+        )?;
         drop(normed);
 
         let k = qkv.view(dim, [p * row - dim])?;
@@ -167,7 +220,15 @@ impl Attention {
             conv::gemm(d, &probs, &values, &out, p, dim)?;
         }
         let y = Tensor::zeros(d, [p, dim], DType::F16)?;
-        conv::conv(d, &self.proj, &attended, &y, (h, w), 1, Residual::Same(x))?;
+        conv::conv(
+            d,
+            &self.proj,
+            &attended,
+            &y,
+            (h, w),
+            Sample::Same,
+            Residual::Same(x),
+        )?;
         Ok(y)
     }
 }
@@ -211,18 +272,7 @@ impl Vae {
                 Resnet::load(d, c, "decoder.mid_block.resnets.0", top, top)?,
                 Resnet::load(d, c, "decoder.mid_block.resnets.1", top, top)?,
             ],
-            attention: Attention {
-                norm: gamma(d, c, "decoder.mid_block.attentions.0.norm", top)?,
-                qkv: Conv::load(
-                    d,
-                    c,
-                    "decoder.mid_block.attentions.0.to_qkv",
-                    top,
-                    3 * top,
-                    1,
-                )?,
-                proj: Conv::load(d, c, "decoder.mid_block.attentions.0.proj", top, top, 1)?,
-            },
+            attention: Attention::load(d, c, "decoder.mid_block.attentions.0", top)?,
             ups,
             norm_out: gamma(d, c, "decoder.norm_out", *dims.last().unwrap_or(&0))?,
             conv_out: Conv::load(
@@ -242,15 +292,8 @@ impl Vae {
     /// activations around the last upsampling, where they are largest.
     pub fn estimate_bytes(cfg: &VaeConfig, (h, w): (usize, usize)) -> usize {
         let dims = decoder_dims(cfg).expect("a validated geometry");
-        let conv =
-            |cin: usize, cout: usize, k: usize| page(cout * cin * k * k * 2) + page(cout * 2);
-        let resnet = |cin: usize, cout: usize| {
-            conv(cin, cout, 3)
-                + conv(cout, cout, 3)
-                + if cin == cout { 0 } else { conv(cin, cout, 1) }
-                + page(cin * 4)
-                + page(cout * 4)
-        };
+        let conv = Conv::bytes;
+        let resnet = Resnet::bytes;
         let (z, top) = (cfg.z_dim, dims[0]);
         let mut weights = conv(z, z, 1)
             + conv(z, top, 3)
@@ -315,9 +358,25 @@ impl Vae {
         let top = self.conv_in.cout;
         let zc = self.post_quant.cin;
         let mapped = Tensor::zeros(d, [h * w, zc], DType::F16)?;
-        conv::conv(d, &self.post_quant, z, &mapped, (h, w), 1, Residual::None)?;
+        conv::conv(
+            d,
+            &self.post_quant,
+            z,
+            &mapped,
+            (h, w),
+            Sample::Same,
+            Residual::None,
+        )?;
         let mut x = Tensor::zeros(d, [h * w, top], DType::F16)?;
-        conv::conv(d, &self.conv_in, &mapped, &x, (h, w), 1, Residual::None)?;
+        conv::conv(
+            d,
+            &self.conv_in,
+            &mapped,
+            &x,
+            (h, w),
+            Sample::Same,
+            Residual::None,
+        )?;
         drop(mapped);
         x = self.mid[0].forward(d, &x, (h, w))?;
         x = self.attention.forward(d, &x, (h, w))?;
@@ -340,7 +399,7 @@ impl Vae {
                         frames: block.frames,
                         repeats: block.repeats,
                     };
-                    conv::conv(d, up, &cur, &out, (nh, nw), 2, skip)?;
+                    conv::conv(d, up, &cur, &out, (nh, nw), Sample::Up, skip)?;
                     (h, w) = (nh, nw);
                     out
                 }
@@ -352,7 +411,15 @@ impl Vae {
         conv::channel_rms(d, &x, &self.norm_out, &act, h * w, true)?;
         drop(x);
         let out = Tensor::zeros(d, [h * w, self.conv_out.cout], DType::F16)?;
-        conv::conv(d, &self.conv_out, &act, &out, (h, w), 1, Residual::None)?;
+        conv::conv(
+            d,
+            &self.conv_out,
+            &act,
+            &out,
+            (h, w),
+            Sample::Same,
+            Residual::None,
+        )?;
         let mut pixels = out.to_f32();
         for p in &mut pixels {
             *p = p.clamp(-1., 1.);

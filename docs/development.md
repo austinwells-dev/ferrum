@@ -8,10 +8,10 @@
 | `src/metal/shaders/` | All GPU kernels (`hybrid.metal` and `hybrid_mlx.metal` for the hybrid engine; `ops.metal` and `project_mpp.metal` for the general engine, plus the keep-alive kernel) |
 | `src/tensor/`, `src/loader/` | Tensors; safetensors and GGUF parsing |
 | `src/hybrid/` | The engine the apps run: Qwen3.5-family hybrids (and, experimentally, Flint and Spark): memory planner, forward pass, sessions, drafters |
-| `src/diffusion/` | Qwen-Image-2.1 text-to-image: transformer, VAE decoder, text-encoder glue, staged pipeline (kernels in `diffusion.metal`, `diffusion_vae.metal`; compiled only for image runs) |
-| `src/vision/`, `src/tokenizer/` | Qwen3-VL image encoder; tokenizers |
+| `src/diffusion/` | Qwen-Image-2.1 drawing and editing: transformer, VAE decoder and encoder (`vae_encoder.rs`), text-encoder and vision-tower glue, staged pipeline (kernels in `diffusion.metal`, `diffusion_vae.metal`; compiled only for image runs) |
+| `src/vision/`, `src/tokenizer/` | Qwen3-VL image encoder (from a GGUF projector or, with DeepStack, from safetensors); tokenizers |
 | `src/model/`, `src/ops/`, `src/nn/`, `src/generation.rs`, `src/sampling.rs`, `src/quantization.rs`, `src/reference/` | The general transformer engine (Qwen2.5/3, Granite, OLMo 2, LFM2) and its CPU test oracles. Built only with `--features legacy-engine` |
-| `src/bin/` | `ferrum-cli` (also `ferrum-cli image`), `ferrum-server`, `ferrum-tui` |
+| `src/bin/` | `ferrum-cli` (also `ferrum-cli image`), `ferrum-server` (image routes in `images.rs`, form uploads in `multipart.rs`), `ferrum-tui` (Image tab in `imagetab.rs`, the chat tool in `imagetool.rs`) |
 | `tests/`, `benches/`, `examples/` | Integration tests and Criterion benchmarks (all general-engine, so they need the feature), `examples/hybrid_*` probes for the hybrid engine |
 | `tools/` | Optional Python scripts that compare against Transformers, MLX and llama.cpp, `tools/imgref` (diffusers reference dumps for image generation), and `check_links.py` (run by CI) |
 
