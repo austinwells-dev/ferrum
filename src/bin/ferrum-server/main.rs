@@ -8,10 +8,12 @@
 //! that extends it only prefills the new suffix.
 mod anthropic;
 mod http;
+mod images;
 mod log;
 mod openai;
 mod worker;
 
+use ferrum::diffusion::pipeline;
 use ferrum::hybrid::{
     self,
     chat::ChatTemplate,
@@ -38,7 +40,8 @@ const HELP: &str = "\
 ferrum-server: OpenAI/Anthropic-compatible server for Qwen3.5-family GGUF models
 (experimental: Flint, Spark)
 
-usage: ferrum-server --model FILE.gguf [options]
+usage: ferrum-server --model FILE.gguf [--image-model DIR] [options]
+       ferrum-server --image-model DIR [options]       (images only)
 
 server:
   --host ADDR               bind address (default 127.0.0.1)
@@ -88,6 +91,12 @@ vision (images in chat requests as data: URLs / base64; Qwen3-VL style projector
                             Qwen-VL reads fine print and grounds better with 1024)
                             (requests may lower both per image: `detail` low|high|N,
                             `min_tokens`/`max_tokens`, or image_max_tokens per request)
+image generation (Qwen-Image-2.1 directories; each request needs about 15 GB free, 8 GB
+with --image-text-quantize q8_0, and models load for the request and are freed after it):
+  --image-model DIR         serve /v1/images/generations from this directory
+  --image-alias NAME        model name reported for it (default: the directory name)
+  --image-quantize bf16|q8_0|q4_0       quantize the transformer as it loads (default bf16)
+  --image-text-quantize bf16|q8_0|q4_0  the same for the text encoder (default bf16)
 generation defaults (requests may override):
   --temp, --top-p, --top-k, --min-p, --presence-penalty, --frequency-penalty,
   --repeat-penalty X        sampling (default: the GGUF's recommended values)
@@ -100,8 +109,8 @@ thinking defaults (requests may override):
   --chat-template-kwargs J  JSON object of extra chat-template variables
 
 endpoints: /v1/chat/completions, /v1/completions, /v1/messages,
-  /v1/messages/count_tokens, /v1/models, /health, /props, /slots, /metrics,
-  /tokenize, /detokenize, /apply-template
+  /v1/messages/count_tokens, /v1/images/generations, /v1/models, /health, /props,
+  /slots, /metrics, /tokenize, /detokenize, /apply-template
 ";
 
 pub struct Defaults {
@@ -112,14 +121,21 @@ pub struct Defaults {
     pub max_tokens: usize,
 }
 
-pub struct Server {
-    pub shared: Arc<Shared>,
+/// The chat model: its thread's queue and what requests are rendered with.
+pub struct Llm {
     jobs: Mutex<Sender<Job>>,
     pub tokenizer: Tokenizer,
     pub template: ChatTemplate,
     pub defaults: Defaults,
-    name: String,
     model_path: PathBuf,
+}
+
+pub struct Server {
+    pub shared: Arc<Shared>,
+    /// Absent when started with only `--image-model`.
+    llm: Option<Llm>,
+    pub images: Option<images::Service>,
+    name: String,
     api_key: Option<String>,
     /// Extra origins web pages may call from (`--cors`).
     cors: Vec<String>,
@@ -132,6 +148,14 @@ pub struct Server {
 impl Server {
     pub fn model_name(&self) -> String {
         self.name.clone()
+    }
+
+    /// The chat model. Chat routes are refused up front when there is none
+    /// (`handle`), so handlers can rely on it.
+    pub fn llm(&self) -> &Llm {
+        self.llm
+            .as_ref()
+            .expect("chat routes are guarded in handle")
     }
 
     pub fn submit(
@@ -159,7 +183,7 @@ impl Server {
             cancel: cancel.clone(),
             enqueued: Instant::now(),
         };
-        if let Ok(jobs) = self.jobs.lock()
+        if let Ok(jobs) = self.llm().jobs.lock()
             && jobs.send(job).is_err()
         {
             error!(Some(id), "model thread is gone");
@@ -199,6 +223,9 @@ struct Options {
     mmproj: Option<String>,
     image_tokens: usize,
     image_min_tokens: usize,
+    image_model: Option<String>,
+    image_alias: Option<String>,
+    image_settings: ferrum::diffusion::pipeline::Settings,
 }
 
 fn parse() -> Result<Options, String> {
@@ -221,6 +248,9 @@ fn parse() -> Result<Options, String> {
         mmproj: None,
         image_tokens: ferrum::vision::DEFAULT_MAX_TOKENS,
         image_min_tokens: ferrum::vision::DEFAULT_MIN_TOKENS,
+        image_model: None,
+        image_alias: None,
+        image_settings: ferrum::diffusion::pipeline::Settings::default(),
     };
     let mut args = std::env::args().skip(1);
     while let Some(key) = args.next() {
@@ -270,6 +300,16 @@ fn parse() -> Result<Options, String> {
             }
             "--kv-cache" | "-ctk" | "--cache-type-k" | "-ctv" | "--cache-type-v" => {
                 o.plan.kv_cache = value.parse().map_err(|e: ferrum::Error| e.to_string())?
+            }
+            "--image-model" => o.image_model = Some(value.clone()),
+            "--image-alias" => o.image_alias = Some(value.clone()),
+            "--image-quantize" => {
+                o.image_settings.transformer =
+                    pipeline::parse_quantization(&value).map_err(|e| e.to_string())?
+            }
+            "--image-text-quantize" => {
+                o.image_settings.text =
+                    pipeline::parse_quantization(&value).map_err(|e| e.to_string())?
             }
             "--mmproj" => o.mmproj = Some(value.clone()),
             "--image-tokens" => o.image_tokens = number()?,
@@ -322,8 +362,8 @@ fn parse() -> Result<Options, String> {
             _ => return Err(format!("unknown option {key} (see --help)")),
         }
     }
-    if o.model.as_os_str().is_empty() {
-        return Err("--model is required (see --help)".into());
+    if o.model.as_os_str().is_empty() && o.image_model.is_none() {
+        return Err("--model or --image-model is required (see --help)".into());
     }
     o.plan.parallel = o.parallel;
     if o.api_key.is_none() {
@@ -350,12 +390,101 @@ fn main() {
 }
 
 fn run(o: Options) -> Result<(), String> {
+    let chat = !o.model.as_os_str().is_empty();
     info!(
         None,
         "ferrum-server {} starting: {}",
         env!("CARGO_PKG_VERSION"),
-        o.model.display()
+        if chat {
+            o.model.display().to_string()
+        } else {
+            o.image_model.clone().unwrap_or_default()
+        }
     );
+    let image_name = o.image_model.as_ref().map(|dir| {
+        o.image_alias.clone().unwrap_or_else(|| {
+            let path = std::path::Path::new(dir);
+            // A Hugging Face snapshot directory is named by its revision.
+            let named = if path.parent().is_some_and(|p| p.ends_with("snapshots")) {
+                path.parent().and_then(|p| p.parent())
+            } else {
+                Some(path)
+            };
+            named.and_then(|p| p.file_name()).map_or_else(
+                || "image-model".into(),
+                |s| {
+                    s.to_string_lossy()
+                        .trim_start_matches("models--")
+                        .replace("--", "/")
+                },
+            )
+        })
+    });
+    let name = match (&o.alias, chat) {
+        (Some(alias), _) => alias.clone(),
+        (None, true) => o
+            .model
+            .file_stem()
+            .map_or_else(|| "model".into(), |s| s.to_string_lossy().into_owned()),
+        (None, false) => image_name.clone().unwrap_or_default(),
+    };
+    let listener = TcpListener::bind((o.host.as_str(), o.port))
+        .map_err(|e| format!("bind {}:{}: {e}", o.host, o.port))?;
+    let shared = Arc::new(Shared {
+        status: Mutex::new(Status {
+            // With no chat model there is nothing to load.
+            state: if chat { "loading" } else { "ready" },
+            model: name.clone(),
+            ..Status::default()
+        }),
+        queued: AtomicUsize::new(0),
+    });
+    let llm = if chat {
+        Some(start_llm(&o, &shared)?)
+    } else {
+        None
+    };
+    let images = match (&o.image_model, image_name) {
+        (Some(dir), Some(model)) => {
+            info!(None, "image model {model}: {dir}");
+            Some(images::Service::start(dir, o.image_settings, model)?)
+        }
+        _ => None,
+    };
+    let server = Arc::new(Server {
+        shared,
+        llm,
+        images,
+        name,
+        api_key: o.api_key,
+        loopback: o.host == "localhost"
+            || o.host
+                .trim_matches(|c| c == '[' || c == ']')
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback()),
+        cors: o.cors,
+        next_id: AtomicU64::new(1),
+        started: Instant::now(),
+    });
+    info!(
+        None,
+        "listening on http://{}:{} (OpenAI: /v1/chat/completions, /v1/images/generations; Anthropic: /v1/messages){}",
+        o.host,
+        o.port,
+        if chat { "; model loading…" } else { "" }
+    );
+    for stream in listener.incoming() {
+        let Ok(stream) = stream else { continue };
+        let server = server.clone();
+        let _ = std::thread::Builder::new()
+            .name("conn".into())
+            .spawn(move || connection(&server, stream));
+    }
+    Ok(())
+}
+
+/// Start the model thread for `--model` and gather what requests are rendered with.
+fn start_llm(o: &Options, shared: &Arc<Shared>) -> Result<Llm, String> {
     let mut sampling = recommended_sampling_for(&o.model).map_err(|e| e.to_string())?;
     for (key, v) in &o.sampling {
         match key.as_str() {
@@ -374,21 +503,6 @@ fn run(o: Options) -> Result<(), String> {
     let template = hybrid::load_chat_template(&o.model)
         .map_err(|e| e.to_string())?
         .ok_or("the GGUF has no chat template")?;
-    let name = o.alias.clone().unwrap_or_else(|| {
-        o.model
-            .file_stem()
-            .map_or_else(|| "model".into(), |s| s.to_string_lossy().into_owned())
-    });
-    let listener = TcpListener::bind((o.host.as_str(), o.port))
-        .map_err(|e| format!("bind {}:{}: {e}", o.host, o.port))?;
-    let shared = Arc::new(Shared {
-        status: Mutex::new(Status {
-            state: "loading",
-            model: name.clone(),
-            ..Status::default()
-        }),
-        queued: AtomicUsize::new(0),
-    });
     let mmproj = ferrum::vision::resolve_projector(&o.model, o.mmproj.as_deref())
         .map_err(|e| e.to_string())?;
     let jobs = worker::spawn(
@@ -413,44 +527,19 @@ fn run(o: Options) -> Result<(), String> {
     if let Some(b) = o.reasoning_budget {
         info!(None, "default reasoning budget: {b} tokens");
     }
-    let server = Arc::new(Server {
-        shared,
+    Ok(Llm {
         jobs: Mutex::new(jobs),
         tokenizer,
         template,
         defaults: Defaults {
             sampling,
-            template_vars: o.vars,
+            template_vars: o.vars.clone(),
             reasoning_budget: o.reasoning_budget,
             raw_reasoning: o.raw_reasoning,
             max_tokens: o.max_tokens,
         },
-        name,
-        model_path: o.model,
-        api_key: o.api_key,
-        loopback: o.host == "localhost"
-            || o.host
-                .trim_matches(|c| c == '[' || c == ']')
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback()),
-        cors: o.cors,
-        next_id: AtomicU64::new(1),
-        started: Instant::now(),
-    });
-    info!(
-        None,
-        "listening on http://{}:{} (OpenAI: /v1/chat/completions, Anthropic: /v1/messages); model loading…",
-        o.host,
-        o.port
-    );
-    for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let server = server.clone();
-        let _ = std::thread::Builder::new()
-            .name("conn".into())
-            .spawn(move || connection(&server, stream));
-    }
-    Ok(())
+        model_path: o.model.clone(),
+    })
 }
 
 /// Why a request from a web page is refused, if it is. Browsers send
@@ -589,6 +678,20 @@ fn handle(
         }
         serde_json::from_slice(&r.body).map_err(|e| format!("invalid JSON body: {e}"))
     };
+    if path == "/v1/images/generations" {
+        return match (r.method.as_str(), body()) {
+            ("POST", Ok(json_body)) => images::generations(server, stream, &json_body, id, ka),
+            ("POST", Err(e)) => {
+                http::json(stream, 400, &error_json(&e, "invalid_request_error"), ka)
+            }
+            _ => http::json(
+                stream,
+                405,
+                &error_json("use POST", "invalid_request_error"),
+                ka,
+            ),
+        };
+    }
     let needs_model = matches!(
         path,
         "/v1/chat/completions"
@@ -598,6 +701,27 @@ fn handle(
             | "/completion"
             | "/v1/messages"
     );
+    if (needs_model
+        || matches!(
+            path,
+            "/v1/messages/count_tokens"
+                | "/tokenize"
+                | "/detokenize"
+                | "/apply-template"
+                | "/props"
+        ))
+        && server.llm.is_none()
+    {
+        return http::json(
+            stream,
+            404,
+            &error_json(
+                "this server has no chat model (start it with --model FILE.gguf)",
+                "not_found_error",
+            ),
+            ka,
+        );
+    }
     if needs_model && status.state != "ready" {
         let message = match status.state {
             "error" => format!(
@@ -643,7 +767,7 @@ fn handle(
                     .get("content")
                     .and_then(Json::as_str)
                     .unwrap_or_default();
-                match server.tokenizer.encode(text) {
+                match server.llm().tokenizer.encode(text) {
                     Ok(tokens) => http::json(stream, 200, &json!({"tokens": tokens}), ka),
                     Err(e) => http::json(
                         stream,
@@ -663,7 +787,7 @@ fn handle(
                             .collect()
                     })
                     .unwrap_or_default();
-                match server.tokenizer.decode(&ids) {
+                match server.llm().tokenizer.decode(&ids) {
                     Ok(text) => http::json(stream, 200, &json!({"content": text}), ka),
                     Err(e) => http::json(
                         stream,
@@ -687,8 +811,8 @@ fn handle(
                     .unwrap_or_default();
                 let t = openai::thinking(&json_body, server);
                 let mut vars = t.vars;
-                hybrid::runtime::normalize_thinking(server.template.source(), &mut vars);
-                match server.template.render(
+                hybrid::runtime::normalize_thinking(server.llm().template.source(), &mut vars);
+                match server.llm().template.render(
                     &messages,
                     (!tools.is_empty()).then_some(&tools[..]),
                     true,
@@ -696,8 +820,10 @@ fn handle(
                 ) {
                     // The same prompt a chat request feeds the model.
                     Ok(mut prompt) => {
-                        prompt
-                            .push_str(hybrid::runtime::generation_prefix(&server.template, &vars));
+                        prompt.push_str(hybrid::runtime::generation_prefix(
+                            &server.llm().template,
+                            &vars,
+                        ));
                         http::json(stream, 200, &json!({"prompt": prompt}), ka)
                     }
                     Err(e) => http::json(
@@ -729,23 +855,20 @@ fn handle(
         ("GET", "/v1/models" | "/models") => http::json(
             stream,
             200,
-            &json!({"object": "list", "data": [{
-                "id": server.name, "object": "model", "created": openai::now(), "owned_by": "ferrum",
-                "meta": {"n_ctx_train": status.context, "n_ctx": status.context, "status": status.state}
-            }]}),
+            &json!({"object": "list", "data": models(server, &status)}),
             ka,
         ),
         ("GET", "/props") => {
-            let d = &server.defaults;
+            let d = &server.llm().defaults;
             http::json(
                 stream,
                 200,
                 &json!({
-                    "model_path": server.model_path.display().to_string(),
+                    "model_path": server.llm().model_path.display().to_string(),
                     "model_alias": server.name,
                     "n_ctx": status.context,
                     "total_slots": status.slots.len().max(1),
-                    "chat_template": server.template.source(),
+                    "chat_template": server.llm().template.source(),
                     "modalities": {"vision": status.vision, "audio": false},
                     "build_info": format!("ferrum {}", env!("CARGO_PKG_VERSION")),
                     "default_generation_settings": {
@@ -849,6 +972,24 @@ fn handle(
             http::json(stream, 404, &error_json("not found", "not_found_error"), ka)
         }
     }
+}
+
+/// The `/v1/models` entries: the chat model, then the image model.
+fn models(server: &Server, status: &Status) -> Vec<Json> {
+    let mut data = Vec::new();
+    if server.llm.is_some() {
+        data.push(json!({
+            "id": server.name, "object": "model", "created": openai::now(), "owned_by": "ferrum",
+            "meta": {"n_ctx_train": status.context, "n_ctx": status.context, "status": status.state}
+        }));
+    }
+    if let Some(images) = &server.images {
+        data.push(json!({
+            "id": images.model, "object": "model", "created": openai::now(), "owned_by": "ferrum",
+            "meta": {"type": "image", "status": "ready"}
+        }));
+    }
+    data
 }
 
 #[cfg(test)]

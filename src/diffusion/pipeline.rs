@@ -30,6 +30,18 @@ pub const SIZE_STEP: usize = 32;
 pub const MIN_SIDE: usize = 256;
 pub const MAX_SIDE: usize = 2048;
 
+/// Sides must be multiples of `SIZE_STEP` within `MIN_SIDE..=MAX_SIDE`.
+pub fn check_size(width: usize, height: usize) -> Result<()> {
+    for (name, side) in [("width", width), ("height", height)] {
+        if !(MIN_SIDE..=MAX_SIDE).contains(&side) || !side.is_multiple_of(SIZE_STEP) {
+            return Err(Error::Parameter(format!(
+                "{name} {side} must be a multiple of {SIZE_STEP} between {MIN_SIDE} and {MAX_SIDE}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// How the weights are stored on the device.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Settings {
@@ -88,6 +100,22 @@ pub enum Stage {
     },
     LoadDecoder,
     Decode,
+}
+
+/// Watches a generation: told each stage as it starts, and asked between
+/// stages and steps whether to carry on. Any `FnMut(Stage)` is an observer
+/// that never cancels.
+pub trait Observer {
+    fn stage(&mut self, stage: Stage);
+    fn cancelled(&self) -> bool {
+        false
+    }
+}
+
+impl<F: FnMut(Stage)> Observer for F {
+    fn stage(&mut self, stage: Stage) {
+        self(stage);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -159,13 +187,7 @@ impl Pipeline {
 
     /// Latent tokens per side and the sigma schedule for `request`.
     fn geometry(&self, request: &Request) -> Result<((usize, usize), Schedule)> {
-        for (name, side) in [("width", request.width), ("height", request.height)] {
-            if !(MIN_SIDE..=MAX_SIDE).contains(&side) || !side.is_multiple_of(SIZE_STEP) {
-                return Err(Error::Parameter(format!(
-                    "{name} {side} must be a multiple of {SIZE_STEP} between {MIN_SIDE} and {MAX_SIDE}"
-                )));
-            }
-        }
+        check_size(request.width, request.height)?;
         let scale = self.model.vae.scale_factor_spatial;
         let grid = (request.height / scale, request.width / scale);
         let schedule = match (&self.model.sample_sigmas, request.steps) {
@@ -203,33 +225,44 @@ impl Pipeline {
         &self,
         d: &MetalDevice,
         request: &Request,
-        progress: &mut dyn FnMut(Stage),
+        observer: &mut dyn Observer,
     ) -> Result<Generated> {
         let (grid, schedule) = self.geometry(request)?;
-        let budget = d.recommended_max_working_set() as usize;
+        // Whatever else is resident (a chat model) counts against the stage.
+        let (budget, resident) = (
+            d.recommended_max_working_set() as usize,
+            d.allocated_bytes(),
+        );
         for (name, bytes) in self.stage_bytes(request)? {
-            if bytes > budget {
-                return Err(Error::Allocation(bytes)).map_err(|_| {
-                    Error::Parameter(format!(
-                        "the {name} stage needs about {:.1} GB, over this device's {:.1} GB working set",
-                        bytes as f64 / 1e9,
-                        budget as f64 / 1e9
-                    ))
-                });
+            if resident + bytes > budget {
+                eprintln!(
+                    "the {name} stage needs about {:.1} GB with {:.1} GB already in use, over this device's {:.1} GB working set",
+                    bytes as f64 / 1e9,
+                    resident as f64 / 1e9,
+                    budget as f64 / 1e9
+                );
+                return Err(Error::Allocation(bytes));
             }
         }
+        let mut stage = |s: Stage| -> Result<()> {
+            if observer.cancelled() {
+                return Err(Error::Cancelled);
+            }
+            observer.stage(s);
+            Ok(())
+        };
         let mut timings = Timings::default();
         let tokens = grid.0 * grid.1;
 
         let (ids, skip) = self.tokenize(&request.prompt)?;
         let embeds = {
-            progress(Stage::LoadEncoder);
+            stage(Stage::LoadEncoder)?;
             let started = Instant::now();
             let ckpt = Checkpoint::open(self.model.path("text_encoder"))?;
             let encoder =
                 TextEncoder::load(d, &ckpt, &self.model.text, ids.len(), self.settings.text)?;
             timings.load += started.elapsed();
-            progress(Stage::Encode);
+            stage(Stage::Encode)?;
             let started = Instant::now();
             let embeds = encoder.encode(d, &ids, skip)?;
             timings.encode = started.elapsed();
@@ -238,7 +271,7 @@ impl Pipeline {
         let text_rows = embeds.shape().dimensions()[0];
 
         let latents = {
-            progress(Stage::LoadTransformer);
+            stage(Stage::LoadTransformer)?;
             let started = Instant::now();
             let ckpt = Checkpoint::open(self.model.path("transformer"))?;
             let dit = Dit::load(d, &ckpt, &self.model.dit, self.settings.transformer)?;
@@ -269,21 +302,21 @@ impl Pipeline {
                     None,
                 )?;
                 schedule.advance(d, i, &pred, &latents)?;
-                progress(Stage::Denoise {
+                stage(Stage::Denoise {
                     step: i + 1,
                     steps: schedule.steps(),
-                });
+                })?;
             }
             timings.denoise = started.elapsed();
             latents
         };
 
-        progress(Stage::LoadDecoder);
+        stage(Stage::LoadDecoder)?;
         let started = Instant::now();
         let ckpt = Checkpoint::open(self.model.path("vae"))?;
         let vae = Vae::load(d, &ckpt, &self.model.vae)?;
         timings.load += started.elapsed();
-        progress(Stage::Decode);
+        stage(Stage::Decode)?;
         let started = Instant::now();
         let z = vae.denormalize(d, &latents)?;
         let image = vae.decode(d, &z, grid)?;

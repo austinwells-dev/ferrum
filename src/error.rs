@@ -42,6 +42,8 @@ pub enum Error {
     DeviceMismatch,
     #[error("invalid operation parameter: {0}")]
     Parameter(String),
+    #[error("cancelled")]
+    Cancelled,
     #[error("numerical validation: {0}")]
     Validation(String),
 }
