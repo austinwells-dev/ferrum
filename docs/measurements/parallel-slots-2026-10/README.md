@@ -37,3 +37,31 @@ The branch's best is inside the base's range everywhere, apart from Tiel pp512, 
 Through the server with the Tiel drafter (mean decode tok/s over 9 requests, 128 tokens, base, branch, branch, base, base, branch): base 46.0, 41.1, 42.2; branch 47.4, 40.7, 48.6.
 
 Parallel slots interleave requests rather than batch them, so total throughput stays the same as one slot (Spark: 18.4 s for 8 requests with 1 slot, 18.5 s with 8), and each request's own rate drops while it shares the GPU.
+
+## Concurrent users (Tiel)
+
+`ferrum-server --parallel 8 -c 8192 --mmproj none`, with and without `--draft` ornith-ai/Ornith-1.5-35B-A3B-DFlash, 26 October 2026, screen unlocked, under `caffeinate -dims`. [conc.py](conc.py) sends N streaming chat requests at once (219-token prompts, each tagged so nothing comes from cache, 128 greedy tokens each), two rounds per N; [plot_conc.py](plot_conc.py) plots the round with the higher total.
+
+![Total throughput, per-user speed and slowest first token against 1 to 8 concurrent users](concurrency-tiel.png)
+
+| Users | No drafter: total tok/s | per user | worst first token (s) | DFlash: total tok/s | per user | worst first token (s) |
+|---|---|---|---|---|---|---|
+| 1 | 33.0 | 36.7 | 0.38 | 41.2 | 47.1 | 0.39 |
+| 2 | 33.0 | 17.9 | 0.82 | 36.5 | 24.3 | 0.89 |
+| 4 | 35.0 | 9.5 | 1.53 | 36.1 | 11.4 | 1.75 |
+| 8 | 35.0 | 4.8 | 3.12 | 35.8 | 5.4 | 3.20 |
+
+Total throughput stays flat because slots interleave rather than batch: N users share one decode stream. The drafter runs on slot 0 only, so its gain shrinks to slot 0's share as users are added. The first token waits for every request that arrived at the same time to prefill (one 219-token chunk each, about 0.38 s). Raw: [concurrency-tiel.txt](concurrency-tiel.txt), [concurrency-tiel-best.txt](concurrency-tiel-best.txt).
+
+## Cache per user (Tiel)
+
+[cache.py](cache.py): 8 users, each with its own ~1,280-token system prompt. Turn 1 and turn 2 send all 8 at once; turn 3 is user 0 alone, after everyone's turn 2.
+
+| | `--parallel 8` | `--parallel 1` |
+|---|---|---|
+| Turn 2, cached / prompt tokens (8 users) | 10,271 / 10,431 | 0 / 10,431 |
+| Turn 3 (user 0), cached / prompt | 1,307 / 1,331 | 0 / 1,331 |
+| Turn 3 prompt time | 145 ms | 1,895 ms |
+| `/slots` after turn 3 | 8 slots holding 1,307–1,355 tokens each | 1 slot, the last conversation |
+
+Raw: [cache-per-user.txt](cache-per-user.txt).
