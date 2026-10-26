@@ -639,6 +639,18 @@ impl Matrix {
         })
     }
 
+    /// Device bytes of a `[rows, cols]` matrix loaded from BF16 as `format`
+    /// (as stored, or quantized), page-rounded like its allocation.
+    pub(crate) fn bf16_stored_bytes(rows: usize, cols: usize, format: Option<Format>) -> usize {
+        let row = match format {
+            None | Some(Format::Bf16) => cols * 2,
+            Some(Format::Q8_0) => cols / 32 * 34,
+            Some(Format::Q4_0) => cols / 32 * 18,
+            Some(_) => cols * 4,
+        };
+        super::engine::page(rows * row)
+    }
+
     /// Quantize a row-major BF16 `[rows, cols]` matrix (little-endian bytes)
     /// into `format` (Q8_0, Q4_0 or F32), rows in parallel.
     pub(crate) fn from_bf16(

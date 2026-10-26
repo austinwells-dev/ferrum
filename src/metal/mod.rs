@@ -209,6 +209,9 @@ pub struct DispatchTiming {
 pub struct Counters {
     pub allocations: usize,
     pub allocated_bytes: usize,
+    /// Highest `allocated_bytes()` (Metal's own accounting) since the last
+    /// `reset_allocated_peak`.
+    pub allocated_peak: usize,
     pub dispatches: usize,
     pub command_buffers: usize,
     pub completion_waits: usize,
@@ -697,6 +700,12 @@ impl MetalDevice {
     pub fn allocated_bytes(&self) -> usize {
         self.raw.currentAllocatedSize()
     }
+    /// Restart the `allocated_peak` observation from the current allocation.
+    pub fn reset_allocated_peak(&self) {
+        let mut counters = self.counters.get();
+        counters.allocated_peak = self.allocated_bytes();
+        self.counters.set(counters);
+    }
     pub fn max_buffer_length(&self) -> usize {
         self.raw.maxBufferLength()
     }
@@ -725,6 +734,7 @@ impl MetalDevice {
         let mut counters = self.counters.get();
         counters.allocations += 1;
         counters.allocated_bytes += length;
+        counters.allocated_peak = counters.allocated_peak.max(self.allocated_bytes());
         counters.allocation_time += start.elapsed();
         self.counters.set(counters);
         Ok(MetalBuffer {

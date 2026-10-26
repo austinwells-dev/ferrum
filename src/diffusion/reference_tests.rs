@@ -10,6 +10,7 @@ use super::{
     checkpoint::Checkpoint,
     config::ModelDir,
     dit::{Dit, Rope, Scratch},
+    pipeline::{Pipeline, Request, Settings, Stage, parse_quantization},
     schedule::Schedule,
     text::TextEncoder,
     vae::Vae,
@@ -338,4 +339,70 @@ fn text_encoder_matches_diffusers() {
 fn text_encoder_q8_stays_close_to_diffusers() {
     let rel = encoder_error(Some(crate::hybrid::weights::Format::Q8_0));
     assert!(rel < bound(0.08, 0.05), "Q8_0 prompt embedding error {rel}");
+}
+
+#[test]
+#[ignore = "needs the Turbo checkpoint and a tools/imgref dump"]
+fn template_tokenizes_like_diffusers() {
+    let pipeline = Pipeline::open(dir("FERRUM_QWEN_IMAGE"), Settings::default()).unwrap();
+    let meta = meta();
+    let (ids, skip) = pipeline.tokenize(meta["prompt"].as_str().unwrap()).unwrap();
+    let want: Vec<u64> = meta["input_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_u64().unwrap())
+        .collect();
+    assert_eq!(ids.iter().map(|&i| u64::from(i)).collect::<Vec<_>>(), want);
+    assert_eq!(skip as u64, meta["drop_idx"].as_u64().unwrap());
+}
+
+/// The whole pipeline at the dump's size. Writes the PNG to `FERRUM_IMAGE_OUT`
+/// when set, and prints each stage's predicted and measured device bytes.
+#[test]
+#[ignore = "needs the Turbo checkpoint"]
+fn pipeline_generates_an_image() {
+    let d = MetalDevice::new().unwrap();
+    let settings = Settings {
+        text: std::env::var("FERRUM_TEXT_QUANT").map_or(None, |q| parse_quantization(&q).unwrap()),
+        transformer: std::env::var("FERRUM_DIT_QUANT")
+            .map_or(None, |q| parse_quantization(&q).unwrap()),
+    };
+    let pipeline = Pipeline::open(dir("FERRUM_QWEN_IMAGE"), settings).unwrap();
+    let side = std::env::var("FERRUM_SIDE").map_or(512, |s| s.parse().unwrap());
+    let mut request = Request::new("A red fox sitting in fresh snow, golden hour light.");
+    (request.width, request.height, request.seed) = (side, side, 42);
+    let predicted = pipeline.stage_bytes(&request).unwrap();
+
+    let mut stage_peaks = Vec::new();
+    d.reset_allocated_peak();
+    let started = std::time::Instant::now();
+    let generated = pipeline
+        .generate(&d, &request, &mut |stage| {
+            if matches!(stage, Stage::LoadTransformer | Stage::LoadDecoder) {
+                stage_peaks.push(d.counters().allocated_peak);
+                d.reset_allocated_peak();
+            }
+            if let Stage::Denoise { step, steps } = stage {
+                eprint!("\rstep {step}/{steps}");
+            }
+        })
+        .unwrap();
+    stage_peaks.push(d.counters().allocated_peak);
+    eprintln!(
+        "\ntotal {:.1}s, {:?}",
+        started.elapsed().as_secs_f32(),
+        generated.timings
+    );
+    for ((name, want), got) in predicted.iter().zip(&stage_peaks) {
+        eprintln!(
+            "{name:>12}: predicted {:8.1} MiB, measured peak {:8.1} MiB",
+            *want as f64 / 1048576.,
+            *got as f64 / 1048576.
+        );
+    }
+    assert_eq!((generated.width, generated.height), (side, side));
+    if let Some(path) = std::env::var_os("FERRUM_IMAGE_OUT") {
+        std::fs::write(path, generated.png().unwrap()).unwrap();
+    }
 }

@@ -16,6 +16,7 @@ pub mod config;
 pub(crate) mod conv;
 pub mod dit;
 pub(crate) mod ops;
+pub mod pipeline;
 #[cfg(test)]
 mod reference_tests;
 pub mod rope;

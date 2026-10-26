@@ -16,7 +16,7 @@ use super::{
 use crate::{
     DType, Error, MetalDevice, Result, Tensor,
     hybrid::{
-        engine::{HybridModel, Params},
+        engine::{HybridModel, Params, page},
         weights::{Format, Matrix},
     },
 };
@@ -102,6 +102,24 @@ impl Dit {
             blocks,
             cfg: cfg.clone(),
         })
+    }
+
+    /// Weight bytes `load` allocates.
+    pub fn estimate_bytes(cfg: &DitConfig, quantize: Option<Format>) -> usize {
+        let (h, f) = (cfg.hidden(), cfg.ffn());
+        let stored = |rows, cols, q| Matrix::bf16_stored_bytes(rows, cols, q);
+        let block = 4 * stored(h, h, quantize)
+            + 2 * stored(f, h, quantize)
+            + stored(h, f, quantize)
+            + 2 * page(HEAD_DIM * 4);
+        let fixed = stored(h, cfg.in_channels, None)
+            + stored(h, cfg.context, None)
+            + stored(h, h, None) * 3
+            + stored(h, TIME_DIM, None)
+            + stored(4 * h, h, None)
+            + stored(cfg.out_channels(), h, None)
+            + page(cfg.context * 4);
+        fixed + cfg.layers * block
     }
 
     pub fn config(&self) -> &DitConfig {

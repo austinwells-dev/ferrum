@@ -11,6 +11,7 @@ use super::{
     config::VaeConfig,
     conv::{self, Conv, Operand, Residual},
 };
+use crate::hybrid::engine::page;
 use crate::{DType, Error, MetalDevice, Result, Tensor};
 
 /// Residual block: `x + conv2(silu(rms(conv1(silu(rms(x))))))`, with a 1x1
@@ -61,6 +62,16 @@ pub struct Image {
 
 fn gamma(d: &MetalDevice, c: &Checkpoint, name: &str, len: usize) -> Result<Tensor> {
     c.vector(d, &format!("{name}.gamma"), len, 0.)
+}
+
+/// Channel counts from the deepest level outwards: [1152, 1152, 1152, 576, 288, 144].
+fn decoder_dims(cfg: &VaeConfig) -> Result<Vec<usize>> {
+    let widths = cfg.dim_mult.iter().map(|m| m * cfg.decoder_base_dim);
+    let deepest = widths
+        .clone()
+        .next_back()
+        .ok_or_else(|| Error::Config("empty dim_mult".into()))?;
+    Ok(std::iter::once(deepest).chain(widths.rev()).collect())
 }
 
 impl Resnet {
@@ -164,13 +175,7 @@ impl Attention {
 impl Vae {
     pub fn load(d: &MetalDevice, c: &Checkpoint, cfg: &VaeConfig) -> Result<Self> {
         let z = cfg.z_dim;
-        // Channel counts from the deepest level outwards: [1152, 1152, 1152, 576, 288, 144].
-        let widths = cfg.dim_mult.iter().map(|m| m * cfg.decoder_base_dim);
-        let deepest = widths
-            .clone()
-            .next_back()
-            .ok_or_else(|| Error::Config("empty dim_mult".into()))?;
-        let dims: Vec<usize> = std::iter::once(deepest).chain(widths.rev()).collect();
+        let dims = decoder_dims(cfg)?;
         let top = dims[0];
         let mut ups = Vec::new();
         for i in 0..cfg.dim_mult.len() {
@@ -231,6 +236,42 @@ impl Vae {
             mean: stats(&cfg.latents_mean)?,
             std: stats(&cfg.latents_std)?,
         })
+    }
+
+    /// Device bytes to decode a `grid` of latents: the weights and the
+    /// activations around the last upsampling, where they are largest.
+    pub fn estimate_bytes(cfg: &VaeConfig, (h, w): (usize, usize)) -> usize {
+        let dims = decoder_dims(cfg).expect("a validated geometry");
+        let conv =
+            |cin: usize, cout: usize, k: usize| page(cout * cin * k * k * 2) + page(cout * 2);
+        let resnet = |cin: usize, cout: usize| {
+            conv(cin, cout, 3)
+                + conv(cout, cout, 3)
+                + if cin == cout { 0 } else { conv(cin, cout, 1) }
+                + page(cin * 4)
+                + page(cout * 4)
+        };
+        let (z, top) = (cfg.z_dim, dims[0]);
+        let mut weights = conv(z, z, 1)
+            + conv(z, top, 3)
+            + 2 * resnet(top, top)
+            + conv(top, 3 * top, 1)
+            + conv(top, top, 1);
+        for i in 0..cfg.dim_mult.len() {
+            let (cin, cout) = (dims[i], dims[i + 1]);
+            weights += resnet(cin, cout) + 2 * resnet(cout, cout);
+            if i + 1 < cfg.dim_mult.len() {
+                weights += conv(cout, cout, 3);
+            }
+        }
+        weights += conv(dims[dims.len() - 1], cfg.out_channels, 3);
+        let pixels = h * cfg.scale_factor_spatial * w * cfg.scale_factor_spatial;
+        let (wide, narrow) = (dims[dims.len() - 2], dims[dims.len() - 1]);
+        // Live at once in the last block, which holds its input to the end:
+        // that input, and three tensors of its own width (the normalised
+        // copy, the shortcut and the convolution output).
+        let activations = pixels * 2 * (wide + 3 * narrow);
+        weights + activations
     }
 
     /// Weight bytes on the device.

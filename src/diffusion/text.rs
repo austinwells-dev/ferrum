@@ -17,6 +17,47 @@ use crate::{
     },
 };
 
+fn hybrid_config(cfg: &TextConfig) -> Result<HybridConfig> {
+    let config = HybridConfig {
+        variant: Variant::Flint,
+        name: "qwen3-vl-text".into(),
+        vocab: cfg.vocab,
+        hidden: cfg.hidden,
+        layers: cfg.layers,
+        attention_layers: vec![true; cfg.layers],
+        attn: vec![
+            AttnSpec {
+                window: None,
+                rope: true,
+                sinks: false,
+                gated: false,
+            };
+            cfg.layers
+        ],
+        leading_dense: cfg.layers,
+        heads: cfg.heads,
+        kv_heads: cfg.kv_heads,
+        head_dim: cfg.head_dim,
+        rope_dims: cfg.head_dim,
+        rope_theta: cfg.rope_theta,
+        swa_rope: None,
+        rope_sections: [0; 4],
+        eps: cfg.eps,
+        ffn: cfg.ffn,
+        gelu_ffn: false,
+        conv_kernel: 4,
+        ssm_head_dim: 0,
+        ssm_k_heads: 0,
+        ssm_v_heads: 0,
+        ssm_grouped_heads: false,
+        moe: None,
+        trained_context: cfg.context,
+        kv_cache: KvCache::F16,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
 pub struct TextEncoder {
     model: HybridModel,
     max_tokens: usize,
@@ -33,43 +74,7 @@ impl TextEncoder {
         max_tokens: usize,
         quantize: Option<Format>,
     ) -> Result<Self> {
-        let config = HybridConfig {
-            variant: Variant::Flint,
-            name: "qwen3-vl-text".into(),
-            vocab: cfg.vocab,
-            hidden: cfg.hidden,
-            layers: cfg.layers,
-            attention_layers: vec![true; cfg.layers],
-            attn: vec![
-                AttnSpec {
-                    window: None,
-                    rope: true,
-                    sinks: false,
-                    gated: false,
-                };
-                cfg.layers
-            ],
-            leading_dense: cfg.layers,
-            heads: cfg.heads,
-            kv_heads: cfg.kv_heads,
-            head_dim: cfg.head_dim,
-            rope_dims: cfg.head_dim,
-            rope_theta: cfg.rope_theta,
-            swa_rope: None,
-            rope_sections: [0; 4],
-            eps: cfg.eps,
-            ffn: cfg.ffn,
-            gelu_ffn: false,
-            conv_kernel: 4,
-            ssm_head_dim: 0,
-            ssm_k_heads: 0,
-            ssm_v_heads: 0,
-            ssm_grouped_heads: false,
-            moe: None,
-            trained_context: cfg.context,
-            kv_cache: KvCache::F16,
-        };
-        config.validate()?;
+        let config = hybrid_config(cfg)?;
         let (hidden, q, kv) = (
             cfg.hidden,
             cfg.heads * cfg.head_dim,
@@ -124,6 +129,29 @@ impl TextEncoder {
             },
         )?;
         Ok(Self { model, max_tokens })
+    }
+
+    /// Device bytes of an encoder for `max_tokens`-token prompts: weights,
+    /// engine scratch, K/V cache and the feature capture.
+    pub fn estimate_bytes(cfg: &TextConfig, max_tokens: usize, quantize: Option<Format>) -> usize {
+        use crate::hybrid::{engine::page, engine::scratch_bytes};
+        let stored = |rows, cols| Matrix::bf16_stored_bytes(rows, cols, quantize);
+        let (h, q, kv) = (
+            cfg.hidden,
+            cfg.heads * cfg.head_dim,
+            cfg.kv_heads * cfg.head_dim,
+        );
+        let layer = stored(q, h)
+            + 2 * stored(kv, h)
+            + stored(h, q)
+            + 2 * stored(cfg.ffn, h)
+            + stored(h, cfg.ffn)
+            + 2 * page(h * 4)
+            + 2 * page(cfg.head_dim * 4);
+        let weights = Matrix::bf16_stored_bytes(cfg.vocab, h, None) + cfg.layers * layer;
+        let config = hybrid_config(cfg).expect("a validated geometry");
+        let kv_cache = cfg.layers * 2 * page(max_tokens.next_multiple_of(32) * kv * 2);
+        weights + scratch_bytes(&config, max_tokens, 1) + kv_cache + page(max_tokens.max(2) * h * 4)
     }
 
     /// Weight bytes on the device.
