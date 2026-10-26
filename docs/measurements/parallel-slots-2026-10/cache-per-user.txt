@@ -1,0 +1,20 @@
+== --parallel 8
+turn 1 (all at once): u0 0/1279; u1 0/1280; u2 0/1281; u3 0/1281; u4 0/1280; u5 0/1279; u6 0/1278; u7 0/1279
+turn 2 (all at once): u0 1283/1303; u1 1285/1305; u2 1286/1306; u3 1285/1305; u4 1284/1304; u5 1283/1303; u6 1282/1302; u7 1283/1303
+turn 3 (user 0 alone): u0 1307/1331
+== --parallel 1
+turn 1 (all at once): u0 0/1279; u1 0/1280; u2 0/1281; u3 0/1281; u4 0/1280; u5 0/1279; u6 0/1278; u7 0/1279
+turn 2 (all at once): u0 0/1303; u1 0/1305; u2 0/1306; u3 0/1305; u4 0/1304; u5 0/1303; u6 0/1302; u7 0/1303
+turn 3 (user 0 alone): u0 0/1331
+
+# --parallel 8: per turn, cached / prompt tokens over the users, and mean prompt_ms from each response's timings
+turn 1 (all at once)     cached 0 / 10237; prompt_ms mean 12411
+turn 2 (all at once)     cached 10271 / 10431; prompt_ms mean 823
+turn 3 (user 0 alone)    cached 1307 / 1331; prompt_ms mean 145
+/slots after turn 3 (id, n_cached_tokens): [(0, 1310), (1, 1309), (2, 1309), (3, 1307), (4, 1308), (5, 1355), (6, 1310), (7, 1307)]
+
+# --parallel 1: per turn, cached / prompt tokens over the users, and mean prompt_ms from each response's timings
+turn 1 (all at once)     cached 0 / 10237; prompt_ms mean 1727
+turn 2 (all at once)     cached 0 / 10431; prompt_ms mean 1853
+turn 3 (user 0 alone)    cached 0 / 1331; prompt_ms mean 1895
+/slots after turn 3 (id, n_cached_tokens): [(0, 1355)]

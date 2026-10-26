@@ -409,6 +409,7 @@ pub fn generate_streaming(
         stop: Vec::new(),
         reasoning_budget: thinking,
         raw_reasoning: false,
+        image_budget: Default::default(),
     };
     let r = rt
         .chat(&request, Streaming { stop, on })

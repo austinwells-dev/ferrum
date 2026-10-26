@@ -3,8 +3,9 @@
 //!
 //! The model runs on its own thread behind a FIFO queue; every connection
 //! gets a thread, so health and status endpoints answer while a request is
-//! generating. The session keeps the previous conversation, so a request that
-//! extends it only prefills the new suffix.
+//! generating. Up to `--parallel` requests run at once, one session (slot)
+//! each, taking turns on the GPU. A slot keeps its conversation, so a request
+//! that extends it only prefills the new suffix.
 mod anthropic;
 mod http;
 mod log;
@@ -31,7 +32,7 @@ use std::{
     },
     time::Instant,
 };
-use worker::{Event, Job, Shared, Status, Work};
+use worker::{Event, Job, Route, Shared, Status, Work};
 
 const HELP: &str = "\
 ferrum-server: OpenAI/Anthropic-compatible server for Qwen3.5-family GGUF models
@@ -47,9 +48,13 @@ server:
   --cors ORIGIN             let web pages from ORIGIN call the server (repeatable;
                             `*` for any). Default: only localhost pages
   --alias NAME              model name reported to clients (default: file name)
+  -np, --parallel N         requests served at once, each in its own session with its
+                            own context-sized cache (1-8, default 1); requests go to
+                            the session whose cache holds most of their prompt
   -v, --verbose             debug logging (request bodies, outputs, first-token times)
 memory:
-  -c, --context N|auto      context length (default auto: largest that fits)
+  -c, --context N|auto      context length of each session (default auto: largest that
+                            fits --parallel sessions)
   --kv-cache f16|q8         K/V cache format; q8 nearly halves its memory, so auto
                             context grows, and decodes faster at long context
                             (default f16, or FERRUM_KV_CACHE). Also -ctk/-ctv.
@@ -81,6 +86,8 @@ vision (images in chat requests as data: URLs / base64; Qwen3-VL style projector
   --image-tokens N          most context tokens one image may take (default 1024)
   --image-min-tokens N      scale small images up to at least N tokens (default 64;
                             Qwen-VL reads fine print and grounds better with 1024)
+                            (requests may lower both per image: `detail` low|high|N,
+                            `min_tokens`/`max_tokens`, or image_max_tokens per request)
 generation defaults (requests may override):
   --temp, --top-p, --top-k, --min-p, --presence-penalty, --frequency-penalty,
   --repeat-penalty X        sampling (default: the GGUF's recommended values)
@@ -131,20 +138,23 @@ impl Server {
         &self,
         id: u64,
         work: Work,
+        route: Route,
         client: &TcpStream,
     ) -> (Receiver<Event>, Arc<AtomicBool>) {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         http::watch_hangup(client, id, &cancel);
         let status = self.shared.status();
-        let ahead = self.shared.queued.fetch_add(1, Ordering::SeqCst)
-            + usize::from(status.busy_request.is_some());
+        let queued = self.shared.queued.fetch_add(1, Ordering::SeqCst);
+        // Requests that must start or finish before a slot is free for this one.
+        let ahead = (queued + status.busy() + 1).saturating_sub(status.slots.len().max(1));
         if ahead > 0 {
             info!(Some(id), "queued behind {ahead} request(s)");
         }
         let job = Job {
             id,
             work,
+            route,
             events: tx,
             cancel: cancel.clone(),
             enqueued: Instant::now(),
@@ -180,6 +190,7 @@ struct Options {
     cors: Vec<String>,
     alias: Option<String>,
     verbose: bool,
+    parallel: usize,
     sampling: Vec<(String, f32)>,
     max_tokens: usize,
     vars: Map<String, Json>,
@@ -201,6 +212,7 @@ fn parse() -> Result<Options, String> {
         cors: Vec::new(),
         alias: None,
         verbose: false,
+        parallel: 1,
         sampling: Vec::new(),
         max_tokens: usize::MAX,
         vars: Map::new(),
@@ -240,6 +252,15 @@ fn parse() -> Result<Options, String> {
             "--api-key" => o.api_key = Some(value.clone()),
             "--cors" => o.cors.push(value.trim_end_matches('/').to_owned()),
             "--alias" => o.alias = Some(value.clone()),
+            "-np" | "--parallel" => {
+                o.parallel = number()?;
+                if !(1..=worker::MAX_PARALLEL).contains(&o.parallel) {
+                    return Err(format!(
+                        "--parallel takes 1..={} sessions",
+                        worker::MAX_PARALLEL
+                    ));
+                }
+            }
             "-c" | "--context" | "--ctx-size" => {
                 o.plan.context = if value == "auto" || value == "0" {
                     None
@@ -304,6 +325,7 @@ fn parse() -> Result<Options, String> {
     if o.model.as_os_str().is_empty() {
         return Err("--model is required (see --help)".into());
     }
+    o.plan.parallel = o.parallel;
     if o.api_key.is_none() {
         o.api_key = std::env::var("FERRUM_API_KEY")
             .ok()
@@ -363,7 +385,6 @@ fn run(o: Options) -> Result<(), String> {
         status: Mutex::new(Status {
             state: "loading",
             model: name.clone(),
-            busy_phase: "idle",
             ..Status::default()
         }),
         queued: AtomicUsize::new(0),
@@ -723,7 +744,7 @@ fn handle(
                     "model_path": server.model_path.display().to_string(),
                     "model_alias": server.name,
                     "n_ctx": status.context,
-                    "total_slots": 1,
+                    "total_slots": status.slots.len().max(1),
                     "chat_template": server.template.source(),
                     "modalities": {"vision": status.vision, "audio": false},
                     "build_info": format!("ferrum {}", env!("CARGO_PKG_VERSION")),
@@ -746,16 +767,21 @@ fn handle(
                 ka,
             )
         }
-        ("GET", "/slots") => http::json(
-            stream,
-            200,
-            &json!([{
-                "id": 0, "n_ctx": status.context, "is_processing": status.busy_request.is_some(),
-                "id_task": status.busy_request, "phase": status.busy_phase,
-                "n_cached_tokens": status.session_tokens, "queued": server.shared.queued.load(Ordering::SeqCst)
-            }]),
-            ka,
-        ),
+        ("GET", "/slots") => {
+            let queued = server.shared.queued.load(Ordering::SeqCst);
+            let slots: Vec<Json> = status
+                .slots
+                .iter()
+                .map(|s| {
+                    json!({
+                        "id": s.id, "n_ctx": status.context, "is_processing": s.request.is_some(),
+                        "id_task": s.request, "phase": s.phase, "n_cached_tokens": s.tokens,
+                        "prompt_cache_key": s.key, "queued": queued
+                    })
+                })
+                .collect();
+            http::json(stream, 200, &Json::Array(slots), ka)
+        }
         ("GET", "/metrics") => {
             let s = &status;
             let text = format!(
@@ -772,6 +798,7 @@ fn handle(
                  # TYPE ferrum_generation_tokens_per_second gauge\nferrum_generation_tokens_per_second {:.2}\n\
                  # TYPE ferrum_last_prompt_tokens_per_second gauge\nferrum_last_prompt_tokens_per_second {:.2}\n\
                  # TYPE ferrum_last_generation_tokens_per_second gauge\nferrum_last_generation_tokens_per_second {:.2}\n\
+                 # TYPE ferrum_slots gauge\nferrum_slots {}\n\
                  # TYPE ferrum_requests_processing gauge\nferrum_requests_processing {}\n\
                  # TYPE ferrum_requests_queued gauge\nferrum_requests_queued {}\n\
                  # TYPE ferrum_cached_tokens gauge\nferrum_cached_tokens {}\n\
@@ -793,9 +820,10 @@ fn handle(
                 s.generated_tokens as f64 / s.decode_seconds.max(1e-9),
                 s.last_prefill_tps,
                 s.last_decode_tps,
-                u8::from(s.busy_request.is_some()),
+                s.slots.len(),
+                s.busy(),
                 server.shared.queued.load(Ordering::SeqCst),
-                s.session_tokens,
+                s.cached(),
                 s.context,
                 s.memory_predicted_bytes,
                 server.started.elapsed().as_secs_f64(),

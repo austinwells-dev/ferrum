@@ -1,0 +1,47 @@
+# check.py greedy parity: each set's first file is the base (12a6e09), the rest are this branch.
+# Spark-X2.6-4B Q4_K_M: 8 prompts, 96 tokens, -c 4096. Qwen3.8-27B UD-Q4_K_XL and Tiel-Coder-35B-A3B IQ4_XS: 9 prompts (the last ~2,300 tokens), 48 tokens, -c 8192 (-c 4096 for q27-par8), --mmproj none.
+# tiel-df-*: --draft ornith-ai/Ornith-1.5-35B-A3B-DFlash. abba-*: same drafter, 128 tokens, run base, branch, branch, base, base, branch.
+# Per-request decode tok/s under --parallel is each request's own rate while it shares the GPU; wall time is the total.
+# par4/par8: all requests sent at once, --parallel 4/8. Then a retry of request 1 and a second turn of request 9.
+
+seq1.json: identical to base1.json 8/8 ; wall 18.4 s
+par4.json: identical to base1.json 8/8 ; wall 18.5 s
+par8.json: identical to base1.json 8/8 ; wall 18.5 s
+  base1.json           decode tok/s [34.4, 34.0, 34.3, 34.4, 34.0, 34.3, 34.0, 34.0] mean 34.2 | retry cached 12 / 28 (no second turn in this run)
+  seq1.json            decode tok/s [34.3, 33.6, 33.9, 33.9, 33.7, 33.9, 33.7, 33.8] mean 33.9 | retry cached 12 / 28 (no second turn in this run)
+  par4.json            decode tok/s [8.4, 8.3, 8.4, 8.4, 8.1, 13.2, 9.1, 12.2] mean 9.5 | retry cached 12 / 28 (no second turn in this run)
+  par8.json            decode tok/s [5.2, 5.1, 5.4, 5.4, 4.1, 5.4, 4.4, 5.0] mean 5.0 | retry cached 27 / 28 (no second turn in this run)
+
+q27-seq.json: identical to q27-base.json 9/9 ; wall 79.8 s
+q27-par4.json: identical to q27-base.json 9/9 ; wall 76.8 s
+q27-par8.json: identical to q27-base.json 9/9 ; wall 79.3 s
+  q27-base.json        decode tok/s [6.4, 6.4, 6.5, 7.0, 6.8, 6.9, 6.7, 6.1, 5.4] mean 6.5 | retry cached 0 / 24 | second turn cached 0 / 2300
+  q27-seq.json         decode tok/s [6.0, 6.2, 6.1, 6.1, 5.7, 6.0, 6.0, 6.0, 6.1] mean 6.0 | retry cached 0 / 24 | second turn cached 0 / 2300
+  q27-par4.json        decode tok/s [1.5, 1.5, 1.5, 1.5, 1.5, 1.1, 0.9, 1.1, 1.7] mean 1.4 | retry cached 0 / 24 | second turn cached 2278 / 2300
+  q27-par8.json        decode tok/s [0.6, 0.6, 0.6, 0.6, 0.7, 0.6, 0.6, 0.6, 0.7] mean 0.6 | retry cached 23 / 24 | second turn cached 2278 / 2300
+
+tiel-seq.json: identical to tiel-base.json 9/9 ; wall 16.8 s
+tiel-par4.json: identical to tiel-base.json 9/9 ; wall 16.5 s
+tiel-par8.json: identical to tiel-base.json 9/9 ; wall 16.9 s
+tiel-df-base.json: identical to tiel-base.json 9/9 ; wall 14.5 s
+tiel-df-seq.json: identical to tiel-base.json 9/9 ; wall 16.4 s
+tiel-df-par4.json: identical to tiel-base.json 9/9 ; wall 16.0 s
+  tiel-base.json       decode tok/s [34.7, 34.6, 34.8, 35.1, 34.3, 34.3, 33.9, 35.1, 33.9] mean 34.5 | retry cached 0 / 202 | second turn cached 0 / 2495
+  tiel-seq.json        decode tok/s [34.8, 34.9, 34.9, 34.9, 34.1, 33.9, 34.1, 34.9, 32.8] mean 34.4 | retry cached 0 / 202 | second turn cached 0 / 2495
+  tiel-par4.json       decode tok/s [7.6, 7.7, 7.7, 7.7, 6.4, 4.1, 4.9, 6.3, 16.4] mean 7.6 | retry cached 0 / 202 | second turn cached 2473 / 2495
+  tiel-par8.json       decode tok/s [3.0, 3.0, 3.5, 3.5, 4.0, 2.8, 3.0, 3.5, 6.9] mean 3.7 | retry cached 201 / 202 | second turn cached 2473 / 2495
+  tiel-df-base.json    decode tok/s [63.7, 42.7, 44.0, 59.2, 35.1, 42.4, 55.9, 30.2, 42.3] mean 46.2 | retry cached 0 / 202 | second turn cached 0 / 2495
+  tiel-df-seq.json     decode tok/s [55.2, 37.0, 33.1, 53.2, 31.8, 37.4, 49.4, 26.8, 41.4] mean 40.6 | retry cached 0 / 202 | second turn cached 0 / 2495
+  tiel-df-par4.json    decode tok/s [6.8, 6.8, 11.5, 6.8, 12.6, 5.8, 6.1, 8.2, 11.9] mean 8.5 | retry cached 0 / 202 | second turn cached 2473 / 2495
+
+abba-2-branch.json: identical to abba-1-base.json 9/9 ; wall 17.9 s
+abba-3-branch.json: identical to abba-1-base.json 9/9 ; wall 20.6 s
+abba-4-base.json: identical to abba-1-base.json 9/9 ; wall 20.2 s
+abba-5-base.json: identical to abba-1-base.json 9/9 ; wall 19.6 s
+abba-6-branch.json: identical to abba-1-base.json 9/9 ; wall 17.2 s
+  abba-1-base.json     decode tok/s [56.8, 44.2, 44.7, 58.5, 35.4, 43.1, 56.2, 30.3, 45.1] mean 46.0 | retry cached 0 / 202 | second turn cached 0 / 2495
+  abba-2-branch.json   decode tok/s [52.8, 46.7, 48.1, 61.1, 38.5, 42.3, 58.6, 30.4, 48.4] mean 47.4 | retry cached 0 / 202 | second turn cached 0 / 2495
+  abba-3-branch.json   decode tok/s [53.1, 39.2, 38.8, 49.9, 35.3, 36.9, 45.4, 23.9, 43.5] mean 40.7 | retry cached 0 / 202 | second turn cached 0 / 2495
+  abba-4-base.json     decode tok/s [47.3, 35.1, 40.0, 45.8, 30.8, 43.1, 52.3, 29.3, 46.3] mean 41.1 | retry cached 0 / 202 | second turn cached 0 / 2495
+  abba-5-base.json     decode tok/s [59.4, 38.4, 42.0, 53.0, 36.3, 44.2, 38.6, 28.3, 39.3] mean 42.2 | retry cached 0 / 202 | second turn cached 0 / 2495
+  abba-6-branch.json   decode tok/s [59.5, 45.1, 48.6, 62.5, 35.6, 49.2, 56.6, 31.7, 48.1] mean 48.6 | retry cached 0 / 202 | second turn cached 0 / 2495

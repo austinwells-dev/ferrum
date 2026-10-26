@@ -3,11 +3,14 @@ use crate::{
     Server, error_json,
     http::{self, Chunked},
     info, warn,
-    worker::{Event, Work},
+    worker::{Event, Route, Work},
 };
-use ferrum::hybrid::{
-    runtime::{ChatRequest, ChatResult, Delta},
-    session::{Completion, SamplingParams},
+use ferrum::{
+    hybrid::{
+        runtime::{ChatRequest, ChatResult, Delta},
+        session::{Completion, SamplingParams},
+    },
+    vision::{ImageBudget, media},
 };
 use serde_json::{Map, Value as Json, json};
 use std::{
@@ -162,6 +165,51 @@ pub fn stop_strings(body: &Json, key: &str) -> Vec<String> {
     }
 }
 
+/// The slot a request asks for: `id_slot` (llama-server; -1 is any), and a
+/// cache key (`prompt_cache_key`, OpenAI's; `session_id`) to return to the
+/// slot that served it last.
+pub fn route(body: &Json) -> Result<Route, String> {
+    let slot = match body.get("id_slot") {
+        None | Some(Json::Null) => None,
+        Some(v) => match v.as_i64() {
+            Some(-1) => None,
+            Some(i) if i >= 0 => Some(i as usize),
+            _ => return Err("id_slot must be a slot number or -1".into()),
+        },
+    };
+    let key = ["prompt_cache_key", "session_id"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(Json::as_str))
+        .filter(|k| !k.is_empty())
+        .map(|k| crate::worker::truncate(k, 200));
+    Ok(Route { slot, key })
+}
+
+/// Token limits for every image of a request: `image_detail` (low, high,
+/// auto or a token cap), `image_max_tokens` and `image_min_tokens`. An image
+/// part's own `detail`, `max_tokens` and `min_tokens` win over these.
+pub fn image_budget(body: &Json) -> Result<ImageBudget, String> {
+    let mut budget = match body.get("image_detail") {
+        None | Some(Json::Null) => ImageBudget::default(),
+        Some(Json::String(d)) => media::parse_detail(d).map_err(|e| e.to_string())?,
+        Some(Json::Number(n)) => media::parse_detail(&n.to_string()).map_err(|e| e.to_string())?,
+        Some(_) => return Err("image_detail must be low, high, auto or a token count".into()),
+    };
+    for (key, slot) in [
+        ("image_min_tokens", &mut budget.min_tokens),
+        ("image_max_tokens", &mut budget.max_tokens),
+    ] {
+        match body.get(key) {
+            None | Some(Json::Null) => {}
+            Some(v) => match v.as_u64() {
+                Some(n) if n > 0 => *slot = Some(n as usize),
+                _ => return Err(format!("{key} must be a positive integer")),
+            },
+        }
+    }
+    Ok(budget)
+}
+
 pub fn max_tokens(body: &Json, keys: &[&str], server: &Server) -> usize {
     keys.iter()
         .find_map(|k| body.get(*k).and_then(Json::as_i64))
@@ -220,6 +268,7 @@ fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, b
         stop: stop_strings(body, "stop"),
         reasoning_budget: t.budget,
         raw_reasoning: t.raw,
+        image_budget: image_budget(body)?,
     };
     Ok((request, t.exclude))
 }
@@ -353,7 +402,8 @@ pub fn chat(
     id: u64,
     keep_alive: bool,
 ) -> std::io::Result<()> {
-    let (request, exclude) = match chat_request(body, server, id) {
+    let parsed = chat_request(body, server, id).and_then(|r| Ok((r, route(body)?)));
+    let ((request, exclude), route) = match parsed {
         Ok(r) => r,
         Err(e) => {
             warn!(Some(id), "bad request: {e}");
@@ -367,7 +417,7 @@ pub fn chat(
     };
     let streaming = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
     info!(Some(id), "chat: {}", describe(&request, exclude, streaming));
-    let (rx, cancel) = server.submit(id, Work::Chat(Box::new(request)), stream);
+    let (rx, cancel) = server.submit(id, Work::Chat(Box::new(request)), route, stream);
     let include_usage = body
         .pointer("/stream_options/include_usage")
         .and_then(Json::as_bool)
@@ -640,7 +690,8 @@ pub fn completion(
             );
         }
     };
-    let sampling = match sampling(body, server) {
+    let parsed = sampling(body, server).and_then(|s| Ok((s, route(body)?)));
+    let (sampling, route) = match parsed {
         Ok(s) => s,
         Err(e) => {
             return http::json(
@@ -668,6 +719,7 @@ pub fn completion(
             sampling,
             stop,
         },
+        route,
         stream,
     );
     let model = server.model_name();

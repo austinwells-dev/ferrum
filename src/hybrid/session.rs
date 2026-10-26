@@ -381,6 +381,21 @@ impl Session {
         }
     }
 
+    /// Tokens of `prompt` (with images `media`) this session's cache holds as
+    /// its own prefix: what a request reuses here at best (a hybrid model
+    /// resumes a divergence only from a snapshot, so possibly less). For
+    /// picking the session a request should run on.
+    pub fn shared_prefix(&self, prompt: &[u32], media: &[ImageSpan]) -> usize {
+        let common = self
+            .tokens
+            .iter()
+            .zip(prompt)
+            .take(prompt.len().saturating_sub(1))
+            .take_while(|(a, b)| a == b)
+            .count();
+        reusable_before_images(common, self.state.media(), media)
+    }
+
     /// Bring the state to the longest reusable prefix of `prompt`, keeping at
     /// least the final prompt token to recompute. Returns the reused length.
     fn reuse_prefix(
@@ -526,6 +541,30 @@ impl Session {
         eos: &[u32],
         hooks: &mut impl GenerationHooks,
     ) -> Result<Completion> {
+        let mut g = self.begin(d, model, prompt, max_tokens, params, eos, hooks)?;
+        loop {
+            if let Some(done) = self.advance(d, model, &mut g, hooks)? {
+                return Ok(done);
+            }
+        }
+    }
+
+    /// Start `generate` without running it: reuse the cached prefix and call
+    /// `hooks.begin`. Each `advance` then runs one prompt chunk or one decode
+    /// step, so a caller can interleave several sessions on one model.
+    /// Another session's forwards between two steps change nothing here:
+    /// everything a step leaves for the next lives in this session's state.
+    #[allow(clippy::too_many_arguments)]
+    pub fn begin(
+        &mut self,
+        d: &MetalDevice,
+        model: &HybridModel,
+        prompt: &[u32],
+        max_tokens: usize,
+        params: &SamplingParams,
+        eos: &[u32],
+        hooks: &mut impl GenerationHooks,
+    ) -> Result<Generation> {
         params.validate()?;
         if prompt.is_empty() {
             return Err(Error::Parameter("prompt must not be empty".into()));
@@ -544,7 +583,114 @@ impl Session {
         self.sync_drafter(d, model)?;
         self.spec_stats = SpecStats::default();
         hooks.begin(prompt.len(), reused);
-        let mut generated: Vec<u32> = Vec::new();
+        Ok(Generation {
+            prompt: prompt.to_vec(),
+            reused,
+            processed: 0,
+            max_tokens,
+            params: params.clone(),
+            eos: eos.to_vec(),
+            generated: Vec::new(),
+            next: None,
+            start,
+            prefill: Duration::ZERO,
+            decode_start: start,
+            speculate: self.speculate && self.drafter.is_some(),
+        })
+    }
+
+    /// Run the next prompt chunk or decode step of `g`; the completion once
+    /// it has finished (and then `g` is spent).
+    pub fn advance(
+        &mut self,
+        d: &MetalDevice,
+        model: &HybridModel,
+        g: &mut Generation,
+        hooks: &mut impl GenerationHooks,
+    ) -> Result<Option<Completion>> {
+        let stop = match g.next {
+            None => match self.prefill_step(d, model, g, hooks)? {
+                Some(stop) => stop,
+                None => return Ok(None),
+            },
+            Some(_) => match self.decode_step(d, model, g, hooks)? {
+                Some(stop) => stop,
+                None => return Ok(None),
+            },
+        };
+        if stop == StopReason::Cancelled {
+            return Ok(Some(Completion {
+                tokens: Vec::new(),
+                stop,
+                prompt_tokens: g.prompt.len(),
+                reused_tokens: g.reused,
+                prefill: g.start.elapsed(),
+                decode: Duration::ZERO,
+                drafted: 0,
+                accepted: 0,
+            }));
+        }
+        if let Some(rule) = self.tree_rule.as_mut() {
+            rule.save(SAVE_EVERY);
+        }
+        Ok(Some(Completion {
+            tokens: std::mem::take(&mut g.generated),
+            stop,
+            prompt_tokens: g.prompt.len(),
+            reused_tokens: g.reused,
+            prefill: g.prefill,
+            decode: g.decode_start.elapsed(),
+            drafted: self.spec_stats.drafted,
+            accepted: self.spec_stats.accepted,
+        }))
+    }
+
+    /// One prompt chunk, or (once the body is in) the final prompt token,
+    /// which yields the first output.
+    fn prefill_step(
+        &mut self,
+        d: &MetalDevice,
+        model: &HybridModel,
+        g: &mut Generation,
+        hooks: &mut impl GenerationHooks,
+    ) -> Result<Option<StopReason>> {
+        // Prefill all but the final prompt token and snapshot there: the next
+        // request always recomputes at least its final token, so a snapshot
+        // at `len - 1` serves both a retry of this prompt and a continuation
+        // of the conversation. The final token then yields the first output.
+        let body_len = g.prompt.len() - g.reused - 1;
+        if g.processed < body_len {
+            let at = g.reused + g.processed;
+            let n = model.chunk().min(body_len - g.processed);
+            self.extend(d, model, &g.prompt[at..at + n])?;
+            g.processed += n;
+            if !hooks.prefill(g.processed, body_len + 1) {
+                return Ok(Some(StopReason::Cancelled));
+            }
+            return Ok(None);
+        }
+        self.snapshot(d)?;
+        let tail = [g.prompt[g.prompt.len() - 1]];
+        let produced = self.step(d, model, &tail, g.output())?;
+        hooks.prefill(body_len + 1, body_len + 1);
+        g.prefill = g.start.elapsed();
+        g.decode_start = Instant::now();
+        g.next = Some(select(produced, &g.params, self.state.len())?);
+        Ok(None)
+    }
+
+    /// One decode step after `g.next`: a plain token, or a speculative cycle.
+    fn decode_step(
+        &mut self,
+        d: &MetalDevice,
+        model: &HybridModel,
+        g: &mut Generation,
+        hooks: &mut impl GenerationHooks,
+    ) -> Result<Option<StopReason>> {
+        let params = &g.params;
+        let (eos, max_tokens) = (&g.eos[..], g.max_tokens);
+        let next = g.next.expect("decoding follows the prompt's last token");
+        let generated = &mut g.generated;
         let output = |generated: &[u32]| -> Output {
             if params.uses_candidates() {
                 Output::Candidates(penalties(params, generated))
@@ -552,231 +698,227 @@ impl Session {
                 Output::Argmax
             }
         };
-        // Prefill all but the final prompt token and snapshot there: the next
-        // request always recomputes at least its final token, so a snapshot
-        // at `len - 1` serves both a retry of this prompt and a continuation
-        // of the conversation. The final token then yields the first output.
-        let (body, tail) = prompt[reused..].split_at(prompt.len() - reused - 1);
-        let mut processed = 0;
-        for piece in body.chunks(model.chunk()) {
-            self.extend(d, model, piece)?;
-            processed += piece.len();
-            if !hooks.prefill(processed, body.len() + 1) {
-                return Ok(Completion {
-                    tokens: Vec::new(),
-                    stop: StopReason::Cancelled,
-                    prompt_tokens: prompt.len(),
-                    reused_tokens: reused,
-                    prefill: start.elapsed(),
-                    decode: Duration::ZERO,
-                    drafted: 0,
-                    accepted: 0,
-                });
-            }
+        if eos.contains(&next) {
+            return Ok(Some(StopReason::Eos));
         }
-        self.snapshot(d)?;
-        let produced = self.step(d, model, tail, output(&generated))?;
-        hooks.prefill(body.len() + 1, body.len() + 1);
-        let prefill = start.elapsed();
-        let decode_start = Instant::now();
-        let mut next = select(produced, params, self.state.len())?;
-        let speculate = self.speculate && self.drafter.is_some();
-        let stop = 'generation: loop {
-            if eos.contains(&next) {
-                break StopReason::Eos;
+        generated.push(next);
+        let flow = hooks.token(next)?;
+        if flow == Flow::Stop {
+            return Ok(Some(StopReason::Stopped));
+        }
+        if generated.len() >= max_tokens {
+            return Ok(Some(StopReason::Length));
+        }
+        let mut feed = vec![next];
+        if let Flow::Inject(extra) = flow {
+            feed.extend(extra);
+        }
+        if self.state.len() + feed.len() > self.capacity() {
+            return Ok(Some(StopReason::ContextFull));
+        }
+        // Speculative step: draft after `next`, verify, keep the path the
+        // target agrees with: each row's own token (its argmax, or when
+        // sampling its draw with the uniform of the position it fills, as
+        // plain decoding draws it), so the output is plain decoding's.
+        let room = self.capacity() - self.state.len() - 1;
+        let k = if g.speculate && feed.len() == 1 {
+            let drafter = self.drafter.as_ref().expect("speculate implies a drafter");
+            drafter
+                .max_drafts()
+                .min(self.depth_cap.unwrap_or(usize::MAX))
+                .min(max_tokens - generated.len())
+                .min(room)
+        } else {
+            0
+        };
+        let tree_budget = self.tree_budget.filter(|_| k > 0).map(|b| b.min(room));
+        let plan = self
+            .tree_rule
+            .as_ref()
+            .filter(|_| tree_budget.is_some())
+            .map(Budget::plan);
+        let cycle = Instant::now();
+        let mut expected = 0.;
+        let drafts = if k > 0 {
+            let t0 = Instant::now();
+            let pos = self.state.len();
+            let drafter = self.drafter.as_mut().expect("speculate implies a drafter");
+            let mut drafts = match tree_budget {
+                Some(budget) => {
+                    if let Some(plan) = &plan {
+                        drafter.set_calibration(&plan.calibration);
+                    }
+                    drafter.draft_tree(d, model, pos, next, k, budget)?
+                }
+                None => DraftTree::chain(&drafter.draft(d, model, pos, next, k)?),
+            };
+            if let Some(plan) = plan.as_ref().filter(|_| !drafts.score.is_empty()) {
+                let (rows, e) = plan.rows(&drafts.score);
+                drafts.truncate(rows - 1);
+                expected = e;
             }
-            generated.push(next);
-            let flow = hooks.token(next)?;
-            if flow == Flow::Stop {
-                break StopReason::Stopped;
+            self.spec_stats.draft_seconds += t0.elapsed().as_secs_f64();
+            drafts
+        } else {
+            DraftTree::default()
+        };
+        if drafts.is_empty() {
+            let produced = self.step(d, model, &feed, output(generated))?;
+            generated.extend_from_slice(&feed[1..]);
+            g.next = Some(select(produced, params, self.state.len())?);
+            return Ok(None);
+        }
+        let t0 = Instant::now();
+        let (rows, parents) = drafts.rows(next);
+        // The accepted path (verify rows from the anchor's 0) and the
+        // target's token after it.
+        let anchor_pos = self.state.len();
+        let depths = drafts.depths();
+        let row_output = if params.uses_candidates() {
+            // Each row's penalties see its own root path.
+            let mut seen: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
+            seen.push(generated.clone());
+            for (i, &token) in drafts.tokens.iter().enumerate() {
+                let mut path = seen[drafts.parents[i].map_or(0, |p| p + 1)].clone();
+                path.push(token);
+                seen.push(path);
+            }
+            RowOutput::Candidates(seen.iter().map(|s| penalties(params, s)).collect())
+        } else {
+            RowOutput::Argmax
+        };
+        let verified = if tree_budget.is_some() {
+            model.verify_tree(d, &mut self.state, &rows, &parents, row_output)?
+        } else {
+            model.verify(d, &mut self.state, &rows, row_output)?
+        };
+        let targets = match verified {
+            RowsProduced::Tokens(targets) => targets,
+            RowsProduced::Candidates(mut per_row) => per_row
+                .iter_mut()
+                .enumerate()
+                .map(|(r, c)| {
+                    let depth = if r == 0 { 0 } else { depths[r - 1] };
+                    sample(c, params, uniform(params.seed, anchor_pos + depth + 1))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            RowsProduced::Logits(_) => {
+                return Err(Error::Parameter("verify produced logits".into()));
+            }
+        };
+        // The accepted path (verify rows from the anchor's 0) and the
+        // target's token after it.
+        let (path, bonus) = accept_walk(&drafts, &targets);
+        self.spec_stats.verify_seconds += t0.elapsed().as_secs_f64();
+        self.spec_stats
+            .record(drafts.len(), drafts.depth(), path.len() - 1);
+        if let Some(rule) = self.tree_rule.as_mut().filter(|_| expected > 0.) {
+            // Calibration records: every node whose parent is on the path.
+            let mut on_path = vec![false; drafts.len() + 1];
+            for &row in &path {
+                on_path[row] = true;
+            }
+            let records: Vec<Record> = (0..drafts.len())
+                .filter(|&i| on_path[drafts.parents[i].map_or(0, |p| p + 1)])
+                .map(|i| Record {
+                    depth: depths[i],
+                    lq: drafts.lq[i],
+                    accepted: on_path[i + 1],
+                })
+                .collect();
+            let ms = cycle.elapsed().as_secs_f64() * 1e3;
+            rule.observe(rows.len(), expected, path.len() - 1, ms, &records);
+        }
+        // Emit the accepted drafts one by one; the anchor row is always kept.
+        let mut keep = 1;
+        let mut stopped = None;
+        let mut inject = None;
+        for &row in &path[1..] {
+            let token = rows[row];
+            if eos.contains(&token) {
+                stopped = Some(StopReason::Eos);
+                break;
+            }
+            generated.push(token);
+            match hooks.token(token)? {
+                Flow::Stop => {
+                    stopped = Some(StopReason::Stopped);
+                    break;
+                }
+                Flow::Inject(extra) => {
+                    inject = Some((token, extra));
+                    break;
+                }
+                Flow::Continue => {}
             }
             if generated.len() >= max_tokens {
-                break StopReason::Length;
+                stopped = Some(StopReason::Length);
+                break;
             }
-            let mut feed = vec![next];
-            if let Flow::Inject(extra) = flow {
-                feed.extend(extra);
-            }
-            if self.state.len() + feed.len() > self.capacity() {
-                break StopReason::ContextFull;
-            }
-            // Speculative step: draft after `next`, verify, keep the path the
-            // target agrees with: each row's own token (its argmax, or when
-            // sampling its draw with the uniform of the position it fills, as
-            // plain decoding draws it), so the output is plain decoding's.
-            let room = self.capacity() - self.state.len() - 1;
-            let k = if speculate && feed.len() == 1 {
-                let drafter = self.drafter.as_ref().expect("speculate implies a drafter");
-                drafter
-                    .max_drafts()
-                    .min(self.depth_cap.unwrap_or(usize::MAX))
-                    .min(max_tokens - generated.len())
-                    .min(room)
-            } else {
-                0
-            };
-            let tree_budget = self.tree_budget.filter(|_| k > 0).map(|b| b.min(room));
-            let plan = self
-                .tree_rule
-                .as_ref()
-                .filter(|_| tree_budget.is_some())
-                .map(Budget::plan);
-            let cycle = Instant::now();
-            let mut expected = 0.;
-            let drafts = if k > 0 {
-                let t0 = Instant::now();
-                let pos = self.state.len();
-                let drafter = self.drafter.as_mut().expect("speculate implies a drafter");
-                let mut drafts = match tree_budget {
-                    Some(budget) => {
-                        if let Some(plan) = &plan {
-                            drafter.set_calibration(&plan.calibration);
-                        }
-                        drafter.draft_tree(d, model, pos, next, k, budget)?
-                    }
-                    None => DraftTree::chain(&drafter.draft(d, model, pos, next, k)?),
-                };
-                if let Some(plan) = plan.as_ref().filter(|_| !drafts.score.is_empty()) {
-                    let (rows, e) = plan.rows(&drafts.score);
-                    drafts.truncate(rows - 1);
-                    expected = e;
-                }
-                self.spec_stats.draft_seconds += t0.elapsed().as_secs_f64();
-                drafts
-            } else {
-                DraftTree::default()
-            };
-            if drafts.is_empty() {
-                let produced = self.step(d, model, &feed, output(&generated))?;
-                generated.extend_from_slice(&feed[1..]);
-                next = select(produced, params, self.state.len())?;
-                continue;
-            }
-            let t0 = Instant::now();
-            let (rows, parents) = drafts.rows(next);
-            // The accepted path (verify rows from the anchor's 0) and the
-            // target's token after it.
-            let anchor_pos = self.state.len();
-            let depths = drafts.depths();
-            let row_output = if params.uses_candidates() {
-                // Each row's penalties see its own root path.
-                let mut seen: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
-                seen.push(generated.clone());
-                for (i, &token) in drafts.tokens.iter().enumerate() {
-                    let mut path = seen[drafts.parents[i].map_or(0, |p| p + 1)].clone();
-                    path.push(token);
-                    seen.push(path);
-                }
-                RowOutput::Candidates(seen.iter().map(|s| penalties(params, s)).collect())
-            } else {
-                RowOutput::Argmax
-            };
-            let verified = if tree_budget.is_some() {
-                model.verify_tree(d, &mut self.state, &rows, &parents, row_output)?
-            } else {
-                model.verify(d, &mut self.state, &rows, row_output)?
-            };
-            let targets = match verified {
-                RowsProduced::Tokens(targets) => targets,
-                RowsProduced::Candidates(mut per_row) => per_row
-                    .iter_mut()
-                    .enumerate()
-                    .map(|(r, c)| {
-                        let depth = if r == 0 { 0 } else { depths[r - 1] };
-                        sample(c, params, uniform(params.seed, anchor_pos + depth + 1))
-                    })
-                    .collect::<Result<Vec<_>>>()?,
-                RowsProduced::Logits(_) => {
-                    return Err(Error::Parameter("verify produced logits".into()));
-                }
-            };
-            // The accepted path (verify rows from the anchor's 0) and the
-            // target's token after it.
-            let (path, bonus) = accept_walk(&drafts, &targets);
-            self.spec_stats.verify_seconds += t0.elapsed().as_secs_f64();
-            self.spec_stats
-                .record(drafts.len(), drafts.depth(), path.len() - 1);
-            if let Some(rule) = self.tree_rule.as_mut().filter(|_| expected > 0.) {
-                // Calibration records: every node whose parent is on the path.
-                let mut on_path = vec![false; drafts.len() + 1];
-                for &row in &path {
-                    on_path[row] = true;
-                }
-                let records: Vec<Record> = (0..drafts.len())
-                    .filter(|&i| on_path[drafts.parents[i].map_or(0, |p| p + 1)])
-                    .map(|i| Record {
-                        depth: depths[i],
-                        lq: drafts.lq[i],
-                        accepted: on_path[i + 1],
-                    })
-                    .collect();
-                let ms = cycle.elapsed().as_secs_f64() * 1e3;
-                rule.observe(rows.len(), expected, path.len() - 1, ms, &records);
-            }
-            // Emit the accepted drafts one by one; the anchor row is always kept.
-            let mut keep = 1;
-            let mut stopped = None;
-            let mut inject = None;
-            for &row in &path[1..] {
-                let token = rows[row];
-                if eos.contains(&token) {
-                    stopped = Some(StopReason::Eos);
-                    break;
-                }
-                generated.push(token);
-                match hooks.token(token)? {
-                    Flow::Stop => {
-                        stopped = Some(StopReason::Stopped);
-                        break;
-                    }
-                    Flow::Inject(extra) => {
-                        inject = Some((token, extra));
-                        break;
-                    }
-                    Flow::Continue => {}
-                }
-                if generated.len() >= max_tokens {
-                    stopped = Some(StopReason::Length);
-                    break;
-                }
-                keep += 1;
-            }
-            let pos = self.state.len();
-            let kept: Vec<u32> = path[..keep].iter().map(|&r| rows[r]).collect();
-            model.commit_path(d, &mut self.state, &path[..keep])?;
-            self.tokens.extend_from_slice(&kept);
-            if let Some(drafter) = self.drafter.as_mut() {
-                drafter.ingest(d, model, pos, &kept)?;
-            }
-            if let Some(reason) = stopped {
-                break 'generation reason;
-            }
-            if let Some((token, extra)) = inject {
-                let mut feed = vec![token];
-                feed.extend(extra);
-                if self.state.len() + feed.len() > self.capacity() {
-                    break StopReason::ContextFull;
-                }
-                let produced = self.step(d, model, &feed, output(&generated))?;
-                generated.extend_from_slice(&feed[1..]);
-                next = select(produced, params, self.state.len())?;
-                continue;
-            }
-            next = bonus;
-        };
-        if let Some(rule) = self.tree_rule.as_mut() {
-            rule.save(SAVE_EVERY);
+            keep += 1;
         }
-        Ok(Completion {
-            tokens: generated,
-            stop,
-            prompt_tokens: prompt.len(),
-            reused_tokens: reused,
-            prefill,
-            decode: decode_start.elapsed(),
-            drafted: self.spec_stats.drafted,
-            accepted: self.spec_stats.accepted,
-        })
+        let pos = self.state.len();
+        let kept: Vec<u32> = path[..keep].iter().map(|&r| rows[r]).collect();
+        model.commit_path(d, &mut self.state, &path[..keep])?;
+        self.tokens.extend_from_slice(&kept);
+        if let Some(drafter) = self.drafter.as_mut() {
+            drafter.ingest(d, model, pos, &kept)?;
+        }
+        if let Some(reason) = stopped {
+            return Ok(Some(reason));
+        }
+        if let Some((token, extra)) = inject {
+            let mut feed = vec![token];
+            feed.extend(extra);
+            if self.state.len() + feed.len() > self.capacity() {
+                return Ok(Some(StopReason::ContextFull));
+            }
+            let produced = self.step(d, model, &feed, output(generated))?;
+            generated.extend_from_slice(&feed[1..]);
+            g.next = Some(select(produced, params, self.state.len())?);
+            return Ok(None);
+        }
+        g.next = Some(bonus);
+        Ok(None)
+    }
+}
+
+/// A generation in progress (`Session::begin`, `Session::advance`).
+pub struct Generation {
+    prompt: Vec<u32>,
+    reused: usize,
+    /// Prompt tokens past `reused` already in the cache.
+    processed: usize,
+    max_tokens: usize,
+    params: SamplingParams,
+    eos: Vec<u32>,
+    generated: Vec<u32>,
+    /// The token to emit next; None while the prompt is still prefilling.
+    next: Option<u32>,
+    start: Instant,
+    prefill: Duration,
+    decode_start: Instant,
+    speculate: bool,
+}
+
+impl Generation {
+    /// Prompt length and tokens reused from the cache.
+    pub fn prompt(&self) -> (usize, usize) {
+        (self.prompt.len(), self.reused)
+    }
+    /// The prompt is in the cache and tokens are being generated.
+    pub fn decoding(&self) -> bool {
+        self.next.is_some()
+    }
+    pub fn generated(&self) -> usize {
+        self.generated.len()
+    }
+    fn output(&self) -> Output {
+        if self.params.uses_candidates() {
+            Output::Candidates(penalties(&self.params, &self.generated))
+        } else {
+            Output::Argmax
+        }
     }
 }
 

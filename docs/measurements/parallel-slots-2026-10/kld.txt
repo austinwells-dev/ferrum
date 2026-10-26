@@ -1,0 +1,12 @@
+0.13.010.398 I Final estimate: PPL = 17.5205 +/- 1.20023
+tiel base: positions 2040; Ferrum PPL 17.5253; llama.cpp PPL 17.5205; mean KLD 0.006826; median 0.003642; p99 0.043010; max 0.189655; same top-1 95.98%; 16.2 s
+tiel branch: positions 2040; Ferrum PPL 17.5253; llama.cpp PPL 17.5205; mean KLD 0.006826; median 0.003642; p99 0.043010; max 0.189655; same top-1 95.98%; 15.1 s
+tiel base2: positions 2040; Ferrum PPL 17.5253; llama.cpp PPL 17.5205; mean KLD 0.006826; median 0.003642; p99 0.043010; max 0.189655; same top-1 95.98%; 15.5 s
+tiel branch2: positions 2040; Ferrum PPL 17.5253; llama.cpp PPL 17.5205; mean KLD 0.006826; median 0.003642; p99 0.043010; max 0.189655; same top-1 95.98%; 15.7 s
+0.38.437.199 I Final estimate: PPL = 10.2524 +/- 0.61532
+q27 base: positions 2040; Ferrum PPL 10.2536; llama.cpp PPL 10.2524; mean KLD 0.000001; median 0.000000; p99 0.000038; max 0.000062; same top-1 99.95%; 45.7 s
+q27 branch: positions 2040; Ferrum PPL 10.2536; llama.cpp PPL 10.2524; mean KLD 0.000001; median 0.000000; p99 0.000038; max 0.000062; same top-1 99.95%; 45.0 s
+q27 base2: positions 2040; Ferrum PPL 10.2536; llama.cpp PPL 10.2524; mean KLD 0.000001; median 0.000000; p99 0.000038; max 0.000062; same top-1 99.95%; 45.0 s
+q27 branch2: positions 2040; Ferrum PPL 10.2536; llama.cpp PPL 10.2524; mean KLD 0.000001; median 0.000000; p99 0.000038; max 0.000062; same top-1 99.95%; 44.7 s
+
+[exited with code 0]

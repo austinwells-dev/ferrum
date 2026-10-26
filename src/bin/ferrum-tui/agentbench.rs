@@ -638,6 +638,7 @@ fn attempt(
             stop: Vec::new(),
             reasoning_budget: plan.thinking,
             raw_reasoning: false,
+            image_budget: Default::default(),
         };
         let r = match rt.chat(
             &request,

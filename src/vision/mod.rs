@@ -25,6 +25,8 @@ use std::{
 pub const DEFAULT_MIN_TOKENS: usize = 64;
 /// Default cap on language-model tokens per image.
 pub const DEFAULT_MAX_TOKENS: usize = 1024;
+/// Cap for `detail: "low"` images: a 512x512 picture, as OpenAI's low detail.
+pub const LOW_DETAIL_TOKENS: usize = 256;
 /// Hard cap on one image's longest decoded side before resizing.
 const MAX_SOURCE_SIDE: u32 = 16384;
 /// Attention score scratch (all heads of a group) stays under this many bytes.
@@ -57,6 +59,24 @@ impl VisionConfig {
     /// Pixels of one merged language-model token (a `patch*merge` square).
     fn factor(&self) -> usize {
         self.patch * self.merge
+    }
+}
+
+/// Token limits one request asks for an image, within the projector's own
+/// (`VisionModel::limits`). `None` keeps the projector's setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ImageBudget {
+    pub min_tokens: Option<usize>,
+    pub max_tokens: Option<usize>,
+}
+
+impl ImageBudget {
+    /// Each limit this budget leaves unset, taken from `fallback`.
+    pub fn or(self, fallback: Self) -> Self {
+        Self {
+            min_tokens: self.min_tokens.or(fallback.min_tokens),
+            max_tokens: self.max_tokens.or(fallback.max_tokens),
+        }
     }
 }
 
@@ -400,20 +420,41 @@ impl VisionModel {
         self.encode_prepared(d, &image).map(drop)
     }
 
+    /// The (fewest, most) tokens an image with `budget` takes. A request may
+    /// lower the cap but never raise it past `max_tokens`, which the memory
+    /// plan budgets the encoder's activations for.
+    pub fn limits(&self, budget: ImageBudget) -> (usize, usize) {
+        let max = budget
+            .max_tokens
+            .unwrap_or(self.max_tokens)
+            .clamp(4, self.max_tokens);
+        (budget.min_tokens.unwrap_or(self.min_tokens).min(max), max)
+    }
+
     /// Pixel size an image of `width` x `height` is resized to.
     pub fn target_size(&self, width: usize, height: usize) -> (usize, usize) {
+        self.target_size_with(width, height, ImageBudget::default())
+    }
+
+    /// `target_size` within a request's `budget`.
+    pub fn target_size_with(
+        &self,
+        width: usize,
+        height: usize,
+        budget: ImageBudget,
+    ) -> (usize, usize) {
         let f = self.config.factor();
-        smart_resize(
-            height,
-            width,
-            f,
-            self.min_tokens.min(self.max_tokens) * f * f,
-            self.max_tokens * f * f,
-        )
+        let (min, max) = self.limits(budget);
+        smart_resize(height, width, f, min * f * f, max * f * f)
     }
 
     /// Decode and resize an encoded image (PNG, JPEG, GIF, WebP, BMP).
     pub fn prepare(&self, bytes: &[u8]) -> Result<Prepared> {
+        self.prepare_with(bytes, ImageBudget::default())
+    }
+
+    /// `prepare` within a request's `budget`.
+    pub fn prepare_with(&self, bytes: &[u8], budget: ImageBudget) -> Result<Prepared> {
         let hash = content_hash(bytes);
         let decoded = image::load_from_memory(bytes)
             .map_err(|e| Error::Parameter(format!("cannot decode image: {e}")))?;
@@ -435,7 +476,8 @@ impl VisionModel {
             let mix = |c: u8| ((u32::from(c) * a + 255 * (255 - a) + 127) / 255) as u8;
             *o = image::Rgb([mix(p[0]), mix(p[1]), mix(p[2])]);
         }
-        let (width, height) = self.target_size(rgb.width() as usize, rgb.height() as usize);
+        let (width, height) =
+            self.target_size_with(rgb.width() as usize, rgb.height() as usize, budget);
         let rgb = if (rgb.width() as usize, rgb.height() as usize) == (width, height) {
             rgb
         } else {
@@ -470,7 +512,17 @@ impl VisionModel {
 
     /// Encode one image into language-model embeddings.
     pub fn encode(&self, d: &MetalDevice, bytes: &[u8]) -> Result<ImageEmbedding> {
-        let prepared = self.prepare(bytes)?;
+        self.encode_with(d, bytes, ImageBudget::default())
+    }
+
+    /// `encode` within a request's `budget`.
+    pub fn encode_with(
+        &self,
+        d: &MetalDevice,
+        bytes: &[u8],
+        budget: ImageBudget,
+    ) -> Result<ImageEmbedding> {
+        let prepared = self.prepare_with(bytes, budget)?;
         self.encode_prepared(d, &prepared)
     }
 

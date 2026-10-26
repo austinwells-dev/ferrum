@@ -9,8 +9,8 @@ projector that ships as `mmproj*.gguf`.
 |---|---|---|
 | Discovery | `vision::resolve_projector` | `--mmproj auto` takes a sibling `mmproj*.gguf` whose `clip.vision.projection_dim` equals the model's `embedding_length`; `none` disables; a path must be a `clip` GGUF |
 | Memory plan | `PlanOptions::vision`, `vision::projector_bytes` | projector weights plus a full-size image's activations are charged before the context is fitted |
-| Request | `vision::media::take_images` | finds OpenAI `image_url` / Anthropic `image` parts, decodes `data:` URLs / base64, replaces each with `{"type": "image"}` so the GGUF chat template emits `<|vision_start|><|image_pad|><|vision_end|>` |
-| Encode | `vision::VisionModel` | decode, `smart_resize` to a multiple of 32 within `[min, max]` tokens, normalise, patchify in 2x2 block order, ViT on Metal, merger; cached by content hash (`Runtime`, 8 images) |
+| Request | `vision::media::take_images` | finds OpenAI `image_url` / Anthropic `image` parts, decodes `data:` URLs / base64, reads each part's `detail` / `min_tokens` / `max_tokens` into an `ImageBudget`, replaces each with `{"type": "image"}` so the GGUF chat template emits `<|vision_start|><|image_pad|><|vision_end|>` |
+| Encode | `vision::VisionModel` | decode, `smart_resize` to a multiple of 32 within `[min, max]` tokens (`VisionModel::limits`: the request's budget, never above `--image-tokens`), normalise, patchify in 2x2 block order, ViT on Metal, merger; cached by content hash and limits (`Runtime`, shared by every session, up to 8 full-size images' worth of tokens) |
 | Prompt | `Runtime::expand_images` | each pad token becomes one per image position (`rows x cols` of the merged grid); the runs are found again in the token ids and become `ImageSpan`s |
 | Prefix reuse | `Session::set_media`, `reusable_before_images` | pad tokens look alike, so cached tokens are reused only up to the first image whose position, grid and content hash do not all match |
 | Forward | `HybridModel::forward_chunk` | rows inside a span are overwritten with the image embeddings after the token lookup; attention prep gets rotary positions from a `RopePlan` |
@@ -34,7 +34,9 @@ buffer, in head groups that bound its size. DeepStack projectors are rejected at
 * `hybrid::engine::tests::attention_prep_follows_the_position_table` checks the rotary kernel against a CPU
   implementation of the interleaved multi-axis scheme, and that equal axes reproduce the scalar path.
 * `rope_positions_compress_around_images`, `prefix_stops_before_a_changed_or_cut_image` and the media
-  parsing tests cover the position bookkeeping, reuse rules and request handling.
+  parsing tests cover the position bookkeeping, reuse rules and request handling;
+  `request_budgets_stay_within_the_projector_cap` and `reads_per_image_detail_and_token_limits` cover
+  per-request sizes.
 * End to end on Qwen3.8-27B (UD-Q4_K_XL) and Tiel-Coder 35B-A3B (BF16 projector): the description of a
   test picture agrees with `llama-mtmd-cli` at temperature 0 (same shapes, colours and layout in near-identical wording), multi-turn conversations
   with the image in history reuse the cache, and text after an image answers correctly.
