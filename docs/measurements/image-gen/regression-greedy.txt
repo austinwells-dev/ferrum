@@ -1,0 +1,15 @@
+# ferrum hybrid --raw --prompt 'The capital of France is' --max-new-tokens 48; main = 155a899, branch = a12bf78; M5 32 GB
+== main Spark-X2.6-4B-Q4_K_M.gguf
+measured: weights+scratch 3496 MiB (predicted 3496), state 19960 MiB (predicted 19961)
+stdout md5 c7397fd44e4549e8896067519e9f9458 bytes      155
+== branch Spark-X2.6-4B-Q4_K_M.gguf
+measured: weights+scratch 3496 MiB (predicted 3496), state 19960 MiB (predicted 19961)
+stdout md5 c7397fd44e4549e8896067519e9f9458 bytes      155
+greedy output identical
+== main Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+measured: weights+scratch 18067 MiB (predicted 18069), state 5183 MiB (predicted 5184)
+stdout md5 eeb9fbbdd64dc08f033b98aaf794dee9 bytes      224
+== branch Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+measured: weights+scratch 18067 MiB (predicted 18069), state 5183 MiB (predicted 5184)
+stdout md5 eeb9fbbdd64dc08f033b98aaf794dee9 bytes      224
+greedy output identical
