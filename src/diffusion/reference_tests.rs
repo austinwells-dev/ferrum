@@ -11,6 +11,7 @@ use super::{
     config::ModelDir,
     dit::{Dit, Rope, Scratch},
     schedule::Schedule,
+    vae::Vae,
 };
 use crate::{DType, MetalDevice, Tensor};
 use std::path::PathBuf;
@@ -218,4 +219,60 @@ fn dit_sampling_matches_diffusers_latents() {
     eprintln!("8 steps in {:.1}s", started.elapsed().as_secs_f32());
     let rel = compare("final latents", &latents.to_f32(), &s.f32("latents.7"));
     assert!(rel < 0.1, "final latent error {rel}");
+}
+
+#[test]
+#[ignore = "needs the Turbo checkpoint and a tools/imgref dump"]
+fn vae_decodes_like_diffusers() {
+    let d = MetalDevice::new().unwrap();
+    let model = ModelDir::open(dir("FERRUM_QWEN_IMAGE")).unwrap();
+    let dump = Checkpoint::open(dir("FERRUM_IMGREF")).unwrap();
+    let started = std::time::Instant::now();
+    let vae = Vae::load(
+        &d,
+        &Checkpoint::open(model.path("vae")).unwrap(),
+        &model.vae,
+    )
+    .unwrap();
+    eprintln!(
+        "loaded {:.2} GB in {:.1}s",
+        vae.weight_bytes() as f64 / 1e9,
+        started.elapsed().as_secs_f32()
+    );
+
+    // The dump is channel-first; the decoder wants one row of channels per pixel.
+    let z = dump.entry("vae_in").unwrap().shape.clone();
+    let (c, h, w) = (z[0], z[1], z[2]);
+    let chw = dump.read_f32("vae_in").unwrap();
+    let nhwc: Vec<f32> = (0..h * w)
+        .flat_map(|p| (0..c).map(move |ch| (ch, p)))
+        .map(|(ch, p)| chw[ch * h * w + p])
+        .collect();
+    let input = Tensor::from_f32(&d, [h * w, c], DType::F16, &nhwc).unwrap();
+
+    let started = std::time::Instant::now();
+    let image = vae.decode(&d, &input, (h, w)).unwrap();
+    eprintln!("decoded in {:.2}s", started.elapsed().as_secs_f32());
+
+    let want = dump.read_f32("image").unwrap();
+    let want_shape = dump.entry("image").unwrap().shape.clone();
+    assert_eq!(want_shape[1..], [image.height, image.width]);
+    let channels = want_shape[0].min(image.channels);
+    let (n, got_c) = (image.height * image.width, image.channels);
+    let (mut got_cmp, mut want_cmp) = (Vec::new(), Vec::new());
+    for ch in 0..channels {
+        for p in 0..n {
+            got_cmp.push(image.pixels[p * got_c + ch]);
+            want_cmp.push(want[ch * n + p].clamp(-1., 1.));
+        }
+    }
+    let rel = compare("decoded image", &got_cmp, &want_cmp);
+    let mse = got_cmp
+        .iter()
+        .zip(&want_cmp)
+        .map(|(g, w)| f64::from((g - w) / 2.).powi(2))
+        .sum::<f64>()
+        / got_cmp.len() as f64;
+    eprintln!("PSNR {:.1} dB (on [0, 1])", -10. * mse.log10());
+    assert!(rel < 0.05, "image error {rel}");
 }

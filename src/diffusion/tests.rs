@@ -276,3 +276,252 @@ impl Pad for Vec<f32> {
         }
     }
 }
+
+mod decoder_kernels {
+    use super::*;
+    use crate::diffusion::conv::{self, Conv, Operand, Residual};
+
+    fn rounded(x: Vec<f32>) -> Vec<f32> {
+        x.into_iter().map(f16).collect()
+    }
+
+    /// One conv case: output `h x w`, input `h/up x w/up`, `k` x `k` kernel.
+    struct Case {
+        h: usize,
+        w: usize,
+        cin: usize,
+        cout: usize,
+        k: usize,
+        up: usize,
+    }
+
+    /// 0: none, 1: same-shape residual, 2: pixel-shuffled shortcut (frames 2, repeats 4).
+    fn run(c: &Case, mode: u32) {
+        let d = MetalDevice::new().unwrap();
+        let (ih, iw) = (c.h / c.up, c.w / c.up);
+        let x = rounded(random(ih * iw * c.cin, 1 + c.cin as u64));
+        let wt = rounded(
+            random(c.cout * c.cin * c.k * c.k, 2 + c.cout as u64)
+                .iter()
+                .map(|v| v * 0.3)
+                .collect(),
+        );
+        let bias = rounded(random(c.cout, 3));
+        let (frames, repeats) = (2usize, 4usize);
+        let src_channels = c.cout * frames * 4 / repeats;
+        let res_same = rounded(random(c.h * c.w * c.cout, 4));
+        let res_half = rounded(random((c.h / 2) * (c.w / 2) * src_channels, 5));
+        let conv_w = Conv::from_values(&d, &wt, &bias, c.cin, c.cout, c.k).unwrap();
+        let xt = tensor(&d, &[ih * iw, c.cin], DType::F16, &x);
+        let yt = Tensor::zeros(&d, [c.h * c.w, c.cout], DType::F16).unwrap();
+        let same = tensor(&d, &[c.h * c.w, c.cout], DType::F16, &res_same);
+        let half = tensor(
+            &d,
+            &[(c.h / 2) * (c.w / 2), src_channels],
+            DType::F16,
+            &res_half,
+        );
+        let res = match mode {
+            1 => Residual::Same(&same),
+            2 => Residual::Shuffled {
+                src: &half,
+                channels: src_channels,
+                frames,
+                repeats,
+            },
+            _ => Residual::None,
+        };
+        conv::conv(&d, &conv_w, &xt, &yt, (c.h, c.w), c.up, res).unwrap();
+
+        let pad = (c.k / 2) as isize;
+        let mut want = vec![0f32; c.h * c.w * c.cout];
+        for yy in 0..c.h {
+            for xx in 0..c.w {
+                for o in 0..c.cout {
+                    let mut acc = f64::from(bias[o]);
+                    for ky in 0..c.k {
+                        for kx in 0..c.k {
+                            let (iy, ix) = (
+                                yy as isize + ky as isize - pad,
+                                xx as isize + kx as isize - pad,
+                            );
+                            if iy < 0 || ix < 0 || iy >= c.h as isize || ix >= c.w as isize {
+                                continue;
+                            }
+                            let (sy, sx) = (iy as usize / c.up, ix as usize / c.up);
+                            for ch in 0..c.cin {
+                                acc += f64::from(x[(sy * iw + sx) * c.cin + ch])
+                                    * f64::from(wt[((o * c.cin + ch) * c.k + ky) * c.k + kx]);
+                            }
+                        }
+                    }
+                    let p = yy * c.w + xx;
+                    acc += match mode {
+                        1 => f64::from(res_same[p * c.cout + o]),
+                        2 => {
+                            let j = ((o * frames + frames - 1) * 2 + (yy & 1)) * 2 + (xx & 1);
+                            let sc = j / repeats;
+                            f64::from(res_half[((yy / 2) * (c.w / 2) + xx / 2) * src_channels + sc])
+                        }
+                        _ => 0.,
+                    };
+                    want[p * c.cout + o] = acc as f32;
+                }
+            }
+        }
+        close(
+            &yt.to_f32(),
+            &want,
+            4e-3,
+            &format!(
+                "conv {}x{} {}->{} k{} up{} mode{mode}",
+                c.h, c.w, c.cin, c.cout, c.k, c.up
+            ),
+        );
+    }
+
+    #[test]
+    fn convolutions_match_the_cpu() {
+        let case = |h, w, cin, cout, k, up| Case {
+            h,
+            w,
+            cin,
+            cout,
+            k,
+            up,
+        };
+        run(&case(9, 13, 64, 70, 3, 1), 0);
+        run(&case(10, 6, 48, 20, 3, 1), 1);
+        run(&case(8, 12, 32, 64, 3, 2), 0);
+        run(&case(12, 10, 144, 33, 3, 2), 1);
+        run(&case(7, 7, 32, 16, 1, 1), 0);
+        run(&case(8, 8, 64, 32, 3, 1), 2);
+        run(&case(16, 16, 288, 144, 3, 1), 0);
+    }
+
+    #[test]
+    fn channel_rms_matches_the_cpu() {
+        let d = MetalDevice::new().unwrap();
+        for (pixels, channels, silu) in
+            [(9usize, 144usize, false), (7, 1152, true), (130, 64, true)]
+        {
+            let x = rounded(
+                random(pixels * channels, 6)
+                    .iter()
+                    .map(|v| v * 4.)
+                    .collect(),
+            );
+            let gamma = random(channels, 7)
+                .iter()
+                .map(|v| 1. + v * 0.3)
+                .collect::<Vec<_>>();
+            let xt = tensor(&d, &[pixels, channels], DType::F16, &x);
+            let gt = tensor(&d, &[channels], DType::F32, &gamma);
+            let yt = Tensor::zeros(&d, [pixels, channels], DType::F16).unwrap();
+            conv::channel_rms(&d, &xt, &gt, &yt, pixels, silu).unwrap();
+            let mut want = Vec::new();
+            for row in x.chunks(channels) {
+                let norm = row
+                    .iter()
+                    .map(|&v| f64::from(v).powi(2))
+                    .sum::<f64>()
+                    .sqrt()
+                    .max(1e-12);
+                want.extend(row.iter().zip(&gamma).map(|(&v, &g)| {
+                    let y = f64::from(v) / norm * (channels as f64).sqrt() * f64::from(g);
+                    (if silu { y / (1. + (-y).exp()) } else { y }) as f32
+                }));
+            }
+            close(
+                &yt.to_f32(),
+                &want,
+                2e-3,
+                &format!("rms {pixels}x{channels}"),
+            );
+        }
+    }
+
+    #[test]
+    fn strided_gemm_and_softmax_match_the_cpu() {
+        let d = MetalDevice::new().unwrap();
+        // The decoder's attention: scores of Q against K read from a packed
+        // [q | k | v] row, then weights times V read transposed.
+        let (pixels, dim) = (150usize, 96usize);
+        let row = 3 * dim;
+        let qkv = rounded(random(pixels * row, 8));
+        let t = tensor(&d, &[pixels, row], DType::F16, &qkv);
+        let (q, k, v) = (
+            t.view(0, [pixels * row]).unwrap(),
+            t.view(dim, [pixels * row - dim]).unwrap(),
+            t.view(2 * dim, [pixels * row - 2 * dim]).unwrap(),
+        );
+        let scores = Tensor::zeros(&d, [pixels, pixels], DType::F32).unwrap();
+        let qa = Operand {
+            t: &q,
+            rows: pixels,
+            stride_row: row,
+            stride_k: 1,
+        };
+        let ka = Operand {
+            t: &k,
+            rows: pixels,
+            stride_row: row,
+            stride_k: 1,
+        };
+        conv::gemm(&d, &qa, &ka, &scores, dim, pixels).unwrap();
+        let mut want = vec![0f32; pixels * pixels];
+        for i in 0..pixels {
+            for j in 0..pixels {
+                want[i * pixels + j] = (0..dim)
+                    .map(|c| f64::from(qkv[i * row + c]) * f64::from(qkv[j * row + dim + c]))
+                    .sum::<f64>() as f32;
+            }
+        }
+        close(&scores.to_f32(), &want, 2e-3, "scores");
+
+        let weights = Tensor::zeros(&d, [pixels, pixels], DType::F16).unwrap();
+        let scale = 1. / (dim as f32).sqrt();
+        conv::softmax_rows(&d, &scores, &weights, pixels, pixels, scale).unwrap();
+        let mut probs = vec![0f32; pixels * pixels];
+        for i in 0..pixels {
+            let s: Vec<f64> = (0..pixels)
+                .map(|j| f64::from(want[i * pixels + j] * scale))
+                .collect();
+            let max = s.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let total: f64 = s.iter().map(|x| (x - max).exp()).sum();
+            for j in 0..pixels {
+                probs[i * pixels + j] = ((s[j] - max).exp() / total) as f32;
+            }
+        }
+        close(&weights.to_f32(), &probs, 2e-3, "softmax");
+
+        let out = Tensor::zeros(&d, [pixels, dim], DType::F16).unwrap();
+        let pa = Operand {
+            t: &weights,
+            rows: pixels,
+            stride_row: pixels,
+            stride_k: 1,
+        };
+        let vt = Tensor::zeros(&d, [dim, pixels], DType::F16).unwrap();
+        conv::transpose(&d, &v, &vt, pixels, dim, row).unwrap();
+        let va = Operand {
+            t: &vt,
+            rows: dim,
+            stride_row: pixels,
+            stride_k: 1,
+        };
+        conv::gemm(&d, &pa, &va, &out, pixels, dim).unwrap();
+        let got_probs: Vec<f32> = weights.to_f32();
+        let mut want_out = vec![0f32; pixels * dim];
+        for i in 0..pixels {
+            for c in 0..dim {
+                want_out[i * dim + c] = (0..pixels)
+                    .map(|j| {
+                        f64::from(got_probs[i * pixels + j]) * f64::from(qkv[j * row + 2 * dim + c])
+                    })
+                    .sum::<f64>() as f32;
+            }
+        }
+        close(&out.to_f32(), &want_out, 4e-3, "weights x V");
+    }
+}

@@ -893,7 +893,8 @@ impl MetalDevice {
         const SOURCE: &str = concat!(
             include_str!("shaders/hybrid.metal"),
             include_str!("shaders/hybrid_mlx.metal"),
-            include_str!("shaders/diffusion.metal")
+            include_str!("shaders/diffusion.metal"),
+            include_str!("shaders/diffusion_vae.metal")
         );
         let p = self.compile_kernel_version(SOURCE, name, MTLLanguageVersion::Version4_0)?;
         self.builtins.borrow_mut().insert(name, p.clone());

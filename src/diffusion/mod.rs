@@ -13,6 +13,7 @@
 #![forbid(unsafe_code)]
 pub mod checkpoint;
 pub mod config;
+pub(crate) mod conv;
 pub mod dit;
 pub(crate) mod ops;
 #[cfg(test)]
@@ -21,5 +22,6 @@ pub mod rope;
 pub mod schedule;
 #[cfg(test)]
 mod tests;
+pub mod vae;
 
 pub use config::{DitConfig, ModelDir, VaeConfig};
