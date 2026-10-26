@@ -21,6 +21,10 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+/// What a tool reports back: its turn, whether it worked, the text for the
+/// model, how long it took, and a picture to add to its reply, if any.
+pub type ToolResult = (usize, bool, String, f32, Option<Vec<u8>>);
+
 pub struct ChatOpts {
     pub model: PathBuf,
     pub context: Option<usize>,
@@ -395,11 +399,11 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                         Err(e) => progress(format!("the chat model did not load again: {e}")),
                     }
                 }
-                let (ok, text) = match result {
-                    Ok(text) => (true, text),
-                    Err(e) => (false, format!("error: {e}")),
+                let (ok, text, shown) = match result {
+                    Ok((text, shown)) => (true, text, shown),
+                    Err(e) => (false, format!("error: {e}"), None),
                 };
-                let _ = work.reply.send((work.idx, ok, text, secs));
+                let _ = work.reply.send((work.idx, ok, text, secs, shown));
             }
             ToWorker::Turn {
                 messages,
@@ -730,7 +734,7 @@ pub struct Chat {
     tool_msgs: Vec<Json>,
     /// A call waiting for the user's yes or no.
     pub approval: Option<(usize, String, String, Map<String, Json>)>,
-    exec_rx: Option<Receiver<(usize, bool, String, f32)>>,
+    exec_rx: Option<Receiver<ToolResult>>,
     tool_cancel: Arc<AtomicBool>,
     /// An image model is set up, so `generate_image` is offered.
     image_tool: bool,
@@ -1087,16 +1091,16 @@ impl Chat {
         }
         let mut defs = match &self.agent {
             Some(a) => {
-                let mut defs = coding::tool_defs(a.plan, self.network);
+                let mut defs = coding::tool_defs(a.plan, self.network, self.sees_images());
                 if !a.skills_text.is_empty() {
                     defs.push(coding::skill_def());
                 }
                 defs
             }
-            None => agent::tool_defs(self.network),
+            None => agent::tool_defs(self.network, self.sees_images()),
         };
         if self.image_tool {
-            defs.push(imagetool::def_json());
+            defs.push(imagetool::def_json(self.sees_images()));
         }
         defs
     }
@@ -1140,8 +1144,8 @@ impl Chat {
                 results.push(r);
             }
         }
-        for (idx, ok, out, secs) in results {
-            self.tool_done(idx, ok, out, secs);
+        for (idx, ok, out, secs, image) in results {
+            self.tool_done(idx, ok, out, secs, image);
         }
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -1276,18 +1280,21 @@ impl Chat {
         self.end_generation();
     }
 
-    fn tool_message(&mut self, idx: usize, text: &str) {
+    fn tool_message(&mut self, idx: usize, text: &str, image: Option<Vec<u8>>) {
         let (id, name) = self
             .turns
             .get(idx)
             .and_then(|t| t.tool.as_ref())
             .map(|t| (t.id.clone(), t.name.clone()))
             .unwrap_or_default();
+        let held = ferrum::vision::media::count_images(&self.history)
+            + ferrum::vision::media::count_images(&self.tool_msgs);
+        let content = tool_content(text, image, self.sees_images(), held, self.image_detail);
         self.tool_msgs.push(json!({
             "role": "tool",
             "tool_call_id": id,
             "name": name,
-            "content": text,
+            "content": content,
         }));
     }
 
@@ -1303,7 +1310,7 @@ impl Chat {
         if self.aborted {
             while let Some((idx, _, _, _)) = self.queue.pop_front() {
                 self.set_tool(idx, ToolState::Denied, "cancelled");
-                self.tool_message(idx, "cancelled by the user");
+                self.tool_message(idx, "cancelled by the user", None);
             }
             return self.finish_round();
         }
@@ -1328,7 +1335,7 @@ impl Chat {
             Ok(sb) => sb,
             Err(e) => {
                 self.set_tool(idx, ToolState::Failed, &e);
-                self.tool_message(idx, &format!("error: {e}"));
+                self.tool_message(idx, &format!("error: {e}"), None);
                 return self.next_tool();
             }
         };
@@ -1342,7 +1349,7 @@ impl Chat {
         });
         if let Some(Err(e)) = &image {
             self.set_tool(idx, ToolState::Failed, e);
-            self.tool_message(idx, &format!("error: {e}"));
+            self.tool_message(idx, &format!("error: {e}"), None);
             return self.next_tool();
         }
         if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
@@ -1365,34 +1372,34 @@ impl Chat {
         let coder = self.agent.as_ref().map(|a| (a.shared.clone(), a.plan));
         std::thread::spawn(move || {
             let started = Instant::now();
-            let (ok, out) = match coder {
+            let (ok, out, shown) = match coder {
                 Some((shared, plan)) => {
                     if plan && !coding::read_only(&name) {
-                        (false, "error: plan mode is on, so nothing can be changed. Finish the plan; the user will turn plan mode off to carry it out.".to_string())
+                        (false, "error: plan mode is on, so nothing can be changed. Finish the plan; the user will turn plan mode off to carry it out.".to_string(), None)
                     } else if shared
                         .lock()
                         .map(|mut g| g.is_loop(&name, &args))
                         .unwrap_or(false)
                     {
-                        (false, "error: you already made this exact call twice. Do something different, or ask the user.".to_string())
+                        (false, "error: you already made this exact call twice. Do something different, or ask the user.".to_string(), None)
                     } else {
                         coding::execute(&shared, &sb, &name, &args, &cancel)
                     }
                 }
                 None => sb.execute(&name, &args, &cancel),
             };
-            let _ = tx.send((idx, ok, out, started.elapsed().as_secs_f32()));
+            let _ = tx.send((idx, ok, out, started.elapsed().as_secs_f32(), shown));
         });
     }
 
-    fn tool_done(&mut self, idx: usize, ok: bool, out: String, secs: f32) {
+    fn tool_done(&mut self, idx: usize, ok: bool, out: String, secs: f32, image: Option<Vec<u8>>) {
         self.exec_rx = None;
         if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
             t.state = if ok { ToolState::Ok } else { ToolState::Failed };
             t.output = out.clone();
             t.secs = secs;
         }
-        self.tool_message(idx, &out);
+        self.tool_message(idx, &out, image);
         let question = self
             .turns
             .get(idx)
@@ -1425,7 +1432,7 @@ impl Chat {
     pub fn deny(&mut self) {
         if let Some((idx, _, _, _)) = self.approval.take() {
             self.set_tool(idx, ToolState::Denied, "denied");
-            self.tool_message(idx, "The user denied this tool call.");
+            self.tool_message(idx, "The user denied this tool call.", None);
             self.next_tool();
         }
     }
@@ -3435,9 +3442,82 @@ impl App {
     }
 }
 
+/// The content of one tool's reply: its text, with an image part in front
+/// when the tool has a picture to show and the prompt can carry it. `held` is
+/// how many images the messages already sent hold.
+fn tool_content(
+    text: &str,
+    image: Option<Vec<u8>>,
+    vision: bool,
+    held: usize,
+    detail: ImageBudget,
+) -> Json {
+    let Some(bytes) = image else {
+        return Json::String(text.to_owned());
+    };
+    // Only a loaded projector can turn a part back into pixels; a prompt also
+    // carries at most MAX_IMAGES pictures.
+    if !vision {
+        return Json::String(format!(
+            "{text}\n(the picture is not shown: this model has no vision projector)"
+        ));
+    }
+    if held >= ferrum::vision::media::MAX_IMAGES {
+        return Json::String(format!(
+            "{text}\n(the picture is not shown: this request already carries {} images, the most a prompt takes)",
+            ferrum::vision::media::MAX_IMAGES
+        ));
+    }
+    json!([
+        ferrum::vision::media::image_part_with(&bytes, detail),
+        {"type": "text", "text": text},
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_reply_shows_its_picture_unless_the_prompt_is_full() {
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        let content = tool_content(
+            "saved a.png",
+            Some(png.to_vec()),
+            true,
+            0,
+            Default::default(),
+        );
+        assert_eq!(content[0]["type"], "image_url");
+        assert!(
+            content[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "saved a.png");
+        // No projector, or no room left: the text says why the picture is absent.
+        let blind = tool_content(
+            "saved a.png",
+            Some(png.to_vec()),
+            false,
+            0,
+            Default::default(),
+        );
+        assert!(blind.is_string());
+        assert!(blind.as_str().unwrap().contains("no vision projector"));
+        let full = tool_content(
+            "saved a.png",
+            Some(png.to_vec()),
+            true,
+            ferrum::vision::media::MAX_IMAGES,
+            Default::default(),
+        );
+        assert!(full.is_string());
+        assert!(full.as_str().unwrap().contains("already carries"));
+        assert!(tool_content("plain", None, true, 0, Default::default()).is_string());
+    }
 
     #[test]
     fn each_session_gets_its_own_folder() {
