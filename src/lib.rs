@@ -18,6 +18,7 @@ pub use error::{Error, Result};
 pub use metal::MetalDevice;
 pub use tensor::{DType, Tensor};
 
+pub mod diffusion;
 #[cfg(feature = "legacy-engine")]
 pub mod generation;
 pub mod hybrid;
