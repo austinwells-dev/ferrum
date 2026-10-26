@@ -97,6 +97,7 @@ with --image-text-quantize q8_0, and models load for the request and are freed a
   --image-alias NAME        model name reported for it (default: the directory name)
   --image-quantize bf16|q8_0|q4_0       quantize the transformer as it loads (default bf16)
   --image-text-quantize bf16|q8_0|q4_0  the same for the text encoder (default bf16)
+  --image-transformer-file FILE.gguf    take the transformer from a GGUF instead (keeps its quantization)
 generation defaults (requests may override):
   --temp, --top-p, --top-k, --min-p, --presence-penalty, --frequency-penalty,
   --repeat-penalty X        sampling (default: the GGUF's recommended values)
@@ -306,6 +307,9 @@ fn parse() -> Result<Options, String> {
             "--image-quantize" => {
                 o.image_settings.transformer =
                     pipeline::parse_quantization(&value).map_err(|e| e.to_string())?
+            }
+            "--image-transformer-file" => {
+                o.image_settings.transformer_file = Some(value.clone().into())
             }
             "--image-text-quantize" => {
                 o.image_settings.text =

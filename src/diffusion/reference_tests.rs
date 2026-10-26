@@ -63,9 +63,14 @@ fn setup() -> Setup {
     let d = MetalDevice::new().unwrap();
     let model = ModelDir::open(dir("FERRUM_QWEN_IMAGE")).unwrap();
     let dump = Checkpoint::open(dir("FERRUM_IMGREF")).unwrap();
-    let ckpt = Checkpoint::open(model.path("transformer")).unwrap();
     let started = std::time::Instant::now();
-    let dit = Dit::load(&d, &ckpt, &model.dit, None).unwrap();
+    let dit = Dit::load(
+        &d,
+        &Checkpoint::open(model.path("transformer")).unwrap(),
+        &model.dit,
+        std::env::var("FERRUM_DIT_QUANT").map_or(None, |q| parse_quantization(&q).unwrap()),
+    )
+    .unwrap();
     eprintln!(
         "loaded {:.1} GB in {:.1}s",
         dit.weight_bytes() as f64 / 1e9,
@@ -357,7 +362,9 @@ fn template_tokenizes_like_diffusers() {
     assert_eq!(skip as u64, meta["drop_idx"].as_u64().unwrap());
 }
 
-/// The whole pipeline at the dump's size. Writes the PNG to `FERRUM_IMAGE_OUT`
+/// The whole pipeline at the dump's size. `FERRUM_DIT_GGUF` takes the
+/// transformer from a GGUF (the published ones hold the base model, not Turbo,
+/// so only the memory estimates and the picture can be checked). Writes the PNG to `FERRUM_IMAGE_OUT`
 /// when set, and prints each stage's predicted and measured device bytes.
 #[test]
 #[ignore = "needs the Turbo checkpoint"]
@@ -367,6 +374,7 @@ fn pipeline_generates_an_image() {
         text: std::env::var("FERRUM_TEXT_QUANT").map_or(None, |q| parse_quantization(&q).unwrap()),
         transformer: std::env::var("FERRUM_DIT_QUANT")
             .map_or(None, |q| parse_quantization(&q).unwrap()),
+        transformer_file: std::env::var_os("FERRUM_DIT_GGUF").map(PathBuf::from),
     };
     let pipeline = Pipeline::open(dir("FERRUM_QWEN_IMAGE"), settings).unwrap();
     let side = std::env::var("FERRUM_SIDE").map_or(512, |s| s.parse().unwrap());

@@ -724,6 +724,57 @@ impl Matrix {
         })
     }
 
+    /// A `[rows, cols]` matrix from the raw payload of a GGML tensor of
+    /// `type_id`, in its stored encoding. `name` is for error messages.
+    pub(crate) fn from_ggml(
+        device: &MetalDevice,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        type_id: u32,
+        bytes: &[u8],
+    ) -> Result<Self> {
+        let fail = |message: String| Error::Weight {
+            name: name.into(),
+            message,
+        };
+        let format = match type_id {
+            30 => Format::Bf16,
+            t => Format::from_type(t)
+                .ok_or_else(|| fail(format!("GGML type {t} has no matrix kernel")))?,
+        };
+        let layout = block_layout(type_id)?;
+        let unit = if matches!(format, Format::F32 | Format::Bf16) {
+            layout.elements.max(16)
+        } else {
+            256
+        };
+        if !cols.is_multiple_of(unit) {
+            return Err(fail(format!(
+                "row width {cols} is not a whole number of blocks"
+            )));
+        }
+        let row_bytes = cols / layout.elements * layout.bytes;
+        if row_bytes * rows != bytes.len() {
+            return Err(fail(format!(
+                "{} bytes for {rows} rows of {row_bytes}",
+                bytes.len()
+            )));
+        }
+        let storage = PackedStorage::from_reader(device, bytes.len(), |dst| {
+            dst.copy_from_slice(bytes);
+            Ok(())
+        })?;
+        Ok(Matrix {
+            rows,
+            cols,
+            experts: 1,
+            format,
+            row_bytes,
+            storage,
+        })
+    }
+
     /// `experts` stacked slices of `rows` rows each, from raw packed bytes in
     /// `format`, for kernel tests.
     #[cfg(test)]

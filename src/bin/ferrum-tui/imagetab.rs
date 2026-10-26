@@ -257,6 +257,7 @@ impl ImageTab {
         Settings {
             text: QUANTS[self.text_quant].1,
             transformer: QUANTS[self.quant].1,
+            transformer_file: None,
         }
     }
 

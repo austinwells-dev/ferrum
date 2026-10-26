@@ -8,7 +8,7 @@
 //! cached text and bidirectionally to each other. That is the arithmetic of
 //! diffusers' KV-cached pipeline, whose first step also runs the text.
 use super::{
-    checkpoint::Checkpoint,
+    checkpoint::Weights,
     config::DitConfig,
     ops::{self, HEAD_DIM, KeyValues, QkvIn},
     rope::RopeTable,
@@ -55,7 +55,7 @@ impl Dit {
     /// the modulation and the output projection stay BF16.
     pub fn load(
         device: &MetalDevice,
-        ckpt: &Checkpoint,
+        ckpt: &impl Weights,
         cfg: &DitConfig,
         quantize: Option<Format>,
     ) -> Result<Self> {
@@ -71,6 +71,7 @@ impl Dit {
             .map(|i| {
                 let n = |s: &str| format!("transformer_blocks.{i}.{s}.weight");
                 let b = |s: &str, rows, cols| ckpt.matrix(device, &n(s), rows, cols, quantize);
+                let (gate, up) = ckpt.mlp_in(device, i, f, h, quantize)?;
                 Ok(Block {
                     q: b("attn.to_q", h, h)?,
                     k: b("attn.to_k", h, h)?,
@@ -78,8 +79,8 @@ impl Dit {
                     o: b("attn.to_out.0", h, h)?,
                     q_norm: ckpt.vector(device, &n("attn.norm_q"), HEAD_DIM, 0.)?,
                     k_norm: ckpt.vector(device, &n("attn.norm_k"), HEAD_DIM, 0.)?,
-                    gate: b("img_mlp.gate_layer", f, h)?,
-                    up: b("img_mlp.proj", f, h)?,
+                    gate,
+                    up,
                     down: b("img_mlp.out", h, f)?,
                 })
             })

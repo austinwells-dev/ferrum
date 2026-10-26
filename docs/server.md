@@ -203,7 +203,10 @@ curl localhost:8080/v1/images/generations -d '{"prompt":"a lighthouse at dusk","
 | `--steps N` | the checkpoint's schedule | Turbo ships 8 explicit sigmas |
 | `--quantize bf16\|q8_0\|q4_0` | `bf16` | Transformer matrices, quantized as they load |
 | `--text-quantize bf16\|q8_0\|q4_0` | `bf16` | Text encoder matrices, likewise |
+| `--transformer-file FILE.gguf` (CLI), `--image-transformer-file` (server) | none | Take the transformer from a GGUF (below) instead of the directory's safetensors |
 | `--image-model DIR`, `--image-alias NAME` | none | Server: the checkpoint and the name `/v1/models` reports |
 | `--image-quantize`, `--image-text-quantize` | `bf16` | Server: as `--quantize` and `--text-quantize` |
+
+**GGUF transformers.** The published `unsloth/Qwen-Image-2.1-GGUF` files (Q2_K to Q8_0; BF16 and F32 tensors also load) hold the denoiser only and keep their own encoding, so `--quantize` does not apply. They are the *base* model, which runs 40 steps with the dynamic-shift schedule, so give `--model` a directory with the base `Qwen/Qwen-Image-2.1` `model_index.json` and `scheduler/`, and the text encoder, `vae/` and `processor/` (the Turbo ones work). Q4_K_M needs 4.3 GB for the transformer (Q8_0 7.6 GB), measured in [gguf-2026-10-26.txt](measurements/image-gen/gguf-2026-10-26.txt).
 
 The response follows OpenAI's shape with `b64_json` PNGs only; `n` is at most 4. A request that does not fit in memory gets 503, and a client that hangs up cancels the generation at the next step. With no `--model`, the chat routes return 404. Timings are in [speed-2026-10-26.txt](measurements/image-gen/speed-2026-10-26.txt): 512² takes about 21–23 s (about 15 s of it denoising) and 1024² about 77 s with a Q8_0 text encoder.

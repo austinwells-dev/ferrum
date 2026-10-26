@@ -19,6 +19,7 @@ const MAX_METADATA: u64 = 1_000_000;
 const MAX_ARRAY_ITEMS: u64 = 4_000_000;
 const MAX_STRING_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_TENSOR_NAME_BYTES: u64 = 64;
+const MAX_UNTAGGED_TENSOR_NAME_BYTES: u64 = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -173,11 +174,19 @@ impl GgufFile {
         let file = File::open(path).map_err(|e| Error::Gguf(format!("{}: {e}", path.display())))?;
         Self::from_reader(file)
     }
+
+    /// Like `open`, for files that carry tensors only and no metadata, such as
+    /// the image-model GGUFs, which have no `general.architecture`.
+    pub fn open_untagged(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = File::open(path).map_err(|e| Error::Gguf(format!("{}: {e}", path.display())))?;
+        Self::read(file, u64::MAX, false)
+    }
 }
 
 impl<R: Read + Seek> GgufReader<R> {
     pub fn from_reader(reader: R) -> Result<Self> {
-        Self::read(reader, u64::MAX)
+        Self::read(reader, u64::MAX, true)
     }
 
     /// Like `from_reader`, but metadata arrays longer than `max_items` (the
@@ -185,10 +194,10 @@ impl<R: Read + Seek> GgufReader<R> {
     /// For callers that need only the settings and the tensor list: it avoids
     /// hundreds of thousands of string allocations per file.
     pub fn from_reader_skipping_arrays(reader: R, max_items: u64) -> Result<Self> {
-        Self::read(reader, max_items)
+        Self::read(reader, max_items, true)
     }
 
-    fn read(mut file: R, max_items: u64) -> Result<Self> {
+    fn read(mut file: R, max_items: u64, require_architecture: bool) -> Result<Self> {
         // The header is millions of small values (a tokenizer string is two
         // reads): parse it through a buffer, not one syscall per value.
         let mut reader = std::io::BufReader::with_capacity(1 << 20, &mut file);
@@ -240,10 +249,12 @@ impl<R: Read + Seek> GgufReader<R> {
                 "general.alignment must be a positive multiple of 8, got {alignment}"
             )));
         }
-        if !matches!(
-            metadata.get("general.architecture"),
-            Some(MetadataValue::String(_))
-        ) {
+        if require_architecture
+            && !matches!(
+                metadata.get("general.architecture"),
+                Some(MetadataValue::String(_))
+            )
+        {
             return Err(Error::Gguf(
                 "missing or invalid general.architecture metadata".into(),
             ));
@@ -254,10 +265,14 @@ impl<R: Read + Seek> GgufReader<R> {
         let mut contains_quantized = false;
         for _ in 0..tensor_count {
             let name = read_string(&mut reader, file_len, "tensor name")?;
-            if name.len() as u64 > MAX_TENSOR_NAME_BYTES {
-                return Err(Error::Gguf(format!(
-                    "tensor name exceeds {MAX_TENSOR_NAME_BYTES} bytes"
-                )));
+            // Image-model files name tensors past the spec's 64 bytes.
+            let max_name = if require_architecture {
+                MAX_TENSOR_NAME_BYTES
+            } else {
+                MAX_UNTAGGED_TENSOR_NAME_BYTES
+            };
+            if name.len() as u64 > max_name {
+                return Err(Error::Gguf(format!("tensor name exceeds {max_name} bytes")));
             }
             let dimensions_count = read_u32(&mut reader, "tensor rank")?;
             if !(1..=4).contains(&dimensions_count) {
@@ -344,7 +359,8 @@ impl<R: Read + Seek> GgufReader<R> {
                 )));
             }
         }
-        if contains_quantized
+        if require_architecture
+            && contains_quantized
             && !matches!(
                 metadata.get("general.quantization_version"),
                 Some(MetadataValue::Uint32(_))
@@ -723,6 +739,31 @@ mod tests {
             assert!(!name.is_empty());
         }
         bytes
+    }
+
+    /// Image-model files carry tensors only: no metadata, names past 64 bytes.
+    #[test]
+    fn an_untagged_file_opens_only_on_request() {
+        let name = "model.diffusion_model.transformer_blocks.10.img_mlp.gate_up.weight";
+        assert!(name.len() > 64);
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(MAGIC);
+        push_u32(&mut bytes, 3);
+        push_u64(&mut bytes, 1);
+        push_u64(&mut bytes, 0);
+        push_string(&mut bytes, name);
+        push_u32(&mut bytes, 2);
+        push_u64(&mut bytes, 32);
+        push_u64(&mut bytes, 1);
+        push_u32(&mut bytes, 8);
+        push_u64(&mut bytes, 0);
+        while !bytes.len().is_multiple_of(32) {
+            bytes.push(0);
+        }
+        bytes.extend_from_slice(&[0; 34]);
+        assert!(GgufReader::from_reader(Cursor::new(bytes.clone())).is_err());
+        let file = GgufReader::read(Cursor::new(bytes), u64::MAX, false).unwrap();
+        assert_eq!(file.tensor(name).unwrap().dimensions, [32, 1]);
     }
 
     #[test]

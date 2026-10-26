@@ -2,10 +2,14 @@
 //! file or several shards, each self-describing, so the index file isn't read.
 use crate::{
     DType, Error, MetalDevice, Result, Tensor,
-    hybrid::weights::{Format, Matrix},
+    hybrid::{
+        engine::page,
+        weights::{Format, Matrix},
+    },
+    loader::gguf::GgufFile,
 };
 use serde::Deserialize;
-use std::{collections::BTreeMap, fs::File, os::unix::fs::FileExt, path::Path};
+use std::{cell::RefCell, collections::BTreeMap, fs::File, os::unix::fs::FileExt, path::Path};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
@@ -227,5 +231,169 @@ impl Checkpoint {
             *x += add;
         }
         Tensor::from_f32(device, [len], DType::F32, &v)
+    }
+}
+
+/// Where the transformer's tensors come from. Names are the diffusers ones
+/// (`transformer_blocks.0.attn.to_q.weight`) whatever the file calls them.
+pub trait Weights {
+    /// A `[rows, cols]` matrix, quantized as it loads when the file holds BF16
+    /// and `quantize` is set.
+    fn matrix(
+        &self,
+        device: &MetalDevice,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        quantize: Option<Format>,
+    ) -> Result<Matrix>;
+
+    /// A float vector as F32, plus `add` to each value.
+    fn vector(&self, device: &MetalDevice, name: &str, len: usize, add: f32) -> Result<Tensor>;
+
+    /// One block's SwiGLU input matrices, `(gate, up)`, each `[ffn, hidden]`.
+    fn mlp_in(
+        &self,
+        device: &MetalDevice,
+        layer: usize,
+        ffn: usize,
+        hidden: usize,
+        quantize: Option<Format>,
+    ) -> Result<(Matrix, Matrix)>;
+}
+
+impl Weights for Checkpoint {
+    fn matrix(
+        &self,
+        device: &MetalDevice,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        quantize: Option<Format>,
+    ) -> Result<Matrix> {
+        Checkpoint::matrix(self, device, name, rows, cols, quantize)
+    }
+
+    fn vector(&self, device: &MetalDevice, name: &str, len: usize, add: f32) -> Result<Tensor> {
+        Checkpoint::vector(self, device, name, len, add)
+    }
+
+    fn mlp_in(
+        &self,
+        device: &MetalDevice,
+        layer: usize,
+        ffn: usize,
+        hidden: usize,
+        quantize: Option<Format>,
+    ) -> Result<(Matrix, Matrix)> {
+        let n = |s: &str| format!("transformer_blocks.{layer}.img_mlp.{s}.weight");
+        Ok((
+            Checkpoint::matrix(self, device, &n("gate_layer"), ffn, hidden, quantize)?,
+            Checkpoint::matrix(self, device, &n("proj"), ffn, hidden, quantize)?,
+        ))
+    }
+}
+
+/// A quantized (or BF16/F32) transformer in a ComfyUI-style GGUF: the
+/// denoiser alone, with no metadata, under `model.diffusion_model.`, and each
+/// block's gate and up matrices stacked in one `gate_up` tensor. Matrices keep
+/// the encoding they are stored in.
+pub struct GgufWeights {
+    file: RefCell<GgufFile>,
+}
+
+const GGUF_PREFIX: &str = "model.diffusion_model.";
+const GGML_F32: u32 = 0;
+const GGML_BF16: u32 = 30;
+
+impl GgufWeights {
+    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Ok(Self {
+            file: RefCell::new(GgufFile::open_untagged(path)?),
+        })
+    }
+
+    /// Device bytes `Dit::load` allocates for the weights in this file.
+    pub fn estimate_bytes(&self) -> usize {
+        self.file
+            .borrow()
+            .tensors()
+            .iter()
+            .map(|(name, t)| match t.dimensions.len() {
+                1 => page(t.dimensions[0] * 4),
+                _ if name.ends_with(".gate_up.weight") => 2 * page(t.byte_len / 2),
+                _ => page(t.byte_len),
+            })
+            .sum()
+    }
+
+    fn read(&self, name: &str, dims: &[usize]) -> Result<(u32, Vec<u8>)> {
+        let full = format!("{GGUF_PREFIX}{name}");
+        let mut file = self.file.borrow_mut();
+        let info = file.tensor(&full)?.clone();
+        if info.dimensions != dims {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: format!("expected GGUF dims {dims:?}, found {:?}", info.dimensions),
+            });
+        }
+        let mut bytes = vec![0u8; info.byte_len];
+        file.read_tensor_into(&full, &mut bytes)?;
+        Ok((info.type_id, bytes))
+    }
+}
+
+impl Weights for GgufWeights {
+    fn matrix(
+        &self,
+        device: &MetalDevice,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        _quantize: Option<Format>,
+    ) -> Result<Matrix> {
+        let (type_id, bytes) = self.read(name, &[cols, rows])?;
+        Matrix::from_ggml(device, name, rows, cols, type_id, &bytes)
+    }
+
+    fn vector(&self, device: &MetalDevice, name: &str, len: usize, add: f32) -> Result<Tensor> {
+        let (type_id, bytes) = self.read(name, &[len])?;
+        let mut v: Vec<f32> = match type_id {
+            GGML_F32 => bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
+            GGML_BF16 => bytes
+                .chunks_exact(2)
+                .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+                .collect(),
+            t => {
+                return Err(Error::Weight {
+                    name: name.into(),
+                    message: format!("GGML type {t} is not a float vector"),
+                });
+            }
+        };
+        for x in &mut v {
+            *x += add;
+        }
+        Tensor::from_f32(device, [len], DType::F32, &v)
+    }
+
+    fn mlp_in(
+        &self,
+        device: &MetalDevice,
+        layer: usize,
+        ffn: usize,
+        hidden: usize,
+        _quantize: Option<Format>,
+    ) -> Result<(Matrix, Matrix)> {
+        let name = format!("transformer_blocks.{layer}.img_mlp.gate_up.weight");
+        let (type_id, bytes) = self.read(&name, &[hidden, 2 * ffn])?;
+        let (gate, up) = bytes.split_at(bytes.len() / 2);
+        Ok((
+            Matrix::from_ggml(device, &name, ffn, hidden, type_id, gate)?,
+            Matrix::from_ggml(device, &name, ffn, hidden, type_id, up)?,
+        ))
     }
 }

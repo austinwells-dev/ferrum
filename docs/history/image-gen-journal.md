@@ -37,3 +37,9 @@ Each stage is checked against the harness dumps by `#[ignore]`d tests in `src/di
 - Every hybrid kernel's first dispatch compiles the whole concatenated source, so the image kernels would have slowed LLM startup. They now join the source only when an `i_*` or `vae_*` kernel is requested; the decoder kernels were renamed from `v_*` because the vision kernels already use that prefix.
 - Two TUI tests that scan the real home directory block in `opendir` on this machine; they pass with an empty `HOME`.
 
+## 2026-10-26 — GGUF transformers
+
+- The unsloth GGUFs have no metadata at all (no `general.architecture`, no quantization version) and tensor names past the spec's 64 bytes, so `GgufFile::open_untagged` skips those checks; the LLM readers still require them. Names are the diffusers ones under `model.diffusion_model.`, each block's gate and up matrices are stacked in one `gate_up` tensor (gate first), and a Q8_0 file holds Q8_0 matrices with BF16 `img_in` and text projections and F32 norms.
+- The GGUF is the base model, not Turbo. Its tensors differ from Turbo's by about 0.6% relative RMS (Q8_0 rounding alone is about 0.1%), so the Turbo diffusers dump cannot be the reference; the mapping is checked by pairing tensors with Turbo's (the right gate/up order shows 0.6%, the wrong one 140%), and the base runs through the 40-step dynamic-shift schedule without guidance and gives clean pictures. Record: [gguf-2026-10-26.txt](../measurements/image-gen/gguf-2026-10-26.txt).
+- 512² at 40 steps: Q8_0 69 s, Q4_K_M 72 s (about 1.6 s a step, so the Q4_K kernels are not faster than Q8_0 here: denoising is compute-bound). Transformer memory 7.6 GB and 4.3 GB.
+

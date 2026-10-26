@@ -2,7 +2,7 @@
 //! models are loaded one at a time and released before the next, which is
 //! what fits a 7B transformer and an 8B encoder on a 32 GB Mac.
 use super::{
-    checkpoint::Checkpoint,
+    checkpoint::{Checkpoint, GgufWeights},
     config::ModelDir,
     dit::{Dit, Rope, Scratch, TextPrefix},
     schedule::Schedule,
@@ -15,7 +15,7 @@ use crate::{
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::{
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -43,12 +43,15 @@ pub fn check_size(width: usize, height: usize) -> Result<()> {
 }
 
 /// How the weights are stored on the device.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct Settings {
     /// Quantize the encoder's layer matrices as they load (BF16 when `None`).
     pub text: Option<Format>,
     /// The same for the transformer's block matrices.
     pub transformer: Option<Format>,
+    /// Take the transformer from this GGUF instead of the model directory,
+    /// keeping the encoding it is stored in (so `transformer` must be unset).
+    pub transformer_file: Option<PathBuf>,
 }
 
 /// `bf16`, `q8_0` or `q4_0` (what the BF16 checkpoints can be quantized to
@@ -158,6 +161,12 @@ pub struct Pipeline {
 
 impl Pipeline {
     pub fn open(dir: impl AsRef<Path>, settings: Settings) -> Result<Self> {
+        if settings.transformer_file.is_some() && settings.transformer.is_some() {
+            return Err(Error::Parameter(
+                "a transformer GGUF keeps its own encoding; drop the transformer quantization"
+                    .into(),
+            ));
+        }
         let model = ModelDir::open(dir)?;
         let tokenizer = Tokenizer::from_file(model.path("processor/tokenizer.json"))?;
         let drop_idx = tokenizer.encode(&system_turn())?.len();
@@ -214,7 +223,11 @@ impl Pipeline {
         let (ids, skip) = self.tokenize(&request.prompt)?;
         let text_rows = ids.len() - skip;
         let text = TextEncoder::estimate_bytes(&self.model.text, ids.len(), self.settings.text);
-        let dit = Dit::estimate_bytes(cfg, self.settings.transformer)
+        let weights = match &self.settings.transformer_file {
+            Some(path) => GgufWeights::open(path)?.estimate_bytes(),
+            None => Dit::estimate_bytes(cfg, self.settings.transformer),
+        };
+        let dit = weights
             + Scratch::bytes(cfg, tokens.max(text_rows))
             + TextPrefix::bytes(cfg, text_rows);
         let vae = Vae::estimate_bytes(&self.model.vae, grid);
@@ -273,8 +286,16 @@ impl Pipeline {
         let latents = {
             stage(Stage::LoadTransformer)?;
             let started = Instant::now();
-            let ckpt = Checkpoint::open(self.model.path("transformer"))?;
-            let dit = Dit::load(d, &ckpt, &self.model.dit, self.settings.transformer)?;
+            let dit = match &self.settings.transformer_file {
+                Some(path) => {
+                    let gguf = GgufWeights::open(path)?;
+                    Dit::load(d, &gguf, &self.model.dit, None)?
+                }
+                None => {
+                    let ckpt = Checkpoint::open(self.model.path("transformer"))?;
+                    Dit::load(d, &ckpt, &self.model.dit, self.settings.transformer)?
+                }
+            };
             let scratch = Scratch::new(d, &self.model.dit, text_rows.max(tokens))?;
             let rope = Rope::new(d, &self.model.dit, text_rows, grid)?;
             timings.load += started.elapsed();

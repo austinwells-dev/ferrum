@@ -1,0 +1,36 @@
+# unsloth/Qwen-Image-2.1-GGUF (base model) on Apple M5, 32 GB; commit 082c419+uncommitted GGUF loader; Q8_0 and Q4_K_M, text encoder Q8_0, 512x512, seed 42, 40 steps, base scheduler (dynamic shift), no guidance
+
+## tensor mapping: tools/imgref/compare_gguf.py <Q8_0.gguf> <Turbo transformer dir>
+1 gate_up shape (24576, 4096)
+1 first vs gate_layer 0.0060037970542907715
+1 first vs proj 1.4330037832260132
+1 second vs gate_layer 1.3977408409118652
+1 second vs proj 0.0060135298408567905
+1 attn.to_q.weight 0.0060890004970133305
+1 attn.to_out.0.weight 0.005786239169538021
+1 img_mlp.out.weight 0.006236465647816658
+20 gate_up shape (24576, 4096)
+20 first vs gate_layer 0.006390610709786415
+20 first vs proj 1.3129920959472656
+20 second vs gate_layer 1.547184944152832
+20 second vs proj 0.006205964367836714
+20 attn.to_q.weight 0.0063918158411979675
+20 attn.to_out.0.weight 0.005764401983469725
+20 img_mlp.out.weight 0.006098021753132343
+img_in.weight (4096, 64) (4096, 64) 0.0011940480908378959 -0.00018258373893331736 -0.00018257615738548338
+txt_in.text_norm.weight (4096,) (4096,) 4.690090008807601e-06 -0.8066869974136353 -0.80668705701828
+modulation.1.weight (16384, 4096) (16384, 4096) 0.0094627495855093 0.00042925262823700905 0.0004291527147870511
+norm_out.linear.weight (4096, 4096) (4096, 4096) 0.005203039385378361 0.0012170352274551988 0.0012162304483354092
+proj_out.weight (64, 4096) (64, 4096) 0.008356457576155663 6.430732173612341e-05 6.460419535869732e-05
+
+## generation (ferrum-cli image --transformer-file; model dir = base configs + Turbo text_encoder/vae/processor)
+Q8_0:   512x512, seed 42, 69.1 s (load 5.6, encode 0.2, denoise 62.6, decode 0.7)
+Q4_K_M: 512x512, seed 42, 72.0 s (load 4.3, encode 0.2, denoise 66.8, decode 0.7)
+PSNR of the Q4_K_M image against the Q8_0 image: 32.0 dB (8-bit RGB)
+
+## memory estimates (pipeline_generates_an_image, FERRUM_DIT_GGUF)
+Q8_0:   transformer predicted 7577.8 MiB, measured peak 7578.7 MiB
+Q4_K_M: transformer predicted 4296.0 MiB, measured peak 4296.8 MiB
+
+## DiT against the Turbo fp16 dump (dit_blocks / dit_sampling tests, run once with the Q8_0 GGUF patched in)
+final latents 35.6% off, as expected: the GGUF is the base model, not Turbo. The same test with the Turbo weights quantized to Q8_0 on load: prediction 0.47% (block 0 0.08%).
