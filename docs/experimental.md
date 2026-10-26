@@ -124,6 +124,8 @@ Against Kapitsa through each server (same prompts): 82–91% of its greedy speed
 
 Qwen-Image-2.1-Turbo (8 steps, no guidance) on a 32 GB M5, drawing and editing, through `ferrum-cli image`, `ferrum-server --image-model`, the TUI Image tab and the chat and agent tool `generate_image`. Usage: [server.md](server.md#image-generation).
 
+With a vision projector loaded, the chat and agent tools close the loop: `generate_image` adds the picture it just made to its own reply (`inject: true`, the default; `inject: false` for a call that only needs the file), and `view_image` opens any image file the sandbox allows. The model sees its output as pixels and can correct it in the next call. Without a projector both still save or read the file, and the reply says the picture was not shown.
+
 ## Validation
 
 All against diffusers at 512², with diffusers' own noise, and repeatable with the ignored tests in `src/diffusion/reference_tests.rs` ([edit-parity-2026-10-26.txt](measurements/image-gen/edit-parity-2026-10-26.txt)). Errors are relative RMS.

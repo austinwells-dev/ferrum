@@ -218,6 +218,7 @@ pub fn read_only(name: &str) -> bool {
     matches!(
         name,
         "read_file"
+            | "view_image"
             | "list_dir"
             | "glob"
             | "grep"
@@ -265,7 +266,7 @@ pub fn skill_def() -> Json {
     )
 }
 
-pub fn tool_defs(plan: bool, network: bool) -> Vec<Json> {
+pub fn tool_defs(plan: bool, network: bool, vision: bool) -> Vec<Json> {
     let mut tools = vec![
         def(
             "read_file",
@@ -364,6 +365,9 @@ pub fn tool_defs(plan: bool, network: bool) -> Vec<Json> {
             &["name"],
         ),
     ];
+    if vision {
+        tools.push(crate::agent::view_image_def());
+    }
     if network {
         tools.push(def(
             "web_search",
@@ -687,18 +691,25 @@ impl Sandbox {
     }
 }
 
-/// Run one agent tool call. Returns (succeeded, text for the model).
+/// Run one agent tool call. Returns (succeeded, text for the model, an image
+/// the caller may add to the tool's reply).
 pub fn execute(
     shared: &SharedRef,
     sb: &Sandbox,
     name: &str,
     args: &Map<String, Json>,
     cancel: &AtomicBool,
-) -> (bool, String) {
+) -> (bool, String, Option<Vec<u8>>) {
+    if name == "view_image" {
+        return match sb.view_image(args) {
+            Ok((text, bytes)) => (true, text, Some(bytes)),
+            Err(e) => (false, format!("error: {e}"), None),
+        };
+    }
     let result = run(shared, sb, name, args, cancel);
     match result {
-        Ok(text) => (true, text),
-        Err(e) => (false, format!("error: {e}")),
+        Ok(text) => (true, text, None),
+        Err(e) => (false, format!("error: {e}"), None),
     }
 }
 
@@ -1102,13 +1113,14 @@ mod tests {
     }
 
     fn call(sb: &Sandbox, shared: &SharedRef, name: &str, args: Json) -> (bool, String) {
-        execute(
+        let (ok, out, _image) = execute(
             shared,
             sb,
             name,
             args.as_object().unwrap(),
             &AtomicBool::new(false),
-        )
+        );
+        (ok, out)
     }
 
     #[test]
@@ -1305,7 +1317,7 @@ mod tests {
     #[test]
     fn plan_mode_has_no_mutating_tools() {
         let names = |plan| -> Vec<String> {
-            tool_defs(plan, true)
+            tool_defs(plan, true, true)
                 .iter()
                 .map(|t| t["function"]["name"].as_str().unwrap().to_string())
                 .collect()
@@ -1314,5 +1326,13 @@ mod tests {
         assert!(plan.iter().all(|n| read_only(n)), "{plan:?}");
         assert!(!plan.contains(&"bash".to_string()));
         assert!(names(false).contains(&"edit_file".to_string()));
+        // Only a model that can see images is offered the tool.
+        assert!(plan.contains(&"view_image".to_string()));
+        let without = tool_defs(true, true, false);
+        assert!(
+            !without
+                .iter()
+                .any(|t| t["function"]["name"] == "view_image")
+        );
     }
 }

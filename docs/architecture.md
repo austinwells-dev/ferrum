@@ -68,3 +68,5 @@ The transformer reads one sequence: text rows, then each condition image's laten
 
 `Pipeline` estimates each stage's bytes (the tests hold every stage within 4 MiB of its measured peak), checks them against the working-set limit minus what is already resident, and frees a stage before loading the next. The TUI's `generate_image` tool runs on the chat model's thread: when `Pipeline::fits_now` says the stages do not fit beside the chat model, it drops the model for the picture and loads it again after. The image kernels (`i_*`, `vae_*`) are compiled only with image runs, so LLM startup is unchanged. No `unsafe` was added.
 
+A picture a tool makes, and a file the `view_image` tool reads, reach the model as an image part inside that tool's reply (`role: "tool"` with a content array), beside the text that names the path. They take the same `vision::media::take_images` → `<|image_pad|>` path as attached images, so the session's prefix reuse treats them like any other image. A reply that would take a prompt past `MAX_IMAGES` (16) carries only its text, saying why; the same happens when the loaded model has no projector.
+

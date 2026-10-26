@@ -492,6 +492,37 @@ mod tests {
     }
 
     #[test]
+    fn types_the_image_tools_arguments() {
+        let tools: Vec<Json> = vec![
+            serde_json::json!({"type": "function", "function": {
+                "name": "view_image",
+                "parameters": {"properties": {"path": {"type": "string"}}}}}),
+            serde_json::json!({"type": "function", "function": {
+                "name": "generate_image",
+                "parameters": {"properties": {
+                    "prompt": {"type": "string"},
+                    "inject": {"type": "boolean"},
+                    "seed": {"type": "integer"}}}}}),
+        ];
+        let text = "<tool_call>\n<function=view_image>\n<parameter=path>\nimages/fox.png\n\
+                    </parameter>\n</function>\n</tool_call>\n\
+                    <tool_call>\n<function=generate_image>\n<parameter=prompt>\na fox\n\
+                    </parameter>\n<parameter=inject>\nfalse\n</parameter>\n\
+                    <parameter=seed>\n7\n</parameter>\n</function>\n</tool_call>";
+        let parsed = parse_output(text, false, &tools);
+        assert_eq!(parsed.tool_calls.len(), 2);
+        assert_eq!(parsed.tool_calls[0].name, "view_image");
+        assert_eq!(
+            parsed.tool_calls[0].arguments["path"],
+            Json::String("images/fox.png".into())
+        );
+        assert_eq!(parsed.tool_calls[1].name, "generate_image");
+        // A boolean from the schema is a JSON boolean, not the text "false".
+        assert_eq!(parsed.tool_calls[1].arguments["inject"], Json::Bool(false));
+        assert_eq!(parsed.tool_calls[1].arguments["seed"], Json::from(7));
+    }
+
+    #[test]
     fn flint_calls_without_arguments_and_malformed_blocks() {
         let tools = vec![serde_json::json!({"name": "now"})];
         let parsed = parse_output("<tool_call>now</tool_call>", false, &tools);

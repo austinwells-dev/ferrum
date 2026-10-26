@@ -12,6 +12,8 @@ use std::sync::mpsc::channel;
 
 const PROFILE: &str = include_str!("sandbox.sb");
 const MAX_OUTPUT: usize = 12_000;
+/// Most bytes `view_image` reads: a picture has to reach the vision encoder.
+const MAX_IMAGE_BYTES: usize = 48 << 20;
 /// macOS `open(2)` flag: fail if any component of the path is a symlink.
 const O_NOFOLLOW_ANY: i32 = 0x2000_0000;
 /// `ELOOP`, what `O_NOFOLLOW_ANY` reports on meeting a symlink.
@@ -95,7 +97,7 @@ pub fn def(name: &str, description: &str, properties: Json, required: &[&str]) -
     })
 }
 
-pub fn tool_defs(network: bool) -> Vec<Json> {
+pub fn tool_defs(network: bool, vision: bool) -> Vec<Json> {
     let mut tools = vec![
         def(
             "bash",
@@ -143,6 +145,9 @@ pub fn tool_defs(network: bool) -> Vec<Json> {
             &[],
         ),
     ];
+    if vision {
+        tools.push(view_image_def());
+    }
     if network {
         tools.push(def(
             "web_search",
@@ -161,6 +166,18 @@ pub fn tool_defs(network: bool) -> Vec<Json> {
         ));
     }
     tools
+}
+
+/// `view_image`: the picture itself is added to the tool's reply, so the model
+/// sees it without the user attaching anything.
+pub fn view_image_def() -> Json {
+    def(
+        "view_image",
+        "Look at an image file: its pixels are added to this tool's reply for you to see. Use it on \
+         screenshots, diagrams, photos and pictures you or another tool made.",
+        json!({"path": {"type": "string", "description": "Path to an image file (PNG, JPEG, GIF, WebP or BMP), relative to the workspace."}}),
+        &["path"],
+    )
 }
 
 pub fn system_prompt(workspace: &Path, network: bool) -> String {
@@ -361,6 +378,56 @@ impl Sandbox {
             .map_err(|_| format!("{} is not UTF-8 text", self.rel(path)))
     }
 
+    /// Read an image for `view_image`: its bytes, and a description saying
+    /// what they are. Confined reads use `resolve` (the workspace and its
+    /// attachments only, refusing symlinks); unconfined ones may read any path.
+    pub fn view_image(&self, args: &Map<String, Json>) -> Result<(String, Vec<u8>), String> {
+        let given = arg_str(args, "path")?;
+        let raw = expand(given);
+        let path = if self.confined {
+            self.resolve(given)?
+        } else if raw.is_absolute() {
+            raw
+        } else {
+            self.workspace.join(raw)
+        };
+        let bytes = if self.confined {
+            self.read_bytes(&path)?
+        } else {
+            fs::read(&path).map_err(|e| format!("{given}: {e}"))?
+        };
+        if bytes.len() > MAX_IMAGE_BYTES {
+            return Err(format!(
+                "{given} is {:.0} MB; view_image reads at most {} MB",
+                bytes.len() as f64 / (1 << 20) as f64,
+                MAX_IMAGE_BYTES >> 20
+            ));
+        }
+        let mime = ferrum::vision::media::image_mime(&bytes).ok_or_else(|| {
+            format!(
+                "{given} is not an image: view_image reads PNG, JPEG, GIF, WebP and BMP files \
+                 (read_file opens text files)"
+            )
+        })?;
+        let (w, h) = image::ImageReader::new(std::io::Cursor::new(&bytes))
+            .with_guessed_format()
+            .map_err(|e| format!("{given}: {e}"))?
+            .into_dimensions()
+            .map_err(|e| format!("{given}: {e}"))?;
+        let name = if self.confined {
+            self.rel(&path)
+        } else {
+            path.display().to_string()
+        };
+        Ok((
+            format!(
+                "{name} ({w}×{h}, {mime}, {:.0} KB): the picture is in this reply for you to look at, and it stays at that path.",
+                bytes.len() as f64 / 1024.0
+            ),
+            bytes,
+        ))
+    }
+
     pub fn write_text(&self, path: &Path, text: &str) -> Result<(), String> {
         self.write_bytes(path, text.as_bytes())
     }
@@ -506,13 +573,20 @@ impl Sandbox {
         Ok((code, String::from_utf8_lossy(&out).into_owned(), killed))
     }
 
-    /// Run one tool call. Returns (succeeded, text for the model).
+    /// Run one tool call. Returns (succeeded, text for the model, an image the
+    /// caller may add to the tool's reply).
     pub fn execute(
         &self,
         name: &str,
         args: &Map<String, Json>,
         cancel: &AtomicBool,
-    ) -> (bool, String) {
+    ) -> (bool, String, Option<Vec<u8>>) {
+        if name == "view_image" {
+            return match self.view_image(args) {
+                Ok((text, bytes)) => (true, text, Some(bytes)),
+                Err(e) => (false, format!("error: {e}"), None),
+            };
+        }
         let result = match name {
             "bash" => self.bash(args, cancel),
             "read_file" => self.read_file(args),
@@ -527,8 +601,8 @@ impl Sandbox {
             other => Err(format!("unknown tool {other}")),
         };
         match result {
-            Ok(text) => (true, text),
-            Err(e) => (false, format!("error: {e}")),
+            Ok(text) => (true, text, None),
+            Err(e) => (false, format!("error: {e}"), None),
         }
     }
 
@@ -868,7 +942,8 @@ mod tests {
 
     fn call(sb: &Sandbox, name: &str, args: Json) -> (bool, String) {
         let map = args.as_object().cloned().unwrap_or_default();
-        sb.execute(name, &map, &AtomicBool::new(false))
+        let (ok, out, _image) = sb.execute(name, &map, &AtomicBool::new(false));
+        (ok, out)
     }
 
     #[test]
@@ -991,6 +1066,49 @@ mod tests {
         assert!(!ok && out.contains("matches"), "{out}");
         let (ok, out) = call(&sb, "list_dir", json!({}));
         assert!(ok && out.contains("a/") && !out.contains(".home"), "{out}");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn view_image_shows_pictures_inside_the_sandbox_only() {
+        let (sb, dir) = sandbox("view", false);
+        let mut png = Vec::new();
+        image::RgbaImage::new(64, 32)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        fs::write(dir.join("shot.png"), &png).unwrap();
+        let show = |sb: &Sandbox, path: &str| {
+            sb.execute(
+                "view_image",
+                &json!({"path": path})
+                    .as_object()
+                    .cloned()
+                    .unwrap_or_default(),
+                &AtomicBool::new(false),
+            )
+        };
+        let (ok, out, shown) = show(&sb, "shot.png");
+        assert!(ok, "{out}");
+        assert!(out.contains("64×32") && out.contains("image/png"), "{out}");
+        assert_eq!(shown.as_deref(), Some(&png[..]));
+        // A text file and a missing one are refused rather than shown.
+        fs::write(dir.join("note.txt"), "hello").unwrap();
+        let (ok, out, shown) = show(&sb, "note.txt");
+        assert!(
+            !ok && shown.is_none() && out.contains("not an image"),
+            "{out}"
+        );
+        assert!(!show(&sb, "missing.png").0);
+        // Outside the workspace needs the sandbox to be off.
+        let outside = std::env::temp_dir().join(format!("ferrum-view-{}.png", std::process::id()));
+        fs::write(&outside, &png).unwrap();
+        assert!(!show(&sb, &outside.display().to_string()).0);
+        let mut free = sb.clone();
+        free.confined = false;
+        let (ok, out, shown) = show(&free, &outside.display().to_string());
+        assert!(ok, "{out}");
+        assert_eq!(shown.as_deref(), Some(&png[..]));
+        let _ = fs::remove_file(outside);
         let _ = fs::remove_dir_all(dir);
     }
 

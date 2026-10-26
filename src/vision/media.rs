@@ -66,17 +66,23 @@ pub fn image_part_from_bytes(bytes: &[u8]) -> Json {
     image_part_with(bytes, ImageBudget::default())
 }
 
-/// `image_part_from_bytes` asking for `budget` (as `min_tokens` and
-/// `max_tokens` next to the URL).
-pub fn image_part_with(bytes: &[u8], budget: ImageBudget) -> Json {
-    let mime = match bytes {
+/// The MIME type of an image from its first bytes, or `None` if it is not
+/// one of the formats the decoder reads.
+pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    Some(match bytes {
         [0x89, b'P', b'N', b'G', ..] => "image/png",
         [0xff, 0xd8, ..] => "image/jpeg",
         [b'G', b'I', b'F', ..] => "image/gif",
         [b'R', b'I', b'F', b'F', ..] => "image/webp",
         [b'B', b'M', ..] => "image/bmp",
-        _ => "application/octet-stream",
-    };
+        _ => return None,
+    })
+}
+
+/// `image_part_from_bytes` asking for `budget` (as `min_tokens` and
+/// `max_tokens` next to the URL).
+pub fn image_part_with(bytes: &[u8], budget: ImageBudget) -> Json {
+    let mime = image_mime(bytes).unwrap_or("application/octet-stream");
     let mut url = json!({"url": format!("data:{mime};base64,{}", base64_encode(bytes))});
     if let Some(n) = budget.min_tokens {
         url["min_tokens"] = json!(n);
@@ -206,11 +212,17 @@ fn image_part(part: &Json) -> Option<Result<Vec<u8>>> {
 
 /// Does any message carry an image part?
 pub fn has_images(messages: &[Json]) -> bool {
-    messages.iter().any(|m| {
-        m.get("content")
-            .and_then(Json::as_array)
-            .is_some_and(|parts| parts.iter().any(|p| image_part(p).is_some()))
-    })
+    count_images(messages) > 0
+}
+
+/// How many image parts the messages carry.
+pub fn count_images(messages: &[Json]) -> usize {
+    messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Json::as_array))
+        .flatten()
+        .filter(|p| image_part(p).is_some())
+        .count()
 }
 
 /// Replace every image part with `{"type": "image"}` (what chat templates
@@ -266,6 +278,27 @@ mod tests {
         assert_eq!(base64_encode(b"fo"), "Zm8=");
         assert_eq!(base64_decode("-_8").unwrap(), [0xfb, 0xff]);
         assert!(base64_decode("a*b").is_err());
+    }
+
+    #[test]
+    fn counts_image_parts_in_any_message() {
+        let messages = [
+            json!({"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,Zm9v"}}]}),
+            json!({"role": "tool", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,Zm9v"}},
+                {"type": "text", "text": "a.png"}]}),
+            json!({"role": "assistant", "content": "no picture"}),
+        ];
+        assert_eq!(count_images(&messages), 2);
+        assert!(has_images(&messages));
+        assert_eq!(count_images(&messages[2..]), 0);
+        assert_eq!(image_mime(b"\x89PNG\r\n"), Some("image/png"));
+        assert_eq!(image_mime(&[0xff, 0xd8, 0xff]), Some("image/jpeg"));
+        assert_eq!(image_mime(b"GIF89a"), Some("image/gif"));
+        assert_eq!(image_mime(b"RIFF....WEBP"), Some("image/webp"));
+        assert_eq!(image_mime(b"BM123"), Some("image/bmp"));
+        assert_eq!(image_mime(b"plain text"), None);
     }
 
     #[test]
