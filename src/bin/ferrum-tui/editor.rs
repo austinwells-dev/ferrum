@@ -185,6 +185,7 @@ impl App {
                     return;
                 }
             }
+            Editing::ImagePrompt => self.set_image_prompt(),
             Editing::SearchUrl => self.search.url = self.buffer.trim().to_string(),
             Editing::SearchKey => self.search.key = self.buffer.trim().to_string(),
             Editing::RenameFav(i) => {

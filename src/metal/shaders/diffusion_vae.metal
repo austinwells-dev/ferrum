@@ -6,7 +6,7 @@
 struct PrepArgs2 { uint n; uint channels; };
 
 // z = x * std + mean per channel, F32 [pixels][channels] to F16.
-kernel void v_denorm(constant PrepArgs2 & a [[buffer(4)]], device const float * x [[buffer(0)]],
+kernel void vae_denorm(constant PrepArgs2 & a [[buffer(4)]], device const float * x [[buffer(0)]],
                      device const float * mean [[buffer(1)]], device const float * stdev [[buffer(2)]],
                      device half * y [[buffer(3)]], uint i [[thread_position_in_grid]]) {
     if (i < a.n) {
@@ -19,7 +19,7 @@ struct RmsArgs { uint pixels; uint channels; uint silu; };
 
 // y = x / rms(x over channels) * gamma, optionally followed by SiLU
 // (F.normalize(x) * sqrt(C) * gamma). One simdgroup per pixel, four per threadgroup.
-kernel void v_chan_rms(constant RmsArgs & a [[buffer(3)]], device const half * x [[buffer(0)]],
+kernel void vae_chan_rms(constant RmsArgs & a [[buffer(3)]], device const half * x [[buffer(0)]],
                        device const float * gamma [[buffer(1)]], device half * y [[buffer(2)]],
                        uint g [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     const uint pixel = g * 4 + tid / 32;
@@ -130,8 +130,8 @@ kernel void NAME(constant VaeConvArgs & a [[buffer(5)]], device half * x [[buffe
                  ushort tid [[thread_index_in_threadgroup]]) {                                    \
     conv_impl<NK>(a, x, wt, bias, res, y, tb, tg, tid);                                           \
 }
-CONV_KERNEL(v_conv_k32, 32)
-CONV_KERNEL(v_conv_k16, 16)
+CONV_KERNEL(vae_conv_k32, 32)
+CONV_KERNEL(vae_conv_k16, 16)
 
 struct GemmArgs {
     uint m; uint n; uint k;
@@ -170,12 +170,12 @@ void gemm_impl(constant GemmArgs & a, device half * A, device half * B, device T
     }
 }
 
-kernel void v_gemm_f32(constant GemmArgs & a [[buffer(3)]], device half * A [[buffer(0)]],
+kernel void vae_gemm_f32(constant GemmArgs & a [[buffer(3)]], device half * A [[buffer(0)]],
                        device half * B [[buffer(1)]], device float * C [[buffer(2)]],
                        uint2 tg [[threadgroup_position_in_grid]]) {
     gemm_impl<float>(a, A, B, C, tg);
 }
-kernel void v_gemm_f16(constant GemmArgs & a [[buffer(3)]], device half * A [[buffer(0)]],
+kernel void vae_gemm_f16(constant GemmArgs & a [[buffer(3)]], device half * A [[buffer(0)]],
                        device half * B [[buffer(1)]], device half * C [[buffer(2)]],
                        uint2 tg [[threadgroup_position_in_grid]]) {
     gemm_impl<half>(a, A, B, C, tg);
@@ -185,7 +185,7 @@ struct SoftmaxArgs { uint rows; uint cols; float scale; };
 
 // Row softmax of F32 scores (times `scale`) into F16 weights; one threadgroup
 // of 256 threads per row.
-kernel void v_softmax_rows(constant SoftmaxArgs & a [[buffer(2)]], device const float * s [[buffer(0)]],
+kernel void vae_softmax_rows(constant SoftmaxArgs & a [[buffer(2)]], device const float * s [[buffer(0)]],
                            device half * p [[buffer(1)]], uint row [[threadgroup_position_in_grid]],
                            ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float scratch[8];
@@ -209,7 +209,7 @@ struct TransposeArgs { uint rows; uint cols; uint ld; };
 
 // out[c][r] = in[r][c] for F16 `in` with row stride `ld`; the TensorOps gemm
 // wants unit stride along k, which the decoder's attention needs for V.
-kernel void v_transpose(constant TransposeArgs & a [[buffer(2)]], device const half * x [[buffer(0)]],
+kernel void vae_transpose(constant TransposeArgs & a [[buffer(2)]], device const half * x [[buffer(0)]],
                         device half * y [[buffer(1)]], uint2 g [[thread_position_in_grid]]) {
     if (g.x < a.cols && g.y < a.rows) y[(ulong)g.x * a.rows + g.y] = x[(ulong)g.y * a.ld + g.x];
 }

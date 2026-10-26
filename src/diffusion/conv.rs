@@ -151,9 +151,9 @@ pub(crate) fn conv(
         .u(frames)?
         .u(repeats)?;
     let (name, nk) = if c.cin.is_multiple_of(32) {
-        ("v_conv_k32", 32)
+        ("vae_conv_k32", 32)
     } else if c.cin.is_multiple_of(16) {
-        ("v_conv_k16", 16)
+        ("vae_conv_k16", 16)
     } else {
         return Err(Error::Shape(format!("{} input channels", c.cin)));
     };
@@ -179,7 +179,7 @@ pub(crate) fn channel_rms(
 ) -> Result<()> {
     let channels = gamma.numel();
     d.dispatch_hybrid(
-        "v_chan_rms",
+        "vae_chan_rms",
         &[x.binding(), gamma.binding()],
         &[y.binding()],
         &Params::default()
@@ -203,7 +203,7 @@ pub(crate) fn denormalize(
 ) -> Result<()> {
     let n = x.numel();
     d.dispatch_hybrid(
-        "v_denorm",
+        "vae_denorm",
         &[x.binding(), mean.binding(), std.binding()],
         &[z.binding()],
         &Params::default().u(n)?.u(mean.numel())?.0,
@@ -240,7 +240,7 @@ pub(crate) fn gemm(
         .u(b.stride_row)?
         .u(ldc)?;
     d.dispatch_hybrid(
-        if wide { "v_gemm_f32" } else { "v_gemm_f16" },
+        if wide { "vae_gemm_f32" } else { "vae_gemm_f16" },
         &[a.t.binding(), b.t.binding()],
         &[c.binding()],
         &args.0,
@@ -260,7 +260,7 @@ pub(crate) fn transpose(
     ld: usize,
 ) -> Result<()> {
     d.dispatch_hybrid(
-        "v_transpose",
+        "vae_transpose",
         &[x.binding()],
         &[y.binding()],
         &Params::default().u(rows)?.u(cols)?.u(ld)?.0,
@@ -280,7 +280,7 @@ pub(crate) fn softmax_rows(
     scale: f32,
 ) -> Result<()> {
     d.dispatch_hybrid(
-        "v_softmax_rows",
+        "vae_softmax_rows",
         &[s.binding()],
         &[p.binding()],
         &Params::default().u(rows)?.u(cols)?.f(scale).0,

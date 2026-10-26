@@ -898,15 +898,27 @@ impl MetalDevice {
         if let Some(p) = self.builtins.borrow().get(name) {
             return Ok(p.clone());
         }
-        // The MLX kernels (Apache-2.0, adapted from Kapitsa) and the image
-        // transformer's kernels build on hybrid.metal's types.
-        const SOURCE: &str = concat!(
+        // The MLX kernels (Apache-2.0, adapted from Kapitsa) build on
+        // hybrid.metal's types. The image kernels (`i_`, `vae_`) build on both,
+        // and are compiled only with the kernels that use them: every
+        // kernel's first dispatch compiles its whole source, so the language
+        // models' startup does not pay for them.
+        const HYBRID: &str = concat!(
+            include_str!("shaders/hybrid.metal"),
+            include_str!("shaders/hybrid_mlx.metal")
+        );
+        const IMAGE: &str = concat!(
             include_str!("shaders/hybrid.metal"),
             include_str!("shaders/hybrid_mlx.metal"),
             include_str!("shaders/diffusion.metal"),
             include_str!("shaders/diffusion_vae.metal")
         );
-        let p = self.compile_kernel_version(SOURCE, name, MTLLanguageVersion::Version4_0)?;
+        let source = if name.starts_with("i_") || name.starts_with("vae_") {
+            IMAGE
+        } else {
+            HYBRID
+        };
+        let p = self.compile_kernel_version(source, name, MTLLanguageVersion::Version4_0)?;
         self.builtins.borrow_mut().insert(name, p.clone());
         Ok(p)
     }
