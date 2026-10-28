@@ -2,7 +2,7 @@
 //! (`clip.projector_type = qwen3vl_merger`), the `mmproj` file next to
 //! Qwen3.5/3.6/3.8-family checkpoints, are the path in this file: an image
 //! becomes a grid of embeddings that replace `<|image_pad|>` rows.
-//! LFM3-VL (`clip.vision.projector_type = lfm3vl`) is [`lfm3`]. It repeats
+//! LFM3-VL (`clip.vision.projector_type = lfm3vl`) is the private `lfm3` module. It repeats
 //! `<|image|>` and gives each of those tokens its own position, not a 2-D grid.
 //! Audio projectors (`lfm3a`, `lfm3a_gen`) and video are refused.
 //!
