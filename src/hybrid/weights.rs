@@ -128,10 +128,20 @@ pub struct DeltaWeights {
     pub norm: Tensor,
 }
 
+/// LFM3 short convolution: `in_proj` is `[3H, H]` (B, C, X), `conv` is F32
+/// `[H, K]` with tap `k` of channel `c` at `c * K + k` (oldest tap first),
+/// and `out_proj` is `[H, H]`.
+pub struct ShortConvWeights {
+    pub in_proj: Matrix,
+    pub conv: Tensor,
+    pub out_proj: Matrix,
+}
+
 #[allow(clippy::large_enum_variant)] // one per layer; never moved in hot paths
 pub enum Mixer {
     Attention(AttentionWeights),
     Delta(DeltaWeights),
+    ShortConv(ShortConvWeights),
 }
 
 pub struct DenseFfn {
@@ -158,7 +168,13 @@ pub enum Ffn {
 
 pub struct Layer {
     pub attn_norm: Tensor,
+    /// Next pre-norm fused into the residual add: Qwen's post-attention norm,
+    /// or `ffn_norm` for Flint, Spark and LFM3.
     pub post_norm: Tensor,
+    /// Sandwich RMSNorm of the mixer branch, before the residual add (LFM3).
+    pub post_attn: Option<Tensor>,
+    /// Sandwich RMSNorm of the feed-forward branch, before the residual add.
+    pub post_ffw: Option<Tensor>,
     pub mixer: Mixer,
     pub ffn: Ffn,
 }
@@ -167,6 +183,9 @@ pub struct Weights {
     pub embedding: Matrix,
     pub output_norm: Tensor,
     pub output: Matrix,
+    /// Shared RoPE frequency factors (`rope_freqs.weight`), full-attention
+    /// layers only. Length `head_dim / 2`. Absent except on LFM3.
+    pub rope_freqs: Option<Tensor>,
     pub layers: Vec<Layer>,
 }
 
@@ -175,8 +194,11 @@ impl Weights {
         let m = |x: &Matrix| x.byte_size();
         let dense = |f: &DenseFfn| m(&f.gate) + m(&f.up) + m(&f.down);
         let mut total = m(&self.embedding) + m(&self.output) + self.output_norm.byte_size();
+        total += self.rope_freqs.as_ref().map_or(0, Tensor::byte_size);
         for layer in &self.layers {
             total += layer.attn_norm.byte_size() + layer.post_norm.byte_size();
+            total += layer.post_attn.as_ref().map_or(0, Tensor::byte_size);
+            total += layer.post_ffw.as_ref().map_or(0, Tensor::byte_size);
             total += match &layer.mixer {
                 Mixer::Attention(a) => {
                     m(&a.q)
@@ -202,6 +224,7 @@ impl Weights {
                         + d.dt_bias.byte_size()
                         + d.norm.byte_size()
                 }
+                Mixer::ShortConv(s) => m(&s.in_proj) + s.conv.byte_size() + m(&s.out_proj),
             };
             total += match &layer.ffn {
                 Ffn::Dense(f) => dense(f),
@@ -428,18 +451,56 @@ fn load_weights(
     for i in 0..c.layers {
         let n = |s: &str| format!("blk.{i}.{s}");
         let attn_norm = l.vector(&n("attn_norm.weight"), c.hidden)?;
-        // Flint and Spark have no separate post-attention norm: `ffn_norm` sits there.
+        // Flint, Spark and LFM3 fuse `ffn_norm` with the residual add. Qwen
+        // stores its post-attention norm there instead.
         let post_norm = match c.variant {
-            Variant::Flint | Variant::Spark => l.vector(&n("ffn_norm.weight"), c.hidden)?,
+            Variant::Flint | Variant::Spark | Variant::Lfm3 => {
+                l.vector(&n("ffn_norm.weight"), c.hidden)?
+            }
             Variant::Dense | Variant::Moe => {
                 l.vector(&n("post_attention_norm.weight"), c.hidden)?
             }
         };
+        // LFM3 sandwich norms sit on the branch, after the operator and
+        // before the residual add. Both or neither.
+        let (post_attn, post_ffw) = if c.variant == Variant::Lfm3 {
+            let attn_name = n("post_attention_norm.weight");
+            let ffw_name = n("post_ffw_norm.weight");
+            let has_attn = l.file.tensors().contains_key(&attn_name);
+            let has_ffw = l.file.tensors().contains_key(&ffw_name);
+            if has_attn != has_ffw {
+                return Err(Error::Weight {
+                    name: format!("blk.{i}"),
+                    message: "post_attention_norm and post_ffw_norm must both be present".into(),
+                });
+            }
+            if has_attn {
+                (
+                    Some(l.vector(&attn_name, c.hidden)?),
+                    Some(l.vector(&ffw_name, c.hidden)?),
+                )
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
+        let has_shortconv = l
+            .file
+            .tensors()
+            .contains_key(&n("shortconv.in_proj.weight"));
         let mixer = if c.is_attention(i) {
+            if c.variant == Variant::Lfm3 && has_shortconv {
+                return Err(Error::Weight {
+                    name: n("shortconv.in_proj.weight"),
+                    message: "attention layer also has a short convolution".into(),
+                });
+            }
             let q = c.heads * c.head_dim;
             let kv = c.kv_heads * c.head_dim;
             let spec = c.attn[i];
             let spark = c.variant == Variant::Spark;
+            let head_gate = matches!(c.variant, Variant::Spark | Variant::Lfm3);
             let (wq, wk, wv) = if spark {
                 let mut qkv = l.split(&n("attn_qkv.weight"), &[q, kv, kv], c.hidden)?;
                 let wv = qkv.pop().expect("three parts");
@@ -473,10 +534,22 @@ fn load_weights(
                     true => Some(l.vector(&n("attn_sinks.weight"), c.heads)?),
                     false => None,
                 },
-                head_gate: match spark {
+                head_gate: match head_gate {
                     true => Some(l.matrix_or_bf16(&n("attn_gate.weight"), c.heads, c.hidden)?),
                     false => None,
                 },
+            })
+        } else if c.variant == Variant::Lfm3 {
+            if l.file.tensors().contains_key(&n("attn_q.weight")) {
+                return Err(Error::Weight {
+                    name: n("attn_q.weight"),
+                    message: "short-conv layer also has attention".into(),
+                });
+            }
+            Mixer::ShortConv(ShortConvWeights {
+                in_proj: l.matrix(&n("shortconv.in_proj.weight"), 3 * c.hidden, c.hidden)?,
+                conv: l.vector(&n("shortconv.conv.weight"), c.hidden * c.conv_kernel)?,
+                out_proj: l.matrix(&n("shortconv.out_proj.weight"), c.hidden, c.hidden)?,
             })
         } else {
             let v_heads = c.ssm_v_heads;
@@ -535,14 +608,22 @@ fn load_weights(
         layers.push(Layer {
             attn_norm,
             post_norm,
+            post_attn,
+            post_ffw,
             mixer,
             ffn,
         });
     }
+    let rope_freqs = if c.variant == Variant::Lfm3 {
+        Some(l.vector("rope_freqs.weight", c.head_dim / 2)?)
+    } else {
+        None
+    };
     Ok(Weights {
         embedding,
         output_norm,
         output,
+        rope_freqs,
         layers,
     })
 }

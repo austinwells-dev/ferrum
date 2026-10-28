@@ -433,6 +433,8 @@ pub(crate) fn load_weights(d: &MetalDevice, dir: &Path, c: &HybridConfig) -> Res
         layers.push(Layer {
             attn_norm,
             post_norm,
+            post_attn: None,
+            post_ffw: None,
             mixer,
             ffn,
         });
@@ -441,6 +443,7 @@ pub(crate) fn load_weights(d: &MetalDevice, dir: &Path, c: &HybridConfig) -> Res
         embedding,
         output_norm,
         output,
+        rope_freqs: None,
         layers,
     })
 }

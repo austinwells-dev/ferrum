@@ -1,5 +1,5 @@
 //! `ferrum hybrid`: load a hybrid-engine GGUF (Qwen3.5 family, or experimentally
-//! Flint and Spark) and generate.
+//! Flint, Spark and LFM3) and generate.
 use ferrum::{
     Error, MetalDevice, Result,
     hybrid::{self, HybridState, Output, Produced},

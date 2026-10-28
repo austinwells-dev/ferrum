@@ -103,6 +103,8 @@ impl TextEncoder {
             layers.push(Layer {
                 attn_norm: vector(format!("{p}input_layernorm.weight"), hidden)?,
                 post_norm: vector(format!("{p}post_attention_layernorm.weight"), hidden)?,
+                post_attn: None,
+                post_ffw: None,
                 mixer: Mixer::Attention(AttentionWeights {
                     q: matrix(&format!("{a}q_proj.weight"), q, hidden)?,
                     k: matrix(&format!("{a}k_proj.weight"), kv, hidden)?,
@@ -131,6 +133,7 @@ impl TextEncoder {
             output_norm: ckpt.vector(d, "model.language_model.norm.weight", hidden, 0.)?,
             // Logits are never computed, so the LM head is not read.
             output: Matrix::bf16_with(d, 1, hidden, |_| Ok(()))?,
+            rope_freqs: None,
             layers,
         };
         Self::with_weights(d, config, weights, cfg, max_tokens)

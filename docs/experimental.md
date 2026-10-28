@@ -1,8 +1,8 @@
-# Experimental: Flint, Spark, MLX checkpoints and KFlash
+# Experimental: Flint, Spark, LFM3, MLX checkpoints and KFlash
 
-> **Experimental.** This page covers Flint and Spark support, MLX 4-bit checkpoints, and KFlash speculative decoding (ported from Kapitsa). None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
+> **Experimental.** This page covers Flint, Spark and LFM3 support, MLX 4-bit checkpoints, and KFlash speculative decoding (ported from Kapitsa). None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
 
-Contents: [Flint](#what-works) · [Spark-X2.6-4B](#spark-x26-4b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding)
+Contents: [Flint](#what-works) · [Spark-X2.6-4B](#spark-x26-4b) · [LFM3-1.7B](#lfm3-17b) · [LFM3-VL-2B](#lfm3-vl-2b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding)
 
 ## What works
 
@@ -68,6 +68,83 @@ XHToken's `spark2_5` architecture: a 4.4B dense model with attention on all 36 l
 - Tool calls use Flint's `<arg_key>`/`<arg_value>` format and go through the same parser. A weather-tool request through `ferrum-server` returns a call with schema-typed arguments; broader tool use is untested.
 - `reasoning_effort` (`low`/`high`) is passed through to the template; the 1M trained context is capped by the memory plan.
 - No trained drafter (MTP, DFlash, DSpark) exists for Spark. Prompt lookup (`--draft lookup`, "Prompt lookup" in the TUI) works and is lossless: 1.13× on the `hybrid_spec` chat prompts (35.8 → 40.4 tok/s). Plain decode already reads weights at about 81% of the M5's measured bandwidth ceiling.
+
+# LFM3-1.7B
+
+LiquidAI's text model (`general.architecture = lfm3`). The language model is one architecture. Still images are [LFM3-VL-2B](#lfm3-vl-2b). Audio is not implemented. Ferrum does not download weights. The file this section talks about is the hub-cache snapshot
+
+`~/models/hub/models--LiquidAI--LFM3-1.7B-GGUF/snapshots/main/LFM3-1.7B-Q4_K_M.gguf`
+
+(1.1 GB, Q4_K_M). The Hugging Face repo is [`LiquidAI/LFM3-1.7B-GGUF`](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF).
+
+24 layers, hidden 2048, SwiGLU width 7680, vocab 128000, trained context 262144, tied embeddings. Thirteen gated short convolutions (kernel 7), five sliding-window attention layers (window 256) and six full-attention layers. The layer kinds come from the GGUF (KV heads are 0 on a conv layer and 4 on an attention layer); they are not hardcoded. Full-attention RoPE uses base 1,000,000 and divides the angle by `rope_freqs.weight` (in this file the first 32 factors are 1 and the last 32 are about 1e30, so those pairs do not rotate). Sliding layers rotate all 128 dimensions at base 10,000 and ignore the factors. The contract is llama.cpp's `lfm3` graph (build 11946 or newer). The llama.cpp build cited in the October verification notes (11669) cannot load this file.
+
+The chat template is the GGUF's own Jinja. It emits `<|startoftext|>` itself (`add_bos_token` is false), opens a generation with `<think>` unless `enable_thinking` is false, and writes tool calls as `<tool_call><function=NAME><parameter=K>…</parameter></function></tool_call>`, which the existing parser accepts. `tests/fixtures/lfm3/` compares those renderings to Jinja2. Sampling metadata is temperature 0.1, top-k 50 and repetition penalty 1.1. There is no top-p key, so the usual fallback of 0.95 applies. `general.sampling.penalty_repeat` is read only for `lfm3`; any other GGUF keeps a penalty of 1 even when the key is set.
+
+## Validation
+
+`LFM3-1.7B-Q4_K_M.gguf` on a 32 GB M5, against llama.cpp build 11962. The record is [measurements/lfm3/](measurements/lfm3/). Homebrew llama.cpp build 11669 cannot load this file.
+
+| Check | Result |
+|---|---|
+| Tokenizer ids vs `llama-tokenize` (mixed-script sample, 19 ids) | identical |
+| Greedy continuation, "The capital of France is", 16 tokens | identical token ids |
+| KLD vs llama.cpp Metal, one 512-token chunk of this repo's README (255 positions) | mean 0.0010, median 0.00082, top-1 99.22%; PPL 158.00 vs 160.45 |
+| Memory plan, auto context | weights+scratch 1344 vs 1345 MiB; state 3081 vs 3082 MiB |
+| `--draft lookup` vs plain greedy (12 tokens, thinking off) | same text; 3 of 3 drafts accepted |
+| `--draft-tree` | refused: `draft trees are not supported for this model` |
+| Qwen greedy, 16 tokens, vs `experimental` at `ec14e94` | identical ids on Swift Q4_K_M and Tiel IQ4_XS |
+
+The perplexity is on one chunk of the README, not a standard corpus. It is only there to sit next to the KLD.
+
+## Known gaps
+
+- One quant (`Q4_K_M`) is the file on disk. Other quants are not loaded.
+- No MTP head. `--draft lookup` can verify a chain; a draft tree is refused, because each row would need its parent's short-conv window.
+- This file has no projector. Still images need [LFM3-VL-2B](#lfm3-vl-2b). Audio projectors (`lfm3a`, `lfm3a_gen`) are refused.
+- Liquid's card says the model is for local agents, tool calling and structured output, and is not recommended for agentic coding or complex multi-step reasoning because of its size. Use retrieval for knowledge-heavy tasks.
+
+# LFM3-VL-2B
+
+The same `lfm3` language model with a still-image projector (`clip.vision.projector_type = lfm3vl`). The Hugging Face repo is [`LiquidAI/LFM3-VL-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF). It publishes no Q4_K_M projector (BF16, F16 and Q8_0 only), so the pair checked here is the Q4_K_M language file and `mmproj-LFM3-VL-2B-Q8_0.gguf`:
+
+`~/models/hub/models--LiquidAI--LFM3-VL-2B-GGUF/snapshots/main/LFM3-VL-2B-Q4_K_M.gguf` (1.1 GB)
+
+`~/models/hub/models--LiquidAI--LFM3-VL-2B-GGUF/snapshots/main/mmproj-LFM3-VL-2B-Q8_0.gguf` (194 MB)
+
+The language file matches the 1.7B schedule: 24 layers, hidden 2048, SwiGLU 7680, vocab 128000, 13 short convolutions (kernel 7), 5 sliding-window layers (window 256) and 6 full-attention layers. Its trained context is 128000, not 262144. There is no `rope.dimension_sections`. Each image token keeps its own position. The chat template emits `<|vision_start|><|image|><|vision_end|>`, and `<|image|>` (id 125030) is the token that is repeated. A rendered prompt that contains `<|video|>` is refused, including when no projector is loaded. Sampling metadata is the same as the 1.7B file: temperature 0.1, top-k 50, repetition penalty 1.1, and the 0.95 top-p fallback. The card is [LFM3-VL-2B](https://docs.liquid.ai/lfm/models/lfm3-vl-2b).
+
+The projector is a 14-block tower (hidden 1024, 16 heads, 8 KV heads, patch 16, 2×2 merge, SwiGLU, mean and std 0.5). Resize follows `clip.vision.image_resize_algo` (bicubic on this file, Catmull-Rom). The projector's layer-norm epsilon is 1e-6, not the encoder's 1e-5. Pixel limits are 65536 to 16777216. The attention-score buffer caps one image at 1773 language tokens; `--image-tokens` is clamped to that, and the default 1024 sits under it. With both files in one folder, `--mmproj auto` picks the projector whose width matches the language model.
+
+```sh
+hf download LiquidAI/LFM3-VL-2B-GGUF \
+  LFM3-VL-2B-Q4_K_M.gguf mmproj-LFM3-VL-2B-Q8_0.gguf --local-dir ~/models
+ferrum-cli --model ~/models/LFM3-VL-2B-Q4_K_M.gguf \
+  --mmproj ~/models/mmproj-LFM3-VL-2B-Q8_0.gguf
+```
+
+`/image PATH` attaches a still image. The same flags work on `ferrum-server` and in the TUI.
+
+## Validation
+
+On a 32 GB M5, against llama.cpp build 11962. The record is [measurements/lfm3/](measurements/lfm3/).
+
+| Check | Result |
+|---|---|
+| Language memory, auto context, no projector | weights+scratch 1344 vs 1345 MiB; state 1509 vs 1510 MiB |
+| Greedy, one 256×256 image, "Describe the image in one sentence.", 16 tokens, thinking on | same sentence as `llama-mtmd-cli`; that sentence is 16 tokens |
+| Greedy, one 770×500 image resized to 768×512, same prompt, 48 tokens, thinking on | same continuation as `llama-mtmd-cli`, including "vertical red stripe on the left" |
+| Qwen greedy, 16 tokens, after these kernels, vs the ids recorded at `ec14e94` | identical on Swift Q4_K_M and Tiel IQ4_XS |
+
+The 256×256 image is exactly 65536 pixels, so neither side resizes it. The 770×500 image is not a multiple of 32; both sides resize it to 768×512 (384 language tokens). llama-mtmd-cli did not print the prompt length either time; only the continuation was compared. Ferrum reported 83 prompt tokens and 0.06 s to encode the square image, and 403 prompt tokens and 0.39 s for the wide one. Those timings are one run each, not a bench. No vision-tower KLD was measured. The 27B and 35B were not re-benched: the greedy ids above are the regression check for the shared forward.
+
+## Known gaps
+
+- One language quant (`Q4_K_M`) and one projector quant (`Q8_0`). Other pairs are not loaded.
+- Video is refused. Audio projectors are refused. The image-generation text encoder stays Qwen3-VL.
+- The language memory line does not include the projector. The planner still estimates a projector the way it does for Qwen (`v.blk` and `mm` tensors at 2 bytes each, plus 640 MiB), so that reservation did not move.
+- Draft trees stay refused, as on the text model.
+- The score buffer, not the file's pixel cap, limits an image to 1773 language tokens.
 
 # MLX 4-bit checkpoints
 

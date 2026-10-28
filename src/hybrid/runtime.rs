@@ -573,7 +573,9 @@ impl Runtime {
                         loaded.model.config.hidden
                     )));
                 }
-                if loaded.model.config.rope_sections[1] == 0 {
+                // Qwen places image tokens on a 2-D grid and needs the section
+                // sizes. LFM3 gives each image token the next position.
+                if !model.linear_positions() && loaded.model.config.rope_sections[1] == 0 {
                     return Err(Error::Config(
                         "the language model declares no multi-axis RoPE sections, so it cannot place images"
                             .into(),
@@ -689,9 +691,23 @@ impl Runtime {
         images: &[Rc<ImageEmbedding>],
     ) -> Result<(Vec<u32>, Vec<ImageSpan>)> {
         let tokenizer = &self.loaded.tokenizer;
+        if self.loaded.model.config.variant == Variant::Lfm3 && prompt.contains("<|video|>") {
+            return Err(Error::Parameter(
+                "video is not supported; LFM3-VL reads still images only".into(),
+            ));
+        }
         if images.is_empty() {
             return Ok((tokenizer.encode(prompt)?, Vec::new()));
         }
+        let marker = self
+            .vision
+            .as_ref()
+            .map(|v| v.model.marker())
+            .unwrap_or(IMAGE_PAD);
+        let linear = self
+            .vision
+            .as_ref()
+            .is_some_and(|v| v.model.linear_positions());
         let mismatch = || {
             Error::Parameter(
                 "the chat template's image placeholders do not match the attached images".into(),
@@ -700,21 +716,19 @@ impl Runtime {
         let mut text = String::with_capacity(prompt.len());
         let mut rest = prompt;
         for image in images {
-            let at = rest.find(IMAGE_PAD).ok_or_else(mismatch)?;
+            let at = rest.find(marker).ok_or_else(mismatch)?;
             text.push_str(&rest[..at]);
-            text.push_str(&IMAGE_PAD.repeat(image.tokens()));
-            rest = &rest[at + IMAGE_PAD.len()..];
+            text.push_str(&marker.repeat(image.tokens()));
+            rest = &rest[at + marker.len()..];
         }
-        if rest.contains(IMAGE_PAD) {
+        if rest.contains(marker) {
             return Err(mismatch());
         }
         text.push_str(rest);
         let tokens = tokenizer.encode(&text)?;
-        let pad = tokenizer.encode(IMAGE_PAD)?;
+        let pad = tokenizer.encode(marker)?;
         let [pad] = pad[..] else {
-            return Err(Error::Tokenizer(format!(
-                "{IMAGE_PAD} is not a single token"
-            )));
+            return Err(Error::Tokenizer(format!("{marker} is not a single token")));
         };
         let mut spans = Vec::with_capacity(images.len());
         let mut i = 0;
@@ -737,6 +751,7 @@ impl Runtime {
                 embedding: image.rows.clone(),
                 deepstack: image.deepstack.clone(),
                 hash: image.hash,
+                linear,
             });
         }
         if spans.len() != images.len() {
@@ -1129,7 +1144,7 @@ pub fn generation_prefix(template: &ChatTemplate, vars: &Map<String, Json>) -> &
 /// the bare `</think>` Flint's and Spark's templates write after past reasoning.
 fn reasoning_close(variant: Variant) -> &'static str {
     match variant {
-        Variant::Flint | Variant::Spark => "</think>",
+        Variant::Flint | Variant::Spark | Variant::Lfm3 => "</think>",
         Variant::Dense | Variant::Moe => "\n</think>\n\n",
     }
 }
@@ -1224,11 +1239,22 @@ pub fn recommended_sampling(file: &GgufFile) -> SamplingParams {
         Some(MetadataValue::Float64(v)) => Some(*v as f32),
         _ => None,
     };
+    let arch = match md.get("general.architecture") {
+        Some(MetadataValue::String(a)) => a.as_str(),
+        _ => "",
+    };
     SamplingParams {
         temperature: float("general.sampling.temp").unwrap_or(1.0),
         top_p: float("general.sampling.top_p").unwrap_or(0.95),
         top_k: uint(md, "general.sampling.top_k").unwrap_or(20),
         min_p: float("general.sampling.min_p").unwrap_or(0.),
+        // Only lfm3 adopts this key. Another file that carries it keeps 1,
+        // which is what those models did before the key was read at all.
+        repetition_penalty: if arch == "lfm3" {
+            float("general.sampling.penalty_repeat").unwrap_or(1.0)
+        } else {
+            1.0
+        },
         ..SamplingParams::default()
     }
 }
@@ -1493,6 +1519,7 @@ mod thinking_tests {
         assert_eq!(generation_prefix(&plain, &Map::new()), "");
         assert_eq!(reasoning_close(Variant::Flint), "</think>");
         assert_eq!(reasoning_close(Variant::Spark), "</think>");
+        assert_eq!(reasoning_close(Variant::Lfm3), "</think>");
         assert_eq!(reasoning_close(Variant::Dense), "\n</think>\n\n");
     }
 

@@ -267,6 +267,13 @@ impl Session {
             .drafter
             .as_ref()
             .ok_or_else(|| Error::Parameter("a draft tree needs a drafter".into()))?;
+        // A tree row would need its parent's short-conv window. Chains replay
+        // one B*x tape and stay available.
+        if budget.is_some() && model.config.variant == super::config::Variant::Lfm3 {
+            return Err(Error::Parameter(
+                "draft trees are not supported for this model".into(),
+            ));
+        }
         let mut geometry = drafter.geometry();
         if let Some(budget) = budget {
             if budget == 0 {
@@ -1203,6 +1210,7 @@ mod media_tests {
             embedding: Rc::new(Tensor::zeros(d, [grid.0 * grid.1, 4], DType::F32).unwrap()),
             deepstack: Vec::new(),
             hash,
+            linear: false,
         }
     }
 

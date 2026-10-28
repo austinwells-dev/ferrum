@@ -752,6 +752,7 @@ mod edit {
                 .map(|k| feature(&format!("deepstack.{k}")))
                 .collect(),
             hash: ours.hash,
+            linear: false,
         };
         let ours = crate::hybrid::engine::ImageSpan {
             start,
@@ -759,6 +760,7 @@ mod edit {
             embedding: ours.rows,
             deepstack: ours.deepstack,
             hash: ours.hash,
+            linear: false,
         };
 
         let pad = dump.read_f32("image_pad_mask").unwrap();

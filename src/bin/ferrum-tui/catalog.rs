@@ -569,13 +569,19 @@ pub fn check(path: &Path) -> Checked {
             .unwrap_or(20),
         float("general.sampling.min_p").unwrap_or(0.),
     );
+    // Same gate as `recommended_sampling`: only lfm3 adopts penalty_repeat.
+    let penalty = if arch == "lfm3" {
+        float("general.sampling.penalty_repeat").filter(|p| *p != 1.0)
+    } else {
+        None
+    };
     let info = Info {
         name: text("general.name"),
         layers: get("block_count"),
         experts: get("expert_count").filter(|n| *n > 0),
         train_ctx: get("context_length"),
         sampling: format!(
-            "t {} · p {} · k {}{}",
+            "t {} · p {} · k {}{}{}",
             s.0,
             s.1,
             s.2,
@@ -583,7 +589,8 @@ pub fn check(path: &Path) -> Checked {
                 format!(" · min-p {}", s.3)
             } else {
                 String::new()
-            }
+            },
+            penalty.map(|p| format!(" · rep {p}")).unwrap_or_default()
         ),
         arch: arch.clone(),
     };
@@ -606,15 +613,19 @@ pub fn check(path: &Path) -> Checked {
         result.problem = Some("a DFlash drafter, not a chat model".into());
         return result;
     }
-    if !matches!(arch.as_str(), "qwen35" | "qwen35moe" | "flint" | "spark2_5") {
+    if !matches!(
+        arch.as_str(),
+        "qwen35" | "qwen35moe" | "flint" | "spark2_5" | "lfm3"
+    ) {
         result.problem = Some(format!(
-            "architecture {arch}: needs qwen35, qwen35moe, flint or spark2_5"
+            "architecture {arch}: needs qwen35, qwen35moe, flint, spark2_5 or lfm3"
         ));
         return result;
     }
     let pre = text("tokenizer.ggml.pre");
     let pre_ok = match arch.as_str() {
         "flint" | "spark2_5" => pre.as_deref() == Some(arch.as_str()),
+        "lfm3" => pre.as_deref() == Some("lfm2"),
         _ => pre.as_deref() == Some("qwen35"),
     };
     if text("tokenizer.ggml.model").as_deref() != Some("gpt2") || !pre_ok {

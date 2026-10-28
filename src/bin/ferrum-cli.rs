@@ -1,5 +1,5 @@
 //! Interactive terminal chat with a Qwen3.5-family GGUF (or, experimentally,
-//! Flint or Spark).
+//! Flint, Spark or LFM3).
 //!
 //! ferrum-cli --model FILE.gguf [--context N|auto] [--kv-cache f16|q8] [--system TEXT]
 //!            [--temperature T] [--top-p P] [--top-k K] [--min-p P]

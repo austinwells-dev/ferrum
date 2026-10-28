@@ -31,18 +31,21 @@ impl Tokenizer {
         token_types: &[i32],
         pattern: &str,
     ) -> Result<Self> {
-        Self::from_gguf_bpe_with_patterns(tokens, merges, token_types, &[pattern], true)
+        Self::from_gguf_bpe_with_patterns(tokens, merges, token_types, &[pattern], true, false)
     }
 
     /// GPT-2 byte-level BPE whose split patterns apply in order, each to the
     /// pieces the previous one produced (llama.cpp's `regex_exprs`). `nfc`
     /// normalizes the text first; llama.cpp leaves some families unnormalized.
+    /// `ignore_merges` keeps a pre-token that is already one vocab entry from
+    /// being split further (llama.cpp's Llama 3 / `lfm2` pre-type).
     pub(crate) fn from_gguf_bpe_with_patterns(
         tokens: &[String],
         merges: &[String],
         token_types: &[i32],
         patterns: &[&str],
         nfc: bool,
+        ignore_merges: bool,
     ) -> Result<Self> {
         if tokens.is_empty() || tokens.len() != token_types.len() {
             return Err(Error::Tokenizer(
@@ -137,7 +140,7 @@ impl Tokenizer {
                 "end_of_word_suffix": null,
                 "fuse_unk": false,
                 "byte_fallback": false,
-                "ignore_merges": false,
+                "ignore_merges": ignore_merges,
                 "vocab": vocab,
                 "merges": merge_pairs
             }

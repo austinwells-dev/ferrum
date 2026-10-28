@@ -1,4 +1,4 @@
-//! Hybrid-engine geometry read from GGUF metadata (Qwen3.5 family, Flint, Spark).
+//! Hybrid-engine geometry read from GGUF metadata (Qwen3.5 family, Flint, Spark, LFM3).
 #![forbid(unsafe_code)]
 use crate::{
     Error, Result,
@@ -20,6 +20,10 @@ pub enum Variant {
     /// fourth), fused QKV, a per-head sigmoid output gate, no QK norm, its own
     /// RoPE width and base on sliding-window layers, and a GEGLU feed-forward.
     Spark,
+    /// `lfm3`: short convolution on some layers, sliding-window and full
+    /// attention on the rest, sandwich RMSNorms, and partial RoPE on the
+    /// full-attention layers via a frequency-factor vector.
+    Lfm3,
 }
 
 /// How one attention layer masks, rotates and gates its keys and queries.
@@ -168,6 +172,7 @@ impl HybridConfig {
             "qwen35moe" => Variant::Moe,
             "flint" => Variant::Flint,
             "spark2_5" => Variant::Spark,
+            "lfm3" => Variant::Lfm3,
             other => {
                 return Err(Error::Config(format!(
                     "GGUF architecture {other:?} is not a supported hybrid"
@@ -184,8 +189,42 @@ impl HybridConfig {
             .checked_sub(nextn)
             .filter(|&l| l > 0)
             .ok_or_else(|| Error::Config("no trunk layers".into()))?;
+        if variant == Variant::Lfm3 {
+            if nextn != 0 {
+                return Err(Error::Config("lfm3 NextN blocks are not supported".into()));
+            }
+            if let Some(name) = file.tensors().keys().find(|n| {
+                n.contains("ffn_gate_exps") || n.contains("ffn_up_exps") || n.ends_with(".bias")
+            }) {
+                return Err(Error::Config(format!(
+                    "lfm3 expert or bias tensors are not supported ({name})"
+                )));
+            }
+        }
+        // LFM3 stores KV heads per layer (0 on short-conv layers). One shared
+        // count is enough when every attention layer agrees.
+        let kv_heads_array = if variant == Variant::Lfm3 {
+            Some(i32_array(md, &key("attention.head_count_kv"), layers)?)
+        } else {
+            None
+        };
         let attention_layers = match variant {
             Variant::Flint | Variant::Spark => vec![true; layers],
+            Variant::Lfm3 => kv_heads_array
+                .as_ref()
+                .expect("lfm3 kv-head array")
+                .iter()
+                .enumerate()
+                .map(|(i, &n)| {
+                    if n < 0 {
+                        Err(Error::Config(format!(
+                            "lfm3.attention.head_count_kv[{i}] is negative"
+                        )))
+                    } else {
+                        Ok(n > 0)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?,
             _ => match md.get(&key("attention.recurrent_layers")) {
                 Some(MetadataValue::Array { values, .. }) => values
                     .iter()
@@ -215,6 +254,15 @@ impl HybridConfig {
         // absent and unused.
         let (ssm_head_dim, ssm_v_heads, ssm_k_heads, conv_kernel) = match variant {
             Variant::Flint | Variant::Spark => (0, 0, 0, 4),
+            Variant::Lfm3 => {
+                let kernel = uint(md, &key("shortconv.l_cache"))?;
+                if !(2..=9).contains(&kernel) {
+                    return Err(Error::Config(format!(
+                        "shortconv.l_cache {kernel} is outside 2..=9"
+                    )));
+                }
+                (0, 0, 0, kernel)
+            }
             _ => {
                 let ssm_head_dim = uint(md, &key("ssm.state_size"))?;
                 let ssm_v_heads = uint(md, &key("ssm.time_step_rank"))?;
@@ -233,7 +281,7 @@ impl HybridConfig {
             }
         };
         let moe = match variant {
-            Variant::Dense | Variant::Spark => None,
+            Variant::Dense | Variant::Spark | Variant::Lfm3 => None,
             Variant::Moe => Some(MoeConfig {
                 experts: uint(md, &key("expert_count"))?,
                 experts_used: uint(md, &key("expert_used_count"))?,
@@ -281,15 +329,44 @@ impl HybridConfig {
             }
         };
         let leading_dense = match variant {
-            Variant::Dense | Variant::Spark => layers,
+            Variant::Dense | Variant::Spark | Variant::Lfm3 => layers,
             Variant::Moe => 0,
             Variant::Flint => uint_or(md, &key("leading_dense_block_count"), 0)?,
         };
         let attn = attention_specs(md, &key, variant, layers)?;
+        if variant == Variant::Lfm3 {
+            for (i, spec) in attn.iter().enumerate() {
+                if spec.window.is_some() && !attention_layers[i] {
+                    return Err(Error::Config("sliding window on a short-conv layer".into()));
+                }
+            }
+        }
+        let kv_heads = match &kv_heads_array {
+            Some(counts) => {
+                let mut heads = None;
+                for &n in counts {
+                    if n > 0 {
+                        let n = n as usize;
+                        if let Some(prev) = heads
+                            && prev != n
+                        {
+                            return Err(Error::Config(
+                                "lfm3 attention layers disagree on KV heads".into(),
+                            ));
+                        }
+                        heads = Some(n);
+                    }
+                }
+                heads.ok_or_else(|| Error::Config("lfm3 has no attention layer".into()))?
+            }
+            None => uint(md, &key("attention.head_count_kv"))?,
+        };
         let embedding = file.tensor("token_embd.weight")?.logical_matrix_shape()?;
         let rope_dims = match variant {
             Variant::Flint | Variant::Spark => uint_or(md, &key("rope.dimension_count"), head_dim)?,
-            Variant::Dense | Variant::Moe => uint(md, &key("rope.dimension_count"))?,
+            Variant::Dense | Variant::Moe | Variant::Lfm3 => {
+                uint(md, &key("rope.dimension_count"))?
+            }
         };
         let rope_theta = float(md, &key("rope.freq_base"))?;
         // llama.cpp falls back to the global width and base for either key.
@@ -301,6 +378,9 @@ impl HybridConfig {
                     None => rope_theta,
                 },
             )),
+            // Sliding layers rotate the full head; full-attention layers keep
+            // `rope_theta` and divide by `rope_freqs`.
+            Variant::Lfm3 => Some((rope_dims, float(md, &key("rope.freq_base_swa"))?)),
             _ => None,
         };
         let config = Self {
@@ -319,7 +399,7 @@ impl HybridConfig {
             attn,
             leading_dense,
             heads: uint(md, &key("attention.head_count"))?,
-            kv_heads: uint(md, &key("attention.head_count_kv"))?,
+            kv_heads,
             head_dim,
             rope_dims,
             rope_theta,
@@ -328,7 +408,7 @@ impl HybridConfig {
             eps: float(md, &key("attention.layer_norm_rms_epsilon"))?,
             ffn: match variant {
                 Variant::Moe => 0,
-                Variant::Dense | Variant::Flint | Variant::Spark => {
+                Variant::Dense | Variant::Flint | Variant::Spark | Variant::Lfm3 => {
                     uint(md, &key("feed_forward_length"))?
                 }
             },
@@ -353,6 +433,7 @@ impl HybridConfig {
         }
         let head_dim_ok = match self.variant {
             Variant::Flint | Variant::Spark => matches!(self.head_dim, 128 | 256),
+            Variant::Lfm3 => self.head_dim == 128 && self.rope_dims == self.head_dim,
             Variant::Dense | Variant::Moe => self.head_dim == 256,
         };
         let rope_ok = |dims: usize| dims <= self.head_dim && dims.is_multiple_of(2);
@@ -365,7 +446,11 @@ impl HybridConfig {
         if self.kv_heads == 0 || !self.heads.is_multiple_of(self.kv_heads) {
             return bad("grouped-query head ratio");
         }
-        if self.recurrent_layer_count() > 0 {
+        if self.variant == Variant::Lfm3 {
+            if !(2..=9).contains(&self.conv_kernel) {
+                return bad("short convolution kernel must be 2..=9");
+            }
+        } else if self.recurrent_layer_count() > 0 {
             if self.conv_kernel != 4 {
                 return bad("convolution kernel must be 4");
             }
@@ -430,7 +515,13 @@ impl HybridConfig {
         self.attention_layer_count() * 2 * self.kv_cache.row_bytes(self.kv_heads * self.head_dim)
     }
     /// Fixed recurrent state bytes (conv window + delta-rule matrices, F32).
+    /// LFM3 keeps only the short-conv window, `(l_cache - 1) * hidden` per
+    /// conv layer, and no delta-rule matrix.
     pub fn recurrent_state_bytes(&self) -> usize {
+        if self.variant == Variant::Lfm3 {
+            let conv = (self.conv_kernel - 1) * self.hidden * 4;
+            return self.recurrent_layer_count() * conv;
+        }
         let conv = (self.conv_kernel - 1) * self.conv_channels() * 4;
         let ssm = self.ssm_v_heads * self.ssm_head_dim * self.ssm_head_dim * 4;
         self.recurrent_layer_count() * (conv + ssm)
@@ -461,6 +552,31 @@ fn attention_specs(
             gated: matches!(variant, Variant::Dense | Variant::Moe),
         })
         .collect())
+}
+
+fn i32_array(md: &BTreeMap<String, MetadataValue>, key: &str, layers: usize) -> Result<Vec<i32>> {
+    let MetadataValue::Array { values, .. } = md
+        .get(key)
+        .ok_or_else(|| Error::Config(format!("missing GGUF metadata {key}")))?
+    else {
+        return Err(Error::Config(format!("{key} must be an array")));
+    };
+    let counts = values
+        .iter()
+        .map(|v| match v {
+            MetadataValue::Int32(n) => Ok(*n),
+            MetadataValue::Uint32(n) => i32::try_from(*n)
+                .map_err(|_| Error::Config(format!("{key} value does not fit i32"))),
+            _ => Err(Error::Config(format!("{key} must hold integers"))),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if counts.len() != layers {
+        return Err(Error::Config(format!(
+            "{key} has {} entries for {layers} layers",
+            counts.len()
+        )));
+    }
+    Ok(counts)
 }
 
 fn bool_array(

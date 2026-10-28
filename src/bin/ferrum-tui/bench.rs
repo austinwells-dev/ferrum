@@ -213,7 +213,7 @@ pub struct Plan {
 /// chains for the same reason).
 pub fn tree_target(config: Option<&ferrum::hybrid::HybridConfig>) -> bool {
     use ferrum::hybrid::config::Variant;
-    config.is_some_and(|c| !matches!(c.variant, Variant::Moe | Variant::Flint))
+    config.is_some_and(|c| !matches!(c.variant, Variant::Moe | Variant::Flint | Variant::Lfm3))
 }
 
 impl Plan {

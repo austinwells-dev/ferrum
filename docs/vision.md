@@ -1,7 +1,8 @@
 # Vision support
 
-Image input for the Qwen3.5-family hybrid engine (`qwen35`, `qwen35moe`) using the Qwen3-VL
-projector that ships as `mmproj*.gguf`.
+Image input for the hybrid engine. Qwen3.5-family models (`qwen35`, `qwen35moe`) use the
+Qwen3-VL projector (`clip.projector_type = qwen3vl_merger`). LFM3-VL uses
+`clip.vision.projector_type = lfm3vl` ([below](#lfm3-vl)). Both ship as `mmproj*.gguf`.
 
 ## Pathways, front to back
 
@@ -9,12 +10,12 @@ projector that ships as `mmproj*.gguf`.
 |---|---|---|
 | Discovery | `vision::resolve_projector` | `--mmproj auto` takes a sibling `mmproj*.gguf` whose `clip.vision.projection_dim` equals the model's `embedding_length`; `none` disables; a path must be a `clip` GGUF |
 | Memory plan | `PlanOptions::vision`, `vision::projector_bytes` | projector weights plus a full-size image's activations are charged before the context is fitted |
-| Request | `vision::media::take_images` | finds OpenAI `image_url` / Anthropic `image` parts, decodes `data:` URLs / base64, reads each part's `detail` / `min_tokens` / `max_tokens` into an `ImageBudget`, replaces each with `{"type": "image"}` so the GGUF chat template emits `<|vision_start|><|image_pad|><|vision_end|>` |
+| Request | `vision::media::take_images` | finds OpenAI `image_url` / Anthropic `image` parts, decodes `data:` URLs / base64, reads each part's `detail` / `min_tokens` / `max_tokens` into an `ImageBudget`, replaces each with `{"type": "image"}` so the GGUF chat template emits its image marker (`<|image_pad|>` on Qwen, `<|image|>` on LFM3) |
 | Encode | `vision::VisionModel` | decode, `smart_resize` to a multiple of 32 within `[min, max]` tokens (`VisionModel::limits`: the request's budget, never above `--image-tokens`), normalise, patchify in 2x2 block order, ViT on Metal, merger; cached by content hash and limits (`Runtime`, shared by every session, up to 8 full-size images' worth of tokens) |
 | Prompt | `Runtime::expand_images` | each pad token becomes one per image position (`rows x cols` of the merged grid); the runs are found again in the token ids and become `ImageSpan`s |
 | Prefix reuse | `Session::set_media`, `reusable_before_images` | pad tokens look alike, so cached tokens are reused only up to the first image whose position, grid and content hash do not all match |
 | Forward | `HybridModel::forward_chunk` | rows inside a span are overwritten with the image embeddings after the token lookup; attention prep gets rotary positions from a `RopePlan` |
-| Positions | `engine::rope_position`, `h_attn_prep` | text keeps counting from where an image's position grid ended (`max(rows, cols)` positions for `rows x cols` tokens); image rows use (time, row, column) positions with interleaved sections `[11, 11, 10]` read from `rope.dimension_sections`; text-only chunks use a scalar offset, so the hot path is unchanged |
+| Positions | `engine::rope_position`, `h_attn_prep` | Qwen text keeps counting from where an image's position grid ended (`max(rows, cols)` positions for `rows x cols` tokens); image rows use (time, row, column) positions with interleaved sections `[11, 11, 10]` read from `rope.dimension_sections`. LFM3 gives each image token its own position and does not read those sections. Text-only chunks use a scalar offset, so the hot path is unchanged |
 | Surfaces | server, `ferrum-cli`, TUI | `/props` modalities, `--mmproj`, `/image`, attachment handling; OCR text remains the fallback without a projector |
 
 ## Encoder
@@ -29,10 +30,23 @@ buffer, in head groups that bound its size. GGUF projectors with DeepStack layer
 pipeline loads the same tower from Qwen-Image's text-encoder safetensors with its DeepStack mergers
 ([architecture](architecture.md#image-generation)).
 
+## LFM3-VL
+
+`clip.vision.projector_type = lfm3vl` on an `lfm3` language model. Patches stay in raster
+order. Each block is a pre-norm residual: a gated depthwise convolution or full
+bidirectional attention, then a SwiGLU. The projector layer-normalises each patch
+(epsilon 1e-6), interleaves every 2×2 (top-left, top-right, bottom-left, bottom-right)
+and runs a GELU MLP. A still image fills both patch-embedding taps, so they add.
+`<|image|>` is repeated once per language token. Any LFM3 prompt containing `<|video|>`
+is refused, projector or not, as are audio projectors (`lfm3a`, `lfm3a_gen`). The checked pair is
+`LFM3-VL-2B-Q4_K_M.gguf` with `mmproj-LFM3-VL-2B-Q8_0.gguf`; that repo has no Q4_K_M
+projector. Numbers and the known gaps are in [experimental.md](experimental.md#lfm3-vl-2b).
+
 ## Validation
 
-* `vision::tests::encoder_matches_cpu_reference` runs a small random ViT on the GPU and in plain Rust
+* `vision::tests::encoder_matches_cpu_reference` runs a small random Qwen ViT on the GPU and in plain Rust
   (several image shapes, one head group and one head per group).
+  `vision::lfm3::tests::encoder_matches_cpu_reference` does the same for a tiny LFM3-VL tower.
 * `hybrid::engine::tests::attention_prep_follows_the_position_table` checks the rotary kernel against a CPU
   implementation of the interleaved multi-axis scheme, and that equal axes reproduce the scalar path.
 * `rope_positions_compress_around_images`, `prefix_stops_before_a_changed_or_cut_image` and the media
@@ -51,5 +65,5 @@ to speed this up.
 
 ## Not covered
 
-Video, other projector types (Gemma, LLaVA, Pixtral), DeepStack layers in chat, remote image URLs, and images on
+Video (including LFM3 `<|video|>`), LFM3 audio projectors, other projector types (Gemma, LLaVA, Pixtral), DeepStack layers in chat, remote image URLs, and images on
 the shared-transformer models (Qwen2.5/3, Granite, OLMo, LFM2).

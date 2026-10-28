@@ -543,6 +543,7 @@ impl Pipeline {
                     embedding: embedded.rows,
                     deepstack: embedded.deepstack,
                     hash: embedded.hash,
+                    linear: false,
                 });
             }
             drop(tower);

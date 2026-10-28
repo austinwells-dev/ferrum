@@ -1,7 +1,10 @@
-//! Vision encoder for Qwen3-VL style projectors (`clip` GGUF with
-//! `clip.projector_type = qwen3vl_merger`), the `mmproj` file that ships next
-//! to Qwen3.5/3.6/3.8-family checkpoints. An image becomes a grid of
-//! language-model embeddings that replace `<|image_pad|>` rows in the prompt.
+//! Vision encoders for still images. Qwen3-VL projectors
+//! (`clip.projector_type = qwen3vl_merger`), the `mmproj` file next to
+//! Qwen3.5/3.6/3.8-family checkpoints, are the path in this file: an image
+//! becomes a grid of embeddings that replace `<|image_pad|>` rows.
+//! LFM3-VL (`clip.vision.projector_type = lfm3vl`) is the private `lfm3` module. It repeats
+//! `<|image|>` and gives each of those tokens its own position, not a 2-D grid.
+//! Audio projectors (`lfm3a`, `lfm3a_gen`) and video are refused.
 //!
 //! Pipeline: decode, resize to a multiple of `patch * merge`, normalise, cut
 //! into 16x16 patches (ordered so each 2x2 merge block is contiguous), embed
@@ -151,6 +154,13 @@ pub struct VisionModel {
     weight_bytes: usize,
     /// Attention score scratch per head group.
     score_bytes: usize,
+    /// LFM3-VL tower. Absent on the Qwen path.
+    lfm3: Option<lfm3::Tower>,
+    /// Placeholder the chat template emits once per image (`<|image_pad|>` or
+    /// `<|image|>`). Repeated once per language-model token.
+    marker: &'static str,
+    /// Resize filter. Qwen is Catmull-Rom; LFM3 follows the file.
+    filter: image::imageops::FilterType,
 }
 
 fn meta_uint(md: &BTreeMap<String, MetadataValue>, key: &str) -> Result<usize> {
@@ -294,14 +304,28 @@ impl VisionModel {
             Some(MetadataValue::String(a)) if a == "clip" => {}
             _ => return unsupported("not a clip/mmproj GGUF".into()),
         }
-        match md.get("clip.projector_type") {
-            Some(MetadataValue::String(t)) if t == "qwen3vl_merger" => {}
-            Some(MetadataValue::String(t)) => {
+        // `clip.projector_type` wins when both keys are set, so a combined
+        // audio+vision file that names `lfm3a` there is refused instead of
+        // loading the vision half.
+        let projector = match (
+            md.get("clip.projector_type"),
+            md.get("clip.vision.projector_type"),
+        ) {
+            (Some(MetadataValue::String(t)), _) | (_, Some(MetadataValue::String(t))) => t.as_str(),
+            _ => return unsupported("missing clip.projector_type".into()),
+        };
+        match projector {
+            "qwen3vl_merger" | "lfm3vl" => {}
+            "lfm3a" | "lfm3a_gen" => {
                 return unsupported(format!(
-                    "projector type {t} (only qwen3vl_merger is implemented)"
+                    "projector type {projector} (audio is not implemented; still images only)"
                 ));
             }
-            _ => return unsupported("missing clip.projector_type".into()),
+            other => {
+                return unsupported(format!(
+                    "projector type {other} (only qwen3vl_merger and lfm3vl are implemented)"
+                ));
+            }
         }
         if let Some(MetadataValue::Array { values, .. }) = md.get("clip.vision.is_deepstack_layers")
             && values
@@ -337,7 +361,70 @@ impl VisionModel {
             return unsupported("vision geometry".into());
         }
         let mut source = GgufSource(file);
+        if projector == "lfm3vl" {
+            return Self::load_lfm3(d, config, &md, &mut source, max_tokens);
+        }
         Self::build(d, config, &[], &mut source, max_tokens)
+    }
+
+    /// LFM3-VL still-image tower. The Qwen fields stay empty; encoding goes
+    /// through `lfm3` and language positions are linear.
+    fn load_lfm3(
+        d: &MetalDevice,
+        mut config: VisionConfig,
+        md: &BTreeMap<String, MetadataValue>,
+        source: &mut dyn Source,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let unsupported =
+            |what: String| Err(Error::Config(format!("unsupported projector: {what}")));
+        match md.get("clip.use_silu") {
+            Some(MetadataValue::Bool(true)) => {}
+            _ => return unsupported("lfm3vl encoder without clip.use_silu".into()),
+        }
+        let filter = match md.get("clip.vision.image_resize_algo") {
+            Some(MetadataValue::String(s)) if s == "bicubic" => {
+                image::imageops::FilterType::CatmullRom
+            }
+            Some(MetadataValue::String(s)) if s == "bilinear" => {
+                image::imageops::FilterType::Triangle
+            }
+            Some(MetadataValue::String(s)) => {
+                return unsupported(format!("image resize {s} (bicubic or bilinear)"));
+            }
+            _ => return unsupported("missing clip.vision.image_resize_algo".into()),
+        };
+        let kv_heads = meta_uint(md, "clip.vision.attention.head_count_kv")?;
+        let min_pixels = meta_uint(md, "clip.vision.image_min_pixels")?;
+        let max_pixels = meta_uint(md, "clip.vision.image_max_pixels")?;
+        // The position table is a Qwen tensor. LFM3 does not have one.
+        config.table = config.table.max(1);
+        let (tower, limits) = lfm3::load(
+            d, &config, source, max_tokens, kv_heads, min_pixels, max_pixels,
+        )?;
+        let z = || Tensor::zeros(d, [1], DType::F32);
+        let m = || Tensor::zeros(d, [1, 1], DType::F16);
+        Ok(Self {
+            config,
+            max_tokens: limits.max_tokens,
+            min_tokens: limits.min_tokens,
+            layers: Vec::new(),
+            patch: (m()?, z()?),
+            position: Vec::new(),
+            merger: Merger {
+                norm: (z()?, z()?),
+                fc1: (m()?, z()?),
+                fc2: (m()?, z()?),
+                post_shuffle: false,
+            },
+            deepstack: Vec::new(),
+            zero: z()?,
+            weight_bytes: tower.weight_bytes,
+            score_bytes: SCORE_BYTES,
+            lfm3: Some(tower),
+            marker: "<|image|>",
+            filter,
+        })
     }
 
     /// Load the tower of a Hugging Face Qwen3-VL checkpoint, whose tensors
@@ -446,7 +533,20 @@ impl VisionModel {
             zero,
             weight_bytes,
             score_bytes: SCORE_BYTES,
+            lfm3: None,
+            marker: "<|image_pad|>",
+            filter: image::imageops::FilterType::CatmullRom,
         })
+    }
+
+    /// Placeholder repeated once per image token.
+    pub fn marker(&self) -> &'static str {
+        self.marker
+    }
+
+    /// Language-model positions are one per token (LFM3), not a 2-D grid.
+    pub fn linear_positions(&self) -> bool {
+        self.lfm3.is_some()
     }
 
     pub fn weight_bytes(&self) -> usize {
@@ -508,12 +608,7 @@ impl VisionModel {
         let rgb = if (rgb.width() as usize, rgb.height() as usize) == (width, height) {
             rgb
         } else {
-            image::imageops::resize(
-                &rgb,
-                width as u32,
-                height as u32,
-                image::imageops::FilterType::CatmullRom,
-            )
+            image::imageops::resize(&rgb, width as u32, height as u32, self.filter)
         };
         Ok(self.normalise(&rgb, hash))
     }
@@ -574,6 +669,9 @@ impl VisionModel {
     }
 
     pub fn encode_prepared(&self, d: &MetalDevice, image: &Prepared) -> Result<ImageEmbedding> {
+        if let Some(tower) = &self.lfm3 {
+            return tower.encode(self, d, image);
+        }
         let c = &self.config;
         let (gh, gw) = (image.height / c.patch, image.width / c.patch);
         let n = gh * gw;
@@ -745,6 +843,27 @@ impl VisionModel {
                     let start =
                         ch * image.width * image.height + (row * p + y) * image.width + col * p;
                     out.extend_from_slice(&image.pixels[start..start + p]);
+                }
+            }
+        }
+        out
+    }
+
+    /// Patch vectors in raster order (row, then column). LFM3 keeps this order
+    /// through the encoder; Qwen regroups into merge blocks ([`patchify`]).
+    fn patchify_raster(&self, image: &Prepared) -> Vec<f32> {
+        let c = &self.config;
+        let (gh, gw) = (image.height / c.patch, image.width / c.patch);
+        let p = c.patch;
+        let mut out = Vec::with_capacity(gh * gw * c.patch_len());
+        for row in 0..gh {
+            for col in 0..gw {
+                for ch in 0..3 {
+                    for y in 0..p {
+                        let start =
+                            ch * image.width * image.height + (row * p + y) * image.width + col * p;
+                        out.extend_from_slice(&image.pixels[start..start + p]);
+                    }
                 }
             }
         }
@@ -946,6 +1065,7 @@ impl Default for Gemm {
 /// Where the tower's tensors come from, by their GGUF names
 /// (`v.blk.0.ln1.weight`).
 trait Source {
+    fn contains(&mut self, name: &str) -> bool;
     /// Any float tensor's values.
     fn values(&mut self, name: &str) -> Result<Vec<f32>>;
     /// A `[rows, cols]` matrix as F16 on the device.
@@ -964,6 +1084,10 @@ impl GgufSource {
 }
 
 impl Source for GgufSource {
+    fn contains(&mut self, name: &str) -> bool {
+        self.0.tensors().contains_key(name)
+    }
+
     fn values(&mut self, name: &str) -> Result<Vec<f32>> {
         let (ty, data) = self.raw(name)?;
         Ok(match ty {
@@ -975,6 +1099,7 @@ impl Source for GgufSource {
                 .chunks_exact(2)
                 .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
                 .collect(),
+            8 => dequant_q8(name, &data)?,
             30 => data
                 .chunks_exact(2)
                 .map(|b| half::bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
@@ -1002,8 +1127,33 @@ impl Source for GgufSource {
             });
         }
         let values = self.values(name)?;
+        if values.len() != rows * cols {
+            return Err(Error::Gguf(format!(
+                "projector tensor {name} has {} values, expected {}",
+                values.len(),
+                rows * cols
+            )));
+        }
         Tensor::from_f32(d, [rows, cols], DType::F16, &values)
     }
+}
+
+/// ggml Q8_0: 32 int8 values and one F16 scale per 34-byte block.
+fn dequant_q8(name: &str, data: &[u8]) -> Result<Vec<f32>> {
+    if !data.len().is_multiple_of(34) {
+        return Err(Error::Gguf(format!(
+            "projector tensor {name} has {} bytes, not a whole Q8_0 block",
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(data.len() / 34 * 32);
+    for block in data.chunks_exact(34) {
+        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        for &q in &block[2..] {
+            out.push(f32::from(q as i8) * scale);
+        }
+    }
+    Ok(out)
 }
 
 /// A Hugging Face Qwen3-VL tower under `prefix`.
@@ -1056,6 +1206,10 @@ fn transformers_name(prefix: &str, gguf: &str) -> String {
 }
 
 impl Source for SafetensorsSource<'_> {
+    fn contains(&mut self, name: &str) -> bool {
+        self.ckpt.entry(&self.name(name)).is_ok()
+    }
+
     fn values(&mut self, name: &str) -> Result<Vec<f32>> {
         // The patch kernel is one `[out, 3, 2, p, p]` tensor; GGUF splits
         // its two temporal taps.
@@ -1221,6 +1375,7 @@ pub fn smart_resize(
     (wb as usize, hb as usize)
 }
 
+mod lfm3;
 pub mod media;
 
 #[cfg(test)]

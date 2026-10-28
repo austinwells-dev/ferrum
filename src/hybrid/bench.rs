@@ -85,6 +85,9 @@ impl HybridModel {
                     ("ssm_alpha", &w.alpha),
                     ("ssm_out", &w.out),
                 ]),
+                Mixer::ShortConv(w) => {
+                    mats.extend([("shortconv_in", &w.in_proj), ("shortconv_out", &w.out_proj)])
+                }
             }
             match &layer.ffn {
                 Ffn::Dense(f) => mats.extend([
