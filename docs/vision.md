@@ -37,8 +37,8 @@ order. Each block is a pre-norm residual: a gated depthwise convolution or full
 bidirectional attention, then a SwiGLU. The projector layer-normalises each patch
 (epsilon 1e-6), interleaves every 2×2 (top-left, top-right, bottom-left, bottom-right)
 and runs a GELU MLP. A still image fills both patch-embedding taps, so they add.
-`<|image|>` is repeated once per language token. A rendered prompt containing `<|video|>`
-is refused, as are audio projectors (`lfm3a`, `lfm3a_gen`). The checked pair is
+`<|image|>` is repeated once per language token. Any LFM3 prompt containing `<|video|>`
+is refused, projector or not, as are audio projectors (`lfm3a`, `lfm3a_gen`). The checked pair is
 `LFM3-VL-2B-Q4_K_M.gguf` with `mmproj-LFM3-VL-2B-Q8_0.gguf`; that repo has no Q4_K_M
 projector. Numbers and the known gaps are in [experimental.md](experimental.md#lfm3-vl-2b).
 

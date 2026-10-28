@@ -156,9 +156,10 @@ impl ChatTemplate {
             },
         );
         // Hugging Face marks the assistant span with `{% generation %}` …
-        // `{% endgeneration %}`. Those tags carry no text; strip them so the
-        // template is ordinary Jinja.
-        let source = strip_generation_tags(source);
+        // `{% endgeneration %}`. Those tags carry no text. Rewrite them to
+        // `{% if true %}` / `{% endif %}`, keeping each tag's whitespace
+        // dashes, so the template is ordinary Jinja.
+        let source = rewrite_generation_tags(source);
         env.add_template_owned("chat", source.clone())
             .map_err(|e| Error::Tokenizer(format!("chat template: {e:#}")))?;
         Ok(Self {
@@ -223,31 +224,45 @@ impl ChatTemplate {
     }
 }
 
-/// Drop Hugging Face `{% generation %}` / `{% endgeneration %}` tags. The
-/// dashes are optional; the body between them stays.
-fn strip_generation_tags(source: &str) -> String {
-    let mut out = source.to_owned();
-    for tag in ["generation", "endgeneration"] {
-        let mut rest = out;
-        let mut next = String::new();
-        while let Some(start) = rest.find("{%") {
-            next.push_str(&rest[..start]);
-            let Some(end) = rest[start..].find("%}") else {
-                next.push_str(&rest[start..]);
-                rest = String::new();
-                break;
-            };
-            let body = rest[start + 2..start + end].trim().trim_matches('-').trim();
-            if body == tag {
-                rest = rest[start + end + 2..].to_owned();
-            } else {
-                next.push_str(&rest[start..start + end + 2]);
-                rest = rest[start + end + 2..].to_owned();
+/// Turn Hugging Face `{% generation %}` / `{% endgeneration %}` into
+/// `{% if true %}` / `{% endif %}`. A dash on either side stays, so
+/// `{%- generation -%}` keeps the whitespace control a deleted tag would drop.
+fn rewrite_generation_tags(source: &str) -> String {
+    let mut rest = source;
+    let mut out = String::with_capacity(source.len());
+    while let Some(start) = rest.find("{%") {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find("%}") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = rest[start + 2..start + end].trim();
+        let left = inner.starts_with('-');
+        let right = inner.ends_with('-');
+        let body = inner.trim_matches('-').trim();
+        let replacement = match body {
+            "generation" => Some("if true"),
+            "endgeneration" => Some("endif"),
+            _ => None,
+        };
+        if let Some(keyword) = replacement {
+            out.push_str("{%");
+            if left {
+                out.push('-');
             }
+            out.push(' ');
+            out.push_str(keyword);
+            out.push(' ');
+            if right {
+                out.push('-');
+            }
+            out.push_str("%}");
+        } else {
+            out.push_str(&rest[start..start + end + 2]);
         }
-        next.push_str(&rest);
-        out = next;
+        rest = &rest[start + end + 2..];
     }
+    out.push_str(rest);
     out
 }
 
@@ -455,6 +470,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generation_tags_keep_their_whitespace_dashes() {
+        assert_eq!(
+            rewrite_generation_tags("A{%- generation -%}B{% endgeneration %}C{% generation %}"),
+            "A{%- if true -%}B{% endif %}C{% if true %}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{% if generation %}keep{% endif %}"),
+            "{% if generation %}keep{% endif %}"
+        );
+    }
+
+    #[test]
     fn tojson_matches_python_json_dumps() {
         let value: Json = serde_json::from_str(r#"{"b": 1, "a": [1.0, "x<y"], "c": {}}"#).unwrap();
         let mut out = String::new();
@@ -617,7 +644,8 @@ mod tests {
 
     /// LFM3's template writes `bos_token`, switches on `enable_thinking`, and
     /// wraps tool calls in `<function=` / `<parameter=`. The GGUF marks the
-    /// assistant span with `{% generation %}`, which `ChatTemplate` strips.
+    /// assistant span with `{%- generation -%}`, which `ChatTemplate` rewrites
+    /// to `{%- if true -%}`.
     #[test]
     fn renders_lfm3_template_like_jinja2() {
         let template = ChatTemplate::with_special_tokens(

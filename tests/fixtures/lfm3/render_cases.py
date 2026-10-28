@@ -1,9 +1,9 @@
 """Reference renderings of the LFM3-1.7B chat template, from Jinja2 as Hugging Face's
 `apply_chat_template` uses it (trim_blocks, lstrip_blocks, and json.dumps for
-`tojson`). `{% generation %}` / `{% endgeneration %}` are stripped first, the
-same way `ChatTemplate` does: they carry no text. Writes render_cases.json
-next to this file; the Rust test in src/hybrid/chat.rs renders the same cases
-and compares.
+`tojson`). `{% generation %}` / `{% endgeneration %}` are rewritten to
+`{% if true %}` / `{% endif %}` first, keeping each tag's whitespace dashes,
+the same way `ChatTemplate` does. Writes render_cases.json next to this file;
+the Rust test in src/hybrid/chat.rs renders the same cases and compares.
 
 usage: python3 -I render_cases.py   (needs jinja2)
 
@@ -20,29 +20,30 @@ BOS = "<|startoftext|>"
 EOS = "<|im_end|>"
 
 
-def strip_generation_tags(source: str) -> str:
-    out = source
-    for tag in ("generation", "endgeneration"):
-        rest = out
-        next_ = []
-        while True:
-            start = rest.find("{%")
-            if start < 0:
-                next_.append(rest)
-                break
-            next_.append(rest[:start])
-            end = rest.find("%}", start)
-            if end < 0:
-                next_.append(rest[start:])
-                break
-            body = rest[start + 2 : end].strip().strip("-").strip()
-            if body == tag:
-                rest = rest[end + 2 :]
-            else:
-                next_.append(rest[start : end + 2])
-                rest = rest[end + 2 :]
-        out = "".join(next_)
-    return out
+def rewrite_generation_tags(source: str) -> str:
+    rest = source
+    out = []
+    while True:
+        start = rest.find("{%")
+        if start < 0:
+            out.append(rest)
+            break
+        out.append(rest[:start])
+        end = rest.find("%}", start)
+        if end < 0:
+            out.append(rest[start:])
+            break
+        inner = rest[start + 2 : end].strip()
+        left = inner.startswith("-")
+        right = inner.endswith("-")
+        body = inner.strip("-").strip()
+        keyword = {"generation": "if true", "endgeneration": "endif"}.get(body)
+        if keyword is None:
+            out.append(rest[start : end + 2])
+        else:
+            out.append("{%" + ("-" if left else "") + f" {keyword} " + ("-" if right else "") + "%}")
+        rest = rest[end + 2 :]
+    return "".join(out)
 
 
 def tojson(value, ensure_ascii=False, indent=None, separators=None, sort_keys=False):
@@ -57,7 +58,7 @@ def render(template, case):
     env.globals["raise_exception"] = lambda message: (_ for _ in ()).throw(
         jinja2.exceptions.TemplateError(message)
     )
-    return env.from_string(strip_generation_tags(template)).render(
+    return env.from_string(rewrite_generation_tags(template)).render(
         messages=case["messages"],
         tools=case.get("tools"),
         add_generation_prompt=case["add_generation_prompt"],

@@ -691,12 +691,7 @@ impl Runtime {
         images: &[Rc<ImageEmbedding>],
     ) -> Result<(Vec<u32>, Vec<ImageSpan>)> {
         let tokenizer = &self.loaded.tokenizer;
-        if self
-            .vision
-            .as_ref()
-            .is_some_and(|v| v.model.linear_positions())
-            && prompt.contains("<|video|>")
-        {
+        if self.loaded.model.config.variant == Variant::Lfm3 && prompt.contains("<|video|>") {
             return Err(Error::Parameter(
                 "video is not supported; LFM3-VL reads still images only".into(),
             ));
@@ -1244,12 +1239,22 @@ pub fn recommended_sampling(file: &GgufFile) -> SamplingParams {
         Some(MetadataValue::Float64(v)) => Some(*v as f32),
         _ => None,
     };
+    let arch = match md.get("general.architecture") {
+        Some(MetadataValue::String(a)) => a.as_str(),
+        _ => "",
+    };
     SamplingParams {
         temperature: float("general.sampling.temp").unwrap_or(1.0),
         top_p: float("general.sampling.top_p").unwrap_or(0.95),
         top_k: uint(md, "general.sampling.top_k").unwrap_or(20),
         min_p: float("general.sampling.min_p").unwrap_or(0.),
-        repetition_penalty: float("general.sampling.penalty_repeat").unwrap_or(1.0),
+        // Only lfm3 adopts this key. Another file that carries it keeps 1,
+        // which is what those models did before the key was read at all.
+        repetition_penalty: if arch == "lfm3" {
+            float("general.sampling.penalty_repeat").unwrap_or(1.0)
+        } else {
+            1.0
+        },
         ..SamplingParams::default()
     }
 }

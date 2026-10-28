@@ -304,6 +304,9 @@ impl VisionModel {
             Some(MetadataValue::String(a)) if a == "clip" => {}
             _ => return unsupported("not a clip/mmproj GGUF".into()),
         }
+        // `clip.projector_type` wins when both keys are set, so a combined
+        // audio+vision file that names `lfm3a` there is refused instead of
+        // loading the vision half.
         let projector = match (
             md.get("clip.projector_type"),
             md.get("clip.vision.projector_type"),

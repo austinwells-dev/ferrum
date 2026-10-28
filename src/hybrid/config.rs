@@ -193,12 +193,12 @@ impl HybridConfig {
             if nextn != 0 {
                 return Err(Error::Config("lfm3 NextN blocks are not supported".into()));
             }
-            if file.tensors().keys().any(|n| {
+            if let Some(name) = file.tensors().keys().find(|n| {
                 n.contains("ffn_gate_exps") || n.contains("ffn_up_exps") || n.ends_with(".bias")
             }) {
-                return Err(Error::Config(
-                    "lfm3 expert or bias tensors are not supported".into(),
-                ));
+                return Err(Error::Config(format!(
+                    "lfm3 expert or bias tensors are not supported ({name})"
+                )));
             }
         }
         // LFM3 stores KV heads per layer (0 on short-conv layers). One shared

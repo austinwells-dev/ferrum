@@ -85,6 +85,12 @@ pub(super) fn load(
     let bad = |what: String| Error::Config(format!("unsupported lfm3vl tower: {what}"));
     let h = config.hidden;
     let hd = config.head_dim();
+    if config.merge != 2 {
+        return Err(bad(format!(
+            "spatial merge {} (the interleave is 2x2)",
+            config.merge
+        )));
+    }
     if kv_heads == 0 || !config.heads.is_multiple_of(kv_heads) {
         return Err(bad(format!(
             "{kv_heads} KV heads for {} query heads",
@@ -96,6 +102,12 @@ pub(super) fn load(
         return Err(bad(format!("pixel limits {min_pixels}/{max_pixels}")));
     }
     let meta_max = (max_pixels / area).min(4096);
+    // `clamp` panics when the file's pixel cap is below the floor.
+    if meta_max < 4 {
+        return Err(bad(format!(
+            "image_max_pixels allows {meta_max} language tokens (need at least 4)"
+        )));
+    }
     let max_tokens = requested
         .clamp(4, meta_max)
         .min(score_language_cap(config.merge, SCORE_BYTES));
@@ -495,7 +507,7 @@ impl Tower {
         }
         self.norm(d, &x, &self.proj_norm, &xn, n, h, PROJECTOR_EPS)?;
         let rows = n / (c.merge * c.merge);
-        let merged = h * 4;
+        let merged = h * c.merge * c.merge;
         let grouped = Tensor::zeros(d, [rows, merged], DType::F32)?;
         d.dispatch_hybrid(
             "v_interleave",
@@ -1175,25 +1187,26 @@ mod tests {
         }
         let (pw, pb) = (&tower.proj_norm.0.to_f32(), &tower.proj_norm.1.to_f32());
         let xn = layernorm(&x, pw, pb, h, PROJECTOR_EPS);
-        let rows = n / 4;
-        let mut grouped = vec![0.; rows * h * 4];
+        let rows = n / (c.merge * c.merge);
+        let merged = h * c.merge * c.merge;
+        let mut grouped = vec![0.; rows * merged];
         for yb in 0..gh / 2 {
             for x2 in 0..gw / 2 {
                 let tok = yb * (gw / 2) + x2;
                 for (which, (dx, dy)) in [(0, 0), (1, 0), (0, 1), (1, 1)].iter().enumerate() {
                     let src = ((2 * yb + dy) * gw + (2 * x2 + dx)) * h;
-                    grouped[tok * h * 4 + which * h..tok * h * 4 + (which + 1) * h]
+                    grouped[tok * merged + which * h..tok * merged + (which + 1) * h]
                         .copy_from_slice(&xn[src..src + h]);
                 }
             }
         }
         let (w1, b1) = w(&tower.fc1);
-        let mid: Vec<f32> = linear(&grouped, &w1, &b1, rows, h * 4, h * 4)
+        let mid: Vec<f32> = linear(&grouped, &w1, &b1, rows, merged, merged)
             .into_iter()
             .map(gelu_erf)
             .collect();
         let (w2, b2) = w(&tower.fc2);
-        linear(&mid, &w2, &b2, rows, c.out_dim, h * 4)
+        linear(&mid, &w2, &b2, rows, c.out_dim, merged)
     }
 
     #[test]

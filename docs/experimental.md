@@ -79,7 +79,7 @@ LiquidAI's text model (`general.architecture = lfm3`). The language model is one
 
 24 layers, hidden 2048, SwiGLU width 7680, vocab 128000, trained context 262144, tied embeddings. Thirteen gated short convolutions (kernel 7), five sliding-window attention layers (window 256) and six full-attention layers. The layer kinds come from the GGUF (KV heads are 0 on a conv layer and 4 on an attention layer); they are not hardcoded. Full-attention RoPE uses base 1,000,000 and divides the angle by `rope_freqs.weight` (in this file the first 32 factors are 1 and the last 32 are about 1e30, so those pairs do not rotate). Sliding layers rotate all 128 dimensions at base 10,000 and ignore the factors. The contract is llama.cpp's `lfm3` graph (build 11946 or newer). The llama.cpp build cited in the October verification notes (11669) cannot load this file.
 
-The chat template is the GGUF's own Jinja. It emits `<|startoftext|>` itself (`add_bos_token` is false), opens a generation with `<think>` unless `enable_thinking` is false, and writes tool calls as `<tool_call><function=NAME><parameter=K>…</parameter></function></tool_call>`, which the existing parser accepts. `tests/fixtures/lfm3/` compares those renderings to Jinja2. Sampling metadata is temperature 0.1, top-k 50 and repetition penalty 1.1. There is no top-p key, so the usual fallback of 0.95 applies.
+The chat template is the GGUF's own Jinja. It emits `<|startoftext|>` itself (`add_bos_token` is false), opens a generation with `<think>` unless `enable_thinking` is false, and writes tool calls as `<tool_call><function=NAME><parameter=K>…</parameter></function></tool_call>`, which the existing parser accepts. `tests/fixtures/lfm3/` compares those renderings to Jinja2. Sampling metadata is temperature 0.1, top-k 50 and repetition penalty 1.1. There is no top-p key, so the usual fallback of 0.95 applies. `general.sampling.penalty_repeat` is read only for `lfm3`; any other GGUF keeps a penalty of 1 even when the key is set.
 
 ## Validation
 
@@ -112,7 +112,7 @@ The same `lfm3` language model with a still-image projector (`clip.vision.projec
 
 `~/models/hub/models--LiquidAI--LFM3-VL-2B-GGUF/snapshots/main/mmproj-LFM3-VL-2B-Q8_0.gguf` (194 MB)
 
-The language file matches the 1.7B schedule: 24 layers, hidden 2048, SwiGLU 7680, vocab 128000, 13 short convolutions (kernel 7), 5 sliding-window layers (window 256) and 6 full-attention layers. Its trained context is 128000, not 262144. There is no `rope.dimension_sections`. Each image token keeps its own position. The chat template emits `<|vision_start|><|image|><|vision_end|>`, and `<|image|>` (id 125030) is the token that is repeated. A rendered prompt that contains `<|video|>` is refused. Sampling metadata is the same as the 1.7B file: temperature 0.1, top-k 50, repetition penalty 1.1, and the 0.95 top-p fallback. The card is [LFM3-VL-2B](https://docs.liquid.ai/lfm/models/lfm3-vl-2b).
+The language file matches the 1.7B schedule: 24 layers, hidden 2048, SwiGLU 7680, vocab 128000, 13 short convolutions (kernel 7), 5 sliding-window layers (window 256) and 6 full-attention layers. Its trained context is 128000, not 262144. There is no `rope.dimension_sections`. Each image token keeps its own position. The chat template emits `<|vision_start|><|image|><|vision_end|>`, and `<|image|>` (id 125030) is the token that is repeated. A rendered prompt that contains `<|video|>` is refused, including when no projector is loaded. Sampling metadata is the same as the 1.7B file: temperature 0.1, top-k 50, repetition penalty 1.1, and the 0.95 top-p fallback. The card is [LFM3-VL-2B](https://docs.liquid.ai/lfm/models/lfm3-vl-2b).
 
 The projector is a 14-block tower (hidden 1024, 16 heads, 8 KV heads, patch 16, 2×2 merge, SwiGLU, mean and std 0.5). Resize follows `clip.vision.image_resize_algo` (bicubic on this file, Catmull-Rom). The projector's layer-norm epsilon is 1e-6, not the encoder's 1e-5. Pixel limits are 65536 to 16777216. The attention-score buffer caps one image at 1773 language tokens; `--image-tokens` is clamped to that, and the default 1024 sits under it. With both files in one folder, `--mmproj auto` picks the projector whose width matches the language model.
 
@@ -133,9 +133,10 @@ On a 32 GB M5, against llama.cpp build 11962. The record is [measurements/lfm3/]
 |---|---|
 | Language memory, auto context, no projector | weights+scratch 1344 vs 1345 MiB; state 1509 vs 1510 MiB |
 | Greedy, one 256×256 image, "Describe the image in one sentence.", 16 tokens, thinking on | same sentence as `llama-mtmd-cli`; that sentence is 16 tokens |
+| Greedy, one 770×500 image resized to 768×512, same prompt, 48 tokens, thinking on | same continuation as `llama-mtmd-cli`, including "vertical red stripe on the left" |
 | Qwen greedy, 16 tokens, after these kernels, vs the ids recorded at `ec14e94` | identical on Swift Q4_K_M and Tiel IQ4_XS |
 
-The image is exactly 65536 pixels, so neither side resizes it. llama-mtmd-cli did not print the prompt length; only the continuation was compared. Ferrum's run reported 83 prompt tokens and 0.06 s to encode. Those timings are one run, not a bench. No vision-tower KLD was measured. The 27B and 35B were not re-benched: the greedy ids above are the regression check for the shared forward.
+The 256×256 image is exactly 65536 pixels, so neither side resizes it. The 770×500 image is not a multiple of 32; both sides resize it to 768×512 (384 language tokens). llama-mtmd-cli did not print the prompt length either time; only the continuation was compared. Ferrum reported 83 prompt tokens and 0.06 s to encode the square image, and 403 prompt tokens and 0.39 s for the wide one. Those timings are one run each, not a bench. No vision-tower KLD was measured. The 27B and 35B were not re-benched: the greedy ids above are the regression check for the shared forward.
 
 ## Known gaps
 
