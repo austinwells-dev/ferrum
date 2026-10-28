@@ -3,7 +3,8 @@
 use super::{
     config::{AttnSpec, HybridConfig, KvCache, Variant},
     weights::{
-        AttentionWeights, DeltaWeights, DenseFfn, Ffn, Format, Matrix, Mixer, MoeFfn, Weights,
+        AttentionWeights, DeltaWeights, DenseFfn, Ffn, Format, Matrix, Mixer, MoeFfn,
+        ShortConvWeights, Weights,
     },
 };
 use crate::{DType, Error, MetalDevice, Result, Tensor, metal::MetalBuffer};
@@ -50,6 +51,9 @@ pub struct ImageSpan {
     pub deepstack: Vec<std::rc::Rc<Tensor>>,
     /// Identity of the image content, for prefix reuse.
     pub hash: u64,
+    /// One language-model position per token. Qwen's grid is false: those
+    /// tokens share `max(rows, cols)` rotary positions.
+    pub linear: bool,
 }
 
 impl ImageSpan {
@@ -63,9 +67,14 @@ impl ImageSpan {
         self.start + self.len()
     }
     /// How many positions the image advances the rotary position less than it
-    /// advances the cache: its tokens share a 2-D grid of positions.
+    /// advances the cache. A 2-D grid shares `max(rows, cols)` positions.
+    /// A linear span (LFM3) takes one position per token.
     fn rope_saving(&self) -> usize {
-        self.len() - self.grid.0.max(self.grid.1)
+        if self.linear {
+            0
+        } else {
+            self.len() - self.grid.0.max(self.grid.1)
+        }
     }
 }
 
@@ -292,6 +301,17 @@ impl HybridState {
                 state.v.push(Some(c.kv_cache.alloc(d, rows, kv_row)?));
                 state.conv.push(None);
                 state.ssm.push(None);
+            } else if c.variant == Variant::Lfm3 {
+                // Previous B*x rows only. No delta-rule matrix: `page(0)` would
+                // still reserve 16 KiB, and the snapshot skips a missing SSM.
+                state.k.push(None);
+                state.v.push(None);
+                state.conv.push(Some(Tensor::zeros_resident(
+                    d,
+                    [(c.conv_kernel - 1) * c.hidden],
+                    DType::F32,
+                )?));
+                state.ssm.push(None);
             } else {
                 state.k.push(None);
                 state.v.push(None);
@@ -376,11 +396,16 @@ impl HybridState {
                 Some(span) => {
                     let base = rope_position(&self.media, span.start) as i32;
                     let offset = index - span.start;
-                    (
-                        base,
-                        base + (offset / span.grid.1) as i32,
-                        base + (offset % span.grid.1) as i32,
-                    )
+                    if span.linear {
+                        let p = base + offset as i32;
+                        (p, p, p)
+                    } else {
+                        (
+                            base,
+                            base + (offset / span.grid.1) as i32,
+                            base + (offset % span.grid.1) as i32,
+                        )
+                    }
                 }
                 None => {
                     let p = rope_position(&self.media, index) as i32;
@@ -604,8 +629,13 @@ pub fn spec_bytes(c: &HybridConfig, chunk: usize, g: &SpecGeometry) -> usize {
     if g.final_hidden {
         total += f32s(capture * c.hidden);
     }
-    total += c.recurrent_layer_count()
-        * (f32s(g.rows * c.conv_channels()) + 2 * f32s(g.rows * c.ssm_v_heads));
+    total += if c.variant == Variant::Lfm3 {
+        // One B*x tape per short-conv layer. No g/beta tapes.
+        c.recurrent_layer_count() * f32s(g.rows * c.hidden)
+    } else {
+        c.recurrent_layer_count()
+            * (f32s(g.rows * c.conv_channels()) + 2 * f32s(g.rows * c.ssm_v_heads))
+    };
     total
         + f32s(g.rows * c.vocab)
         + f32s(g.rows * c.vocab.div_ceil(1024) * 64)
@@ -619,6 +649,74 @@ fn gather_width(c: &HybridConfig, g: &SpecGeometry) -> usize {
     (g.aux_layers.len() * c.hidden)
         .max(c.hidden)
         .max(c.kv_heads * c.head_dim)
+}
+
+/// Gated depthwise conv of one LFM3 short-conv layer. `tape`, when set, receives
+/// the B*x rows and the live state is left unchanged (speculative verify).
+#[allow(clippy::too_many_arguments)]
+fn run_short_conv(
+    d: &MetalDevice,
+    c: &HybridConfig,
+    s: &Scratch,
+    w: &ShortConvWeights,
+    state: &HybridState,
+    layer: usize,
+    xn: &Tensor,
+    out: &Tensor,
+    m: usize,
+    tape: Option<&Tensor>,
+) -> Result<()> {
+    let h = c.hidden;
+    let packed = rows(&s.qkv, 0, m, 3 * h)?;
+    HybridModel::project(d, &w.in_proj, xn, m, &packed)?;
+    let y = rows(&s.conv, 0, m, h)?;
+    let conv_state = state.conv[layer]
+        .as_ref()
+        .expect("short-conv layer has a conv window");
+    // Unread unless the verify tapes B*x. A zero-width view is enough.
+    let bx = match tape {
+        Some(t) => rows(t, 0, m, h)?,
+        None => s.z.view(0, [0])?,
+    };
+    d.dispatch_hybrid(
+        "h_short_conv",
+        &[packed.binding(), w.conv.binding()],
+        &[y.binding(), conv_state.binding(), bx.binding()],
+        &Params::default()
+            .u(m)?
+            .u(h)?
+            .u(c.conv_kernel - 1)?
+            .u(usize::from(tape.is_none()))?
+            .u(usize::from(tape.is_some()))?
+            .0,
+        [h.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )?;
+    HybridModel::project(d, &w.out_proj, &y, m, out)
+}
+
+/// Shift `n` recorded B*x rows into a short-conv window.
+fn bx_state(
+    d: &MetalDevice,
+    c: &HybridConfig,
+    bx: &Tensor,
+    state: &HybridState,
+    layer: usize,
+    n: usize,
+) -> Result<()> {
+    let conv_state = state.conv[layer]
+        .as_ref()
+        .expect("short-conv layer has a conv window");
+    d.dispatch_hybrid(
+        "h_bx_state",
+        &[bx.binding()],
+        &[conv_state.binding()],
+        &Params::default().u(n)?.u(c.hidden)?.u(c.conv_kernel - 1)?.0,
+        [c.hidden.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
 }
 
 fn copy(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
@@ -703,20 +801,20 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
         chunk * c.kv_heads * c.head_dim,
         chunk * c.kv_heads * c.head_dim,
         chunk * c.heads * c.head_dim,
-        if c.variant == Variant::Spark {
+        if matches!(c.variant, Variant::Spark | Variant::Lfm3) {
             chunk * c.heads
         } else {
             1
         },
         MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim,
         MAX_SPLITS * MAX_SPLIT_ROWS * 2,
-        chunk * c.conv_channels(),
+        qkv_width(c) * chunk,
         chunk * c.ssm_value_dim(),
         chunk * c.ssm_v_heads,
         chunk * c.ssm_v_heads,
         chunk * c.ssm_v_heads,
         chunk * c.ssm_v_heads,
-        chunk * c.conv_channels(),
+        conv_out_width(c) * chunk,
         chunk * c.ssm_value_dim(),
         chunk * c.ssm_value_dim(),
         chunk * ffn,
@@ -784,10 +882,33 @@ pub fn kv_ring_bytes(c: &HybridConfig, max_rows: usize) -> usize {
 }
 
 /// Convolution windows and delta-rule matrices of every recurrent layer.
+/// LFM3 counts only the short-conv window (`(l_cache - 1) * hidden`).
 pub fn recurrent_bytes(c: &HybridConfig) -> usize {
+    if c.variant == Variant::Lfm3 {
+        let conv = page((c.conv_kernel - 1) * c.hidden * 4);
+        return c.recurrent_layer_count() * conv;
+    }
     let conv = page((c.conv_kernel - 1) * c.conv_channels() * 4);
     let ssm = page(c.ssm_v_heads * c.ssm_head_dim * c.ssm_head_dim * 4);
     c.recurrent_layer_count() * (conv + ssm)
+}
+
+/// Width of the packed QKV / short-conv in-projection scratch.
+fn qkv_width(c: &HybridConfig) -> usize {
+    if c.variant == Variant::Lfm3 {
+        3 * c.hidden
+    } else {
+        c.conv_channels()
+    }
+}
+
+/// Width of the conv-output scratch (delta channels, or the LFM3 gated conv).
+fn conv_out_width(c: &HybridConfig) -> usize {
+    if c.variant == Variant::Lfm3 {
+        c.hidden
+    } else {
+        c.conv_channels()
+    }
 }
 
 /// Metal rounds each allocation up to whole 16 KiB pages.
@@ -814,21 +935,21 @@ impl Scratch {
                 DType::F16,
             )?,
             att: f(&[chunk, c.heads * c.head_dim])?,
-            // Only Spark has a per-head output gate.
-            head_gate: f(&if c.variant == Variant::Spark {
+            // Spark and LFM3 multiply a per-head sigmoid gate onto attention.
+            head_gate: f(&if matches!(c.variant, Variant::Spark | Variant::Lfm3) {
                 [chunk, c.heads]
             } else {
                 [1, 1]
             })?,
             attn_partial: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim])?,
             attn_ml: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * 2])?,
-            qkv: f(&[chunk, c.conv_channels()])?,
+            qkv: f(&[chunk, qkv_width(c)])?,
             z: f(&[chunk, c.ssm_value_dim()])?,
             alpha: f(&[chunk, c.ssm_v_heads])?,
             beta: f(&[chunk, c.ssm_v_heads])?,
             g: f(&[chunk, c.ssm_v_heads])?,
             b: f(&[chunk, c.ssm_v_heads])?,
-            conv: f(&[chunk, c.conv_channels()])?,
+            conv: f(&[chunk, conv_out_width(c)])?,
             delta: f(&[chunk, c.ssm_value_dim()])?,
             gated: f(&[chunk, c.ssm_value_dim()])?,
             ffn_gate: f(&[chunk, ffn])?,
@@ -1013,9 +1134,13 @@ impl HybridModel {
                 recurrent_index.push(None);
             } else {
                 recurrent_index.push(Some(tape_qkv.len()));
-                tape_qkv.push(f(&[g.rows, c.conv_channels()])?);
-                tape_g.push(f(&[g.rows, c.ssm_v_heads])?);
-                tape_b.push(f(&[g.rows, c.ssm_v_heads])?);
+                if c.variant == Variant::Lfm3 {
+                    tape_qkv.push(f(&[g.rows, c.hidden])?);
+                } else {
+                    tape_qkv.push(f(&[g.rows, c.conv_channels()])?);
+                    tape_g.push(f(&[g.rows, c.ssm_v_heads])?);
+                    tape_b.push(f(&[g.rows, c.ssm_v_heads])?);
+                }
             }
         }
         *self.spec.borrow_mut() = Some(Spec {
@@ -1217,6 +1342,11 @@ impl HybridModel {
         {
             return Err(Error::Parameter("one penalty set per verify row".into()));
         }
+        if parents.is_some() && self.config.variant == Variant::Lfm3 {
+            return Err(Error::Parameter(
+                "draft trees are not supported for this model".into(),
+            ));
+        }
         state.verified = 0;
         state.verified_tree.clear();
         // The recurrent state is never written, so a failure leaves it valid.
@@ -1396,6 +1526,19 @@ impl HybridModel {
         let heads = c.ssm_v_heads;
         for (layer, index) in spec.recurrent_index.iter().enumerate() {
             let Some(r) = *index else { continue };
+            if matches!(&self.weights.layers[layer].mixer, Mixer::ShortConv(_)) {
+                let hidden = c.hidden;
+                let bx = match path {
+                    None => rows(&spec.tape_qkv[r], 0, n, hidden)?,
+                    Some(path) => {
+                        let bx = rows(&s.conv, 0, n, hidden)?;
+                        gather_rows(d, &spec.tape_qkv[r], path, &bx, n, hidden, hidden)?;
+                        bx
+                    }
+                };
+                bx_state(d, c, &bx, state, layer, n)?;
+                continue;
+            }
             let Mixer::Delta(w) = &self.weights.layers[layer].mixer else {
                 unreachable!("recurrent index on an attention layer")
             };
@@ -1644,6 +1787,16 @@ impl HybridModel {
                 Mixer::Attention(a) => {
                     self.attention(d, &s, a, state, i, &xn, &mix, m, pos, &rope)?
                 }
+                Mixer::ShortConv(w) => {
+                    let tape = match (verify, spec) {
+                        (true, Some(sp)) => {
+                            let r = sp.recurrent_index[i].expect("short conv is recurrent");
+                            Some(&sp.tape_qkv[r])
+                        }
+                        _ => None,
+                    };
+                    run_short_conv(d, c, &s, w, state, i, &xn, &mix, m, tape)?;
+                }
                 Mixer::Delta(w) => {
                     let tape = match (verify, spec) {
                         (true, Some(sp)) => {
@@ -1655,7 +1808,17 @@ impl HybridModel {
                     self.delta(d, &s, w, state, i, &xn, &mix, m, tape, rope.tree.as_ref())?
                 }
             }
-            self.add_rmsnorm(d, cur, &mix, &layer.post_norm, next, &xn, m)?;
+            // LFM3 sandwich: norm the branch, then the fused residual + next
+            // pre-norm. The dispatcher rejects an input that aliases an
+            // output, so the fused norm lands in `mix` and is copied back to
+            // `xn`, which is where the rest of the loop reads it.
+            if let Some(post) = &layer.post_attn {
+                self.rmsnorm(d, &mix, post, &xn, m)?;
+                self.add_rmsnorm(d, cur, &xn, &layer.post_norm, next, &mix, m)?;
+                copy(d, &mix, &xn)?;
+            } else {
+                self.add_rmsnorm(d, cur, &mix, &layer.post_norm, next, &xn, m)?;
+            }
             std::mem::swap(&mut cur, &mut next);
             match &layer.ffn {
                 Ffn::Dense(f) => self.dense_ffn(d, &s, f, &xn, &mix, m)?,
@@ -1670,7 +1833,13 @@ impl HybridModel {
                 .layers
                 .get(i + 1)
                 .map_or(&self.weights.output_norm, |l| &l.attn_norm);
-            self.add_rmsnorm(d, cur, &mix, norm, next, &xn, m)?;
+            if let Some(post) = &layer.post_ffw {
+                self.rmsnorm(d, &mix, post, &xn, m)?;
+                self.add_rmsnorm(d, cur, &xn, norm, next, &mix, m)?;
+                copy(d, &mix, &xn)?;
+            } else {
+                self.add_rmsnorm(d, cur, &mix, norm, next, &xn, m)?;
+            }
             std::mem::swap(&mut cur, &mut next);
             if self.add_deepstack(d, state, i, cur, pos, m)? {
                 self.rmsnorm(d, cur, norm, &xn, m)?;
@@ -1914,7 +2083,14 @@ impl HybridModel {
             .u(kc.shape().dimensions()[0])?
             .u(usize::from(spec.gated))?
             .u(ring)?
-            .u(usize::from(a.q_norm.is_some()))?;
+            .u(usize::from(a.q_norm.is_some()))?
+            // Full-attention LFM3 layers divide the angle by rope_freqs.
+            // Sliding layers, and every other variant, leave the formula as it is.
+            .u(usize::from(
+                c.variant == Variant::Lfm3
+                    && spec.window.is_none()
+                    && self.weights.rope_freqs.is_some(),
+            ))?;
         let q8 = c.kv_cache == KvCache::Q8;
         d.dispatch_hybrid(
             if q8 { "h_attn_prep_q8" } else { "h_attn_prep" },
@@ -1927,6 +2103,8 @@ impl HybridModel {
                 a.k_norm.as_ref().unwrap_or(&qg).binding(),
                 // Unread unless the plan carries a position table.
                 rope.table.as_ref().unwrap_or(&qg).binding(),
+                // Unread unless use_factors is set.
+                self.weights.rope_freqs.as_ref().unwrap_or(&qg).binding(),
             ],
             &[q.binding(), kc.binding()],
             &prep.0,
@@ -3152,6 +3330,7 @@ mod tests {
             ),
             deepstack: Vec::new(),
             hash: 0,
+            linear: false,
         };
         // A 3x4 image at cache positions 5..17 advances rotary positions by 4.
         let media = [span(5, (3, 4)), span(30, (2, 2))];
@@ -3196,6 +3375,22 @@ mod tests {
         assert_eq!(&ints[39..42], &[9, 9, 9]);
         state.media.clear();
         assert_eq!(state.rope_plan(&d, 17, 4).unwrap().delta, 0);
+        // LFM3: one position per image token, so the text after it is not pulled back.
+        let linear = ImageSpan {
+            linear: true,
+            ..span(5, (3, 4))
+        };
+        assert_eq!(rope_position(std::slice::from_ref(&linear), 17), 17);
+        state.media = vec![linear];
+        let plan = state.rope_plan(&d, 5, 3).unwrap();
+        let ints: Vec<i32> = plan
+            .table
+            .expect("linear image")
+            .to_f32()
+            .iter()
+            .map(|v| v.to_bits() as i32)
+            .collect();
+        assert_eq!(&ints[..9], &[5, 5, 5, 6, 6, 6, 7, 7, 7]);
     }
 
     /// The attention-prep kernel rotates image rows by their (t, h, w) table and
@@ -3264,7 +3459,9 @@ mod tests {
                 .u(0)
                 .unwrap() // ring
                 .u(1)
-                .unwrap(); // qk_norm
+                .unwrap() // qk_norm
+                .u(0)
+                .unwrap(); // use_factors
             let e = d.execution_with_shared_encoder(true).unwrap();
             d.dispatch_hybrid(
                 "h_attn_prep",
@@ -3275,6 +3472,7 @@ mod tests {
                     qn.binding(),
                     kn.binding(),
                     pos3.binding(),
+                    qg_t.binding(),
                 ],
                 &[q_out.binding(), cache.binding()],
                 &params.0,
@@ -3818,7 +4016,9 @@ mod tests {
             .u(0)
             .unwrap() // ring
             .u(1)
-            .unwrap(); // qk_norm
+            .unwrap() // qk_norm
+            .u(0)
+            .unwrap(); // use_factors
         let (qg_t, k_t, zeros) = (t(&qg, qg.len()), t(&kk, kk.len()), t(&[0.], 1));
         let (qn, kn) = (t(&norm, head_dim), t(&norm, head_dim));
         let e = d.execution_with_shared_encoder(true).unwrap();
@@ -3830,6 +4030,7 @@ mod tests {
                 k_t.binding(),
                 qn.binding(),
                 kn.binding(),
+                zeros.binding(),
                 zeros.binding(),
             ],
             &[q_out.binding(), cache.binding()],
@@ -3855,6 +4056,199 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A factor of 1 matches plain RoPE. A factor of 1e30 is identity on that pair.
+    #[test]
+    fn rope_factors_divide_the_angle() {
+        let d = MetalDevice::new().unwrap();
+        let (heads, kv_heads, head_dim, rope_dims, rows) =
+            (2usize, 1usize, 128usize, 128usize, 2usize);
+        let (theta, eps, scale) = (1.0e6f32, 1e-5f32, 1. / (head_dim as f32).sqrt());
+        let qg = random(rows * heads * head_dim, 7);
+        let kk = random(rows * kv_heads * head_dim, 8);
+        let norm = vec![1f32; head_dim];
+        let mut factors = vec![1f32; rope_dims / 2];
+        for f in &mut factors[rope_dims / 4..] {
+            *f = 1e30;
+        }
+        let run = |use_factors: usize| -> Vec<f32> {
+            let t = |data: &[f32]| Tensor::from_f32(&d, [data.len()], DType::F32, data).unwrap();
+            let q_out = Tensor::zeros(&d, [rows * heads * head_dim], DType::F16).unwrap();
+            let cache = Tensor::zeros(&d, [8 * kv_heads * head_dim], DType::F16).unwrap();
+            let mut p = Params::default();
+            for v in [rows, heads, kv_heads, head_dim, rope_dims, 3usize] {
+                p = p.u(v).unwrap();
+            }
+            p = p
+                .f(theta)
+                .f(eps)
+                .u(kv_heads * head_dim)
+                .unwrap()
+                .f(scale)
+                .i(0);
+            for v in [0usize, 0, 0, 8, 0, 0, 1, use_factors] {
+                p = p.u(v).unwrap();
+            }
+            let (qg_t, k_t, n_t, f_t) = (t(&qg), t(&kk), t(&norm), t(&factors));
+            let e = d.execution_with_shared_encoder(true).unwrap();
+            d.dispatch_hybrid(
+                "h_attn_prep",
+                &[
+                    qg_t.binding(),
+                    k_t.binding(),
+                    k_t.binding(),
+                    n_t.binding(),
+                    n_t.binding(),
+                    qg_t.binding(),
+                    f_t.binding(),
+                ],
+                &[q_out.binding(), cache.binding()],
+                &p.0,
+                [heads + kv_heads, rows, 1],
+                [head_dim, 1, 1],
+                0,
+            )
+            .unwrap();
+            e.finish().unwrap();
+            q_out.to_f32()
+        };
+        let plain = run(0);
+        let factored = run(1);
+        let half = rope_dims / 2;
+        for r in 0..rows {
+            for h in 0..heads {
+                let base = (r * heads + h) * head_dim;
+                let row = &qg[base..base + head_dim];
+                let ss = row.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
+                let inv = 1. / (ss + eps).sqrt();
+                let n: Vec<f32> = row.iter().map(|v| v * inv).collect();
+                for pair in 0..half {
+                    let pos = (3 + r) as f32;
+                    let freq = theta.powf(-2. * pair as f32 / rope_dims as f32);
+                    let angle = pos * freq;
+                    let (c, s) = (angle.cos(), angle.sin());
+                    let rotated = n[pair] * c - n[pair + half] * s;
+                    let plain_v = plain[base + pair];
+                    let fact_v = factored[base + pair];
+                    let tol = 2e-3 * rotated.abs().max(1e-2);
+                    assert!(
+                        (plain_v - rotated * scale).abs() <= tol,
+                        "plain pair {pair}"
+                    );
+                    if pair < half / 2 {
+                        assert!((fact_v - plain_v).abs() <= tol, "factor 1 pair {pair}");
+                    } else {
+                        let ident = n[pair] * scale;
+                        assert!(
+                            (fact_v - ident).abs() <= 2e-3 * ident.abs().max(1e-2),
+                            "factor 1e30 pair {pair}: {fact_v} vs {ident}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Short conv matches prepend-state + ggml_ssm_conv, including a non-zero
+    /// window and a single token.
+    #[test]
+    fn short_conv_matches_prepend_state() {
+        let d = MetalDevice::new().unwrap();
+        let (hidden, state_len) = (32usize, 6usize);
+        let kernel = state_len + 1;
+        let reference = |packed: &[f32], weight: &[f32], state0: &[f32], tokens: usize| {
+            let mut hist = state0.to_vec();
+            let mut y = vec![0f32; tokens * hidden];
+            for t in 0..tokens {
+                for c in 0..hidden {
+                    let b = packed[t * 3 * hidden + c];
+                    let gate = packed[t * 3 * hidden + hidden + c];
+                    let x = packed[t * 3 * hidden + 2 * hidden + c];
+                    let bx = b * x;
+                    let mut acc = bx * weight[c * kernel + state_len];
+                    for k in 0..state_len {
+                        acc += hist[k * hidden + c] * weight[c * kernel + k];
+                    }
+                    y[t * hidden + c] = acc * gate;
+                }
+                if state_len > 0 {
+                    hist.copy_within(hidden.., 0);
+                    for c in 0..hidden {
+                        let b = packed[t * 3 * hidden + c];
+                        let x = packed[t * 3 * hidden + 2 * hidden + c];
+                        hist[(state_len - 1) * hidden + c] = b * x;
+                    }
+                }
+            }
+            (y, hist)
+        };
+        for (tokens, seed, nonzero) in [(1usize, 1u64, false), (3, 2, true), (8, 3, true)] {
+            let packed = random(tokens * 3 * hidden, seed);
+            let weight = random(hidden * kernel, seed + 10);
+            let mut state0 = vec![0f32; state_len * hidden];
+            if nonzero {
+                state0 = random(state_len * hidden, seed + 20);
+            }
+            let (want_y, want_state) = reference(&packed, &weight, &state0, tokens);
+            let t = |data: &[f32]| Tensor::from_f32(&d, [data.len()], DType::F32, data).unwrap();
+            let (packed_t, weight_t) = (t(&packed), t(&weight));
+            let state_t = t(&state0);
+            let y = Tensor::zeros(&d, [tokens * hidden], DType::F32).unwrap();
+            let bx = Tensor::zeros(&d, [tokens * hidden], DType::F32).unwrap();
+            let replay = t(&state0);
+            let e = d.execution_with_shared_encoder(true).unwrap();
+            d.dispatch_hybrid(
+                "h_short_conv",
+                &[packed_t.binding(), weight_t.binding()],
+                &[y.binding(), state_t.binding(), bx.binding()],
+                &Params::default()
+                    .u(tokens)
+                    .unwrap()
+                    .u(hidden)
+                    .unwrap()
+                    .u(state_len)
+                    .unwrap()
+                    .u(1)
+                    .unwrap()
+                    .u(1)
+                    .unwrap()
+                    .0,
+                [hidden.div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )
+            .unwrap();
+            d.dispatch_hybrid(
+                "h_bx_state",
+                &[bx.binding()],
+                &[replay.binding()],
+                &Params::default()
+                    .u(tokens)
+                    .unwrap()
+                    .u(hidden)
+                    .unwrap()
+                    .u(state_len)
+                    .unwrap()
+                    .0,
+                [hidden.div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )
+            .unwrap();
+            e.finish().unwrap();
+            let close = |got: &[f32], want: &[f32], what: &str| {
+                for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-5 * w.abs().max(1e-4),
+                        "{what} [{i}] {g} vs {w} tokens {tokens}"
+                    );
+                }
+            };
+            close(&y.to_f32(), &want_y, "y");
+            close(&state_t.to_f32(), &want_state, "state");
+            close(&replay.to_f32(), &want_state, "replay");
         }
     }
 

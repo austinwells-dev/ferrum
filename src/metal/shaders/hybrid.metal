@@ -1768,6 +1768,7 @@ struct AttnPrepArgs {
     uint gated;        // qg rows hold [q | gate] (2 * head_dim per head) instead of q alone
     uint ring;         // 0: position p lives in row p; else in row p % ring (see kv_row)
     uint qk_norm;      // 0: q and k skip the per-head RMS norm (Spark)
+    uint use_factors;  // 1: angle /= factors[pair] (LFM3 full attention). 0 leaves the formula unchanged.
 };
 
 // Cache row of key position `key`. Sliding-window layers keep a ring of `ring`
@@ -1882,8 +1883,8 @@ inline float kv_scale(device const half * scales, ulong e) {
 template <bool Q8>
 void attn_prep_impl(constant AttnPrepArgs & p, device const float * qg, device const float * k,
                     device const float * q_norm, device const float * k_norm, device const int * pos3,
-                    device half * q_out, device half * kv, uint2 group, ushort tid,
-                    threadgroup float * scratch, threadgroup float * normed) {
+                    device const float * factors, device half * q_out, device half * kv, uint2 group,
+                    ushort tid, threadgroup float * scratch, threadgroup float * normed) {
     const uint head = group.x;
     const uint t = group.y;
     const bool is_q = head < p.heads;
@@ -1909,7 +1910,8 @@ void attn_prep_impl(constant AttnPrepArgs & p, device const float * qg, device c
             pos = float(pos3[t * 3 + axis]);
         }
         const float freq = pow(p.theta, -2.f * float(pair) / float(p.rope_dims));
-        const float angle = pos * freq;
+        float angle = pos * freq;
+        if (p.use_factors != 0) angle /= factors[pair];
         const float c = cos(angle), s = sin(angle);
         if (tid < half_rot) outv = nv * c - normed[tid + half_rot] * s;
         else outv = normed[tid - half_rot] * s + nv * c;
@@ -1923,19 +1925,85 @@ void attn_prep_impl(constant AttnPrepArgs & p, device const float * qg, device c
 }
 
 #define ATTN_PREP(name, q8)                                                                          \
-kernel void name(constant AttnPrepArgs & p [[buffer(8)]],                                           \
+kernel void name(constant AttnPrepArgs & p [[buffer(9)]],                                           \
                  device const float * qg [[buffer(0)]], device const float * k [[buffer(1)]],       \
                  device const float * v [[buffer(2)]], device const float * q_norm [[buffer(3)]],   \
                  device const float * k_norm [[buffer(4)]], device const int * pos3 [[buffer(5)]],  \
-                 device half * q_out [[buffer(6)]], device half * kv [[buffer(7)]],                 \
+                 device const float * factors [[buffer(6)]],                                        \
+                 device half * q_out [[buffer(7)]], device half * kv [[buffer(8)]],                 \
                  uint2 group [[threadgroup_position_in_grid]],                                      \
                  ushort tid [[thread_index_in_threadgroup]]) {                                      \
     threadgroup float scratch[8];                                                                   \
     threadgroup float normed[256];                                                                  \
-    attn_prep_impl<q8>(p, qg, k, q_norm, k_norm, pos3, q_out, kv, group, tid, scratch, normed);     \
+    attn_prep_impl<q8>(p, qg, k, q_norm, k_norm, pos3, factors, q_out, kv, group, tid, scratch, normed); \
 }
 ATTN_PREP(h_attn_prep, false)
 ATTN_PREP(h_attn_prep_q8, true)
+
+// LFM3 short conv. packed is [tokens, 3H] = B | C | X. weight is w[c*K+k]
+// with K = state_len + 1 and tap 0 the oldest. state is [state_len, H],
+// oldest row first: the previous B*x values, not the conv output.
+// y[t, c] = C * sum_k window[k] * w[c*K+k], window = state || new B*x.
+struct ShortConvArgs {
+    uint tokens;
+    uint hidden;
+    uint state_len; // 1..=8
+    uint write_state;
+    uint write_bx;
+};
+
+kernel void h_short_conv(device const float * packed [[buffer(0)]],
+                         device const float * weight [[buffer(1)]],
+                         device float * y [[buffer(2)]],
+                         device float * state [[buffer(3)]],
+                         device float * bx_out [[buffer(4)]],
+                         constant ShortConvArgs & p [[buffer(5)]],
+                         uint c [[thread_position_in_grid]]) {
+    if (c >= p.hidden || p.state_len == 0 || p.state_len > 8) return;
+    const uint H = p.hidden;
+    const uint S = p.state_len;
+    const uint K = S + 1;
+    float hist[8];
+    for (uint k = 0; k < S; k++) hist[k] = state[(ulong)k * H + c];
+    for (uint t = 0; t < p.tokens; t++) {
+        const ulong base = ((ulong)t * 3) * H + c;
+        const float bx = packed[base] * packed[base + 2 * H];
+        if (p.write_bx != 0) bx_out[(ulong)t * H + c] = bx;
+        float acc = bx * weight[(ulong)c * K + S];
+        for (uint k = 0; k < S; k++) acc += hist[k] * weight[(ulong)c * K + k];
+        y[(ulong)t * H + c] = acc * packed[base + H];
+        for (uint k = 0; k + 1 < S; k++) hist[k] = hist[k + 1];
+        hist[S - 1] = bx;
+    }
+    if (p.write_state != 0) {
+        for (uint k = 0; k < S; k++) state[(ulong)k * H + c] = hist[k];
+    }
+}
+
+// Shift `tokens` of recorded B*x into the short-conv state. Weight-free, so a
+// speculative commit can replay an accepted prefix without the projection.
+struct BxStateArgs {
+    uint tokens;
+    uint hidden;
+    uint state_len;
+};
+
+kernel void h_bx_state(device const float * bx [[buffer(0)]],
+                       device float * state [[buffer(1)]],
+                       constant BxStateArgs & p [[buffer(2)]],
+                       uint c [[thread_position_in_grid]]) {
+    if (c >= p.hidden || p.state_len == 0 || p.state_len > 8) return;
+    const uint H = p.hidden;
+    const uint S = p.state_len;
+    float hist[8];
+    for (uint k = 0; k < S; k++) hist[k] = state[(ulong)k * H + c];
+    for (uint t = 0; t < p.tokens; t++) {
+        const float v = bx[(ulong)t * H + c];
+        for (uint k = 0; k + 1 < S; k++) hist[k] = hist[k + 1];
+        hist[S - 1] = v;
+    }
+    for (uint k = 0; k < S; k++) state[(ulong)k * H + c] = hist[k];
+}
 
 // V is stored in its own cache buffer with the same geometry. Threadgroups of
 // 256 keep every 32-element Q8 block inside one SIMD group.
@@ -3743,6 +3811,7 @@ inline void v_gemm_impl(constant VGemmArgs & p, device const float * A, device c
         if (p.has_bias != 0) v += bias[gn];
         if (p.epilogue == 1) v = v_gelu_tanh(v);
         else if (p.epilogue == 2) v = v_gelu_erf(v);
+        else if (p.epilogue == 3) v = v / (1.f + precise::exp(-v));
         C[c_base + (ulong)gm * p.ldc + gn] = v;
     }
 }
@@ -3848,4 +3917,100 @@ kernel void v_softmax(constant VRowsArgs & p [[buffer(1)]], device float * s [[b
 kernel void v_add(constant VRowsArgs & p [[buffer(2)]], device const float * y [[buffer(0)]],
                   device float * acc [[buffer(1)]], uint i [[thread_position_in_grid]]) {
     if (i < p.rows * p.cols) acc[i] += y[i];
+}
+
+// RMSNorm (no mean, no bias). One 256-thread threadgroup per row; the same
+// weight is applied to every row, so a [tokens * heads, head_dim] view is a
+// per-head norm.
+kernel void v_rmsnorm(constant VNormArgs & p [[buffer(3)]], device const float * x [[buffer(0)]],
+                      device const float * w [[buffer(1)]], device float * out [[buffer(2)]],
+                      uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float part[8];
+    device const float * xr = x + (ulong)row * p.width;
+    float ss = 0.f;
+    for (uint i = tid; i < p.width; i += 256) ss += xr[i] * xr[i];
+    ss = simd_sum(ss);
+    if (tid % 32 == 0) part[tid / 32] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.f;
+    for (uint i = 0; i < 8; i++) sum += part[i];
+    const float inv = rsqrt(sum / float(p.width) + p.eps);
+    for (uint i = tid; i < p.width; i += 256)
+        out[(ulong)row * p.width + i] = xr[i] * inv * w[i];
+}
+
+struct VMulArgs { uint rows; uint cols; uint a_stride; uint a_off; uint b_stride; uint b_off; };
+
+// out[r, c] = a[r * a_stride + a_off + c] * b[r * b_stride + b_off + c].
+// The conv block's B, C and X thirds share one row, so the strides pick them apart.
+kernel void v_mul(constant VMulArgs & p [[buffer(3)]], device const float * a [[buffer(0)]],
+                  device const float * b [[buffer(1)]], device float * out [[buffer(2)]],
+                  uint i [[thread_position_in_grid]]) {
+    if (i >= p.rows * p.cols) return;
+    const uint r = i / p.cols, c = i % p.cols;
+    out[i] = a[(ulong)r * p.a_stride + p.a_off + c] * b[(ulong)r * p.b_stride + p.b_off + c];
+}
+
+struct VDwArgs { uint gw; uint gh; uint hidden; };
+
+// Depthwise 3x3, padding 1, in-bounds only. Input is raster (x fastest),
+// [gh * gw, hidden]. The kernel is [hidden, 9] with tap ky*3+kx.
+kernel void v_dwconv3(constant VDwArgs & p [[buffer(3)]], device const float * in [[buffer(0)]],
+                      device const float * kern [[buffer(1)]], device float * out [[buffer(2)]],
+                      uint i [[thread_position_in_grid]]) {
+    const uint n = p.gw * p.gh * p.hidden;
+    if (i >= n) return;
+    const uint c = i % p.hidden;
+    const uint t = i / p.hidden;
+    const uint x = t % p.gw;
+    const uint y = t / p.gw;
+    float acc = 0.f;
+    for (uint ky = 0; ky < 3; ky++) {
+        const int sy = int(y) + int(ky) - 1;
+        if (sy < 0 || sy >= int(p.gh)) continue;
+        for (uint kx = 0; kx < 3; kx++) {
+            const int sx = int(x) + int(kx) - 1;
+            if (sx < 0 || sx >= int(p.gw)) continue;
+            acc += in[(ulong)(uint(sy) * p.gw + uint(sx)) * p.hidden + c]
+                 * kern[c * 9 + ky * 3 + kx];
+        }
+    }
+    out[i] = acc;
+}
+
+struct VIntArgs { uint gw; uint gh; uint hidden; };
+
+// 2x2 merge in raster order. Output token (x2, yb) is the concatenation
+// top-left, top-right, bottom-left, bottom-right, each `hidden` floats.
+kernel void v_interleave(constant VIntArgs & p [[buffer(2)]], device const float * in [[buffer(0)]],
+                         device float * out [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    const uint mw = p.gw / 2, mh = p.gh / 2;
+    const uint width = p.hidden * 4;
+    if (i >= mw * mh * width) return;
+    const uint tok = i / width, col = i % width;
+    const uint x2 = tok % mw, yb = tok / mw;
+    const uint which = col / p.hidden, c = col % p.hidden;
+    const uint x = x2 * 2 + (which & 1);
+    const uint y = yb * 2 + (which >> 1);
+    out[i] = in[(ulong)(y * p.gw + x) * p.hidden + c];
+}
+
+struct VRope1Args { uint tokens; uint heads; uint head_dim; uint stride; };
+
+// In-place rotary of one projection [tokens, stride], `heads` of `head_dim`.
+// Pair i rotates (i, i + head_dim/2). cos/sin are [tokens, head_dim/2].
+kernel void v_rope1(constant VRope1Args & p [[buffer(3)]], device const float * cs [[buffer(0)]],
+                    device const float * sn [[buffer(1)]], device float * q [[buffer(2)]],
+                    uint i [[thread_position_in_grid]]) {
+    const uint half_dim = p.head_dim / 2;
+    const uint total = p.tokens * p.heads * half_dim;
+    if (i >= total) return;
+    const uint pair = i % half_dim;
+    const uint head = (i / half_dim) % p.heads;
+    const uint tok = i / (half_dim * p.heads);
+    device float * r = q + (ulong)tok * p.stride + (ulong)head * p.head_dim;
+    const float c = cs[(ulong)tok * half_dim + pair], s = sn[(ulong)tok * half_dim + pair];
+    const float x0 = r[pair], x1 = r[pair + half_dim];
+    r[pair] = x0 * c - x1 * s;
+    r[pair + half_dim] = x1 * c + x0 * s;
 }

@@ -668,7 +668,7 @@ fn tree_rotary_positions_are_plain_rope_at_depth() {
                 p = p.u(v).unwrap();
             }
             let mut p = p.f(theta).f(eps).u(kv_width).unwrap().f(scale).i(0);
-            for v in [usize::from(table.is_some()), 0, 0, kv_rows, 1, 0, 1] {
+            for v in [usize::from(table.is_some()), 0, 0, kv_rows, 1, 0, 1, 0] {
                 p = p.u(v).unwrap();
             }
             let e = d.execution_with_shared_encoder(true).unwrap();
@@ -681,6 +681,7 @@ fn tree_rotary_positions_are_plain_rope_at_depth() {
                     norm.binding(),
                     norm.binding(),
                     table.unwrap_or(&qg_t).binding(),
+                    qg_t.binding(),
                 ],
                 &[q_out.binding(), cache.binding()],
                 &p.0,

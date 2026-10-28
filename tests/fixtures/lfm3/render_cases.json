@@ -1,0 +1,117 @@
+[
+ {
+  "name": "plain_chat_thinking_on",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi there"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expect": "<|startoftext|><|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "thinking_off",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": false
+  },
+  "expect": "<|startoftext|><|im_start|>user\nHi<|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "name": "system_and_user",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hi there"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": true,
+  "extra": {},
+  "expect": "<|startoftext|><|im_start|>system\nYou are terse.<|im_end|>\n<|im_start|>user\nHi there<|im_end|>\n<|im_start|>assistant\n<think>"
+ },
+ {
+  "name": "tool_call_and_result",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Paris?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": {
+        "city": "Paris"
+       }
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "content": "18C and sunny"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "add_generation_prompt": true,
+  "extra": {
+   "enable_thinking": false
+  },
+  "expect": "<|startoftext|><|im_start|>system\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}}, \"required\": [\"city\"]}}\n</tools><|im_end|>\n<|im_start|>user\nWeather in Paris?<|im_end|>\n<|im_start|>assistant\n<think></think><tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>tool\n<tool_response>\n18C and sunny\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think></think>"
+ },
+ {
+  "name": "history_without_generation_prompt",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Count"
+   },
+   {
+    "role": "assistant",
+    "content": "1, 2, 3"
+   }
+  ],
+  "tools": null,
+  "add_generation_prompt": false,
+  "extra": {},
+  "expect": "<|startoftext|><|im_start|>user\nCount<|im_end|>\n<|im_start|>assistant\n<think></think>1, 2, 3<|im_end|>\n"
+ }
+]

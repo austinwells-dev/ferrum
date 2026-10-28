@@ -153,7 +153,7 @@ Responses include `draft_n` and `draft_n_accepted` in `timings`, as llama-server
 
 ## Vision (images)
 
-The Qwen3.5-family models can read images once you load their vision projector (the `mmproj*.gguf` published alongside the model). If a projector with a matching width sits in the same folder as the model, Ferrum loads it automatically. It takes about 1 GiB of the memory budget, and the auto-fitted context shrinks to make room.
+The Qwen3.5-family models can read images once you load their vision projector (the `mmproj*.gguf` published alongside the model). If a projector with a matching width sits in the same folder as the model, Ferrum loads it automatically. It takes about 1 GiB of the memory budget, and the auto-fitted context shrinks to make room. LFM3-VL uses the same flags. The pair checked here is `LFM3-VL-2B-Q4_K_M.gguf` with `mmproj-LFM3-VL-2B-Q8_0.gguf` (that repo publishes no Q4_K_M projector). Its template marker is `<|image|>`, and a prompt that contains `<|video|>` is refused. See [experimental.md](experimental.md#lfm3-vl-2b).
 
 | Flag | Effect |
 |---|---|

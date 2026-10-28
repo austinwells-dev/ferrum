@@ -606,15 +606,19 @@ pub fn check(path: &Path) -> Checked {
         result.problem = Some("a DFlash drafter, not a chat model".into());
         return result;
     }
-    if !matches!(arch.as_str(), "qwen35" | "qwen35moe" | "flint" | "spark2_5") {
+    if !matches!(
+        arch.as_str(),
+        "qwen35" | "qwen35moe" | "flint" | "spark2_5" | "lfm3"
+    ) {
         result.problem = Some(format!(
-            "architecture {arch}: needs qwen35, qwen35moe, flint or spark2_5"
+            "architecture {arch}: needs qwen35, qwen35moe, flint, spark2_5 or lfm3"
         ));
         return result;
     }
     let pre = text("tokenizer.ggml.pre");
     let pre_ok = match arch.as_str() {
         "flint" | "spark2_5" => pre.as_deref() == Some(arch.as_str()),
+        "lfm3" => pre.as_deref() == Some("lfm2"),
         _ => pre.as_deref() == Some("qwen35"),
     };
     if text("tokenizer.ggml.model").as_deref() != Some("gpt2") || !pre_ok {

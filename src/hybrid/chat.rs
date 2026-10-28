@@ -155,11 +155,15 @@ impl ChatTemplate {
                 Ok(Value::from_safe_string(out))
             },
         );
-        env.add_template_owned("chat", source.to_owned())
+        // Hugging Face marks the assistant span with `{% generation %}` …
+        // `{% endgeneration %}`. Those tags carry no text; strip them so the
+        // template is ordinary Jinja.
+        let source = strip_generation_tags(source);
+        env.add_template_owned("chat", source.clone())
             .map_err(|e| Error::Tokenizer(format!("chat template: {e:#}")))?;
         Ok(Self {
             env,
-            source: source.to_owned(),
+            source,
             bos_token: bos_token.to_owned(),
             eos_token: eos_token.to_owned(),
             opens_thinking: false,
@@ -217,6 +221,34 @@ impl ChatTemplate {
             .render(Value::from_serialize(&context))
             .map_err(|e| Error::Tokenizer(format!("chat template: {e:#}")))
     }
+}
+
+/// Drop Hugging Face `{% generation %}` / `{% endgeneration %}` tags. The
+/// dashes are optional; the body between them stays.
+fn strip_generation_tags(source: &str) -> String {
+    let mut out = source.to_owned();
+    for tag in ["generation", "endgeneration"] {
+        let mut rest = out;
+        let mut next = String::new();
+        while let Some(start) = rest.find("{%") {
+            next.push_str(&rest[..start]);
+            let Some(end) = rest[start..].find("%}") else {
+                next.push_str(&rest[start..]);
+                rest = String::new();
+                break;
+            };
+            let body = rest[start + 2..start + end].trim().trim_matches('-').trim();
+            if body == tag {
+                rest = rest[start + end + 2..].to_owned();
+            } else {
+                next.push_str(&rest[start..start + end + 2]);
+                rest = rest[start + end + 2..].to_owned();
+            }
+        }
+        next.push_str(&rest);
+        out = next;
+    }
+    out
 }
 
 /// Python `json.dumps(ensure_ascii=True)` escaping of every non-ASCII character.
@@ -580,6 +612,23 @@ mod tests {
         renders_like_jinja2(
             &template,
             include_str!("../../tests/fixtures/flint/render_cases.json"),
+        );
+    }
+
+    /// LFM3's template writes `bos_token`, switches on `enable_thinking`, and
+    /// wraps tool calls in `<function=` / `<parameter=`. The GGUF marks the
+    /// assistant span with `{% generation %}`, which `ChatTemplate` strips.
+    #[test]
+    fn renders_lfm3_template_like_jinja2() {
+        let template = ChatTemplate::with_special_tokens(
+            include_str!("../../tests/fixtures/lfm3/chat_template.jinja"),
+            "<|startoftext|>",
+            "<|im_end|>",
+        )
+        .unwrap();
+        renders_like_jinja2(
+            &template,
+            include_str!("../../tests/fixtures/lfm3/render_cases.json"),
         );
     }
 

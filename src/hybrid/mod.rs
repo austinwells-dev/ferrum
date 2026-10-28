@@ -2,7 +2,8 @@
 //! linear attention interleaved with gated full attention, on a dedicated
 //! kernel library with preallocated state. The same engine runs the
 //! attention-only `flint` and `spark2_5` architectures (experimental), whose
-//! sliding-window layers keep K/V rings.
+//! sliding-window layers keep K/V rings. `lfm3` (experimental) mixes short
+//! convolutions with sliding and full attention on the same path.
 #![forbid(unsafe_code)]
 pub mod bench;
 pub mod chat;
@@ -48,6 +49,10 @@ const FLINT_PATTERNS: [&str; 3] = [
     r"[一-龥぀-ゟ゠-ヿ]+",
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ];
+
+/// LFM3 pre-tokenizer (llama.cpp `LLAMA_VOCAB_PRE_TYPE_LLAMA3`, selected by
+/// `tokenizer.ggml.pre = lfm2`): one regex, no NFC, and `ignore_merges`.
+const LFM2_PATTERN: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// Spark pre-tokenizer (llama.cpp `LLAMA_VOCAB_PRE_TYPE_SPARK2_5`): digit runs
 /// of up to three, CJK runs, words, punctuation and whitespace, then single
@@ -239,13 +244,15 @@ fn tokenizer(file: &GgufFile, vocab: usize) -> Result<(Tokenizer, Vec<u32>)> {
     }
     // Qwen3.5 text is NFC-normalized before splitting; llama.cpp's Flint
     // tokenizer is not, so combining marks stay separate tokens.
-    let (patterns, nfc): (&[&str], bool) = match text("tokenizer.ggml.pre")? {
-        "qwen35" => (&[QWEN35_PATTERN], true),
-        "flint" => (&FLINT_PATTERNS, false),
-        "spark2_5" => (&SPARK_PATTERNS, false),
+    let pre = text("tokenizer.ggml.pre")?;
+    let (patterns, nfc, ignore_merges): (&[&str], bool, bool) = match pre {
+        "qwen35" => (&[QWEN35_PATTERN], true, false),
+        "flint" => (&FLINT_PATTERNS, false, false),
+        "spark2_5" => (&SPARK_PATTERNS, false, false),
+        "lfm2" => (&[LFM2_PATTERN], false, true),
         other => {
             return Err(Error::Tokenizer(format!(
-                "hybrid GGUF pre-tokenizer {other:?} is not supported (qwen35, flint, spark2_5)"
+                "hybrid GGUF pre-tokenizer {other:?} is not supported (qwen35, flint, spark2_5, lfm2)"
             )));
         }
     };
@@ -281,8 +288,14 @@ fn tokenizer(file: &GgufFile, vocab: usize) -> Result<(Tokenizer, Vec<u32>)> {
             "tokenizer vocabulary exceeds embedding rows".into(),
         ));
     }
-    let tokenizer =
-        Tokenizer::from_gguf_bpe_with_patterns(&tokens, &merges, &types, patterns, nfc)?;
+    let tokenizer = Tokenizer::from_gguf_bpe_with_patterns(
+        &tokens,
+        &merges,
+        &types,
+        patterns,
+        nfc,
+        ignore_merges,
+    )?;
     let eos = config::uint(md, "tokenizer.ggml.eos_token_id")? as u32;
     let mut eos_ids = vec![eos];
     // Architectures that list their end-of-generation tokens use that list.
