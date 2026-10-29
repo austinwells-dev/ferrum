@@ -1,4 +1,4 @@
-# Greedy output and memory line at 0b95fb0 (all three commits after aa2b402), 29 October 2026, same machine.
+# Greedy output and memory line with all three commits after aa2b402 applied (built from the disk-cache commit), 29 October 2026, same machine.
 # target/release/ferrum hybrid --model MODEL --raw --prompt 'The capital of France is' --max-new-tokens 48
 # The md5 of stdout matches regression-2026-10-29.txt on experimental ab8f57e and on aa2b402 for every model.
 Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf md5 b7587183510804ec010b930f941ed75f | measured: weights+scratch 17114 MiB (predicted 17116), state 5183 MiB (predicted 5184)
