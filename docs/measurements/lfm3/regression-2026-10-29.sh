@@ -1,6 +1,21 @@
 #!/bin/zsh
 # LFM3 (#8) regression vs experimental ec14e94: greedy, memory, KLD, A-B-B-A bench.
-# Run under: caffeinate -dims zsh run.sh > record.txt 2>&1
+# This is the script as it ran on 2026-10-29, with only these comments added.
+# Run under: caffeinate -dims zsh regression-2026-10-29.sh > regression-2026-10-29.txt 2>&1
+#
+# Setup it expects in its own directory W (it creates none of it):
+#   git worktree add --detach $W/base ec14e94
+#   git worktree add --detach $W/branch d691ca6
+#   (cd $W/<each> && cargo build --release --bin ferrum --example hybrid_bench --example hybrid_kld)
+#   mkdir -p $W/out
+#   corpus.txt, in this order (chunks are positional, so order matters):
+#     (git show ec14e94:README.md; for f in $(git ls-tree --name-only ec14e94 docs/ | grep '\.md$' | sort); do git show ec14e94:$f; done) > $W/corpus.txt
+# Model and repo paths below are this machine's.
+#
+# Known weaknesses, kept as run: the hybrid_kld and hybrid_bench lines pipe into grep, so a
+# crash would print nothing rather than a failing status (every run in the record printed its
+# results), and check_unlocked passes if ioreg stops printing IOConsoleLocked (it printed
+# "No" before every run in the record).
 set -u
 W=${0:A:h}
 REPO=/Users/austinwells/Documents/ferrum

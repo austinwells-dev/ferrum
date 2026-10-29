@@ -89,7 +89,7 @@ Run on 29 October 2026 against separate builds of `ec14e94` (before #8) and `d69
 | Tiel | pp2048 | 835.77 (814.23–835.77) | 814.69 (804.44–814.69) |
 | Tiel | tg128 | 38.83 (38.62–38.83) | 39.22 (38.99–39.22) |
 
-Every branch best is inside the base's range or above it. Tiel pp2048 is the exception to watch: the base's best is its first run, and all four branch runs sit at or below the base's slowest, medians 821.7 against 813.5 (about 1% lower). That is within this bench's spread, so it neither shows a slowdown nor rules one out.
+Every branch best is inside the base's range or above it. Tiel pp2048 is the exception to watch: the base's best is its first run, and the branch's four runs (804.44–814.69) sit at or within 0.5 of the base's slowest (814.23), medians 821.7 against 813.5 (about 1% lower). That is within this bench's spread, so it neither shows a slowdown nor rules one out.
 
 ## LFM3-VL-2B
 
