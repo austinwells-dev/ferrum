@@ -4,7 +4,7 @@ Instructions for anyone changing this repository, human or agent. They describe 
 
 ## What this is
 
-A single Rust crate that runs LLMs on Apple Silicon with its own Metal kernels. The three apps (`ferrum-tui`, `ferrum-server`, `ferrum-cli`) run only the **hybrid engine** (`src/hybrid`, plus `vision`, `tokenizer`, `loader`, `tensor` and `metal`). The older general transformer engine (`model`, `ops`, `nn`, `generation`, `sampling`, `quantization`, `reference`, `metal/legacy.rs`) is behind the `legacy-engine` cargo feature, off by default, together with `tests/`, `benches/` and the non-`hybrid_` examples.
+A single Rust crate that runs LLMs on Apple Silicon with its own Metal kernels. The three apps (`ferrum-tui`, `ferrum-server`, `ferrum-cli`) run only the **hybrid engine** (`src/hybrid`, plus `vision`, `tokenizer`, `loader`, `tensor` and `metal`) and, for image generation, `diffusion`. The older general transformer engine (`model`, `ops`, `nn`, `generation`, `sampling`, `quantization`, `reference`, `metal/legacy.rs`) is behind the `legacy-engine` cargo feature, off by default, together with `tests/`, `benches/` and the non-`hybrid_` examples.
 
 Start with [docs/README.md](docs/README.md) (guides) and [docs/architecture.md](docs/architecture.md) (current design). [docs/history/](docs/history/) is a record of how things were built and is not kept up to date: don't treat it as a description of the current code.
 

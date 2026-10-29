@@ -13,12 +13,14 @@ Ferrum runs 27B–35B language models on a 32 GB Mac, at llama.cpp's speed on th
 
 You give it a model file and then either chat in the terminal, use the full-screen TUI (chat, a sandboxed coding agent, and a benchmarking tool), or run a local server that speaks the **OpenAI** and **Anthropic** APIs, so existing clients and coding agents work with it unchanged.
 
-> **Experimental branch.** Three additions here are not on `main` yet and are not production-ready; their flags and behaviour may change:
+> **Experimental branch.** These additions are not on `main` yet and are not production-ready; their flags and behaviour may change:
 > - **MLX checkpoints.** MLX 4-bit Qwen3.5-family checkpoint directories load, but only the 27B is validated.
 > - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets, 16-row DFlash2 blocks, and sampled output identical to plain decoding.
-> - **Concurrency.** The server now supports up to 8 concurrent users and has better multi user caching to prevent long uncached prefill during multi agent/task use cases
+> - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts.
+> - **Image generation.** Qwen-Image-2.1-Turbo drawing and editing in the CLI, server and TUI, and the TUI tools `generate_image` and `view_image`.
+> - **LFM3.** LiquidAI LFM3-1.7B text and LFM3-VL-2B still images.
 >
-> GGUF models without these flags behave as on `main`. Details and known gaps: [docs/experimental.md](docs/experimental.md#mlx-4-bit-checkpoints).
+> Everything else behaves as on `main`. Details and known gaps: [docs/experimental.md](docs/experimental.md).
 
 ## Highlights
 

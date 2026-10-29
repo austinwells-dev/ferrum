@@ -1,8 +1,8 @@
-# Experimental: Flint, Spark, LFM3, MLX checkpoints and KFlash
+# Experimental: Flint, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation
 
-> **Experimental.** This page covers Flint, Spark and LFM3 support, MLX 4-bit checkpoints, and KFlash speculative decoding (ported from Kapitsa). None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
+> **Experimental.** This page covers Flint, Spark and LFM3 support, MLX 4-bit checkpoints, KFlash speculative decoding (ported from Kapitsa), the server's parallel requests, and image generation. None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
 
-Contents: [Flint](#what-works) · [Spark-X2.6-4B](#spark-x26-4b) · [LFM3-1.7B](#lfm3-17b) · [LFM3-VL-2B](#lfm3-vl-2b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding)
+Contents: [Flint](#what-works) · [Spark-X2.6-4B](#spark-x26-4b) · [LFM3-1.7B](#lfm3-17b) · [LFM3-VL-2B](#lfm3-vl-2b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding) · [Parallel requests](#parallel-requests) · [Image generation](#image-generation)
 
 ## What works
 
@@ -196,6 +196,24 @@ Against Kapitsa through each server (same prompts): 82–91% of its greedy speed
 - Cycle costs are wall time, not GPU time, so a busy GPU or a hot Mac moves the learned table; a row count's first cycle in a process (pipeline builds) is left out.
 - MoE targets keep chains: every tree row routes to its own experts. Kapitsa's dynamic MoE trees were not ported.
 - Prompt lookup's trees stay a test vehicle and are not offered by the TUI.
+
+# Parallel requests
+
+`ferrum-server --parallel N` (1–8) gives each of N concurrent requests its own session (a *slot*) with its own K/V cache, recurrent state and snapshots, on shared weights. Requests go to the slot whose cache suits them best, so each conversation keeps its cache while others run. Usage and routing: [server.md](server.md#parallel-requests).
+
+## Validation
+
+Against `experimental` at `12a6e09` on a 32 GB M5, with Qwen3.8-27B UD-Q4_K_XL, Tiel-Coder-35B-A3B UD-IQ4_XS and Spark-X2.6-4B Q4_K_M ([parallel-slots-2026-10](measurements/parallel-slots-2026-10/README.md)):
+
+- Greedy server output is identical to the base with 1, 4 and 8 slots, with the requests sent at once, and with a DFlash drafter at 1 and 4 slots.
+- KLD against llama.cpp, `hybrid_session_check`, `hybrid_spec_check` and the memory plan (within 3 MiB) are unchanged.
+- With 8 users on Tiel, each with its own ~1,280-token system prompt, a user's third turn reuses 1,307 of 1,331 prompt tokens and takes 145 ms to prefill, against 0 reused and 1,895 ms with one slot.
+
+## Known gaps
+
+- Slots take turns on the GPU rather than being batched, so total throughput stays about that of one request (Tiel: 33–35 tok/s total from 1 to 8 users), and each request's own rate drops as users are added.
+- The drafter runs on slot 0 only, so its speedup shrinks as users are added.
+- Each slot reserves its own K/V and state, so N slots fit a shorter context each; the 27B fits 8 slots at 4,096 tokens but not 8,192.
 
 # Image generation
 
