@@ -9,7 +9,7 @@ use super::{
     kflash::{Budget, Calibration, MAX_ROWS, Record, SAVE_EVERY},
     speculative::{DraftTree, Drafter, SpecStats, accept_walk},
 };
-use crate::{DType, Error, MetalDevice, Result, Tensor};
+use crate::{Error, MetalDevice, Result, Tensor};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone)]
@@ -139,8 +139,15 @@ pub struct Completion {
 
 struct Snapshot {
     position: usize,
+    /// Recurrent state, then sliding-window K/V rings (`snapshot_tensors`).
     tensors: Vec<Tensor>,
+    /// The state's `written` mark the saved rings go with.
+    written: usize,
     stamp: u64,
+    /// Evicted last: the start of the reply to the latest user message,
+    /// where the next turn diverges once the template drops that reply's
+    /// reasoning.
+    pinned: bool,
 }
 
 /// Shrink a reusable prefix of `common` tokens so it never cuts through an
@@ -186,6 +193,9 @@ pub struct Session {
     pub spec_stats: SpecStats,
     /// Images of the next prompt, taken by the next `prefill`/`generate`.
     pending_media: Vec<ImageSpan>,
+    /// Where the next generation also snapshots, and whether to pin it
+    /// (`set_checkpoint`).
+    checkpoint: Option<(usize, bool)>,
 }
 
 impl Session {
@@ -200,14 +210,12 @@ impl Session {
         let state = HybridState::new(d, &model.config, capacity, model.max_forward_rows())?;
         let mut slots = Vec::with_capacity(snapshots);
         for _ in 0..snapshots {
-            let tensors = state
-                .recurrent()
-                .map(|t| Tensor::zeros_resident(d, [t.numel()], DType::F32))
-                .collect::<Result<Vec<_>>>()?;
             slots.push(Snapshot {
                 position: 0,
-                tensors,
+                tensors: state.alloc_snapshot(d)?,
+                written: 0,
                 stamp: 0,
+                pinned: false,
             });
         }
         Ok(Self {
@@ -223,6 +231,7 @@ impl Session {
             tree_rule: None,
             spec_stats: SpecStats::default(),
             pending_media: Vec::new(),
+            checkpoint: None,
         })
     }
 
@@ -232,6 +241,17 @@ impl Session {
     /// `prefill` or `generate`; without a call the prompt has no images.
     pub fn set_media(&mut self, media: Vec<ImageSpan>) {
         self.pending_media = media;
+    }
+
+    /// Also snapshot the next prompt at `position` (when it lies past the
+    /// reused prefix), pinned when `pin`. A chat passes where the reply's
+    /// header starts: templates rewrite a past reply (dropping its
+    /// reasoning) once a newer user message follows it, so the next turn
+    /// diverges there, before the snapshot at the end of the prompt. Pin it
+    /// when the prompt ends in a user message, so tool rounds that follow
+    /// don't evict it. Consumed by the next `generate`/`begin`.
+    pub fn set_checkpoint(&mut self, position: usize, pin: bool) {
+        self.checkpoint = Some((position, pin));
     }
 
     /// Attach a drafter (enabling the target's verify buffers) and clear the
@@ -382,6 +402,7 @@ impl Session {
         for s in &mut self.snapshots {
             s.position = 0;
             s.stamp = 0;
+            s.pinned = false;
         }
         if self.drafter.is_some() {
             self.drafter_rewind = Some(0);
@@ -435,25 +456,45 @@ impl Session {
             return Ok(common);
         }
         // Without recurrent state the K/V cache is valid at every prefix its
-        // rings still hold, so resume exactly at the divergence. Most drafters
-        // rewind only to their own snapshots, so they take the snapshot path.
+        // rings still hold, so resume exactly at the divergence: from the
+        // rings themselves, or from a snapshot's copy of them taken at or
+        // past it (on this same sequence, so its rows below `common` are
+        // ours). Most drafters rewind only to their own snapshots, so they
+        // take the snapshot path.
         if common > 0
             && !self.state.has_recurrent()
             && self.drafter.as_ref().is_none_or(|t| t.rewinds_anywhere())
-            && self.state.can_resume(common)
         {
-            self.state.restore_recurrent(d, &[], common)?;
-            self.tokens.truncate(common);
-            if self.drafter.is_some() {
-                self.drafter_rewind = Some(common);
-            }
-            for s in &mut self.snapshots {
-                if s.position > common {
-                    s.position = 0;
-                    s.stamp = 0;
+            let state = &self.state;
+            let from = if state.can_resume(common) {
+                Some(None)
+            } else {
+                self.snapshots
+                    .iter()
+                    .filter(|s| s.position >= common && state.can_resume_from(common, s.written))
+                    .min_by_key(|s| s.position)
+                    .map(Some)
+            };
+            if let Some(from) = from {
+                match from {
+                    Some(s) => self
+                        .state
+                        .restore_snapshot(d, &s.tensors, common, s.written)?,
+                    None => self.state.restore_snapshot(d, &[], common, 0)?,
                 }
+                self.tokens.truncate(common);
+                if self.drafter.is_some() {
+                    self.drafter_rewind = Some(common);
+                }
+                for s in &mut self.snapshots {
+                    if s.position > common {
+                        s.position = 0;
+                        s.stamp = 0;
+                        s.pinned = false;
+                    }
+                }
+                return Ok(common);
             }
-            return Ok(common);
         }
         // Diverged inside the cached sequence: resume from the deepest
         // snapshot at or before the divergence point.
@@ -461,7 +502,11 @@ impl Session {
         let best = self
             .snapshots
             .iter_mut()
-            .filter(|s| s.position > 0 && s.position <= common && state.can_resume(s.position))
+            .filter(|s| {
+                s.position > 0
+                    && s.position <= common
+                    && state.can_resume_from(s.position, s.written)
+            })
             .max_by_key(|s| s.position);
         match best {
             Some(snapshot) => {
@@ -469,7 +514,7 @@ impl Session {
                 snapshot.stamp = self.clock;
                 let position = snapshot.position;
                 self.state
-                    .restore_recurrent(d, &snapshot.tensors, position)?;
+                    .restore_snapshot(d, &snapshot.tensors, position, snapshot.written)?;
                 self.tokens.truncate(position);
                 if self.drafter.is_some() {
                     self.drafter_rewind = Some(position);
@@ -479,6 +524,7 @@ impl Session {
                     if s.position > position {
                         s.position = 0;
                         s.stamp = 0;
+                        s.pinned = false;
                     }
                 }
                 Ok(position)
@@ -490,21 +536,46 @@ impl Session {
         }
     }
 
-    fn snapshot(&mut self, d: &MetalDevice) -> Result<()> {
+    /// Snapshot the state at its current length into the least recently
+    /// used slot, sparing the pinned one; `pin` makes this the pinned one.
+    fn snapshot(&mut self, d: &MetalDevice, pin: bool) -> Result<()> {
         let position = self.tokens.len();
-        if position == 0 || self.snapshots.iter().any(|s| s.position == position) {
+        if position == 0 {
             return Ok(());
         }
         self.clock += 1;
-        let Some(slot) = self.snapshots.iter_mut().min_by_key(|s| s.stamp) else {
+        let existing = self.snapshots.iter().position(|s| s.position == position);
+        let index = existing.or_else(|| {
+            let pinned = self.snapshots.iter().position(|s| s.pinned);
+            let lru = |spare: Option<usize>| {
+                (0..self.snapshots.len())
+                    .filter(|&i| Some(i) != spare)
+                    .min_by_key(|&i| self.snapshots[i].stamp)
+            };
+            match (pin, pinned) {
+                (true, Some(i)) => Some(i),
+                (_, spare) => lru(spare).or(spare),
+            }
+        });
+        let Some(index) = index else {
             return Ok(());
         };
-        self.state.save_recurrent(d, &slot.tensors)?;
-        slot.position = position;
-        slot.stamp = self.clock;
-        if let Some(drafter) = self.drafter.as_mut() {
-            drafter.snapshot(d, position)?;
+        if existing.is_none() {
+            let slot = &mut self.snapshots[index];
+            slot.written = self.state.save_snapshot(d, &slot.tensors)?;
+            slot.position = position;
+            if let Some(drafter) = self.drafter.as_mut() {
+                drafter.snapshot(d, position)?;
+            }
         }
+        if pin {
+            for s in &mut self.snapshots {
+                s.pinned = false;
+            }
+        }
+        let slot = &mut self.snapshots[index];
+        slot.stamp = self.clock;
+        slot.pinned |= pin;
         Ok(())
     }
 
@@ -530,7 +601,8 @@ impl Session {
         for piece in tokens[reused..].chunks(model.chunk()) {
             self.extend(d, model, piece)?;
         }
-        self.snapshot(d)?;
+        self.checkpoint = None;
+        self.snapshot(d, false)?;
         Ok(reused)
     }
 
@@ -599,6 +671,23 @@ impl Session {
             eos: eos.to_vec(),
             generated: Vec::new(),
             next: None,
+            checkpoint: self
+                .checkpoint
+                .take()
+                .filter(|&(at, _)| at >= reused)
+                .map(|(at, pin)| {
+                    // Without recurrent state the end-of-prompt snapshot's rings
+                    // resume anywhere before it, so pin that one rather than split
+                    // the prefill (which would move a chunk boundary).
+                    (
+                        if self.state.has_recurrent() {
+                            at
+                        } else {
+                            prompt.len() - 1
+                        },
+                        pin,
+                    )
+                }),
             start,
             prefill: Duration::ZERO,
             decode_start: start,
@@ -668,7 +757,15 @@ impl Session {
         let body_len = g.prompt.len() - g.reused - 1;
         if g.processed < body_len {
             let at = g.reused + g.processed;
-            let n = model.chunk().min(body_len - g.processed);
+            let mut n = model.chunk().min(body_len - g.processed);
+            if let Some((checkpoint, pin)) = g.checkpoint {
+                if checkpoint == at {
+                    self.snapshot(d, pin)?;
+                    g.checkpoint = None;
+                } else if checkpoint < at + n {
+                    n = checkpoint - at;
+                }
+            }
             self.extend(d, model, &g.prompt[at..at + n])?;
             g.processed += n;
             if !hooks.prefill(g.processed, body_len + 1) {
@@ -676,7 +773,11 @@ impl Session {
             }
             return Ok(None);
         }
-        self.snapshot(d)?;
+        let pin = g
+            .checkpoint
+            .take()
+            .is_some_and(|(at, pin)| pin && at == self.tokens.len());
+        self.snapshot(d, pin)?;
         let tail = [g.prompt[g.prompt.len() - 1]];
         let produced = self.step(d, model, &tail, g.output())?;
         hooks.prefill(body_len + 1, body_len + 1);
@@ -902,6 +1003,8 @@ pub struct Generation {
     generated: Vec<u32>,
     /// The token to emit next; None while the prompt is still prefilling.
     next: Option<u32>,
+    /// Snapshot when the prefill reaches this position (`set_checkpoint`).
+    checkpoint: Option<(usize, bool)>,
     start: Instant,
     prefill: Duration,
     decode_start: Instant,

@@ -357,10 +357,14 @@ impl HybridState {
     /// Whether every K/V row a forward at `position` reads is still intact:
     /// a ring layer must not have overwritten the start of that window.
     pub(crate) fn can_resume(&self, position: usize) -> bool {
+        self.can_resume_from(position, self.written)
+    }
+    /// `can_resume` for rings as they were when `written` positions had been
+    /// written (a snapshot's own copy of them).
+    pub(crate) fn can_resume_from(&self, position: usize, written: usize) -> bool {
         self.ring.iter().zip(&self.window).all(|(&ring, &window)| {
             ring == 0
-                || (position + 1).saturating_sub(window) / 64 * 64
-                    >= self.written.saturating_sub(ring)
+                || (position + 1).saturating_sub(window) / 64 * 64 >= written.saturating_sub(ring)
         })
     }
     /// The images of the sequence being processed. Spans past `len` are the
@@ -453,38 +457,72 @@ impl HybridState {
     pub(crate) fn has_recurrent(&self) -> bool {
         self.recurrent().next().is_some()
     }
-    /// Copy the recurrent state into `dst` (same order and shapes).
-    pub(crate) fn save_recurrent(&self, d: &MetalDevice, dst: &[Tensor]) -> Result<()> {
-        let e = d.execution_with_shared_encoder(true)?;
-        for (src, dst) in self.recurrent().zip(dst) {
-            copy(d, src, dst)?;
-        }
-        e.finish()
+    /// What a snapshot copies: the recurrent tensors, then the K/V rings of
+    /// sliding-window layers. A ring overwrites its oldest rows, so without
+    /// its own copy a snapshot stops being resumable once the conversation
+    /// has moved a window and a chunk past it.
+    pub(crate) fn snapshot_tensors(&self) -> impl Iterator<Item = &Tensor> {
+        let rings = self
+            .ring
+            .iter()
+            .zip(self.k.iter().zip(&self.v))
+            .filter(|(ring, _)| **ring > 0)
+            .flat_map(|(_, (k, v))| k.iter().chain(v));
+        self.recurrent().chain(rings)
     }
-    /// Restore recurrent state saved at `position`. K/V rows up to
-    /// `position` are unchanged because the cache is append-only.
-    pub(crate) fn restore_recurrent(
+    /// Buffers for one `save_snapshot`.
+    pub(crate) fn alloc_snapshot(&self, d: &MetalDevice) -> Result<Vec<Tensor>> {
+        self.snapshot_tensors()
+            .map(|t| Tensor::zeros_resident(d, [t.byte_size() / 4], DType::F32))
+            .collect()
+    }
+    /// Copy `snapshot_tensors` into `dst` (same order, same byte sizes).
+    /// Returns the `written` mark the copied rings go with.
+    pub(crate) fn save_snapshot(&self, d: &MetalDevice, dst: &[Tensor]) -> Result<usize> {
+        let e = d.execution_with_shared_encoder(true)?;
+        for (src, dst) in self.snapshot_tensors().zip(dst) {
+            copy_bytes(d, src, dst)?;
+        }
+        e.finish()?;
+        Ok(self.written)
+    }
+    /// Restore a snapshot saved at `position` with `written` (`save_snapshot`),
+    /// or with `src` empty, only rewind to `position`: K/V rows of full
+    /// attention up to `position` are unchanged because that cache is
+    /// append-only.
+    pub(crate) fn restore_snapshot(
         &mut self,
         d: &MetalDevice,
         src: &[Tensor],
         position: usize,
+        written: usize,
     ) -> Result<()> {
         if position > self.len && self.valid {
             return Err(Error::Cache(
                 "snapshot lies beyond the cached sequence".into(),
             ));
         }
-        if !self.can_resume(position) {
+        let rings = !src.is_empty() && src.len() > self.recurrent().count();
+        let resumable = if rings {
+            self.can_resume_from(position, written)
+        } else {
+            self.can_resume(position)
+        };
+        if !resumable {
             return Err(Error::Cache(
                 "the sliding-window K/V ring no longer holds that position's window".into(),
             ));
         }
         self.valid = false;
         let e = d.execution_with_shared_encoder(true)?;
-        for (dst, src) in self.recurrent().zip(src) {
-            copy(d, src, dst)?;
+        let dst: Vec<&Tensor> = self.snapshot_tensors().collect();
+        for (dst, src) in dst.into_iter().zip(src) {
+            copy_bytes(d, src, dst)?;
         }
         e.finish()?;
+        if rings {
+            self.written = written;
+        }
         self.len = position;
         self.valid = true;
         self.verified = 0;
@@ -714,6 +752,25 @@ fn bx_state(
         &[conv_state.binding()],
         &Params::default().u(n)?.u(c.hidden)?.u(c.conv_kernel - 1)?.0,
         [c.hidden.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
+}
+
+/// `copy` of the raw bytes of two same-sized tensors of any type (a
+/// multiple of 4 bytes, as K/V rows and F32 state are).
+fn copy_bytes(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
+    let bytes = src.byte_size();
+    if dst.byte_size() != bytes || !bytes.is_multiple_of(4) {
+        return Err(Error::Shape("copy between different sizes".into()));
+    }
+    let n = bytes / 4;
+    d.dispatch_hybrid(
+        "h_copy",
+        &[src.binding()],
+        &[dst.binding()],
+        &Params::default().u(n)?.0,
+        [n.div_ceil(256), 1, 1],
         [256, 1, 1],
         0,
     )

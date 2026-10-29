@@ -430,6 +430,9 @@ pub struct ChatPrompt {
     /// Where its images sit in `tokens`.
     pub spans: Vec<ImageSpan>,
     pub text: String,
+    /// Where the reply's header starts, and whether the prompt ends in a
+    /// user message (`Session::set_checkpoint`).
+    pub checkpoint: Option<(usize, bool)>,
 }
 
 /// What a finished `Turn` produced.
@@ -823,6 +826,9 @@ impl Runtime {
         hooks: &mut impl ChatHooks,
     ) -> Result<Turn> {
         let starts_in_reasoning = prompt.text.trim_end().ends_with("<think>");
+        if let Some((at, pin)) = prompt.checkpoint {
+            self.slot_mut(slot).set_checkpoint(at, pin);
+        }
         let mut turn = self.start(
             slot,
             &prompt.tokens,
@@ -855,11 +861,39 @@ impl Runtime {
         let images = self.embed_images(&encoded, request.image_budget)?;
         let text = self.render_messages(&messages, request)?;
         let (tokens, spans) = self.expand_images(&text, &images)?;
+        let checkpoint = self
+            .reply_start(&messages, request, &text, &tokens)
+            .map(|at| {
+                let last = messages.last().and_then(|m| m["role"].as_str());
+                (at, last == Some("user"))
+            });
         Ok(ChatPrompt {
             tokens,
             spans,
             text,
+            checkpoint,
         })
+    }
+
+    /// The token position where the generation prompt (the reply's header)
+    /// begins in `tokens`, the rendered and tokenized `messages`: the same
+    /// render without it is a prefix of `text`, and the rest tokenizes on its
+    /// own to the tail of `tokens` (it opens with a special token, so the
+    /// split is clean). None when the template does not render that way.
+    fn reply_start(
+        &self,
+        messages: &[Json],
+        request: &ChatRequest,
+        text: &str,
+        tokens: &[u32],
+    ) -> Option<usize> {
+        let mut vars = request.template_vars.clone();
+        normalize_thinking(self.template.source(), &mut vars);
+        let tools = (!request.tools.is_empty()).then_some(&request.tools[..]);
+        let head = self.template.render(messages, tools, false, &vars).ok()?;
+        let tail = text.strip_prefix(head.as_str())?;
+        let tail = self.loaded.tokenizer.encode(tail).ok()?;
+        (!tail.is_empty() && tokens.ends_with(&tail)).then(|| tokens.len() - tail.len())
     }
 
     /// `start_chat` for a raw text completion.

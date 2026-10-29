@@ -310,16 +310,13 @@ impl HybridModel {
         for piece in tokens[..context].chunks(self.chunk()) {
             self.forward(d, &mut state, piece, Output::None)?;
         }
-        let saved = state
-            .recurrent()
-            .map(|t| Tensor::zeros_resident(d, [t.numel()], DType::F32))
-            .collect::<Result<Vec<_>>>()?;
-        state.save_recurrent(d, &saved)?;
+        let saved = state.alloc_snapshot(d)?;
+        let written = state.save_snapshot(d, &saved)?;
         let mut results = Vec::new();
         for &m in widths {
             let mut times = Vec::new();
             for rep in 0..reps + 2 {
-                state.restore_recurrent(d, &saved, context)?;
+                state.restore_snapshot(d, &saved, context, written)?;
                 let start = std::time::Instant::now();
                 self.forward(d, &mut state, &tokens[context..context + m], Output::Argmax)?;
                 if rep >= 2 {

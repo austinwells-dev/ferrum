@@ -179,7 +179,8 @@ pub fn plan_for_weights(
         weights,
         scratch: scratch_bytes(c, options.chunk, options.logit_rows),
         recurrent,
-        snapshots: options.snapshots * recurrent,
+        // A snapshot copies the recurrent state and the sliding-window rings.
+        snapshots: options.snapshots * (recurrent + kv_ring),
         kv_per_token,
         kv_ring,
         overhead: RUNTIME_OVERHEAD,
