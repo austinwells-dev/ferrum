@@ -74,6 +74,23 @@ Swift measured weights+scratch 16679 MiB (predicted 16682), state 182 (predicted
 
 The same command was run again on this branch after the LFM3-VL kernels, one model in memory. Both files produced the ids and the measured lines above. That is the regression check for the shared forward (the RoPE position table). It is not a new KLD and not an interleaved `hybrid_bench`.
 
+### After merge: KLD and interleaved bench
+
+Run on 29 October 2026 against separate builds of `ec14e94` (before #8) and `d691ca6` (#8 merged), with the bench hygiene from AGENTS.md ([regression-2026-10-29.txt](regression-2026-10-29.txt), script [regression-2026-10-29.sh](regression-2026-10-29.sh)). Greedy text (48 tokens) and the memory lines are identical between builds on both files, and KLD against llama.cpp is identical to every printed digit (Swift 0.000115, 99.51% top-1; Tiel 0.008244, 96.03%).
+
+`hybrid_bench --pp 512,2048 --tg 128`, A-B-B-A twice, best of 4 (range):
+
+| File | Test | `ec14e94` | `d691ca6` |
+|---|---|---|---|
+| Swift | pp512 | 170.28 (162.99–170.28) | 170.98 (165.48–170.98) |
+| Swift | pp2048 | 165.29 (161.51–165.29) | 164.46 (159.90–164.46) |
+| Swift | tg128 | 6.56 (6.44–6.56) | 6.53 (6.47–6.53) |
+| Tiel | pp512 | 866.75 (823.37–866.75) | 886.80 (867.38–886.80) |
+| Tiel | pp2048 | 835.77 (814.23–835.77) | 814.69 (804.44–814.69) |
+| Tiel | tg128 | 38.83 (38.62–38.83) | 39.22 (38.99–39.22) |
+
+Every branch best is inside the base's range or above it. Tiel pp2048 is the exception to watch: the base's best is its first run, and all four branch runs sit at or below the base's slowest, medians 821.7 against 813.5 (about 1% lower). That is within this bench's spread, so it neither shows a slowdown nor rules one out.
+
 ## LFM3-VL-2B
 
 Same machine and the same llama.cpp build. Language file and projector (the repo publishes no Q4_K_M projector; the pair is Q4_K_M language weights and a Q8_0 mmproj):
