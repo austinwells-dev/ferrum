@@ -1,0 +1,13 @@
+extend        prompt   73 tokens, reused   58: DIFFERENT (32 tokens, 0 verify steps, acceptance 0.00)
+  cached: [248068, 198, 8160, 579, 264, 7047, 1817, 25, 271, 16, 13, 220, 2972, 2014, 53983, 2570, 5396, 64700, 198, 256, 471, 2570, 1018, 25, 328, 6820, 1330, 777, 1149, 198, 256, 471]
+  fresh:  [248068, 198, 8160, 579, 264, 7047, 1817, 25, 271, 16, 13, 220, 2972, 2014, 53983, 2570, 5396, 64700, 198, 256, 471, 2570, 2640, 25, 328, 6820, 1330, 777, 1149, 198, 256, 471]
+rewind        prompt   20 tokens, reused   18: identical (0 tokens, 0 verify steps, acceptance 0.00)
+retry         prompt   19 tokens, reused   18: identical (32 tokens, 0 verify steps, acceptance 0.00)
+replace       prompt   16 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+extend again  prompt   73 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+pin           prompt   73 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+long turn     prompt  988 tokens, reused   72: identical (32 tokens, 0 verify steps, acceptance 0.00)
+later turn    prompt 1004 tokens, reused  987: identical (32 tokens, 0 verify steps, acceptance 0.00)
+pinned rewind prompt   77 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+  expected to resume at the pinned checkpoint, position 70
+FAIL

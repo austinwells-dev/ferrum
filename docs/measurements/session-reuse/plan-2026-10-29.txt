@@ -1,0 +1,23 @@
+# hybrid_plan Spark-X2.6-4B-Q4_K_M flint-UD-Q3_K_XL LFM3-VL-2B-Q4_K_M Qwen3.6-35B-A3B-IQ4_XS (Spark's GGUF names itself 'Dense F32')
+## experimental ab8f57e
+| model | K/V | KiB/token | auto context | K/V at auto context |
+|---|---|---|---|---|
+| Dense F32 | f16 | 36.0 | 564480 | 19.49 GiB |
+| Dense F32 | q8 | 19.1 | 1048576 | 19.19 GiB |
+| Flint Preview | f16 | 28.0 | 204288 | 5.53 GiB |
+| Flint Preview | q8 | 14.9 | 262144 | 3.76 GiB |
+| LFM3 VL 2B | f16 | 12.0 | 128000 | 1.47 GiB |
+| LFM3 VL 2B | q8 | 6.4 | 128000 | 0.78 GiB |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | f16 | 20.0 | 262144 | 5.00 GiB |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | q8 | 10.6 | 262144 | 2.66 GiB |
+## branch
+| model | K/V | KiB/token | auto context | K/V at auto context |
+|---|---|---|---|---|
+| Dense F32 | f16 | 36.0 | 557824 | 19.26 GiB |
+| Dense F32 | q8 | 19.1 | 1048576 | 19.19 GiB |
+| Flint Preview | f16 | 28.0 | 198912 | 5.39 GiB |
+| Flint Preview | q8 | 14.9 | 262144 | 3.76 GiB |
+| LFM3 VL 2B | f16 | 12.0 | 128000 | 1.47 GiB |
+| LFM3 VL 2B | q8 | 6.4 | 128000 | 0.78 GiB |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | f16 | 20.0 | 262144 | 5.00 GiB |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | q8 | 10.6 | 262144 | 2.66 GiB |

@@ -186,7 +186,7 @@ Some of the engineering choices:
 
 - **Quantized weights stay in their GGML block format** and are read straight into Metal buffers. Decode uses GEMV kernels tuned per quant type; prefill dequantizes tiles to F16 and runs on the M5's TensorOps matrix units with F32 accumulation.
 - **Nothing allocates after load.** KV cache, recurrent DeltaNet state and all scratch are sized by the planner once. Prefill is chunked with flash-style attention, so no activation grows with the square of the sequence length.
-- **Conversation caching for hybrid models.** Linear-attention state can't be rewound like a KV cache, so the session keeps recurrent-state snapshots. A request that extends the previous conversation only processes the new tokens.
+- **Conversation caching for hybrid models.** Linear-attention state can't be rewound like a KV cache, and a sliding-window cache overwrites its oldest rows, so the session keeps snapshots of both, including one where the latest reply starts (chat templates rewrite past replies there). A request that extends the previous conversation only processes what is new or rewritten.
 - **Speculative verification is cheap.** Batched GEMV handles 2–3 rows and a narrow 16×64 TensorOps tile handles 4–32 rows. A 16-row verify on the 27B used to cost 3.5× a single-token step and now costs 1.5×.
 - **Safety boundary.** The library is `#![deny(unsafe_code)]` everywhere except the Metal backend, where six small, documented `unsafe` blocks do FFI and shared-memory mapping. Tensors are immutable once published, and command completion is checked before any result is readable.
 
