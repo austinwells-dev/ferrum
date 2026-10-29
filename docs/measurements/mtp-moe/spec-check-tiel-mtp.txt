@@ -1,0 +1,4 @@
+44 verify steps, 2.18 tokens/step, 14 corrupted blocks
+first divergence at token 59: reference margin 0.0012 (near-tie if small)
+verify rows vs single-row decode over 9 positions: max |dlogit| 0.0101, max KL 1.55e-6
+replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 21.1), argmax 2336 vs 2336

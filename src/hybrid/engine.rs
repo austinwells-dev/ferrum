@@ -230,6 +230,8 @@ pub struct HybridState {
     /// One past the highest position whose K/V was ever written: ring rows of
     /// positions below `written - ring` have been overwritten.
     written: usize,
+    /// Format of the K/V caches (`kv_planes`).
+    kv_cache: KvCache,
 }
 
 /// Rows of the K/V ring of sliding-window `layer` when a forward adds at most
@@ -286,6 +288,7 @@ impl HybridState {
             window: Vec::new(),
             max_rows,
             written: 0,
+            kv_cache: c.kv_cache,
         };
         for layer in 0..c.layers {
             let ring = if c.is_attention(layer) {
@@ -357,10 +360,14 @@ impl HybridState {
     /// Whether every K/V row a forward at `position` reads is still intact:
     /// a ring layer must not have overwritten the start of that window.
     pub(crate) fn can_resume(&self, position: usize) -> bool {
+        self.can_resume_from(position, self.written)
+    }
+    /// `can_resume` for rings as they were when `written` positions had been
+    /// written (a snapshot's own copy of them).
+    pub(crate) fn can_resume_from(&self, position: usize, written: usize) -> bool {
         self.ring.iter().zip(&self.window).all(|(&ring, &window)| {
             ring == 0
-                || (position + 1).saturating_sub(window) / 64 * 64
-                    >= self.written.saturating_sub(ring)
+                || (position + 1).saturating_sub(window) / 64 * 64 >= written.saturating_sub(ring)
         })
     }
     /// The images of the sequence being processed. Spans past `len` are the
@@ -453,38 +460,113 @@ impl HybridState {
     pub(crate) fn has_recurrent(&self) -> bool {
         self.recurrent().next().is_some()
     }
-    /// Copy the recurrent state into `dst` (same order and shapes).
-    pub(crate) fn save_recurrent(&self, d: &MetalDevice, dst: &[Tensor]) -> Result<()> {
-        let e = d.execution_with_shared_encoder(true)?;
-        for (src, dst) in self.recurrent().zip(dst) {
-            copy(d, src, dst)?;
-        }
-        e.finish()
+    /// What a snapshot copies: the recurrent tensors, then the K/V rings of
+    /// sliding-window layers. A ring overwrites its oldest rows, so without
+    /// its own copy a snapshot stops being resumable once the conversation
+    /// has moved a window and a chunk past it.
+    pub(crate) fn snapshot_tensors(&self) -> impl Iterator<Item = &Tensor> {
+        let rings = self
+            .ring
+            .iter()
+            .zip(self.k.iter().zip(&self.v))
+            .filter(|(ring, _)| **ring > 0)
+            .flat_map(|(_, (k, v))| k.iter().chain(v));
+        self.recurrent().chain(rings)
     }
-    /// Restore recurrent state saved at `position`. K/V rows up to
-    /// `position` are unchanged because the cache is append-only.
-    pub(crate) fn restore_recurrent(
+    /// K/V caches of full-attention layers (one row per position), K then V
+    /// per layer: what a session saved to disk stores row by row.
+    pub(crate) fn kv_linear(&self) -> impl Iterator<Item = &Tensor> {
+        self.ring
+            .iter()
+            .zip(self.k.iter().zip(&self.v))
+            .filter(|(ring, _)| **ring == 0)
+            .flat_map(|(_, (k, v))| k.iter().chain(v))
+    }
+    pub(crate) fn written(&self) -> usize {
+        self.written
+    }
+    /// The byte planes of a `kv_linear` cache as (offset, bytes per row):
+    /// the whole row for F16; for Q8 every row's values, then every row's
+    /// scales (`KvCache::Q8`).
+    pub(crate) fn kv_planes(&self, t: &Tensor) -> Vec<(usize, usize)> {
+        let rows = t.shape().dimensions()[0];
+        let row = t.byte_size() / rows;
+        debug_assert_eq!(t.byte_size(), rows * row);
+        match self.kv_cache {
+            KvCache::F16 => vec![(0, row)],
+            KvCache::Q8 => {
+                // `row` = width + width / 16 (one F16 scale per 32 values).
+                debug_assert_eq!(row % 17, 0);
+                let width = row / 17 * 16;
+                // `upload` copies whole 4-byte words of scales.
+                debug_assert_eq!(width % 64, 0);
+                vec![(0, width), (rows * width, row - width)]
+            }
+        }
+    }
+    /// Take `len` positions whose K/V rows were written from disk, with
+    /// `written` for the rings a snapshot restore then copies in.
+    pub(crate) fn adopt(&mut self, len: usize, written: usize, media: Vec<ImageSpan>) {
+        self.len = len;
+        self.written = written;
+        self.media = media;
+        self.valid = true;
+        self.verified = 0;
+        self.verified_tree.clear();
+    }
+    /// Buffers for one `save_snapshot`.
+    pub(crate) fn alloc_snapshot(&self, d: &MetalDevice) -> Result<Vec<Tensor>> {
+        self.snapshot_tensors()
+            .map(|t| Tensor::zeros_resident(d, [t.byte_size() / 4], DType::F32))
+            .collect()
+    }
+    /// Copy `snapshot_tensors` into `dst` (same order, same byte sizes).
+    /// Returns the `written` mark the copied rings go with.
+    pub(crate) fn save_snapshot(&self, d: &MetalDevice, dst: &[Tensor]) -> Result<usize> {
+        let e = d.execution_with_shared_encoder(true)?;
+        for (src, dst) in self.snapshot_tensors().zip(dst) {
+            copy_bytes(d, src, dst)?;
+        }
+        e.finish()?;
+        Ok(self.written)
+    }
+    /// Restore a snapshot saved at `position` with `written` (`save_snapshot`),
+    /// or with `src` empty, only rewind to `position`: K/V rows of full
+    /// attention up to `position` are unchanged because that cache is
+    /// append-only.
+    pub(crate) fn restore_snapshot(
         &mut self,
         d: &MetalDevice,
         src: &[Tensor],
         position: usize,
+        written: usize,
     ) -> Result<()> {
         if position > self.len && self.valid {
             return Err(Error::Cache(
                 "snapshot lies beyond the cached sequence".into(),
             ));
         }
-        if !self.can_resume(position) {
+        let rings = !src.is_empty() && src.len() > self.recurrent().count();
+        let resumable = if rings {
+            self.can_resume_from(position, written)
+        } else {
+            self.can_resume(position)
+        };
+        if !resumable {
             return Err(Error::Cache(
                 "the sliding-window K/V ring no longer holds that position's window".into(),
             ));
         }
         self.valid = false;
         let e = d.execution_with_shared_encoder(true)?;
-        for (dst, src) in self.recurrent().zip(src) {
-            copy(d, src, dst)?;
+        let dst: Vec<&Tensor> = self.snapshot_tensors().collect();
+        for (dst, src) in dst.into_iter().zip(src) {
+            copy_bytes(d, src, dst)?;
         }
         e.finish()?;
+        if rings {
+            self.written = written;
+        }
         self.len = position;
         self.valid = true;
         self.verified = 0;
@@ -714,6 +796,36 @@ fn bx_state(
         &[conv_state.binding()],
         &Params::default().u(n)?.u(c.hidden)?.u(c.conv_kernel - 1)?.0,
         [c.hidden.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
+}
+
+/// Write `data` into `dst` at byte `offset` through a staging buffer.
+pub(crate) fn upload(d: &MetalDevice, dst: &Tensor, offset: usize, data: &[u8]) -> Result<()> {
+    let size = dst.dtype().size_bytes();
+    if !offset.is_multiple_of(size) || !data.len().is_multiple_of(4) || data.is_empty() {
+        return Err(Error::Shape("unaligned upload".into()));
+    }
+    let staged = Tensor::staged(d, [data.len() / 4], DType::F32, data)?;
+    let view = dst.view(offset / size, [data.len() / size])?;
+    copy_bytes(d, &staged, &view)
+}
+
+/// `copy` of the raw bytes of two same-sized tensors of any type (a
+/// multiple of 4 bytes, as K/V rows and F32 state are).
+fn copy_bytes(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
+    let bytes = src.byte_size();
+    if dst.byte_size() != bytes || !bytes.is_multiple_of(4) {
+        return Err(Error::Shape("copy between different sizes".into()));
+    }
+    let n = bytes / 4;
+    d.dispatch_hybrid(
+        "h_copy",
+        &[src.binding()],
+        &[dst.binding()],
+        &Params::default().u(n)?.0,
+        [n.div_ceil(256), 1, 1],
         [256, 1, 1],
         0,
     )
@@ -2669,7 +2781,7 @@ impl HybridModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn moe_ffn(
+    pub(crate) fn moe_ffn(
         &self,
         d: &MetalDevice,
         s: &Scratch,
@@ -3356,6 +3468,7 @@ mod tests {
             window: Vec::new(),
             max_rows: 1,
             written: 0,
+            kv_cache: KvCache::F16,
         };
         // Text only: a plain offset.
         let plan = state.rope_plan(&d, 17, 4).unwrap();
@@ -3956,6 +4069,7 @@ mod tests {
             window: vec![0, 513],
             max_rows: 512,
             written,
+            kv_cache: KvCache::F16,
         };
         // Nothing overwritten yet: any position resumes.
         assert!(state(1000).can_resume(10));

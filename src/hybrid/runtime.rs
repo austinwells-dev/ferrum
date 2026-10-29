@@ -12,7 +12,10 @@ use super::{
     lookup::Lookup,
     mtp::{Mtp, mtp_state_bytes, mtp_weight_bytes},
     plan::{DraftMemory, PlanOptions},
-    session::{Completion, Flow, Generation, GenerationHooks, SamplingParams, Session, StopReason},
+    session::{
+        Completion, Flow, Generation, GenerationHooks, SamplingParams, SaveStats, Session,
+        StopReason,
+    },
     speculative::Drafter,
 };
 use crate::{
@@ -198,6 +201,9 @@ impl SpecOptions {
                     TreeSearch::BestFirst => 7,
                     TreeSearch::Siblings => 5,
                 },
+                // On MoE targets each draft routes to its own experts: 2 beats 3
+                // (docs/measurements/mtp-moe).
+                (DraftSource::Mtp, Variant::Moe) => 2,
                 (DraftSource::Mtp, _) => 3,
                 (DraftSource::Lookup, _) => LOOKUP_DRAFTS,
                 (_, Variant::Moe | Variant::Flint) => trained.min(2),
@@ -430,6 +436,9 @@ pub struct ChatPrompt {
     /// Where its images sit in `tokens`.
     pub spans: Vec<ImageSpan>,
     pub text: String,
+    /// Where the reply's header starts, and whether the prompt ends in a
+    /// user message (`Session::set_checkpoint`).
+    pub checkpoint: Option<(usize, bool)>,
 }
 
 /// What a finished `Turn` produced.
@@ -455,6 +464,8 @@ pub struct Runtime {
     pub draft_loaded_bytes: usize,
     /// Present when a vision projector was loaded: requests may carry images.
     pub vision: Option<Vision>,
+    /// The model file as a saved session depends on it (`save_session`).
+    cache_identity: String,
 }
 
 impl Runtime {
@@ -605,7 +616,25 @@ impl Runtime {
             model_name,
             draft_loaded_bytes,
             vision,
+            // Cached image rows depend on the projector as well.
+            cache_identity: match mmproj {
+                Some(mmproj) => format!("{} + {}", cache_identity(path), cache_identity(mmproj)),
+                None => cache_identity(path),
+            },
         })
+    }
+
+    /// Save slot 0's session to `dir` (see `session::Session::save_to`).
+    pub fn save_session(&self, dir: &Path) -> Result<SaveStats> {
+        self.session.save_to(dir, &self.cache_identity)
+    }
+
+    /// Load slot 0's session from `dir` if it was saved for this model file
+    /// and session geometry; returns the tokens now cached.
+    pub fn load_session(&mut self, dir: &Path) -> Result<Option<usize>> {
+        let model = &self.loaded.model;
+        self.session
+            .load_from(&self.device, model, dir, &self.cache_identity)
     }
 
     pub fn supports_vision(&self) -> bool {
@@ -823,6 +852,9 @@ impl Runtime {
         hooks: &mut impl ChatHooks,
     ) -> Result<Turn> {
         let starts_in_reasoning = prompt.text.trim_end().ends_with("<think>");
+        if let Some((at, pin)) = prompt.checkpoint {
+            self.slot_mut(slot).set_checkpoint(at, pin);
+        }
         let mut turn = self.start(
             slot,
             &prompt.tokens,
@@ -855,11 +887,39 @@ impl Runtime {
         let images = self.embed_images(&encoded, request.image_budget)?;
         let text = self.render_messages(&messages, request)?;
         let (tokens, spans) = self.expand_images(&text, &images)?;
+        let checkpoint = self
+            .reply_start(&messages, request, &text, &tokens)
+            .map(|at| {
+                let last = messages.last().and_then(|m| m["role"].as_str());
+                (at, last == Some("user"))
+            });
         Ok(ChatPrompt {
             tokens,
             spans,
             text,
+            checkpoint,
         })
+    }
+
+    /// The token position where the generation prompt (the reply's header)
+    /// begins in `tokens`, the rendered and tokenized `messages`: the same
+    /// render without it is a prefix of `text`, and the rest tokenizes on its
+    /// own to the tail of `tokens` (it opens with a special token, so the
+    /// split is clean). None when the template does not render that way.
+    fn reply_start(
+        &self,
+        messages: &[Json],
+        request: &ChatRequest,
+        text: &str,
+        tokens: &[u32],
+    ) -> Option<usize> {
+        let mut vars = request.template_vars.clone();
+        normalize_thinking(self.template.source(), &mut vars);
+        let tools = (!request.tools.is_empty()).then_some(&request.tools[..]);
+        let head = self.template.render(messages, tools, false, &vars).ok()?;
+        let tail = text.strip_prefix(head.as_str())?;
+        let tail = self.loaded.tokenizer.encode(tail).ok()?;
+        (!tail.is_empty() && tokens.ends_with(&tail)).then(|| tokens.len() - tail.len())
     }
 
     /// `start_chat` for a raw text completion.
@@ -1121,6 +1181,23 @@ impl StopReason {
             StopReason::Length | StopReason::ContextFull => "length",
         }
     }
+}
+
+/// A model file's path, size and modification time: a saved session is only
+/// loaded into the same file.
+fn cache_identity(path: &Path) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let meta = std::fs::metadata(&path).ok();
+    let modified = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |t| t.as_secs());
+    format!(
+        "{} {} {modified}",
+        path.display(),
+        meta.map_or(0, |m| m.len())
+    )
 }
 
 /// Text the generation prompt needs when the template does not open the think

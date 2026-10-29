@@ -45,6 +45,61 @@ pub fn load(id: &str) -> Option<Json> {
 
 pub fn delete(id: &str) {
     let _ = fs::remove_file(dir().join(format!("{id}.json")));
+    let _ = fs::remove_dir_all(cache_dir(id));
+}
+
+/// Most bytes all chats' session caches may take; the least recently saved
+/// go first.
+const CACHE_CAP: u64 = 16 << 30;
+
+fn caches() -> PathBuf {
+    std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .unwrap_or_else(|| home().join(".cache"))
+        .join("ferrum/sessions")
+}
+
+/// Where chat `id`'s session cache (`Runtime::save_session`) lives.
+pub fn cache_dir(id: &str) -> PathBuf {
+    caches().join(id)
+}
+
+/// Remove the least recently saved session caches until all of them fit
+/// `CACHE_CAP`.
+pub fn prune_caches() {
+    let Ok(entries) = fs::read_dir(caches()) else {
+        return;
+    };
+    let size = |dir: &Path| -> u64 {
+        fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.metadata().ok())
+            .map(|m| m.len())
+            .sum()
+    };
+    let mut dirs: Vec<(std::time::SystemTime, u64, PathBuf)> = entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .map(|p| {
+            let saved = fs::metadata(p.join("meta.json"))
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            (saved, size(&p), p)
+        })
+        .collect();
+    dirs.sort_by_key(|d| d.0);
+    let mut total: u64 = dirs.iter().map(|d| d.1).sum();
+    for (_, bytes, path) in dirs {
+        if total <= CACHE_CAP {
+            break;
+        }
+        let _ = fs::remove_dir_all(path);
+        total -= bytes;
+    }
 }
 
 /// Newest first. `kind` is "chat" or "agent"; for agents, only sessions of `project`.

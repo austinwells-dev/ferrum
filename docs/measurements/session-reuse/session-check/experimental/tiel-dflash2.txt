@@ -1,0 +1,13 @@
+drafter dflash2 (51ef7b6923ad6c14cb1bb41c37a9041446496ab6)
+drafter dflash2 (51ef7b6923ad6c14cb1bb41c37a9041446496ab6)
+extend        prompt   73 tokens, reused   58: identical (32 tokens, 14 verify steps, acceptance 2.21)
+rewind        prompt   20 tokens, reused   18: identical (32 tokens, 14 verify steps, acceptance 2.21)
+retry         prompt   19 tokens, reused   18: identical (32 tokens, 11 verify steps, acceptance 2.91)
+replace       prompt   16 tokens, reused    0: identical (32 tokens, 12 verify steps, acceptance 2.58)
+extend again  prompt   73 tokens, reused    0: identical (32 tokens, 15 verify steps, acceptance 2.07)
+pin           prompt   73 tokens, reused    0: identical (32 tokens, 15 verify steps, acceptance 2.07)
+long turn     prompt  988 tokens, reused   72: identical (32 tokens, 12 verify steps, acceptance 2.58)
+later turn    prompt 1004 tokens, reused  987: identical (32 tokens, 15 verify steps, acceptance 2.07)
+pinned rewind prompt   77 tokens, reused    0: identical (32 tokens, 12 verify steps, acceptance 2.67)
+  expected to resume at the pinned checkpoint, position 70
+FAIL

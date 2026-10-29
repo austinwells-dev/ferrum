@@ -593,7 +593,7 @@ fn gguf_weight(
         (Format::F32, 0) | (Format::Q4_0, 2) | (Format::Q8_0, 8)
     );
     if stored && cols.is_multiple_of(256) {
-        return gguf_matrix(d, file, &g, 1, rows, cols);
+        return gguf_matrix(d, file, &g, 1, rows, cols, false);
     }
     let layout = block_layout(info.type_id)?;
     let row_bytes = cols / layout.elements * layout.bytes;
@@ -1882,6 +1882,12 @@ impl Drafter for DraftModel {
     fn rewind(&mut self, _d: &MetalDevice, _t: &HybridModel, _len: usize) -> Result<()> {
         // Slots are tagged with their positions and a query only reads tags
         // below its block, so stale slots past `len` are never read.
+        Ok(())
+    }
+
+    fn adopt(&mut self, _d: &MetalDevice, _t: &HybridModel, _tokens: &[u32]) -> Result<()> {
+        // The loaded positions have no slots of their own: drafts read
+        // whatever earlier tags remain until new rows are ingested.
         Ok(())
     }
 }

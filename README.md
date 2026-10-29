@@ -110,7 +110,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Write a haiku about Rust."}]}'
 ```
 
-To make generation faster, add a drafter. On the dense 27B, `--draft mtp` uses the prediction head inside the GGUF and needs no extra download (the MoE's MTP head routes to experts, which Ferrum does not support yet). A DFlash2 drafter with draft trees is faster still: `--draft <dir> --draft-tree 15`, or the experimental `--draft-tree auto`. On the MoE, use a DFlash2 drafter such as `jzinno/Ornith-1.5-35B-A3B-DFlash2` and keep chains. See [speculative decoding](docs/server.md#speculative-decoding).
+To make generation faster, add a drafter. `--draft mtp` uses the prediction head inside the GGUF and needs no extra download. On the dense 27B a DFlash2 drafter with draft trees is faster still: `--draft <dir> --draft-tree 15`, or the experimental `--draft-tree auto`. On the MoE, keep chains: MTP reaches 1.47× plain decoding on Tiel-Coder, and a DFlash2 drafter is slightly faster (1.52× with `incoai/Qwen3.6-35B-A3B-DFlash2`; `jzinno/Ornith-1.5-35B-A3B-DFlash2` also works). See [speculative decoding](docs/server.md#speculative-decoding).
 
 ## The TUI
 
@@ -186,7 +186,7 @@ Some of the engineering choices:
 
 - **Quantized weights stay in their GGML block format** and are read straight into Metal buffers. Decode uses GEMV kernels tuned per quant type; prefill dequantizes tiles to F16 and runs on the M5's TensorOps matrix units with F32 accumulation.
 - **Nothing allocates after load.** KV cache, recurrent DeltaNet state and all scratch are sized by the planner once. Prefill is chunked with flash-style attention, so no activation grows with the square of the sequence length.
-- **Conversation caching for hybrid models.** Linear-attention state can't be rewound like a KV cache, so the session keeps recurrent-state snapshots. A request that extends the previous conversation only processes the new tokens.
+- **Conversation caching for hybrid models.** Linear-attention state can't be rewound like a KV cache, and a sliding-window cache overwrites its oldest rows, so the session keeps snapshots of both, including one where the latest reply starts (chat templates rewrite past replies there). A request that extends the previous conversation only processes what is new or rewritten. The TUI also keeps each chat's cache on disk when the model is unloaded or the chat is closed: a 52k-token chat on the 27B loads in 0.9 s instead of 410 s of prefill ([measurements](docs/measurements/session-cache/README.md)).
 - **Speculative verification is cheap.** Batched GEMV handles 2–3 rows and a narrow 16×64 TensorOps tile handles 4–32 rows. A 16-row verify on the 27B used to cost 3.5× a single-token step and now costs 1.5×.
 - **Safety boundary.** The library is `#![deny(unsafe_code)]` everywhere except the Metal backend, where six small, documented `unsafe` blocks do FFI and shared-memory mapping. Tensors are immutable once published, and command completion is checked before any result is readable.
 

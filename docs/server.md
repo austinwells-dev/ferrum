@@ -114,7 +114,7 @@ Speculative decoding speeds up generation without changing the output. A small, 
 
 Ferrum supports four kinds of drafter:
 
-- **MTP.** The multi-token-prediction head built into the model's own GGUF. Nothing extra to download. Dense models only: an MTP block with routed experts (as in the 35B MoE GGUFs) is refused.
+- **MTP.** The multi-token-prediction head built into the model's own GGUF. Nothing extra to download. On the 35B MoE GGUFs the block routes to its own experts; Ferrum loads their Q3_K experts as Q6_K holding the same values (about 0.3 GB more), and on Tiel-Coder 2 drafts reach 63.4 tok/s (1.47× plain decoding) against 64.8 with the `incoai/Qwen3.6-35B-A3B-DFlash2` drafter ([measurement](measurements/mtp-moe/README.md)).
 - **DFlash / DFlash2.** Separate block-diffusion drafters that propose a whole block of tokens at once.
 - **DSpark.** DFlash plus a low-rank Markov bias and a confidence head that predicts which guesses will be accepted.
 - **Prompt lookup.** No model: it proposes the tokens that followed the latest earlier occurrence of the last few tokens. It pays off when output repeats its context (code edits, quoted text) and costs nothing when it misses.
@@ -140,7 +140,7 @@ ferrum-cli --model tiel.gguf \
 | Flag | Meaning |
 |---|---|
 | `--draft mtp\|lookup\|DIR\|FILE` | Drafter to use (off by default): the MTP head, prompt lookup, a checkpoint directory or its Hugging Face cache entry, or a DFlash GGUF |
-| `--draft-max N` | Most tokens drafted per step, and the depth of draft trees (default: 3 for MTP and lookup, 7 for MTP with `--draft-tree`, the trained block size for dense targets, 2 for MoE targets) |
+| `--draft-max N` | Most tokens drafted per step, and the depth of draft trees (default: 3 for MTP and lookup, 2 for MTP on MoE targets, 7 for MTP with `--draft-tree`, the trained block size for dense targets, 2 for MoE targets) |
 | `--draft-tree N\|auto` | Draft trees of up to N guesses (1–31; 15 recommended) per step, instead of chains. `auto`: KFlash's budget picks each cycle's guesses (up to 31), learning the drafter's calibration and the check's cost as it runs (kept in `~/.cache/ferrum/kflash`); for DFlash2 it also defaults `--draft-block 16` and `--draft-vocab 98304` |
 | `--draft-block N` | DFlash/DFlash2: draft N rows per pass (N−1 guesses deep), wider than the drafter's trained block |
 | `--draft-vocab N` | Draft among the first N token ids only (the check still uses the full vocabulary) |

@@ -1,6 +1,7 @@
-//! Parity of the IQ2_S, IQ3_XXS and IQ3_S projection kernels against a CPU
-//! dequantizer ported from llama.cpp (ggml-quants.c). The grids are generated
-//! from ggml-common.h and the Metal shader, so the tables match byte for byte.
+//! Parity of the IQ2_S, IQ3_XXS and IQ3_S projection kernels, and of Q3_K
+//! weights loaded as Q6_K, against a CPU dequantizer ported from llama.cpp
+//! (ggml-quants.c). The grids are generated from ggml-common.h and the Metal
+//! shader, so the tables match byte for byte.
 use super::{
     engine::HybridModel,
     weights::{Format, Matrix},
@@ -1434,4 +1435,143 @@ fn iq_expert_projections_match_the_cpu_dequant() {
             &format!("{} routes", kind.format.name()),
         );
     }
+}
+
+/// llama.cpp's `dequantize_row_q3_K`.
+fn dequant_q3_k(x: &[u8], out: &mut [f32]) {
+    const KMASK1: u32 = 0x0303_0303;
+    const KMASK2: u32 = 0x0f0f_0f0f;
+    for (b, y) in x.chunks_exact(110).zip(out.chunks_exact_mut(256)) {
+        let (hm, q, d_all) = (&b[..32], &b[32..96], f16_at(b, 108));
+        let mut aux = [0u32; 4];
+        for (k, a) in aux.iter_mut().take(3).enumerate() {
+            *a = u32::from_le_bytes(b[96 + 4 * k..100 + 4 * k].try_into().unwrap());
+        }
+        let tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+        aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+        aux[0] = (aux[0] & KMASK2) | ((tmp & KMASK1) << 4);
+        aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+        let scales: Vec<i8> = aux
+            .iter()
+            .flat_map(|a| a.to_le_bytes())
+            .map(|v| v as i8)
+            .collect();
+        let (mut is, mut m, mut at) = (0, 1u8, 0);
+        for n in 0..2 {
+            let q = &q[32 * n..];
+            for shift in [0, 2, 4, 6] {
+                for half in 0..2 {
+                    let dl = d_all * (scales[is] as f32 - 32.);
+                    is += 1;
+                    for l in 16 * half..16 * half + 16 {
+                        let v = ((q[l] >> shift) & 3) as i8 - if hm[l] & m != 0 { 0 } else { 4 };
+                        y[at] = dl * v as f32;
+                        at += 1;
+                    }
+                }
+                m <<= 1;
+            }
+        }
+    }
+}
+
+/// llama.cpp's `dequantize_row_q6_K`.
+fn dequant_q6_k(x: &[u8], out: &mut [f32]) {
+    for (b, y) in x.chunks_exact(210).zip(out.chunks_exact_mut(256)) {
+        let d = f16_at(b, 208);
+        for n in 0..2 {
+            let (ql, qh, sc) = (&b[64 * n..], &b[128 + 32 * n..], &b[192 + 8 * n..]);
+            let y = &mut y[128 * n..];
+            for l in 0..32 {
+                let is = l / 16;
+                let q1 = ((ql[l] & 0xF) | (qh[l] & 3) << 4) as i8 - 32;
+                let q2 = ((ql[l + 32] & 0xF) | ((qh[l] >> 2) & 3) << 4) as i8 - 32;
+                let q3 = ((ql[l] >> 4) | ((qh[l] >> 4) & 3) << 4) as i8 - 32;
+                let q4 = ((ql[l + 32] >> 4) | ((qh[l] >> 6) & 3) << 4) as i8 - 32;
+                y[l] = d * (sc[is] as i8) as f32 * q1 as f32;
+                y[l + 32] = d * (sc[is + 2] as i8) as f32 * q2 as f32;
+                y[l + 64] = d * (sc[is + 4] as i8) as f32 * q3 as f32;
+                y[l + 96] = d * (sc[is + 6] as i8) as f32 * q4 as f32;
+            }
+        }
+    }
+}
+
+/// Random Q3_K blocks (their `d` is last) rewritten as Q6_K.
+fn q3k_blocks(blocks: usize, seed: u64) -> (Vec<u8>, Vec<u8>) {
+    let mut q3 = random_blocks(blocks, 110, seed);
+    for b in q3.chunks_exact_mut(110) {
+        let scale = half::f16::from_f32(0.002 + 0.001 * b[0] as f32 / 255.);
+        b[108..].copy_from_slice(&scale.to_le_bytes());
+    }
+    let mut q6 = vec![0; blocks * 210];
+    super::weights::q3k_to_q6k(&q3, &mut q6);
+    (q3, q6)
+}
+
+/// Q3_K tensors load as Q6_K blocks that decode to exactly the same values.
+#[test]
+fn q3_k_rewritten_as_q6_k_keeps_every_value() {
+    let blocks = 64;
+    let (q3, q6) = q3k_blocks(blocks, 5);
+    let (mut a, mut b) = (vec![0f32; blocks * 256], vec![0f32; blocks * 256]);
+    dequant_q3_k(&q3, &mut a);
+    dequant_q6_k(&q6, &mut b);
+    assert!(a.iter().any(|v| *v != 0.));
+    assert_eq!(
+        a.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+        b.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+    );
+}
+
+/// The rewritten Q3_K experts on the Q6_K dense and expert kernels, against
+/// the Q3_K CPU dequant.
+#[test]
+fn q3_k_projections_match_the_cpu_dequant() {
+    let d = MetalDevice::new().unwrap();
+    let (experts, rows, cols) = (3, 13, 1024);
+    let (q3, q6) = q3k_blocks(experts * rows * cols / 256, 9);
+    let mut dense = vec![0f32; experts * rows * cols];
+    dequant_q3_k(&q3, &mut dense);
+    let dot = |x: &[f32], r: usize| {
+        (0..cols)
+            .map(|c| x[c] as f64 * dense[r * cols + c] as f64)
+            .sum::<f64>() as f32
+    };
+    let w = Matrix::from_packed(
+        &d,
+        rows,
+        cols,
+        1,
+        Format::Q6K,
+        &q6[..rows * cols / 256 * 210],
+    )
+    .unwrap();
+    for m in [1, 3, 16, 64] {
+        let x = random(m * cols, m as u64);
+        let xt = Tensor::from_f32(&d, [m * cols], DType::F32, &x).unwrap();
+        let yt = Tensor::zeros(&d, [m * rows], DType::F32).unwrap();
+        HybridModel::project(&d, &w, &xt, m, &yt).unwrap();
+        let want: Vec<f32> = (0..m * rows)
+            .map(|i| dot(&x[i / rows * cols..], i % rows))
+            .collect();
+        assert_close(&yt.to_f32(), &want, &format!("q3_k as q6_k m={m}"));
+    }
+    let w = Matrix::from_packed(&d, rows, cols, experts, Format::Q6K, &q6).unwrap();
+    let ids: [u32; 5] = [2, 0, 1, 1, 2];
+    let routes = ids.len();
+    let x = random(routes * cols, 11);
+    let xt = Tensor::from_f32(&d, [routes * cols], DType::F32, &x).unwrap();
+    let id_bytes: Vec<u8> = ids.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let idt = Tensor::from_le_bytes(&d, [routes], DType::F32, &id_bytes).unwrap();
+    let yt = Tensor::zeros(&d, [routes * rows], DType::F32).unwrap();
+    HybridModel::project_id(&d, &w, &xt, &idt, routes, 1, &yt).unwrap();
+    let want: Vec<f32> = (0..routes * rows)
+        .map(|i| {
+            let (route, r) = (i / rows, i % rows);
+            dot(&x[route * cols..], ids[route] as usize * rows + r)
+        })
+        .collect();
+    assert_close(&yt.to_f32(), &want, "q3_k as q6_k routes");
 }

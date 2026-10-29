@@ -207,6 +207,33 @@ impl Tensor {
             dtype,
         })
     }
+    /// Fresh, non-resident storage holding `data`: a staging copy that a GPU
+    /// copy moves into long-lived state.
+    pub(crate) fn staged(
+        device: &MetalDevice,
+        dims: impl AsRef<[usize]>,
+        dtype: DType,
+        data: &[u8],
+    ) -> Result<Self> {
+        let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape)?;
+        if shape.byte_size(dtype)? != data.len() {
+            return Err(Error::Shape("byte length differs from shape/dtype".into()));
+        }
+        let mut storage = device.allocate(data.len())?;
+        storage.with_bytes_mut(|dst| dst.copy_from_slice(data));
+        Ok(Self {
+            storage: Rc::new(storage),
+            offset: 0,
+            shape,
+            layout,
+            dtype,
+        })
+    }
+    /// The tensor's bytes, once the GPU work that wrote them has completed.
+    pub(crate) fn read_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+        self.storage.with_bytes(self.offset, self.byte_size(), f)
+    }
     pub fn to_f32(&self) -> Vec<f32> {
         self.storage
             .with_bytes(self.offset, self.byte_size(), |bytes| {
