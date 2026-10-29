@@ -16,7 +16,7 @@ You give it a model file and then either chat in the terminal, use the full-scre
 > **Experimental branch.** These additions are not on `main` yet and are not production-ready; their flags and behaviour may change:
 > - **MLX checkpoints.** MLX 4-bit Qwen3.5-family checkpoint directories load, but only the 27B is validated.
 > - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets, 16-row DFlash2 blocks, and sampled output identical to plain decoding.
-> - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts.
+> - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts. A request can also lower an image's token budget below `--image-tokens` ([per-request image sizes](docs/server.md#image-size-per-request)).
 > - **Image generation.** Qwen-Image-2.1-Turbo drawing and editing in the CLI, server and TUI, and the TUI tools `generate_image` and `view_image`.
 > - **LFM3.** LiquidAI LFM3-1.7B text and LFM3-VL-2B still images.
 >
@@ -220,7 +220,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | [Development](docs/development.md) | Building, testing (including Metal validation layers), profiling, using Ferrum as a library |
 | [Architecture](docs/architecture.md) | Tensor and storage model, Metal backend, safety argument, the hybrid engine |
 | [Vision](docs/vision.md) | How image input is encoded and positioned |
-| [Experimental](docs/experimental.md) | Flint, Spark, LFM3, MLX checkpoints, KFlash and image generation: status, validation numbers, known gaps |
+| [Experimental](docs/experimental.md) | Flint, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation: status, validation numbers, known gaps |
 | [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
 | [Contributing](AGENTS.md) | Branch and PR flow (topic → `experimental` → `main`), checks, docs and regression rules |
 
