@@ -674,7 +674,10 @@ pub fn check(path: &Path) -> Checked {
             .and_then(|r| r.split('.').next())
             .and_then(|n| n.parse::<usize>().ok());
         if layer.is_some_and(|l| l >= config.layers) {
-            head.push(t.type_id);
+            // Q3_K MTP experts (the 35B MoE GGUFs) load as Q6_K.
+            if t.type_id != 11 {
+                head.push(t.type_id);
+            }
         } else {
             trunk.push(t.type_id);
         }

@@ -2726,7 +2726,7 @@ impl HybridModel {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn moe_ffn(
+    pub(crate) fn moe_ffn(
         &self,
         d: &MetalDevice,
         s: &Scratch,

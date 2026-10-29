@@ -166,6 +166,28 @@ pub enum Ffn {
     Moe(MoeFfn),
 }
 
+impl DenseFfn {
+    fn byte_size(&self) -> usize {
+        self.gate.byte_size() + self.up.byte_size() + self.down.byte_size()
+    }
+}
+
+impl Ffn {
+    pub fn byte_size(&self) -> usize {
+        match self {
+            Ffn::Dense(f) => f.byte_size(),
+            Ffn::Moe(f) => {
+                f.router.byte_size()
+                    + f.gate_exps.byte_size()
+                    + f.up_exps.byte_size()
+                    + f.down_exps.byte_size()
+                    + f.shared_gate_inp.as_ref().map_or(0, Tensor::byte_size)
+                    + f.shared.byte_size()
+            }
+        }
+    }
+}
+
 pub struct Layer {
     pub attn_norm: Tensor,
     /// Next pre-norm fused into the residual add: Qwen's post-attention norm,
@@ -192,7 +214,6 @@ pub struct Weights {
 impl Weights {
     pub fn byte_size(&self) -> usize {
         let m = |x: &Matrix| x.byte_size();
-        let dense = |f: &DenseFfn| m(&f.gate) + m(&f.up) + m(&f.down);
         let mut total = m(&self.embedding) + m(&self.output) + self.output_norm.byte_size();
         total += self.rope_freqs.as_ref().map_or(0, Tensor::byte_size);
         for layer in &self.layers {
@@ -226,17 +247,7 @@ impl Weights {
                 }
                 Mixer::ShortConv(s) => m(&s.in_proj) + s.conv.byte_size() + m(&s.out_proj),
             };
-            total += match &layer.ffn {
-                Ffn::Dense(f) => dense(f),
-                Ffn::Moe(f) => {
-                    m(&f.router)
-                        + m(&f.gate_exps)
-                        + m(&f.up_exps)
-                        + m(&f.down_exps)
-                        + f.shared_gate_inp.as_ref().map_or(0, Tensor::byte_size)
-                        + dense(&f.shared)
-                }
-            };
+            total += layer.ffn.byte_size();
         }
         total
     }
@@ -254,6 +265,42 @@ impl Loader<'_> {
 
     fn stacked(&mut self, name: &str, experts: usize, rows: usize, cols: usize) -> Result<Matrix> {
         gguf_matrix(self.device, self.file, name, experts, rows, cols)
+    }
+
+    /// The routed and shared experts of the block whose tensor names `n` gives.
+    fn moe(&mut self, n: &dyn Fn(&str) -> String, c: &HybridConfig) -> Result<MoeFfn> {
+        let moe = c.moe.expect("expert layer carries expert geometry");
+        Ok(MoeFfn {
+            // `HybridConfig::from_gguf` refuses a selection bias (`exp_probs_b`).
+            router: self.matrix_or_bf16(&n("ffn_gate_inp.weight"), moe.experts, c.hidden)?,
+            gate_exps: self.stacked(
+                &n("ffn_gate_exps.weight"),
+                moe.experts,
+                moe.expert_ffn,
+                c.hidden,
+            )?,
+            up_exps: self.stacked(
+                &n("ffn_up_exps.weight"),
+                moe.experts,
+                moe.expert_ffn,
+                c.hidden,
+            )?,
+            down_exps: self.stacked(
+                &n("ffn_down_exps.weight"),
+                moe.experts,
+                c.hidden,
+                moe.expert_ffn,
+            )?,
+            shared_gate_inp: match moe.shared_gate {
+                true => Some(self.vector(&n("ffn_gate_inp_shexp.weight"), c.hidden)?),
+                false => None,
+            },
+            shared: DenseFfn {
+                gate: self.matrix(&n("ffn_gate_shexp.weight"), moe.shared_ffn, c.hidden)?,
+                up: self.matrix(&n("ffn_up_shexp.weight"), moe.shared_ffn, c.hidden)?,
+                down: self.matrix(&n("ffn_down_shexp.weight"), c.hidden, moe.shared_ffn)?,
+            },
+        })
     }
 
     /// A plain matrix (router, embedding, LM head, head gate) that may be
@@ -385,7 +432,10 @@ pub(crate) fn gguf_matrix(
             ),
         });
     }
-    let format = Format::from_type(info.type_id).ok_or_else(|| Error::Weight {
+    // Q3_K (only the MTP experts of the Qwen3.6 MoE GGUFs) runs as Q6_K.
+    let q3k = info.type_id == Q3K;
+    let stored = if q3k { Q6K } else { info.type_id };
+    let format = Format::from_type(stored).ok_or_else(|| Error::Weight {
         name: name.into(),
         message: format!("GGML type {} has no hybrid kernel", info.type_id),
     })?;
@@ -397,16 +447,26 @@ pub(crate) fn gguf_matrix(
             message: "row width is not a whole number of blocks".into(),
         });
     }
-    let row_bytes = cols / layout.elements * layout.bytes;
+    let mut row_bytes = cols / layout.elements * layout.bytes;
     if row_bytes * rows * experts != info.byte_len {
         return Err(Error::Weight {
             name: name.into(),
             message: "byte length differs from geometry".into(),
         });
     }
-    let storage = PackedStorage::from_reader(device, info.byte_len, |dst| {
-        file.read_tensor_into(name, dst)
-    })?;
+    let storage = if q3k {
+        let mut q3 = vec![0; info.byte_len];
+        file.read_tensor_into(name, &mut q3)?;
+        row_bytes = row_bytes / Q3K_BLOCK * Q6K_BLOCK;
+        PackedStorage::from_reader(device, q3.len() / Q3K_BLOCK * Q6K_BLOCK, |dst| {
+            q3k_to_q6k(&q3, dst);
+            Ok(())
+        })?
+    } else {
+        PackedStorage::from_reader(device, info.byte_len, |dst| {
+            file.read_tensor_into(name, dst)
+        })?
+    };
     Ok(Matrix {
         rows: rows * experts,
         cols,
@@ -415,6 +475,70 @@ pub(crate) fn gguf_matrix(
         row_bytes,
         storage,
     })
+}
+
+const Q3K: u32 = 11;
+const Q6K: u32 = 14;
+const Q3K_BLOCK: usize = 110;
+const Q6K_BLOCK: usize = 210;
+
+/// Bytes a stored tensor of GGML type `type_id` and `byte_len` bytes takes
+/// once loaded: Q3_K grows into Q6_K (`q3k_to_q6k`).
+pub(crate) fn loaded_bytes(type_id: u32, byte_len: usize) -> usize {
+    match type_id {
+        Q3K => byte_len / Q3K_BLOCK * Q6K_BLOCK,
+        _ => byte_len,
+    }
+}
+
+/// Rewrite Q3_K blocks as Q6_K blocks holding the same values. Both formats
+/// weigh 16 groups of 16 as `d × scale × q`; Q3_K's 6-bit scales (−32..31)
+/// fit Q6_K's 8-bit ones and its 3-bit weights (−4..3) its 6-bit ones, and
+/// `d` carries over, so every product is the one Q3_K describes.
+pub(crate) fn q3k_to_q6k(src: &[u8], dst: &mut [u8]) {
+    for (x, y) in src
+        .chunks_exact(Q3K_BLOCK)
+        .zip(dst.chunks_exact_mut(Q6K_BLOCK))
+    {
+        // Q3_K: hmask[32], qs[64], scales[12] (sixteen 6-bit values), d.
+        let (hmask, qs, packed) = (&x[..32], &x[32..96], &x[96..108]);
+        let mut scales = [0i8; 16];
+        for (j, s) in scales.iter_mut().enumerate() {
+            let low = match j {
+                0..8 => packed[j] & 0xF,
+                _ => packed[j - 8] >> 4,
+            };
+            let high = (packed[8 + j % 4] >> (2 * (j / 4))) & 3;
+            *s = (low | high << 4) as i8 - 32;
+        }
+        // Weight i sits at bit pair `shift` of qs[32 * half + l] and high
+        // bit `bit` of hmask[l] (set means no −4 offset).
+        let mut q = [0u8; 256];
+        for (i, q) in q.iter_mut().enumerate() {
+            let (half, rest) = (i / 128, i % 128);
+            let (shift, l) = (rest / 32, rest % 32);
+            let low = (qs[32 * half + l] >> (2 * shift)) & 3;
+            let high = (hmask[l] >> (4 * half + shift)) & 1;
+            // Q6_K stores q + 32; Q3_K's value is low − 4 + 4 × high.
+            *q = low + 4 * high + 28;
+        }
+        // Q6_K: ql[128], qh[64], scales[16], d.
+        let (ql, rest) = y.split_at_mut(128);
+        let (qh, rest) = rest.split_at_mut(64);
+        for half in 0..2 {
+            for l in 0..32 {
+                let at = |k: usize| q[128 * half + l + 32 * k];
+                ql[64 * half + l] = at(0) & 0xF | (at(2) & 0xF) << 4;
+                ql[64 * half + l + 32] = at(1) & 0xF | (at(3) & 0xF) << 4;
+                qh[32 * half + l] =
+                    at(0) >> 4 | (at(1) >> 4) << 2 | (at(2) >> 4) << 4 | (at(3) >> 4) << 6;
+            }
+        }
+        for (s, v) in rest[..16].iter_mut().zip(scales) {
+            *s = v as u8;
+        }
+        rest[16..18].copy_from_slice(&x[108..110]);
+    }
 }
 
 pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Result<Weights> {
@@ -572,38 +696,7 @@ fn load_weights(
                 down: l.matrix(&n("ffn_down.weight"), c.hidden, c.ffn)?,
             })
         } else {
-            let moe = c.moe.expect("expert layer carries expert geometry");
-            Ffn::Moe(MoeFfn {
-                // `HybridConfig::from_gguf` refuses a selection bias (`exp_probs_b`).
-                router: l.matrix_or_bf16(&n("ffn_gate_inp.weight"), moe.experts, c.hidden)?,
-                gate_exps: l.stacked(
-                    &n("ffn_gate_exps.weight"),
-                    moe.experts,
-                    moe.expert_ffn,
-                    c.hidden,
-                )?,
-                up_exps: l.stacked(
-                    &n("ffn_up_exps.weight"),
-                    moe.experts,
-                    moe.expert_ffn,
-                    c.hidden,
-                )?,
-                down_exps: l.stacked(
-                    &n("ffn_down_exps.weight"),
-                    moe.experts,
-                    c.hidden,
-                    moe.expert_ffn,
-                )?,
-                shared_gate_inp: match moe.shared_gate {
-                    true => Some(l.vector(&n("ffn_gate_inp_shexp.weight"), c.hidden)?),
-                    false => None,
-                },
-                shared: DenseFfn {
-                    gate: l.matrix(&n("ffn_gate_shexp.weight"), moe.shared_ffn, c.hidden)?,
-                    up: l.matrix(&n("ffn_up_shexp.weight"), moe.shared_ffn, c.hidden)?,
-                    down: l.matrix(&n("ffn_down_shexp.weight"), c.hidden, moe.shared_ffn)?,
-                },
-            })
+            Ffn::Moe(l.moe(&n, c)?)
         };
         layers.push(Layer {
             attn_norm,
@@ -630,8 +723,9 @@ fn load_weights(
 
 /// The NextN/MTP block after the trunk (`blk.{layers}`): the token embedding
 /// and the previous hidden state are normalized, concatenated and projected,
-/// then pass one gated-attention layer with a dense FFN; `head_norm` feeds
-/// the shared LM head.
+/// then pass one gated-attention layer with the FFN of the trunk's kind
+/// (dense, or routed experts on MoE targets); `head_norm` feeds the shared
+/// LM head.
 pub struct MtpWeights {
     pub eh_proj: Matrix,
     pub enorm: Tensor,
@@ -640,25 +734,17 @@ pub struct MtpWeights {
     pub attn_norm: Tensor,
     pub post_norm: Tensor,
     pub attention: AttentionWeights,
-    pub ffn: DenseFfn,
+    pub ffn: Ffn,
 }
 
 impl MtpWeights {
     pub fn byte_size(&self) -> usize {
         let a = &self.attention;
-        [
-            &self.eh_proj,
-            &a.q,
-            &a.k,
-            &a.v,
-            &a.o,
-            &self.ffn.gate,
-            &self.ffn.up,
-            &self.ffn.down,
-        ]
-        .iter()
-        .map(|m| m.byte_size())
-        .sum::<usize>()
+        self.ffn.byte_size()
+            + [&self.eh_proj, &a.q, &a.k, &a.v, &a.o]
+                .iter()
+                .map(|m| m.byte_size())
+                .sum::<usize>()
             + [
                 &self.enorm,
                 &self.hnorm,
@@ -674,19 +760,23 @@ impl MtpWeights {
     }
 }
 
-/// Load the first MTP block, if the GGUF has one with a dense FFN.
+/// Load the first MTP block, if the GGUF has one.
 pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Result<MtpWeights> {
     let i = c.layers;
     let n = |s: &str| format!("blk.{i}.{s}");
     if !file.tensors().contains_key(&n("nextn.eh_proj.weight")) {
         return Err(Error::Gguf("the GGUF has no NextN/MTP block".into()));
     }
-    if file.tensors().contains_key(&n("ffn_gate_exps.weight")) {
+    let routed = file.tensors().contains_key(&n("ffn_gate_exps.weight"));
+    if routed && c.moe.is_none() {
         return Err(Error::Gguf(
-            "MTP blocks with routed experts are not supported".into(),
+            "the MTP block has routed experts but the trunk has none".into(),
         ));
     }
-    let ffn_width = file.tensor(&n("ffn_gate.weight"))?.dimensions[1];
+    let ffn_width = match routed {
+        true => 0,
+        false => file.tensor(&n("ffn_gate.weight"))?.dimensions[1],
+    };
     let mut l = Loader { device, file };
     let q = c.heads * c.head_dim;
     let kv = c.kv_heads * c.head_dim;
@@ -707,10 +797,13 @@ pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> 
             sinks: None,
             head_gate: None,
         },
-        ffn: DenseFfn {
-            gate: l.matrix(&n("ffn_gate.weight"), ffn_width, c.hidden)?,
-            up: l.matrix(&n("ffn_up.weight"), ffn_width, c.hidden)?,
-            down: l.matrix(&n("ffn_down.weight"), c.hidden, ffn_width)?,
+        ffn: match routed {
+            true => Ffn::Moe(l.moe(&n, c)?),
+            false => Ffn::Dense(DenseFfn {
+                gate: l.matrix(&n("ffn_gate.weight"), ffn_width, c.hidden)?,
+                up: l.matrix(&n("ffn_up.weight"), ffn_width, c.hidden)?,
+                down: l.matrix(&n("ffn_down.weight"), c.hidden, ffn_width)?,
+            }),
         },
     })
 }

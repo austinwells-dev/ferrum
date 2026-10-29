@@ -198,6 +198,9 @@ impl SpecOptions {
                     TreeSearch::BestFirst => 7,
                     TreeSearch::Siblings => 5,
                 },
+                // On MoE targets each draft routes to its own experts: 2 beats 3
+                // (docs/measurements/mtp-moe).
+                (DraftSource::Mtp, Variant::Moe) => 2,
                 (DraftSource::Mtp, _) => 3,
                 (DraftSource::Lookup, _) => LOOKUP_DRAFTS,
                 (_, Variant::Moe | Variant::Flint) => trained.min(2),

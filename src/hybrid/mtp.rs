@@ -17,7 +17,7 @@ use super::{
         HybridModel, Params, RopePlan, Scratch, SpecGeometry, gather_rows, page, tree_plan_rows,
     },
     speculative::{DraftTree, Drafter, chain_with_siblings, log_softmax},
-    weights::{MtpWeights, load_mtp},
+    weights::{Ffn, MtpWeights, load_mtp},
 };
 use crate::{DType, Error, MetalDevice, Result, Tensor, loader::gguf::GgufFile};
 
@@ -101,7 +101,7 @@ pub fn mtp_weight_bytes(file: &GgufFile, c: &super::HybridConfig) -> usize {
     file.tensors()
         .values()
         .filter(|t| t.name.starts_with(&prefix))
-        .map(|t| page(t.byte_len))
+        .map(|t| page(super::weights::loaded_bytes(t.type_id, t.byte_len)))
         .sum()
 }
 
@@ -124,7 +124,10 @@ impl Mtp {
         let head_rows = vocab.map_or(c.vocab, |v| v.clamp(1024, c.vocab));
         let mut file = GgufFile::open(path)?;
         let weights = load_mtp(d, &mut file, c)?;
-        if weights.ffn.gate.rows != c.ffn {
+        // The block runs in the trunk's scratch, sized for the trunk's FFN.
+        if let Ffn::Dense(f) = &weights.ffn
+            && f.gate.rows != c.ffn
+        {
             return Err(Error::Config(
                 "MTP FFN width differs from the trunk's".into(),
             ));
@@ -322,7 +325,10 @@ impl Mtp {
             rope,
         )?;
         t.add_rmsnorm(d, &x1, &mix, &w.post_norm, &x0, &xn, m)?;
-        t.dense_ffn(d, s, &w.ffn, &xn, &mix, m)?;
+        match &w.ffn {
+            Ffn::Dense(f) => t.dense_ffn(d, s, f, &xn, &mix, m)?,
+            Ffn::Moe(f) => t.moe_ffn(d, s, f, &xn, &mix, m)?,
+        }
         t.add_rmsnorm(d, &x0, &mix, &w.head_norm, &x1, &xn, m)?;
         Ok(xn)
     }

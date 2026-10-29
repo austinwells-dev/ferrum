@@ -110,7 +110,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Write a haiku about Rust."}]}'
 ```
 
-To make generation faster, add a drafter. On the dense 27B, `--draft mtp` uses the prediction head inside the GGUF and needs no extra download (the MoE's MTP head routes to experts, which Ferrum does not support yet). A DFlash2 drafter with draft trees is faster still: `--draft <dir> --draft-tree 15`, or the experimental `--draft-tree auto`. On the MoE, use a DFlash2 drafter such as `jzinno/Ornith-1.5-35B-A3B-DFlash2` and keep chains. See [speculative decoding](docs/server.md#speculative-decoding).
+To make generation faster, add a drafter. `--draft mtp` uses the prediction head inside the GGUF and needs no extra download. On the dense 27B a DFlash2 drafter with draft trees is faster still: `--draft <dir> --draft-tree 15`, or the experimental `--draft-tree auto`. On the MoE, keep chains: MTP reaches 1.47× plain decoding on Tiel-Coder, and a DFlash2 drafter is slightly faster (1.52× with `incoai/Qwen3.6-35B-A3B-DFlash2`; `jzinno/Ornith-1.5-35B-A3B-DFlash2` also works). See [speculative decoding](docs/server.md#speculative-decoding).
 
 ## The TUI
 
