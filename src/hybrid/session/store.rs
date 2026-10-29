@@ -21,7 +21,8 @@ use std::{
     rc::Rc,
 };
 
-const VERSION: u64 = 1;
+/// 2: Q8 K/V rows are stored plane by plane (`HybridState::kv_planes`).
+const VERSION: u64 = 2;
 /// K/V rows uploaded per GPU copy on load.
 const ROWS_PER_UPLOAD: usize = 4096;
 
@@ -52,6 +53,51 @@ fn read_tokens(path: &Path) -> Option<Vec<u32>> {
 /// Bytes per row of a one-row-per-position K/V cache.
 fn row_bytes(t: &Tensor) -> usize {
     t.byte_size() / t.shape().dimensions()[0]
+}
+
+/// Checks the order of the K/V records in `kv.bin` as a load replays them:
+/// each starts within what earlier records reached, and together they cover
+/// the `rows` being loaded. A record may reach past `rows`, or start past
+/// it, when the conversation got shorter after it was written.
+struct Replay {
+    rows: usize,
+    capacity: usize,
+    /// Furthest position any record reached.
+    reach: usize,
+    /// Rows below `rows` loaded so far (all of `0..covered`).
+    covered: usize,
+}
+
+impl Replay {
+    fn new(rows: usize, capacity: usize) -> Self {
+        Self {
+            rows,
+            capacity,
+            reach: 0,
+            covered: 0,
+        }
+    }
+
+    /// The record `from..to`: its rows `from..keep` are loaded, the rest
+    /// skipped. Returns `keep`.
+    fn take(&mut self, from: usize, to: usize) -> Result<usize> {
+        if from > self.reach || from >= to || to > self.capacity {
+            return Err(Error::Cache(
+                "session cache: K/V records out of order".into(),
+            ));
+        }
+        self.reach = self.reach.max(to);
+        let keep = to.min(self.rows).max(from);
+        self.covered = self.covered.max(keep);
+        Ok(keep)
+    }
+
+    fn finish(&self) -> Result<()> {
+        if self.covered < self.rows {
+            return Err(Error::Cache("session cache: K/V rows missing".into()));
+        }
+        Ok(())
+    }
 }
 
 impl Session {
@@ -293,18 +339,13 @@ impl Session {
         // record can reach past `rows` when the conversation got shorter
         // since it was written; those rows are skipped.
         let mut kv = fs::File::open(dir.join("kv.bin")).map_err(io)?;
-        let mut covered = 0;
+        let mut replay = Replay::new(rows, self.capacity());
         let kv_tensors: Vec<Tensor> = self.state.kv_linear().cloned().collect();
         let mut header = [0u8; 16];
         while kv.read_exact(&mut header).is_ok() {
             let from = u64::from_le_bytes(header[..8].try_into().unwrap()) as usize;
             let to = u64::from_le_bytes(header[8..].try_into().unwrap()) as usize;
-            if from > covered || from >= to || to > self.capacity() {
-                return Err(Error::Cache(
-                    "session cache: K/V records out of order".into(),
-                ));
-            }
-            let keep = to.min(rows).max(from);
+            let keep = replay.take(from, to)?;
             for t in &kv_tensors {
                 for (at, row) in self.state.kv_planes(t) {
                     let mut start = from;
@@ -321,11 +362,8 @@ impl Session {
                         .map_err(io)?;
                 }
             }
-            covered = covered.max(keep);
         }
-        if covered < rows {
-            return Err(Error::Cache("session cache: K/V rows missing".into()));
-        }
+        replay.finish()?;
         let media = meta["media"]
             .as_array()
             .into_iter()
@@ -375,5 +413,39 @@ impl Session {
                 .restore_snapshot(d, &s.tensors, resume, s.written)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Replay;
+
+    fn replay(records: &[(usize, usize)], rows: usize) -> Option<Vec<usize>> {
+        let mut r = Replay::new(rows, 1000);
+        let keeps = records
+            .iter()
+            .map(|&(from, to)| r.take(from, to).ok())
+            .collect::<Option<Vec<_>>>()?;
+        r.finish().ok().map(|_| keeps)
+    }
+
+    #[test]
+    fn records_replay_in_order() {
+        // Grown twice: everything loads.
+        assert_eq!(replay(&[(0, 100), (100, 120)], 120), Some(vec![100, 120]));
+        // Rewound to 80 and grown to 90 after one save.
+        assert_eq!(replay(&[(0, 100), (80, 90)], 90), Some(vec![90, 90]));
+        // The same after two saves: the second record starts past the new
+        // length and is skipped.
+        assert_eq!(
+            replay(&[(0, 100), (100, 120), (80, 90)], 90),
+            Some(vec![90, 100, 90])
+        );
+        // A gap, an empty record, or rows past the capacity are refused.
+        assert_eq!(replay(&[(0, 50), (60, 90)], 90), None);
+        assert_eq!(replay(&[(0, 50), (50, 50)], 50), None);
+        assert_eq!(replay(&[(0, 1001)], 90), None);
+        // Records that stop short of the saved rows.
+        assert_eq!(replay(&[(0, 50)], 90), None);
     }
 }

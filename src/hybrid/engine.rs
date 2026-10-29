@@ -491,11 +491,15 @@ impl HybridState {
     pub(crate) fn kv_planes(&self, t: &Tensor) -> Vec<(usize, usize)> {
         let rows = t.shape().dimensions()[0];
         let row = t.byte_size() / rows;
+        debug_assert_eq!(t.byte_size(), rows * row);
         match self.kv_cache {
             KvCache::F16 => vec![(0, row)],
             KvCache::Q8 => {
                 // `row` = width + width / 16 (one F16 scale per 32 values).
+                debug_assert_eq!(row % 17, 0);
                 let width = row / 17 * 16;
+                // `upload` copies whole 4-byte words of scales.
+                debug_assert_eq!(width % 64, 0);
                 vec![(0, width), (rows * width, row - width)]
             }
         }
