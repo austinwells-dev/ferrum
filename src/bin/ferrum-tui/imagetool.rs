@@ -2,8 +2,9 @@
 //! tab's Qwen-Image model. The chat model's thread runs it, because the
 //! picture needs the GPU and often the chat model's memory: when the
 //! pipeline's stages do not fit beside the chat model, the chat model is
-//! unloaded for the picture and loaded again after it (the next turn then
-//! reads the conversation afresh, since its cache went with the model).
+//! unloaded for the picture and loaded again after it. The chat thread saves
+//! its session cache to disk first and loads it back after, when the chat's
+//! session cache is on; otherwise the next turn reads the conversation afresh.
 use crate::agent::{Sandbox, arg_int, arg_str, def};
 use crate::imagetab::stage_label;
 use crate::*;

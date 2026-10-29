@@ -470,6 +470,28 @@ impl HybridState {
             .flat_map(|(_, (k, v))| k.iter().chain(v));
         self.recurrent().chain(rings)
     }
+    /// K/V caches of full-attention layers (one row per position), K then V
+    /// per layer: what a session saved to disk stores row by row.
+    pub(crate) fn kv_linear(&self) -> impl Iterator<Item = &Tensor> {
+        self.ring
+            .iter()
+            .zip(self.k.iter().zip(&self.v))
+            .filter(|(ring, _)| **ring == 0)
+            .flat_map(|(_, (k, v))| k.iter().chain(v))
+    }
+    pub(crate) fn written(&self) -> usize {
+        self.written
+    }
+    /// Take `len` positions whose K/V rows were written from disk, with
+    /// `written` for the rings a snapshot restore then copies in.
+    pub(crate) fn adopt(&mut self, len: usize, written: usize, media: Vec<ImageSpan>) {
+        self.len = len;
+        self.written = written;
+        self.media = media;
+        self.valid = true;
+        self.verified = 0;
+        self.verified_tree.clear();
+    }
     /// Buffers for one `save_snapshot`.
     pub(crate) fn alloc_snapshot(&self, d: &MetalDevice) -> Result<Vec<Tensor>> {
         self.snapshot_tensors()
@@ -755,6 +777,17 @@ fn bx_state(
         [256, 1, 1],
         0,
     )
+}
+
+/// Write `data` into `dst` at byte `offset` through a staging buffer.
+pub(crate) fn upload(d: &MetalDevice, dst: &Tensor, offset: usize, data: &[u8]) -> Result<()> {
+    let size = dst.dtype().size_bytes();
+    if !offset.is_multiple_of(size) || !data.len().is_multiple_of(4) || data.is_empty() {
+        return Err(Error::Shape("unaligned upload".into()));
+    }
+    let staged = Tensor::staged(d, [data.len() / 4], DType::F32, data)?;
+    let view = dst.view(offset / size, [data.len() / size])?;
+    copy_bytes(d, &staged, &view)
 }
 
 /// `copy` of the raw bytes of two same-sized tensors of any type (a

@@ -10,7 +10,10 @@ use super::{
     speculative::{DraftTree, Drafter, SpecStats, accept_walk},
 };
 use crate::{Error, MetalDevice, Result, Tensor};
+
+mod store;
 use std::time::{Duration, Instant};
+pub use store::SaveStats;
 
 #[derive(Debug, Clone)]
 pub struct SamplingParams {

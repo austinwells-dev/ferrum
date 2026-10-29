@@ -157,6 +157,15 @@ pub fn fields() -> Vec<Field> {
             "K/V cache precision. q8 needs about half the memory (auto context grows) and is faster at long context; f16 is exact.",
         ),
         field(
+            "session_cache",
+            "Session cache",
+            m,
+            Chat,
+            Kind::Cycle(&["on", "off"]),
+            "on",
+            "Keep each chat's cache in ~/.cache/ferrum/sessions, so resuming it, restarting, or a picture that unloads the model doesn't re-read the conversation.",
+        ),
+        field(
             "max_tokens",
             "Max tokens",
             m,

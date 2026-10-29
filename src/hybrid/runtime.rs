@@ -12,7 +12,10 @@ use super::{
     lookup::Lookup,
     mtp::{Mtp, mtp_state_bytes, mtp_weight_bytes},
     plan::{DraftMemory, PlanOptions},
-    session::{Completion, Flow, Generation, GenerationHooks, SamplingParams, Session, StopReason},
+    session::{
+        Completion, Flow, Generation, GenerationHooks, SamplingParams, SaveStats, Session,
+        StopReason,
+    },
     speculative::Drafter,
 };
 use crate::{
@@ -461,6 +464,8 @@ pub struct Runtime {
     pub draft_loaded_bytes: usize,
     /// Present when a vision projector was loaded: requests may carry images.
     pub vision: Option<Vision>,
+    /// The model file as a saved session depends on it (`save_session`).
+    cache_identity: String,
 }
 
 impl Runtime {
@@ -611,7 +616,21 @@ impl Runtime {
             model_name,
             draft_loaded_bytes,
             vision,
+            cache_identity: cache_identity(path),
         })
+    }
+
+    /// Save slot 0's session to `dir` (see `session::Session::save_to`).
+    pub fn save_session(&self, dir: &Path) -> Result<SaveStats> {
+        self.session.save_to(dir, &self.cache_identity)
+    }
+
+    /// Load slot 0's session from `dir` if it was saved for this model file
+    /// and session geometry; returns the tokens now cached.
+    pub fn load_session(&mut self, dir: &Path) -> Result<Option<usize>> {
+        let model = &self.loaded.model;
+        self.session
+            .load_from(&self.device, model, dir, &self.cache_identity)
     }
 
     pub fn supports_vision(&self) -> bool {
@@ -1158,6 +1177,23 @@ impl StopReason {
             StopReason::Length | StopReason::ContextFull => "length",
         }
     }
+}
+
+/// A model file's path, size and modification time: a saved session is only
+/// loaded into the same file.
+fn cache_identity(path: &Path) -> String {
+    let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let meta = std::fs::metadata(&path).ok();
+    let modified = meta
+        .as_ref()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |t| t.as_secs());
+    format!(
+        "{} {} {modified}",
+        path.display(),
+        meta.map_or(0, |m| m.len())
+    )
 }
 
 /// Text the generation prompt needs when the template does not open the think

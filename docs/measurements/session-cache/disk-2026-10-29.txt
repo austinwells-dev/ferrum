@@ -1,0 +1,64 @@
+# start 2026-10-29 19:40:03 UTC; macOS 27.0.1; commit a5a8ad4 + working tree
+Apple M5
+34359738368
+   Solid State:               Yes
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 148.9% of one core; largest process 61.2% of one core.
+preflight exit 0
+== LFM3-VL-2B   ("IOConsoleLocked" = No)
+| tokens | prefill s | save s | save MiB | reload s | load s | reused after load | same output | turn 2 reused (memory / disk) | turn 2 save MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| 2356 | 0.94 | 0.057 | 54.4 | 0.5 | 0.022 | 2355 of 2356 | yes | 2355 / 2355 | 27.0 |
+| 9356 | 4.10 | 0.104 | 136.4 | 0.5 | 0.037 | 9355 of 9356 | yes | 9355 / 9355 | 27.0 |
+| 39022 | 23.82 | 0.339 | 484.2 | 0.5 | 0.096 | 39021 of 39022 | yes | 39021 / 39021 | 27.1 |
+PASS
+exit 0
+== Spark-X2.6-4B   ("IOConsoleLocked" = No)
+| tokens | prefill s | save s | save MiB | reload s | load s | reused after load | same output | turn 2 reused (memory / disk) | turn 2 save MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| 3087 | 3.18 | 0.229 | 339.7 | 0.8 | 0.071 | 3086 of 3087 | yes | 3134 / 3134 | 231.6 |
+| 12492 | 15.14 | 0.428 | 670.4 | 0.8 | 0.124 | 12491 of 12492 | yes | 12539 / 12539 | 231.7 |
+| 51761 | 101.64 | 0.505 | 2051.1 | 0.9 | 0.342 | 51760 of 51761 | yes | 51808 / 51808 | 231.8 |
+PASS
+exit 0
+== Qwen3.6-35B-A3B   ("IOConsoleLocked" = No)
+| tokens | prefill s | save s | save MiB | reload s | load s | reused after load | same output | turn 2 reused (memory / disk) | turn 2 save MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| 3032 | 3.86 | 0.189 | 248.6 | 6.4 | 0.100 | 3031 of 3032 | yes | 3027 / 3027 | 189.7 |
+| 12437 | 18.33 | 0.296 | 432.3 | 6.3 | 0.138 | 12436 of 12437 | yes | 12432 / 12432 | 189.7 |
+| 51706 | 122.37 | 0.441 | 1199.4 | 6.3 | 0.295 | 51705 of 51706 | yes | 51701 / 51701 | 189.9 |
+PASS
+exit 0
+== Tiel-Coder-35B-A3B   ("IOConsoleLocked" = No)
+| tokens | prefill s | save s | save MiB | reload s | load s | reused after load | same output | turn 2 reused (memory / disk) | turn 2 save MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| 3207 | 4.32 | 0.184 | 252.0 | 6.0 | 0.099 | 3206 of 3207 | yes | 3254 / 3254 | 189.5 |
+| 12612 | 18.36 | 0.290 | 435.7 | 6.0 | 0.139 | 12611 of 12612 | yes | 12659 / 12659 | 189.8 |
+| 51881 | 121.94 | 0.437 | 1202.9 | 5.8 | 0.302 | 51880 of 51881 | yes | 51928 / 51928 | 189.9 |
+PASS
+exit 0
+== Tiel-Coder-35B-A3B + DFlash2 (--draft-max 2)   ("IOConsoleLocked" = No)
+| tokens | prefill s | save s | save MiB | reload s | load s | reused after load | same output | turn 2 reused (memory / disk) | turn 2 save MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| 3207 | 4.03 | 0.181 | 252.0 | 6.3 | 0.094 | 3206 of 3207 | yes | 3254 / 3254 | 189.5 |
+| 12612 | 18.39 | 0.306 | 435.7 | 6.4 | 0.132 | 12611 of 12612 | yes | 12659 / 12659 | 189.8 |
+| 51881 | 122.45 | 0.450 | 1202.9 | 6.4 | 0.302 | 51880 of 51881 | yes | 51928 / 51928 | 189.9 |
+PASS
+exit 0
+== Tiel-Coder-35B-A3B + MTP   ("IOConsoleLocked" = No)
+| tokens | prefill s | save s | save MiB | reload s | load s | reused after load | same output | turn 2 reused (memory / disk) | turn 2 save MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| 3207 | 4.18 | 0.167 | 252.0 | 6.9 | 0.104 | 3206 of 3207 | yes | 3254 / 3254 | 189.5 |
+| 12612 | 18.93 | 0.303 | 435.7 | 6.7 | 0.131 | 12611 of 12612 | yes | 12659 / 12659 | 189.8 |
+| 51881 | 129.37 | 0.813 | 1202.9 | 6.7 | 0.303 | 51880 of 51881 | yes | 51928 / 51928 | 189.9 |
+PASS
+exit 0
+== Swift-1.5-Qwen3.8-27B   ("IOConsoleLocked" = No)
+| tokens | prefill s | save s | save MiB | reload s | load s | reused after load | same output | turn 2 reused (memory / disk) | turn 2 save MiB |
+|---|---|---|---|---|---|---|---|---|---|
+| 3070 | 18.67 | 0.526 | 643.7 | 7.2 | 0.238 | 3069 of 3070 | yes | 3117 / 3117 | 453.1 |
+| 12475 | 82.86 | 0.707 | 1231.5 | 7.3 | 0.351 | 12474 of 12475 | yes | 12522 / 12522 | 453.1 |
+| 51744 | 449.44 | 1.134 | 3686.0 | 7.1 | 0.903 | 51743 of 51744 | yes | 51791 / 51791 | 453.3 |
+PASS
+exit 0
+# end 2026-10-29 20:08:30 UTC

@@ -715,6 +715,23 @@ impl Drafter for Mtp {
         ))
     }
 
+    fn adopt(&mut self, d: &MetalDevice, t: &HybridModel, tokens: &[u32]) -> Result<()> {
+        // Its own K/V rows and the last hidden state are unknown, so the
+        // first drafts after a load are weak.
+        self.staged.clear();
+        self.saved.clear();
+        self.len = tokens.len();
+        let src = Tensor::from_f32(
+            d,
+            [1, t.config.hidden],
+            DType::F32,
+            &vec![0.; t.config.hidden],
+        )?;
+        let e = d.execution_with_shared_encoder(true)?;
+        copy_rows(d, &src, &self.prev_h, 1, t.config.hidden)?;
+        e.finish()
+    }
+
     fn rewind(&mut self, d: &MetalDevice, t: &HybridModel, len: usize) -> Result<()> {
         if len == self.len + self.staged.len() {
             return Ok(());

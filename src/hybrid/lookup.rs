@@ -132,6 +132,10 @@ impl Drafter for Lookup {
         self.tokens.truncate(len);
         Ok(())
     }
+    fn adopt(&mut self, _: &MetalDevice, _: &HybridModel, tokens: &[u32]) -> Result<()> {
+        self.tokens = tokens.to_vec();
+        Ok(())
+    }
     fn rewinds_anywhere(&self) -> bool {
         true
     }

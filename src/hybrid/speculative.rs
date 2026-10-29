@@ -67,6 +67,10 @@ pub trait Drafter {
     fn rewinds_anywhere(&self) -> bool {
         false
     }
+    /// The target's cache was loaded from disk holding `tokens`, which this
+    /// drafter never ingested. Drafts may be weaker until it ingests new
+    /// tokens; verification keeps the output exact.
+    fn adopt(&mut self, d: &MetalDevice, target: &HybridModel, tokens: &[u32]) -> Result<()>;
     /// The session saved a recurrent snapshot at `pos`.
     fn snapshot(&mut self, _d: &MetalDevice, _pos: usize) -> Result<()> {
         Ok(())

@@ -34,6 +34,8 @@ pub struct ChatOpts {
     pub think: bool,
     pub effort: Option<String>,
     pub show_thinking: bool,
+    /// Keep each chat's session cache on disk (`sessions::cache_dir`).
+    pub session_cache: bool,
     pub budget: Option<usize>,
     pub overrides: Vec<(&'static str, f32)>,
     pub spec: Option<SpecOptions>,
@@ -168,6 +170,7 @@ impl ChatOpts {
             effort: Some(app.value("effort").to_string())
                 .filter(|s| !s.is_empty() && s != "default"),
             show_thinking: app.value("show") != "hide",
+            session_cache: app.value("session_cache") != "off",
             budget: count("budget"),
             overrides,
             spec,
@@ -215,6 +218,9 @@ enum ToWorker {
         tools: Vec<Json>,
     },
     Reset,
+    /// The chat whose cache folder this is is now open: save the current
+    /// one's cache, then load this one's (`None`: the cache is off).
+    Chat(Option<PathBuf>),
     Image(Box<imagetool::Work>),
 }
 
@@ -375,11 +381,37 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
     // `None` while a picture has the chat model's memory, or if loading it
     // again afterwards failed (the next turn tries again).
     let mut rt = Some(rt);
+    // The open chat's cache folder (`ToWorker::Chat`). Its cache is written
+    // only when it would otherwise be lost: before a reset, a switch to
+    // another chat, a picture that unloads the model, and on exit.
+    let mut cache: Option<PathBuf> = None;
+    let save = |rt: &Option<Runtime>, cache: &Option<PathBuf>| {
+        if let (Some(rt), Some(dir)) = (rt, cache)
+            && !rt.session.is_empty()
+            && rt.save_session(dir).is_ok()
+        {
+            sessions::prune_caches();
+        }
+    };
+    let restore = |rt: &mut Runtime, cache: &Option<PathBuf>| {
+        if let Some(dir) = cache {
+            let _ = rt.load_session(dir);
+        }
+    };
     while let Ok(msg) = rx.recv() {
         match msg {
             ToWorker::Reset => {
+                save(&rt, &cache);
                 if let Some(rt) = rt.as_mut() {
                     rt.session.reset();
+                }
+            }
+            ToWorker::Chat(dir) => {
+                save(&rt, &cache);
+                cache = dir;
+                if let Some(rt) = rt.as_mut() {
+                    rt.session.reset();
+                    restore(rt, &cache);
                 }
             }
             ToWorker::Image(work) => {
@@ -388,14 +420,25 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                     let _ = tx.send(FromWorker::ToolProgress(work.idx, text));
                 };
                 let result = match &opts.image {
-                    Some(model) => imagetool::run(model, &work, &mut || rt = None, &progress),
+                    Some(model) => imagetool::run(
+                        model,
+                        &work,
+                        &mut || {
+                            save(&rt, &cache);
+                            rt = None;
+                        },
+                        &progress,
+                    ),
                     None => Err("no Qwen-Image model is set up (see the Image tab)".into()),
                 };
                 let secs = started.elapsed().as_secs_f32();
                 if rt.is_none() {
                     progress("loading the chat model again".into());
                     match load(&opts, mmproj.as_deref(), &|_| {}) {
-                        Ok(loaded) => rt = Some(loaded),
+                        Ok(mut loaded) => {
+                            restore(&mut loaded, &cache);
+                            rt = Some(loaded);
+                        }
                         Err(e) => progress(format!("the chat model did not load again: {e}")),
                     }
                 }
@@ -413,7 +456,10 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                 cancel.store(false, Ordering::SeqCst);
                 if rt.is_none() {
                     match load(&opts, mmproj.as_deref(), &|_| {}) {
-                        Ok(loaded) => rt = Some(loaded),
+                        Ok(mut loaded) => {
+                            restore(&mut loaded, &cache);
+                            rt = Some(loaded);
+                        }
                         Err(e) => {
                             send(FromWorker::TurnFailed(format!(
                                 "loading the chat model again: {e}"
@@ -474,6 +520,7 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
             }
         }
     }
+    save(&rt, &cache);
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -742,6 +789,7 @@ pub struct Chat {
     flash: Option<(String, bool, Instant)>,
     pub agent: Option<Agent>,
     pub id: String,
+    session_cache: bool,
     created: u64,
     title: Option<String>,
     pub resume: Option<ResumeList>,
@@ -875,6 +923,11 @@ impl Chat {
         let flag = cancel.clone();
         let sandbox_confined = opts.sandbox_confined;
         let image_tool = opts.image.is_some();
+        let session_cache = opts.session_cache;
+        let id = sessions::new_id();
+        if session_cache {
+            let _ = tx.send(ToWorker::Chat(Some(sessions::cache_dir(&id))));
+        }
         let handle = std::thread::Builder::new()
             .name("ferrum-chat".into())
             .spawn(move || worker(opts, wrx, wtx, flag))
@@ -926,7 +979,8 @@ impl Chat {
             aborted: false,
             flash: None,
             agent,
-            id: sessions::new_id(),
+            id,
+            session_cache,
             created: bench::now(),
             title: None,
             resume: None,
@@ -1737,7 +1791,12 @@ impl Chat {
         self.ctx = None;
         self.last_stats.clear();
         self.follow = true;
-        let _ = self.tx.send(ToWorker::Reset);
+        let _ = self.tx.send(ToWorker::Chat(self.cache_dir()));
+    }
+
+    /// This chat's session cache folder, unless the cache is off.
+    fn cache_dir(&self) -> Option<PathBuf> {
+        self.session_cache.then(|| sessions::cache_dir(&self.id))
     }
 
     /// Keep this session on disk and start a fresh one in the same loaded model.
@@ -1745,6 +1804,7 @@ impl Chat {
         self.persist();
         self.reset();
         self.id = sessions::new_id();
+        let _ = self.tx.send(ToWorker::Chat(self.cache_dir()));
         self.created = bench::now();
         self.title = None;
         self.note("new session · the previous one is in /resume");
@@ -2263,9 +2323,17 @@ impl App {
                             chat.persist();
                             chat.restore(&data);
                             let n = chat.history.iter().filter(|m| m["role"] == "user").count();
+                            let cached = chat
+                                .cache_dir()
+                                .is_some_and(|d| d.join("meta.json").exists());
                             chat.note(format!(
-                                "resumed {:?} ({n} messages) · the model re-reads it with your next message",
-                                chat.title.clone().unwrap_or_default()
+                                "resumed {:?} ({n} messages) · {}",
+                                chat.title.clone().unwrap_or_default(),
+                                if cached {
+                                    "its saved cache is used if it was made with this model, so only new text is read"
+                                } else {
+                                    "the model re-reads it with your next message"
+                                }
                             ));
                         }
                         None => chat.flash("that session could not be read", false),

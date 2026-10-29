@@ -1884,4 +1884,10 @@ impl Drafter for DraftModel {
         // below its block, so stale slots past `len` are never read.
         Ok(())
     }
+
+    fn adopt(&mut self, _d: &MetalDevice, _t: &HybridModel, _tokens: &[u32]) -> Result<()> {
+        // The loaded positions have no slots of their own: drafts read
+        // whatever earlier tags remain until new rows are ingested.
+        Ok(())
+    }
 }
