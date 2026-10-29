@@ -1,0 +1,192 @@
+LLM regression check for #8 (LFM3), run after merge: base = experimental ec14e94 (before #8),
+branch = experimental d691ca6 (#8 merged). Both built with cargo build --release from detached
+worktrees. Machine: MacBook Pro Mac17,2, Apple M5, 32 GB, macOS 27.0.1. Whole run under
+caffeinate -dims, screen unlocked (IOConsoleLocked checked before every run; never Yes), one
+model in memory, after scripts/phase7a_cpu_preflight.py (PHASE7A_PREFLIGHT_IGNORE=dasd).
+Script: regression-2026-10-29.sh. Models: Swift-1.5-Qwen3.8-27B Q4_K_M (dense hybrid, GGUF name
+"Miroslav 1.0"), Tiel-Coder-35B-A3B MTP UD-IQ4_XS (MoE hybrid, GGUF name "Ornith-1.5-35B").
+Summary:
+  Greedy text (48 tokens): byte-identical on both models.
+  Memory planner: measured and predicted figures identical between builds, within 3 MiB.
+  KLD vs llama.cpp (Homebrew build 11669; corpus README.md + docs/*.md at ec14e94, -c 512,
+  8 chunks): identical to every printed digit.
+    Swift 0.000115, top-1 99.51%, PPL 6.1211 (llama.cpp 6.1201)
+    Tiel  0.008244, top-1 96.03%, PPL 8.9963 (llama.cpp 8.9929)
+  The corpus differs from earlier records', so these KLDs are comparable only base vs branch.
+  hybrid_bench best-of-4 (range), base vs branch:
+    Swift pp512  170.28 (162.99-170.28) vs 170.98 (165.48-170.98)
+          pp2048 165.29 (161.51-165.29) vs 164.46 (159.90-164.46)
+          tg128    6.56 (6.44-6.56)     vs   6.53 (6.47-6.53)
+    Tiel  pp512  866.75 (823.37-866.75) vs 886.80 (867.38-886.80)
+          pp2048 835.77 (814.23-835.77) vs 814.69 (804.44-814.69)
+          tg128   38.83 (38.62-38.83)   vs  39.22 (38.99-39.22)
+  Every branch best lies inside the base's own range, or above it (Tiel pp512, tg128).
+  Tiel pp2048 is the one to watch: the base's best is its first run, and the branch's four
+  runs (804.44-814.69) sit at or within 0.5 of the base's slowest (814.23); medians 821.7
+  vs 813.5, about 1% lower.
+  That is smaller than this bench's run-to-run spread, and not shown to be a slowdown or not.
+
+# start 2026-10-29 16:34:26 UTC; macOS 27.0.1; "IOConsoleLocked" = No
+base = experimental ec14e94 (before #8), branch = experimental d691ca6 (#8 merged)
+Apple M5
+34359738368
+## preflight
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 166.1% of one core; largest process 58.9% of one core.
+preflight exit 0
+## greedy text: ferrum hybrid --model MODEL --raw --prompt 'The capital of France is' --max-new-tokens 48
+== base Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 16679 MiB (predicted 16682), state 6470 MiB (predicted 6471)
+stdout md5 83d343513ccf45f2d3d9e48af6c1fe10 bytes      198
+== branch Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 16679 MiB (predicted 16682), state 6470 MiB (predicted 6471)
+stdout md5 83d343513ccf45f2d3d9e48af6c1fe10 bytes      198
+greedy output identical
+== base Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 17114 MiB (predicted 17116), state 5183 MiB (predicted 5184)
+stdout md5 b7587183510804ec010b930f941ed75f bytes      239
+== branch Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 17114 MiB (predicted 17116), state 5183 MiB (predicted 5184)
+stdout md5 b7587183510804ec010b930f941ed75f bytes      239
+greedy output identical
+## KLD against llama.cpp (version: 0.7.0 (build 11669, commit 620d2225c)), corpus = README.md + docs/*.md at ec14e94, -c 512, 8 chunks
+   ("IOConsoleLocked" = No)
+llama-perplexity exit 0 for Swift-1.5-Qwen3.8-27B-Q4_K_M
+== base Swift-1.5-Qwen3.8-27B-Q4_K_M
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 13.7245 (llama.cpp 13.7273) mean KLD 0.000118 same top 99.61%
+chunk 1: ppl 9.6873 (llama.cpp 9.6725) mean KLD 0.000098 same top 99.61%
+chunk 2: ppl 6.8350 (llama.cpp 6.8312) mean KLD 0.000106 same top 99.61%
+chunk 3: ppl 6.1561 (llama.cpp 6.1539) mean KLD 0.000108 same top 99.71%
+chunk 4: ppl 5.7696 (llama.cpp 5.7669) mean KLD 0.000111 same top 99.69%
+chunk 5: ppl 6.3415 (llama.cpp 6.3384) mean KLD 0.000114 same top 99.54%
+chunk 6: ppl 5.9571 (llama.cpp 5.9550) mean KLD 0.000117 same top 99.50%
+chunk 7: ppl 6.1211 (llama.cpp 6.1201) mean KLD 0.000115 same top 99.51%
+positions 2040; Ferrum PPL 6.1211; llama.cpp PPL 6.1201; mean KLD 0.000115; median 0.000043; p99 0.001264; max 0.007343; same top-1 99.51%; 44.9 s
+== branch Swift-1.5-Qwen3.8-27B-Q4_K_M
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 13.7245 (llama.cpp 13.7273) mean KLD 0.000118 same top 99.61%
+chunk 1: ppl 9.6873 (llama.cpp 9.6725) mean KLD 0.000098 same top 99.61%
+chunk 2: ppl 6.8350 (llama.cpp 6.8312) mean KLD 0.000106 same top 99.61%
+chunk 3: ppl 6.1561 (llama.cpp 6.1539) mean KLD 0.000108 same top 99.71%
+chunk 4: ppl 5.7696 (llama.cpp 5.7669) mean KLD 0.000111 same top 99.69%
+chunk 5: ppl 6.3415 (llama.cpp 6.3384) mean KLD 0.000114 same top 99.54%
+chunk 6: ppl 5.9571 (llama.cpp 5.9550) mean KLD 0.000117 same top 99.50%
+chunk 7: ppl 6.1211 (llama.cpp 6.1201) mean KLD 0.000115 same top 99.51%
+positions 2040; Ferrum PPL 6.1211; llama.cpp PPL 6.1201; mean KLD 0.000115; median 0.000043; p99 0.001264; max 0.007343; same top-1 99.51%; 44.8 s
+   ("IOConsoleLocked" = No)
+llama-perplexity exit 0 for Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS
+== base Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 20.4090 (llama.cpp 20.3977) mean KLD 0.005390 same top 95.29%
+chunk 1: ppl 15.4325 (llama.cpp 15.2890) mean KLD 0.006945 same top 95.10%
+chunk 2: ppl 9.7105 (llama.cpp 9.6877) mean KLD 0.006727 same top 95.95%
+chunk 3: ppl 8.5821 (llama.cpp 8.5697) mean KLD 0.005925 same top 96.37%
+chunk 4: ppl 7.9935 (llama.cpp 7.9563) mean KLD 0.006449 same top 96.31%
+chunk 5: ppl 9.2047 (llama.cpp 9.2082) mean KLD 0.007943 same top 95.88%
+chunk 6: ppl 8.9177 (llama.cpp 8.9038) mean KLD 0.007673 same top 96.02%
+chunk 7: ppl 8.9963 (llama.cpp 8.9929) mean KLD 0.008244 same top 96.03%
+positions 2040; Ferrum PPL 8.9963; llama.cpp PPL 8.9929; mean KLD 0.008244; median 0.002711; p99 0.081773; max 0.363205; same top-1 96.03%; 15.4 s
+== branch Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 20.4090 (llama.cpp 20.3977) mean KLD 0.005390 same top 95.29%
+chunk 1: ppl 15.4325 (llama.cpp 15.2890) mean KLD 0.006945 same top 95.10%
+chunk 2: ppl 9.7105 (llama.cpp 9.6877) mean KLD 0.006727 same top 95.95%
+chunk 3: ppl 8.5821 (llama.cpp 8.5697) mean KLD 0.005925 same top 96.37%
+chunk 4: ppl 7.9935 (llama.cpp 7.9563) mean KLD 0.006449 same top 96.31%
+chunk 5: ppl 9.2047 (llama.cpp 9.2082) mean KLD 0.007943 same top 95.88%
+chunk 6: ppl 8.9177 (llama.cpp 8.9038) mean KLD 0.007673 same top 96.02%
+chunk 7: ppl 8.9963 (llama.cpp 8.9929) mean KLD 0.008244 same top 96.03%
+positions 2040; Ferrum PPL 8.9963; llama.cpp PPL 8.9929; mean KLD 0.008244; median 0.002711; p99 0.081773; max 0.363205; same top-1 96.03%; 15.4 s
+## hybrid_bench --pp 512,2048 --tg 128, A-B-B-A x2
+### Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf
+-- base
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 162.99 ± 1.06 |
+| Miroslav 1.0 | pp2048 | 161.51 ± 0.83 |
+| Miroslav 1.0 | tg128 | 6.56 ± 0.01 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 170.98 ± 1.30 |
+| Miroslav 1.0 | pp2048 | 164.46 ± 0.13 |
+| Miroslav 1.0 | tg128 | 6.51 ± 0.09 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 165.48 ± 1.52 |
+| Miroslav 1.0 | pp2048 | 162.82 ± 0.68 |
+| Miroslav 1.0 | tg128 | 6.53 ± 0.04 |
+-- base
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 167.62 ± 0.82 |
+| Miroslav 1.0 | pp2048 | 164.09 ± 1.27 |
+| Miroslav 1.0 | tg128 | 6.55 ± 0.04 |
+-- base
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 168.17 ± 0.74 |
+| Miroslav 1.0 | pp2048 | 163.15 ± 0.86 |
+| Miroslav 1.0 | tg128 | 6.48 ± 0.02 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 167.67 ± 1.02 |
+| Miroslav 1.0 | pp2048 | 163.73 ± 0.42 |
+| Miroslav 1.0 | tg128 | 6.51 ± 0.03 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 167.09 ± 0.46 |
+| Miroslav 1.0 | pp2048 | 159.90 ± 5.55 |
+| Miroslav 1.0 | tg128 | 6.47 ± 0.07 |
+-- base
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 170.28 ± 1.61 |
+| Miroslav 1.0 | pp2048 | 165.29 ± 0.41 |
+| Miroslav 1.0 | tg128 | 6.44 ± 0.12 |
+### Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf
+-- base
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 866.75 ± 60.55 |
+| Ornith-1.5-35B | pp2048 | 835.77 ± 4.03 |
+| Ornith-1.5-35B | tg128 | 38.77 ± 0.14 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 886.80 ± 58.45 |
+| Ornith-1.5-35B | pp2048 | 814.69 ± 6.33 |
+| Ornith-1.5-35B | tg128 | 38.99 ± 0.29 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 873.79 ± 64.94 |
+| Ornith-1.5-35B | pp2048 | 804.44 ± 10.95 |
+| Ornith-1.5-35B | tg128 | 39.22 ± 0.05 |
+-- base
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 828.57 ± 24.01 |
+| Ornith-1.5-35B | pp2048 | 814.23 ± 12.70 |
+| Ornith-1.5-35B | tg128 | 38.62 ± 0.09 |
+-- base
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 849.12 ± 52.66 |
+| Ornith-1.5-35B | pp2048 | 822.00 ± 3.99 |
+| Ornith-1.5-35B | tg128 | 38.83 ± 0.05 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 884.47 ± 50.84 |
+| Ornith-1.5-35B | pp2048 | 814.30 ± 7.92 |
+| Ornith-1.5-35B | tg128 | 39.09 ± 0.23 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 867.38 ± 62.65 |
+| Ornith-1.5-35B | pp2048 | 812.69 ± 15.98 |
+| Ornith-1.5-35B | tg128 | 39.22 ± 0.23 |
+-- base
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 823.37 ± 7.68 |
+| Ornith-1.5-35B | pp2048 | 821.32 ± 13.10 |
+| Ornith-1.5-35B | tg128 | 38.74 ± 0.10 |
+# end 2026-10-29 17:02:00 UTC
