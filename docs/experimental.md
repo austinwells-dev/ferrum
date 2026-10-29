@@ -203,9 +203,9 @@ Against Kapitsa through each server (same prompts): 82–91% of its greedy speed
 
 ## Validation
 
-Against `experimental` at `12a6e09` on a 32 GB M5, with Qwen3.8-27B UD-Q4_K_XL, Tiel-Coder-35B-A3B UD-IQ4_XS and Spark-X2.6-4B Q4_K_M ([parallel-slots-2026-10](measurements/parallel-slots-2026-10/README.md)):
+Measured on `feat/parallel-slots-image-options`, with `experimental` at `12a6e09` as the base, on a 32 GB M5, with Qwen3.8-27B UD-Q4_K_XL, Tiel-Coder-35B-A3B UD-IQ4_XS and Spark-X2.6-4B Q4_K_M ([parallel-slots-2026-10](measurements/parallel-slots-2026-10/README.md)):
 
-- Greedy server output is identical to the base with 1, 4 and 8 slots, with the requests sent at once, and with a DFlash drafter at 1 and 4 slots.
+- Greedy server output is identical to the base with 1, 4 and 8 slots (sent all at once for 4 and 8), and on Tiel with a DFlash drafter at 1 and 4 slots.
 - KLD against llama.cpp, `hybrid_session_check`, `hybrid_spec_check` and the memory plan (within 3 MiB) are unchanged.
 - With 8 users on Tiel, each with its own ~1,280-token system prompt, a user's third turn reuses 1,307 of 1,331 prompt tokens and takes 145 ms to prefill, against 0 reused and 1,895 ms with one slot.
 
@@ -213,7 +213,7 @@ Against `experimental` at `12a6e09` on a 32 GB M5, with Qwen3.8-27B UD-Q4_K_XL, 
 
 - Slots take turns on the GPU rather than being batched, so total throughput stays about that of one request (Tiel: 33–35 tok/s total from 1 to 8 users), and each request's own rate drops as users are added.
 - The drafter runs on slot 0 only, so its speedup shrinks as users are added.
-- Each slot reserves its own K/V and state, so N slots fit a shorter context each; the 27B fits 8 slots at 4,096 tokens but not 8,192.
+- Each slot reserves its own K/V and state, so N slots fit a shorter context each; the 27B fits 8 slots at 4,096 tokens but not 8,192 (the largest that fits is 5,376).
 
 # Image generation
 
