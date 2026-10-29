@@ -230,6 +230,8 @@ pub struct HybridState {
     /// One past the highest position whose K/V was ever written: ring rows of
     /// positions below `written - ring` have been overwritten.
     written: usize,
+    /// Format of the K/V caches (`kv_planes`).
+    kv_cache: KvCache,
 }
 
 /// Rows of the K/V ring of sliding-window `layer` when a forward adds at most
@@ -286,6 +288,7 @@ impl HybridState {
             window: Vec::new(),
             max_rows,
             written: 0,
+            kv_cache: c.kv_cache,
         };
         for layer in 0..c.layers {
             let ring = if c.is_attention(layer) {
@@ -481,6 +484,21 @@ impl HybridState {
     }
     pub(crate) fn written(&self) -> usize {
         self.written
+    }
+    /// The byte planes of a `kv_linear` cache as (offset, bytes per row):
+    /// the whole row for F16; for Q8 every row's values, then every row's
+    /// scales (`KvCache::Q8`).
+    pub(crate) fn kv_planes(&self, t: &Tensor) -> Vec<(usize, usize)> {
+        let rows = t.shape().dimensions()[0];
+        let row = t.byte_size() / rows;
+        match self.kv_cache {
+            KvCache::F16 => vec![(0, row)],
+            KvCache::Q8 => {
+                // `row` = width + width / 16 (one F16 scale per 32 values).
+                let width = row / 17 * 16;
+                vec![(0, width), (rows * width, row - width)]
+            }
+        }
     }
     /// Take `len` positions whose K/V rows were written from disk, with
     /// `written` for the rings a snapshot restore then copies in.
@@ -3446,6 +3464,7 @@ mod tests {
             window: Vec::new(),
             max_rows: 1,
             written: 0,
+            kv_cache: KvCache::F16,
         };
         // Text only: a plain offset.
         let plan = state.rope_plan(&d, 17, 4).unwrap();
@@ -4046,6 +4065,7 @@ mod tests {
             window: vec![0, 513],
             max_rows: 512,
             written,
+            kv_cache: KvCache::F16,
         };
         // Nothing overwritten yet: any position resumes.
         assert!(state(1000).can_resume(10));

@@ -616,7 +616,11 @@ impl Runtime {
             model_name,
             draft_loaded_bytes,
             vision,
-            cache_identity: cache_identity(path),
+            // Cached image rows depend on the projector as well.
+            cache_identity: match mmproj {
+                Some(mmproj) => format!("{} + {}", cache_identity(path), cache_identity(mmproj)),
+                None => cache_identity(path),
+            },
         })
     }
 

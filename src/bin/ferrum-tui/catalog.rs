@@ -675,7 +675,7 @@ pub fn check(path: &Path) -> Checked {
             .and_then(|n| n.parse::<usize>().ok());
         if layer.is_some_and(|l| l >= config.layers) {
             // Q3_K MTP experts (the 35B MoE GGUFs) load as Q6_K.
-            if t.type_id != 11 {
+            if t.type_id != ferrum::hybrid::weights::Q3K {
                 head.push(t.type_id);
             }
         } else {

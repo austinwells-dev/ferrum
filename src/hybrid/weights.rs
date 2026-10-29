@@ -256,6 +256,9 @@ impl Weights {
 struct Loader<'a> {
     device: &'a MetalDevice,
     file: &'a mut GgufFile,
+    /// Load Q3_K tensors as Q6_K (`q3k_to_q6k`): only the MTP block, whose
+    /// expert tensors are Q3_K in the 35B MoE GGUFs.
+    q3k_as_q6k: bool,
 }
 
 impl Loader<'_> {
@@ -264,7 +267,15 @@ impl Loader<'_> {
     }
 
     fn stacked(&mut self, name: &str, experts: usize, rows: usize, cols: usize) -> Result<Matrix> {
-        gguf_matrix(self.device, self.file, name, experts, rows, cols)
+        gguf_matrix(
+            self.device,
+            self.file,
+            name,
+            experts,
+            rows,
+            cols,
+            self.q3k_as_q6k,
+        )
     }
 
     /// The routed and shared experts of the block whose tensor names `n` gives.
@@ -408,7 +419,7 @@ impl Loader<'_> {
 }
 
 /// Load `[experts][rows][cols]` (GGUF dims `[cols, rows, experts]`) in its
-/// stored encoding.
+/// stored encoding, or Q3_K as Q6_K with `q3k_as_q6k`.
 pub(crate) fn gguf_matrix(
     device: &MetalDevice,
     file: &mut GgufFile,
@@ -416,6 +427,7 @@ pub(crate) fn gguf_matrix(
     experts: usize,
     rows: usize,
     cols: usize,
+    q3k_as_q6k: bool,
 ) -> Result<Matrix> {
     let info = file.tensor(name)?.clone();
     let expected: Vec<usize> = if experts == 1 {
@@ -432,8 +444,7 @@ pub(crate) fn gguf_matrix(
             ),
         });
     }
-    // Q3_K (only the MTP experts of the Qwen3.6 MoE GGUFs) runs as Q6_K.
-    let q3k = info.type_id == Q3K;
+    let q3k = q3k_as_q6k && info.type_id == Q3K;
     let stored = if q3k { Q6K } else { info.type_id };
     let format = Format::from_type(stored).ok_or_else(|| Error::Weight {
         name: name.into(),
@@ -477,7 +488,7 @@ pub(crate) fn gguf_matrix(
     })
 }
 
-const Q3K: u32 = 11;
+pub const Q3K: u32 = 11;
 const Q6K: u32 = 14;
 const Q3K_BLOCK: usize = 110;
 const Q6K_BLOCK: usize = 210;
@@ -561,7 +572,11 @@ fn load_weights(
     c: &HybridConfig,
     head: bool,
 ) -> Result<Weights> {
-    let mut l = Loader { device, file };
+    let mut l = Loader {
+        device,
+        file,
+        q3k_as_q6k: false,
+    };
     let embedding = l.matrix_or_bf16("token_embd.weight", c.vocab, c.hidden)?;
     let output_norm = l.vector("output_norm.weight", c.hidden)?;
     let output = if !head {
@@ -777,7 +792,11 @@ pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> 
         true => 0,
         false => file.tensor(&n("ffn_gate.weight"))?.dimensions[1],
     };
-    let mut l = Loader { device, file };
+    let mut l = Loader {
+        device,
+        file,
+        q3k_as_q6k: true,
+    };
     let q = c.heads * c.head_dim;
     let kv = c.kv_heads * c.head_dim;
     Ok(MtpWeights {

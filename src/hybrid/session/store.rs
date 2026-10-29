@@ -16,7 +16,7 @@ use crate::{
 use serde_json::{Value as Json, json};
 use std::{
     fs,
-    io::{Read, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::Path,
     rc::Rc,
 };
@@ -81,6 +81,9 @@ impl Session {
             .ok()
             .and_then(|b| serde_json::from_slice::<Json>(&b).ok())
             .filter(|m| m["key"] == key.as_str());
+        // Until the new meta.json is in place the folder holds a mix of two
+        // saves; without a meta.json a load ignores it.
+        let _ = fs::remove_file(&meta_path);
         let mut stats = SaveStats::default();
         let len = self.tokens.len();
 
@@ -118,16 +121,19 @@ impl Session {
             kv.write_all(&record).map_err(io)?;
             stats.bytes += 16;
             for t in self.state.kv_linear() {
-                let row = row_bytes(t);
-                t.read_bytes(|b| kv.write_all(&b[from * row..len * row]))
-                    .map_err(io)?;
-                stats.bytes += ((len - from) * row) as u64;
+                for (at, row) in self.state.kv_planes(t) {
+                    t.read_bytes(|b| kv.write_all(&b[at + from * row..at + len * row]))
+                        .map_err(io)?;
+                    stats.bytes += ((len - from) * row) as u64;
+                }
             }
             stats.kv_rows = len - from;
         }
         kv.sync_data().map_err(io)?;
 
-        // Snapshots: one file per (position, written); unchanged ones stay.
+        // Snapshots: one file per (position, written). A file already on disk
+        // is kept only within the prefix that still matches: past it, the
+        // same name may hold another conversation's state.
         let mut snapshots = Vec::new();
         let mut keep = Vec::new();
         for s in self
@@ -137,7 +143,7 @@ impl Session {
         {
             let name = format!("snap-{}-{}.bin", s.position, s.written);
             let path = dir.join(&name);
-            if !(append && path.exists()) {
+            if !(append && s.position <= common && path.exists()) {
                 let mut file = fs::File::create(&path).map_err(io)?;
                 for t in &s.tensors {
                     t.read_bytes(|b| file.write_all(b)).map_err(io)?;
@@ -283,7 +289,9 @@ impl Session {
         resume: usize,
         live: bool,
     ) -> Result<()> {
-        // K/V rows, record by record (a later record may rewrite rows).
+        // K/V rows, record by record (a later record may rewrite rows). A
+        // record can reach past `rows` when the conversation got shorter
+        // since it was written; those rows are skipped.
         let mut kv = fs::File::open(dir.join("kv.bin")).map_err(io)?;
         let mut covered = 0;
         let kv_tensors: Vec<Tensor> = self.state.kv_linear().cloned().collect();
@@ -291,25 +299,29 @@ impl Session {
         while kv.read_exact(&mut header).is_ok() {
             let from = u64::from_le_bytes(header[..8].try_into().unwrap()) as usize;
             let to = u64::from_le_bytes(header[8..].try_into().unwrap()) as usize;
-            if from > covered || to > rows || from >= to {
+            if from > covered || from >= to || to > self.capacity() {
                 return Err(Error::Cache(
                     "session cache: K/V records out of order".into(),
                 ));
             }
+            let keep = to.min(rows).max(from);
             for t in &kv_tensors {
-                let row = row_bytes(t);
-                let mut start = from;
-                while start < to {
-                    let end = (start + ROWS_PER_UPLOAD).min(to);
-                    let mut buf = vec![0; (end - start) * row];
-                    kv.read_exact(&mut buf).map_err(io)?;
-                    // Each upload waits for its copy, so the staging buffer
-                    // outlives it.
-                    upload(d, t, start * row, &buf)?;
-                    start = end;
+                for (at, row) in self.state.kv_planes(t) {
+                    let mut start = from;
+                    while start < keep {
+                        let end = (start + ROWS_PER_UPLOAD).min(keep);
+                        let mut buf = vec![0; (end - start) * row];
+                        kv.read_exact(&mut buf).map_err(io)?;
+                        // Each upload waits for its copy, so the staging
+                        // buffer outlives it.
+                        upload(d, t, at + start * row, &buf)?;
+                        start = end;
+                    }
+                    kv.seek(SeekFrom::Current(((to - keep) * row) as i64))
+                        .map_err(io)?;
                 }
             }
-            covered = covered.max(to);
+            covered = covered.max(keep);
         }
         if covered < rows {
             return Err(Error::Cache("session cache: K/V rows missing".into()));

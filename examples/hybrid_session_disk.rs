@@ -3,8 +3,10 @@
 //! dropped and the model loaded again (as the TUI does around a picture),
 //! the session loaded from disk, and the same request run again. Its output
 //! must be identical and it must reuse the cache; a second turn must reuse
-//! as much as it did in memory. Prints prefill time against save and load
-//! time, and the bytes each save wrote.
+//! as much as it did in memory. Then turn 1 again from that save, which makes
+//! the conversation shorter than the save it appends to: its save must load
+//! and resume with the same output. Prints prefill time against save and
+//! load time, and the bytes each save wrote.
 //!
 //! usage: hybrid_session_disk MODEL.gguf [--lengths 2000,8000,32000]
 //!        [--dir DIR] [--draft ...]
@@ -102,9 +104,9 @@ fn main() -> Result<()> {
     };
     let mut ok = true;
     println!(
-        "| tokens | prefill s | save s | save MiB | reload s | load s | reused after load | same output | turn 2 reused (memory / disk) | turn 2 save MiB |"
+        "| tokens | prefill s | save s | save MiB | reload s | load s | reused after load | same output | turn 2 reused (memory / disk) | turn 2 save MiB | shorter re-save |"
     );
-    println!("|---|---|---|---|---|---|---|---|---|---|");
+    println!("|---|---|---|---|---|---|---|---|---|---|---|");
     for &length in &lengths {
         let _ = std::fs::remove_dir_all(&dir);
         let mut rt = load()?;
@@ -156,10 +158,22 @@ fn main() -> Result<()> {
         rt.load_session(&dir)?;
         let (_, disk) = turn(&mut rt, &request(&next))?;
         let appended = rt.save_session(&dir)?;
+        // Shorter than the save it appends to.
+        rt.session.reset();
+        rt.load_session(&dir)?;
+        let (c, _) = turn(&mut rt, &request(&messages))?;
+        rt.save_session(&dir)?;
+        rt.session.reset();
+        let shorter = rt.load_session(&dir)?;
+        let (e, after) = turn(&mut rt, &request(&messages))?;
+        let shorter_ok = shorter.is_some()
+            && after.reused + 1 >= after.prompt
+            && c.text == a.text
+            && e.text == a.text;
         let reused_all = loaded.is_some() && again.reused + 1 >= again.prompt;
-        ok &= same && reused_all && disk.reused >= memory.reused;
+        ok &= same && reused_all && disk.reused >= memory.reused && shorter_ok;
         println!(
-            "| {} | {:.2} | {save_s:.3} | {:.1} | {reload_s:.1} | {load_s:.3} | {} of {} | {} | {} / {} | {:.1} |",
+            "| {} | {:.2} | {save_s:.3} | {:.1} | {reload_s:.1} | {load_s:.3} | {} of {} | {} | {} / {} | {:.1} | {} |",
             first.prompt,
             first.prefill_s,
             saved.bytes as f64 / (1 << 20) as f64,
@@ -169,6 +183,7 @@ fn main() -> Result<()> {
             memory.reused,
             disk.reused,
             appended.bytes as f64 / (1 << 20) as f64,
+            if shorter_ok { "ok" } else { "FAILED" },
         );
         if !same {
             println!("  memory: {:?}\n  disk:   {:?}", a.text, b.text);

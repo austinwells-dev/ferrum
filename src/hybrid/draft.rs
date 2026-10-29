@@ -593,7 +593,7 @@ fn gguf_weight(
         (Format::F32, 0) | (Format::Q4_0, 2) | (Format::Q8_0, 8)
     );
     if stored && cols.is_multiple_of(256) {
-        return gguf_matrix(d, file, &g, 1, rows, cols);
+        return gguf_matrix(d, file, &g, 1, rows, cols, false);
     }
     let layout = block_layout(info.type_id)?;
     let row_bytes = cols / layout.elements * layout.bytes;
