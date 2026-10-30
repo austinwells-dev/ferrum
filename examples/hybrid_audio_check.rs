@@ -64,16 +64,19 @@ fn main() -> Result<()> {
     if memory {
         // The worst case the plan covers: a full-length clip encoded while
         // the runtime's cache holds the rows of as many others as it keeps.
+        // Counted from here: the clip checked above still holds its rows,
+        // which the runtime would count as one of the cached clips.
+        let base = d.allocated_bytes();
         let longest = vec![0.; vision::MAX_AUDIO_SECONDS * audio::SAMPLE_RATE];
         let mut kept = Vec::new();
         let mut peak = 0;
         for i in 0..vision::AUDIO_CACHE_CLIPS {
-            let held = d.allocated_bytes() - before - loaded;
+            let held = d.allocated_bytes() - base;
             kept.push(model.encode_samples(&d, &longest, i as u64)?);
             peak = peak.max(held + model.activation_bytes());
         }
         let planned = vision::projector_bytes(std::path::Path::new(&args[1]));
-        let rows = (d.allocated_bytes() - before - loaded) / kept.len();
+        let rows = (d.allocated_bytes() - base) / kept.len();
         println!(
             "memory: planned {:.1} MiB; measured weights {:.1} MiB (loader counted {:.1}) + one {} s clip's encode {:.1} MiB (its rows {:.1} MiB) + {} more cached clips' rows = peak {:.1} MiB",
             mib(planned),

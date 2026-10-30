@@ -64,7 +64,8 @@ row per 80 ms of audio.
 `<|audio|>` is repeated once per row, and each row has its own position, as with LFM3 images. Clips
 are cached by content (the last eight, as many as one request may carry). One clip may
 last 120 s, checked from the WAV header before decoding; attention over a clip is n×n, and the memory plan
-counts every activation buffer for that length (`lfm3a::activation_bytes`). The
+counts every buffer encoding that length allocates (`lfm3a::activation_bytes`) plus the rows of the other
+seven cached clips (`lfm3a::output_bytes`). The
 `a.gen.*` speech generator in the same file is not loaded. Numbers and the known gaps are in
 [experimental.md](experimental.md#lfm3-audio-2b).
 

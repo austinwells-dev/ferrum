@@ -156,7 +156,7 @@ Speech input for the same `lfm3` language model, through an audio projector (`cl
 
 The language file has the same tensors as LFM3-1.7B, a trained context of 128000 and greedy sampling metadata (temperature 0, top-k 1). Its template turns `input_audio`, `audio` and `audio_url` parts into `<|audio|>` (id 125031), which is repeated once per encoded row. As in llama.cpp, the rows are not wrapped in begin and end tokens. Ferrum reads the input half only: the projector file also holds the speech generator and codec (`a.gen.*`, `clip.gen.audio.projector_type = lfm3a_gen`), which are not loaded.
 
-The encoder ([vision.md](vision.md#lfm3-audio)) turns 16 kHz mono into 128 log-mel bins every 10 ms, subsamples them 8× with a convolution stem, and runs 17 blocks at width 768: 10 gated short convolutions and 7 attention layers that see the current and 31 previous rows. One row is one language token, so a second of speech is 12.5 tokens. A clip is encoded in one pass, so one clip may last at most 120 s (1500 tokens). Its length is read from the WAV header, so a longer clip is refused before it is decoded. The memory plan counts the encoder's activation buffers for a 120 s clip (339 MiB) on top of the 220 MiB of weights it loads.
+The encoder ([vision.md](vision.md#lfm3-audio)) turns 16 kHz mono into 128 log-mel bins every 10 ms, subsamples them 8× with a convolution stem, and runs 17 blocks at width 768: 10 gated short convolutions and 7 attention layers that see the current and 31 previous rows. One row is one language token, so a second of speech is 12.5 tokens. A clip is encoded in one pass, so one clip may last at most 120 s (1500 tokens). Its length is read from the WAV header, so a longer clip is refused before it is decoded. WAV files above 384 kHz are refused. The memory plan counts the 220 MiB of weights it loads, every buffer encoding a 120 s clip allocates (363 MiB, its output rows included), and the rows of the 7 other clips the runtime keeps cached (82 MiB).
 
 ```sh
 hf download LiquidAI/LFM3-Audio-2B-GGUF \
@@ -178,7 +178,7 @@ On a 32 GB M5, against llama.cpp at `792fcf4` (built from source, since Homebrew
 | Greedy transcription and a question about a clip, vs `llama-mtmd-cli --jinja` | identical text on all four prompts (two ASR, one question, two clips in one turn) |
 | Server `input_audio` request | same transcript; `/props` reports `"audio": true` |
 | Encoder vs a CPU reference (`lfm3a::tests`, tiny random weights) | within 2% of the output scale |
-| Memory plan vs Metal's allocations (`hybrid_audio_check --memory`), BF16 and Q8_0 | 559.3 MiB planned, 559.4 MiB measured (220.0 weights + 339.4 activations of a 120 s clip) |
+| Memory plan vs Metal's allocations (`hybrid_audio_check --memory`), BF16 and Q8_0 | 665.8 MiB planned, 664.9 MiB measured peak (220.0 weights + 362.9 encoding a 120 s clip + 7 × 11.7 cached clips' rows) |
 | CPU front end, 112 s of 48 kHz stereo float | decode and resample 0.18 s, log-mel 0.24 s; the encoder then takes 0.56 s |
 | Over-long clip (247 s, 48 kHz stereo) | refused from its header; 0.54 s in all, the projector load included |
 | Qwen and LFM3-VL greedy, memory and speed vs `experimental` at `8cb5110` | see the [regression record](measurements/lfm3-audio/regression-2026-10-30.txt) |
