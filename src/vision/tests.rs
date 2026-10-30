@@ -434,3 +434,83 @@ fn projectors_match_their_model_by_name() {
     ));
     assert!(!named_after("mmproj.gguf", "anything"));
 }
+
+/// A header-and-zeros GGUF: string, u32 and f32 metadata, F32 tensors.
+fn write_gguf(path: &Path, md: &[(&str, Option<&str>, f64)], tensors: &[(&str, &[usize])]) {
+    let s = |b: &mut Vec<u8>, v: &str| {
+        b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        b.extend_from_slice(v.as_bytes());
+    };
+    let mut b = b"GGUF".to_vec();
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    b.extend_from_slice(&(md.len() as u64).to_le_bytes());
+    for &(key, text, number) in md {
+        s(&mut b, key);
+        match text {
+            Some(t) => {
+                b.extend_from_slice(&8u32.to_le_bytes());
+                s(&mut b, t);
+            }
+            None if number.fract() != 0. => {
+                b.extend_from_slice(&6u32.to_le_bytes());
+                b.extend_from_slice(&(number as f32).to_le_bytes());
+            }
+            None => {
+                b.extend_from_slice(&4u32.to_le_bytes());
+                b.extend_from_slice(&(number as u32).to_le_bytes());
+            }
+        }
+    }
+    let mut offset = 0u64;
+    for (name, dims) in tensors {
+        s(&mut b, name);
+        b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for &d in *dims {
+            b.extend_from_slice(&(d as u64).to_le_bytes());
+        }
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&offset.to_le_bytes());
+        offset += (dims.iter().product::<usize>() * 4).next_multiple_of(32) as u64;
+    }
+    b.resize(b.len().next_multiple_of(32), 0);
+    b.resize(b.len() + offset as usize, 0);
+    std::fs::write(path, b).unwrap();
+}
+
+#[test]
+fn audio_projector_budget_counts_weights_encode_and_cache() {
+    let path = std::env::temp_dir().join(format!("ferrum-lfm3a-{}.gguf", std::process::id()));
+    let md: &[(&str, Option<&str>, f64)] = &[
+        ("general.architecture", Some("clip"), 0.),
+        ("clip.audio.projector_type", Some("lfm3a"), 0.),
+        ("clip.audio.num_mel_bins", None, 128.),
+        ("clip.audio.embedding_length", None, 64.),
+        ("clip.audio.attention.head_count", None, 4.),
+        ("clip.audio.attention.head_count_kv", None, 2.),
+        ("clip.audio.feed_forward_length", None, 96.),
+        ("clip.audio.block_count", None, 3.),
+        ("clip.audio.window_size", None, 32.),
+        ("clip.audio.attention.layer_norm_epsilon", None, 1e-5),
+        ("clip.audio.projection_dim", None, 48.),
+    ];
+    let tensors: &[(&str, &[usize])] = &[
+        ("a.conv1d.0.bias", &[16]),
+        ("a.blk.0.ffn_up.weight", &[64, 96]),
+        ("mm.a.mlp.1.bias", &[40]),
+        ("mm.a.mlp.3.weight", &[40, 48]),
+        // The speech generator is not loaded, so not planned.
+        ("a.gen.code.proj_in.weight", &[4096, 4096]),
+    ];
+    write_gguf(&path, md, tensors);
+    assert!(is_audio_projector(&path));
+    let config = audio_config(GgufFile::open(&path).unwrap().metadata()).unwrap();
+    let frames = audio::MelBank::frames(MAX_AUDIO_SECONDS * audio::SAMPLE_RATE);
+    let page = crate::hybrid::engine::page;
+    let weights = page(16 * 2) + page(64 * 96 * 2) + page(40 * 2) + page(40 * 48 * 2);
+    let want = weights
+        + lfm3a::activation_bytes(&config, 16, 40, frames)
+        + (AUDIO_CACHE_CLIPS - 1) * lfm3a::output_bytes(&config, frames);
+    assert_eq!(projector_bytes(&path), want);
+    let _ = std::fs::remove_file(&path);
+}

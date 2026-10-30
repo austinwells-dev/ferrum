@@ -347,6 +347,9 @@ impl App {
             if serve && let Some(mut s) = self.serve.take() {
                 s.stop();
             }
+            if let Some(h) = self.audio.stop() {
+                self.closing.push(h);
+            }
             self.reap();
             return true;
         }

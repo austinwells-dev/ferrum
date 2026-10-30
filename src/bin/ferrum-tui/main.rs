@@ -512,6 +512,10 @@ fn main() {
     if let Some(s) = app.serve.as_mut() {
         s.stop();
     }
+    // Exiting skips destructors, so end a recording here: ffmpeg would
+    // otherwise keep listening after Ferrum is gone. A run's thread, like
+    // the chat model's, is freed with the process.
+    let _ = app.audio.stop();
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);

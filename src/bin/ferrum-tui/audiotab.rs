@@ -66,6 +66,8 @@ enum Msg {
 struct Run {
     rx: Receiver<Msg>,
     cancel: Arc<AtomicBool>,
+    /// The run's thread, joined once it reports back.
+    thread: Option<std::thread::JoinHandle<()>>,
     loaded: bool,
     started: Instant,
 }
@@ -206,7 +208,9 @@ impl AudioTab {
             }
         }
         if let Some(result) = finished {
-            self.run = None;
+            if let Some(thread) = self.run.take().and_then(|r| r.thread) {
+                let _ = thread.join();
+            }
             match result {
                 Ok(stats) => self.stats = Some(stats),
                 Err(e) => self.error = Some(e),
@@ -258,7 +262,7 @@ impl AudioTab {
         let (tx, rx) = channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let stop = cancel.clone();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let result = listen(&path, mmproj.as_deref(), messages, seconds, &tx, stop);
             let _ = tx.send(Msg::Done(result));
         });
@@ -268,10 +272,21 @@ impl AudioTab {
         self.run = Some(Run {
             rx,
             cancel,
+            thread: Some(thread),
             loaded: false,
             started: Instant::now(),
         });
         Ok(())
+    }
+
+    /// Stop whatever is going on, for another model that needs the memory or
+    /// for quitting: a recording ends (ffmpeg is killed), and a run is told
+    /// to stop. Returns the run's thread for the caller to join.
+    pub fn stop(&mut self) -> Option<std::thread::JoinHandle<()>> {
+        self.recording = None;
+        let run = self.run.take()?;
+        run.cancel.store(true, Ordering::SeqCst);
+        run.thread
     }
 
     fn record(&mut self) -> Result<(), String> {
@@ -325,10 +340,20 @@ impl AudioTab {
     }
 
     fn finish_recording(&mut self, path: PathBuf) {
-        let samples = fs::read(&path)
-            .ok()
-            .and_then(|b| vision::audio::decode_wav(&b).ok())
-            .unwrap_or_default();
+        // ffmpeg failing to open the input, or killed before it finished the
+        // file, leaves nothing readable: say so rather than call it silence.
+        let samples = match fs::read(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|b| vision::audio::decode_wav(&b).map_err(|e| e.to_string()))
+        {
+            Ok(samples) => samples,
+            Err(e) => {
+                self.error = Some(format!(
+                    "the recording failed ({e}); try again, or record with another app and drop the file here"
+                ));
+                return;
+            }
+        };
         // A muted input or one the terminal may not use gives zeros or a
         // faint hiss, and the model would make up an answer from it.
         let peak = samples.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -395,6 +420,10 @@ fn listen(
     };
     let mut rt =
         Runtime::load_multimodal(model, options, None, mmproj, 0).map_err(|e| e.to_string())?;
+    // Esc while loading: the hooks only see it once the reply starts.
+    if cancel.load(Ordering::SeqCst) {
+        return Err("stopped".into());
+    }
     if !rt.supports_audio() {
         return Err(format!("{} has no speech projector", tilde(model)));
     }
@@ -732,6 +761,7 @@ impl AudioTab {
                 self.run = Some(Run {
                     rx,
                     cancel: Arc::new(AtomicBool::new(false)),
+                    thread: None,
                     loaded: true,
                     started: Instant::now(),
                 });
@@ -749,5 +779,55 @@ impl AudioTab {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A 16 kHz mono 16-bit WAV of `samples`.
+    fn wav(samples: &[i16]) -> Vec<u8> {
+        let data: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let mut out = b"RIFF".to_vec();
+        out.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        out.extend_from_slice(b"WAVEfmt ");
+        for v in [16u32, 1 | 1 << 16, 16_000, 32_000, 2 | 16 << 16] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        out
+    }
+
+    #[test]
+    fn broken_and_silent_recordings_are_told_apart() {
+        let dir = std::env::temp_dir().join(format!("ferrum-audiotab-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let mut tab = AudioTab::load();
+        tab.clip = None;
+        // ffmpeg killed before it wrote the header.
+        let broken = dir.join("broken.wav");
+        fs::write(&broken, b"").unwrap();
+        tab.finish_recording(broken);
+        assert!(
+            tab.error
+                .as_deref()
+                .unwrap()
+                .starts_with("the recording failed")
+        );
+        // A muted input: a faint hiss well under the threshold.
+        let quiet = dir.join("quiet.wav");
+        fs::write(&quiet, wav(&[3, -4, 2, 0, -3].repeat(3200))).unwrap();
+        tab.finish_recording(quiet);
+        assert!(
+            tab.error
+                .as_deref()
+                .unwrap()
+                .starts_with("the recording is silent")
+        );
+        assert!(tab.clip.is_none());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

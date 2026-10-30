@@ -7,9 +7,10 @@
 //! f32, so the reference encoder can read exactly what Ferrum encoded (no
 //! second WAV decoder or resampler in the comparison). REF is raw f32
 //! `[rows, width]`. Reports the shapes, the encode time, and per-row cosine
-//! similarity and relative error. `--memory` compares the memory planner's
-//! projector budget with the device bytes the weights and the activations of
-//! a `MAX_AUDIO_SECONDS` clip really take, and times the CPU front end.
+//! similarity and relative error, and times the CPU front end. `--memory`
+//! compares the memory planner's projector budget with the device bytes the
+//! weights take plus the peak of encoding `AUDIO_CACHE_CLIPS` full-length
+//! clips while keeping their rows, as the runtime's cache does.
 use ferrum::{MetalDevice, Result, vision, vision::AudioModel, vision::audio};
 
 fn main() -> Result<()> {
@@ -61,17 +62,28 @@ fn main() -> Result<()> {
         }
     );
     if memory {
+        // The worst case the plan covers: a full-length clip encoded while
+        // the runtime's cache holds the rows of as many others as it keeps.
         let longest = vec![0.; vision::MAX_AUDIO_SECONDS * audio::SAMPLE_RATE];
-        model.encode_samples(&d, &longest, 1)?;
+        let mut kept = Vec::new();
+        let mut peak = 0;
+        for i in 0..vision::AUDIO_CACHE_CLIPS {
+            let held = d.allocated_bytes() - before - loaded;
+            kept.push(model.encode_samples(&d, &longest, i as u64)?);
+            peak = peak.max(held + model.activation_bytes());
+        }
         let planned = vision::projector_bytes(std::path::Path::new(&args[1]));
+        let rows = (d.allocated_bytes() - before - loaded) / kept.len();
         println!(
-            "memory: planned {:.1} MiB; measured weights {:.1} MiB (loader counted {:.1}) + {} s clip activations {:.1} MiB = {:.1} MiB",
+            "memory: planned {:.1} MiB; measured weights {:.1} MiB (loader counted {:.1}) + one {} s clip's encode {:.1} MiB (its rows {:.1} MiB) + {} more cached clips' rows = peak {:.1} MiB",
             mib(planned),
             mib(loaded),
             mib(model.weight_bytes()),
             vision::MAX_AUDIO_SECONDS,
             mib(model.activation_bytes()),
-            mib(loaded + model.activation_bytes()),
+            mib(rows),
+            vision::AUDIO_CACHE_CLIPS - 1,
+            mib(loaded + peak),
         );
     }
     let Some(reference) = reference else {

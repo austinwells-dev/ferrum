@@ -13,6 +13,8 @@ pub const SAMPLE_RATE: usize = 16_000;
 const N_FFT: usize = 400;
 const HOP: usize = 160;
 const MEL_FLOOR: f64 = 1e-12;
+/// Highest sample rate read (studio recorders go to 384 kHz).
+const MAX_RATE: usize = 384_000;
 
 /// A WAV file's format and sample bytes, read without decoding.
 struct Wav<'a> {
@@ -66,6 +68,13 @@ fn parse_wav(bytes: &[u8]) -> Result<Wav<'_>> {
     let data = data.ok_or_else(|| bad("WAV file has no data chunk"))?;
     if channels == 0 || rate == 0 {
         return Err(bad("WAV file declares no channels or no sample rate"));
+    }
+    // The length check reads the header, so a forged rate would make a long
+    // file look short and the resampler's kernel enormous.
+    if rate > MAX_RATE {
+        return Err(bad(&format!(
+            "a WAV sample rate of {rate} Hz is above the {MAX_RATE} Hz this reads"
+        )));
     }
     let wav = Wav {
         tag,
@@ -486,6 +495,9 @@ mod tests {
         // Three seconds of 48 kHz stereo float.
         assert_eq!(wav_seconds(&wav(3, 2, 48_000, 32, &data)).unwrap(), 3.);
         assert!(wav_seconds(b"not a wav").is_err());
+        // A forged rate cannot make a long file look short.
+        assert!(wav_seconds(&wav(1, 1, 4_000_000_000, 16, &[0; 64])).is_err());
+        assert!(wav_seconds(&wav(1, 1, 384_000, 16, &[0; 64])).is_ok());
     }
 
     #[test]

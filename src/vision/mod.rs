@@ -330,31 +330,49 @@ pub fn projector_bytes(path: &Path) -> usize {
                     t.name.starts_with("v.blk.") || t.name.starts_with("mm.")
                 }
             })
-            .map(|t| t.dimensions.iter().product::<usize>() * 2)
-            .sum();
-        // Weights plus the transient activations of a full-size image, or of
-        // a `MAX_AUDIO_SECONDS` clip (counted buffer by buffer, as the
-        // encoder allocates them).
-        weights
-            + if audio {
-                let channels = f
-                    .tensors()
-                    .get("a.conv1d.0.bias")
-                    .map(|t| t.dimensions.iter().product::<usize>());
-                match (audio_config(f.metadata()), channels) {
-                    (Ok(config), Some(channels)) => lfm3a::activation_bytes(
-                        &config,
-                        channels,
-                        audio::MelBank::frames(MAX_AUDIO_SECONDS * audio::SAMPLE_RATE),
-                    ),
-                    // AudioModel::load refuses this file anyway.
-                    _ => 0,
+            .map(|t| {
+                let bytes = t.dimensions.iter().product::<usize>() * 2;
+                // Each speech-encoder tensor is its own buffer.
+                if audio {
+                    crate::hybrid::engine::page(bytes)
+                } else {
+                    bytes
                 }
-            } else {
-                640 << 20
+            })
+            .sum();
+        if !audio {
+            // Weights plus the transient activations of a full-size image.
+            return weights + (640 << 20);
+        }
+        // Weights, every buffer a `MAX_AUDIO_SECONDS` clip's encode
+        // allocates (counted as the encoder makes them), and the rows of the
+        // other clips the runtime keeps cached meanwhile.
+        let width = |name: &str| {
+            f.tensors()
+                .get(name)
+                .map(|t| t.dimensions.iter().product::<usize>())
+        };
+        let frames = audio::MelBank::frames(MAX_AUDIO_SECONDS * audio::SAMPLE_RATE);
+        match (
+            audio_config(f.metadata()),
+            width("a.conv1d.0.bias"),
+            width("mm.a.mlp.1.bias"),
+        ) {
+            (Ok(config), Some(channels), Some(mid)) => {
+                weights
+                    + lfm3a::activation_bytes(&config, channels, mid, frames)
+                    + (AUDIO_CACHE_CLIPS - 1) * lfm3a::output_bytes(&config, frames)
             }
+            // AudioModel::load refuses this file anyway.
+            _ => weights,
+        }
     })
 }
+
+/// Encoded clips the runtime keeps, so a conversation does not re-encode its
+/// history: as many as one request may carry, since each turn walks them in
+/// order and a smaller LRU would miss on every one.
+pub const AUDIO_CACHE_CLIPS: usize = media::MAX_AUDIO_CLIPS;
 
 /// Longest clip, and so the longest each attached clip may be. The encoder runs a clip in one pass,
 /// so its activations grow with the clip.

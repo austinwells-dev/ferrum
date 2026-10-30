@@ -51,11 +51,6 @@ pub struct Vision {
     pub last_encode: std::time::Duration,
 }
 
-/// Encoded audio clips kept so conversations do not re-encode their history:
-/// as many as one request may carry, since each turn walks them in order and
-/// a smaller LRU would miss on every one.
-const AUDIO_CACHE: usize = media::MAX_AUDIO_CLIPS;
-
 /// The speech encoder next to the language model (LFM3-Audio's projector),
 /// and recently encoded clips by content, shared by every session.
 pub struct Audio {
@@ -784,7 +779,7 @@ impl Runtime {
             let embedding = Rc::new(audio.model.encode(&self.device, clip)?);
             audio.last_encode += start.elapsed();
             audio.cache.push((key, embedding.clone()));
-            if audio.cache.len() > AUDIO_CACHE {
+            if audio.cache.len() > crate::vision::AUDIO_CACHE_CLIPS {
                 audio.cache.remove(0);
             }
             out.push(embedding);

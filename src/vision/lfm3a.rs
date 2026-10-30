@@ -104,9 +104,9 @@ enum Block {
 
 /// Device bytes `Encoder::encode` allocates for the activations of a clip of
 /// `frames` mel frames: one buffer per entry, page-rounded as Metal allocates
-/// them. Keep in step with `encode`; `hybrid_audio_check --memory` compares the two
+/// them, the returned rows included. Keep in step with `encode`; `hybrid_audio_check --memory` compares the two
 /// for a full-length clip (small buffers share pages, so a tiny test cannot).
-pub(super) fn activation_bytes(c: &Config, channels: usize, frames: usize) -> usize {
+pub(super) fn activation_bytes(c: &Config, channels: usize, mid: usize, frames: usize) -> usize {
     let (h, hd) = (c.hidden, c.head_dim());
     let t2 = frames.div_ceil(2).div_ceil(2);
     let n = tokens_for(frames);
@@ -137,11 +137,19 @@ pub(super) fn activation_bytes(c: &Config, channels: usize, frames: usize) -> us
         n * hd / 2,
         n * hd / 2,
         n * n,
+        n * mid,
+        n * c.out_dim,
     ];
     counts
         .iter()
         .map(|&e| crate::hybrid::engine::page(e * 4))
         .sum()
+}
+
+/// Device bytes of the rows `encode` returns for a clip of `frames` frames,
+/// which outlive it (the runtime caches them).
+pub(super) fn output_bytes(c: &Config, frames: usize) -> usize {
+    crate::hybrid::engine::page(tokens_for(frames) * c.out_dim * 4)
 }
 
 pub(super) struct Encoder {
@@ -384,7 +392,10 @@ impl Encoder {
         let cos = Tensor::from_f32(d, [n, hd / 2], DType::F32, &cos)?;
         let sin = Tensor::from_f32(d, [n, hd / 2], DType::F32, &sin)?;
         let mask = Tensor::from_f32(d, [n * n], DType::F32, &window_mask(n, c.window))?;
-        // Every activation is allocated above, so this is the clip's peak.
+        let mid = zeros(&[n, self.mid])?;
+        let out = zeros(&[n, c.out_dim])?;
+        // Every buffer encode uses is allocated above, so this is the clip's
+        // peak (`out` is returned and outlives the rest).
         self.activation_bytes
             .set(d.allocated_bytes().saturating_sub(before));
         let scale = 1. / (hd as f32).sqrt();
@@ -545,11 +556,8 @@ impl Encoder {
             [256, 1, 1],
             0,
         )?;
-        let mid_width = self.mid;
-        let mid = zeros(&[n, mid_width])?;
-        let out = zeros(&[n, c.out_dim])?;
-        self.linear(d, &tmp, &self.mm1, &mid, n, mid_width, h, 2)?;
-        self.linear(d, &mid, &self.mm3, &out, n, c.out_dim, mid_width, 0)?;
+        self.linear(d, &tmp, &self.mm1, &mid, n, self.mid, h, 2)?;
+        self.linear(d, &mid, &self.mm3, &out, n, c.out_dim, self.mid, 0)?;
         execution.finish()?;
         Ok(ImageEmbedding {
             hash,
