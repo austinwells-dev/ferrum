@@ -568,8 +568,15 @@ impl App {
                 if let Some(v) = &m.vision {
                     let file = v.file_name().map(|n| n.to_string_lossy().into_owned());
                     lines.push(row(
-                        "vision",
-                        clip(&format!("👁 {}", file.unwrap_or_default()), w),
+                        if m.audio { "audio" } else { "vision" },
+                        clip(
+                            &format!(
+                                "{} {}",
+                                if m.audio { "🔊" } else { "👁" },
+                                file.unwrap_or_default()
+                            ),
+                            w,
+                        ),
                     ));
                 }
                 lines.push(row("sampling", clip(&i.sampling, w)));

@@ -85,8 +85,9 @@ speculative decoding (lossless; off by default):
   --draft-quant q4_0|q8_0   draft weight precision (default q4_0)
   --draft-context N         context slots for drafts without a sliding window (8192)
   --draft-p-min P           DSpark: stop drafting below this confidence (0)
-vision (images in chat requests as data: URLs / base64; Qwen3-VL style projectors):
-  --mmproj FILE|auto|none   vision projector GGUF (default auto: a sibling mmproj*.gguf)
+vision and audio (images, or LFM3-Audio WAV clips as input_audio parts, inline as
+data: URLs / base64):
+  --mmproj FILE|auto|none   projector GGUF (default auto: a sibling mmproj*.gguf)
   --image-tokens N          most context tokens one image may take (default 1024)
   --image-min-tokens N      scale small images up to at least N tokens (default 64;
                             Qwen-VL reads fine print and grounds better with 1024)
@@ -888,7 +889,7 @@ fn handle(
                     "n_ctx": status.context,
                     "total_slots": status.slots.len().max(1),
                     "chat_template": server.llm().template.source(),
-                    "modalities": {"vision": status.vision, "audio": false},
+                    "modalities": {"vision": status.vision, "audio": status.audio},
                     "build_info": format!("ferrum {}", env!("CARGO_PKG_VERSION")),
                     "default_generation_settings": {
                         "n_ctx": status.context,

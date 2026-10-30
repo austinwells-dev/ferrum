@@ -21,8 +21,11 @@ pub struct Model {
     pub mtp: bool,
     /// Why `--draft mtp` is unavailable.
     pub mtp_why: String,
-    /// A vision projector sits next to the file, so images can be attached.
+    /// A projector sits next to the file, so images (or, when `audio`, WAV
+    /// clips) can be attached.
     pub vision: Option<PathBuf>,
+    /// The projector is a speech encoder (LFM3-Audio), not a vision tower.
+    pub audio: bool,
     /// Why ferrum cannot run this file; None means it can.
     pub problem: Option<String>,
     /// The header's scalar `tokenizer.*` keys, to check GGUF drafters against.
@@ -38,8 +41,12 @@ pub fn make_model(path: PathBuf, name: String, size: u64) -> Model {
     } else {
         None
     };
+    let audio = vision
+        .as_deref()
+        .is_some_and(ferrum::vision::is_audio_projector);
     Model {
         vision,
+        audio,
         origin: origin_of(&path),
         path,
         name,

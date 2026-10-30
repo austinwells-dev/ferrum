@@ -22,7 +22,7 @@ use crate::{
     Error, MetalDevice, Result,
     loader::gguf::{GgufFile, MetadataValue},
     tokenizer::Tokenizer,
-    vision::{ImageBudget, ImageEmbedding, VisionModel, media},
+    vision::{AudioModel, ImageBudget, ImageEmbedding, VisionModel, media},
 };
 use serde_json::{Map, Value as Json};
 use std::{
@@ -48,6 +48,19 @@ pub struct Vision {
     pub path: PathBuf,
     cache: Vec<(ImageKey, Rc<ImageEmbedding>)>,
     /// Time spent encoding (not cached) images for the latest request.
+    pub last_encode: std::time::Duration,
+}
+
+/// Encoded audio clips kept so conversations do not re-encode their history.
+const AUDIO_CACHE: usize = 4;
+
+/// The speech encoder next to the language model (LFM3-Audio's projector),
+/// and recently encoded clips by content, shared by every session.
+pub struct Audio {
+    pub model: AudioModel,
+    pub path: PathBuf,
+    cache: Vec<(u64, Rc<ImageEmbedding>)>,
+    /// Time spent encoding (not cached) clips for the latest request.
     pub last_encode: std::time::Duration,
 }
 
@@ -464,6 +477,8 @@ pub struct Runtime {
     pub draft_loaded_bytes: usize,
     /// Present when a vision projector was loaded: requests may carry images.
     pub vision: Option<Vision>,
+    /// Present when a speech projector was loaded: requests may carry audio.
+    pub audio: Option<Audio>,
     /// The model file as a saved session depends on it (`save_session`).
     cache_identity: String,
 }
@@ -573,7 +588,29 @@ impl Runtime {
             }
             draft_loaded_bytes = device.allocated_bytes().saturating_sub(before);
         }
-        let vision = match mmproj {
+        let audio_projector = mmproj.filter(|p| crate::vision::is_audio_projector(p));
+        let audio = match audio_projector {
+            Some(mmproj) => {
+                let model = AudioModel::load(&device, mmproj)?;
+                if model.out_dim() != loaded.model.config.hidden {
+                    return Err(Error::Config(format!(
+                        "{} projects to width {} but the language model is {} wide",
+                        mmproj.display(),
+                        model.out_dim(),
+                        loaded.model.config.hidden
+                    )));
+                }
+                model.warm(&device)?;
+                Some(Audio {
+                    model,
+                    path: mmproj.to_owned(),
+                    cache: Vec::new(),
+                    last_encode: std::time::Duration::ZERO,
+                })
+            }
+            None => None,
+        };
+        let vision = match mmproj.filter(|_| audio_projector.is_none()) {
             Some(mmproj) => {
                 let model = VisionModel::load(&device, mmproj, image_tokens)?;
                 if model.config.out_dim != loaded.model.config.hidden {
@@ -616,6 +653,7 @@ impl Runtime {
             model_name,
             draft_loaded_bytes,
             vision,
+            audio,
             // Cached image rows depend on the projector as well.
             cache_identity: match mmproj {
                 Some(mmproj) => format!("{} + {}", cache_identity(path), cache_identity(mmproj)),
@@ -639,6 +677,10 @@ impl Runtime {
 
     pub fn supports_vision(&self) -> bool {
         self.vision.is_some()
+    }
+
+    pub fn supports_audio(&self) -> bool {
+        self.audio.is_some()
     }
 
     /// Sessions (slot 0 plus `slots`).
@@ -712,12 +754,50 @@ impl Runtime {
         Ok(out)
     }
 
-    /// Replace each image placeholder in `prompt` with one pad token per
-    /// image position, tokenize, and locate every image in the result.
-    fn expand_images(
+    /// Encode WAV `clips` (cached by content), failing when no speech
+    /// projector is loaded.
+    fn embed_audio(&mut self, clips: &[Vec<u8>]) -> Result<Vec<Rc<ImageEmbedding>>> {
+        if let Some(audio) = self.audio.as_mut() {
+            audio.last_encode = std::time::Duration::ZERO;
+        }
+        if clips.is_empty() {
+            return Ok(Vec::new());
+        }
+        let Some(audio) = self.audio.as_mut() else {
+            return Err(Error::Parameter(
+                "this model was loaded without an audio projector, so it cannot hear audio (load LFM3-Audio's mmproj file with --mmproj)"
+                    .into(),
+            ));
+        };
+        let mut out = Vec::with_capacity(clips.len());
+        for clip in clips {
+            let key = crate::vision::content_hash(clip);
+            if let Some(i) = audio.cache.iter().position(|(k, _)| *k == key) {
+                let hit = audio.cache.remove(i);
+                out.push(hit.1.clone());
+                audio.cache.push(hit);
+                continue;
+            }
+            let start = std::time::Instant::now();
+            let embedding = Rc::new(audio.model.encode(&self.device, clip)?);
+            audio.last_encode += start.elapsed();
+            audio.cache.push((key, embedding.clone()));
+            if audio.cache.len() > AUDIO_CACHE {
+                audio.cache.remove(0);
+            }
+            out.push(embedding);
+        }
+        Ok(out)
+    }
+
+    /// Replace each image and audio placeholder in `prompt` with one pad
+    /// token per position, tokenize, and locate every image and clip in the
+    /// result. Clips take one position per row, like LFM3 images.
+    fn expand_media(
         &self,
         prompt: &str,
         images: &[Rc<ImageEmbedding>],
+        clips: &[Rc<ImageEmbedding>],
     ) -> Result<(Vec<u32>, Vec<ImageSpan>)> {
         let tokenizer = &self.loaded.tokenizer;
         if self.loaded.model.config.variant == Variant::Lfm3 && prompt.contains("<|video|>") {
@@ -725,10 +805,10 @@ impl Runtime {
                 "video is not supported; LFM3-VL reads still images only".into(),
             ));
         }
-        if images.is_empty() {
+        if images.is_empty() && clips.is_empty() {
             return Ok((tokenizer.encode(prompt)?, Vec::new()));
         }
-        let marker = self
+        let image_marker = self
             .vision
             .as_ref()
             .map(|v| v.model.marker())
@@ -737,60 +817,99 @@ impl Runtime {
             .vision
             .as_ref()
             .is_some_and(|v| v.model.linear_positions());
-        let mismatch = || {
-            Error::Parameter(
-                "the chat template's image placeholders do not match the attached images".into(),
-            )
+        let audio_marker = self.audio.as_ref().map(|a| a.model.marker());
+        let mismatch = |what: &str| {
+            Error::Parameter(format!(
+                "the chat template's {what} placeholders do not match the attached {what}"
+            ))
         };
+        // Each kind keeps its own order; the prompt interleaves them.
+        let kinds = [
+            (image_marker, images, "image"),
+            (audio_marker.unwrap_or(""), clips, "audio"),
+        ];
+        let mut next = [0usize; 2];
         let mut text = String::with_capacity(prompt.len());
         let mut rest = prompt;
-        for image in images {
-            let at = rest.find(marker).ok_or_else(mismatch)?;
+        loop {
+            let found = kinds
+                .iter()
+                .enumerate()
+                .filter(|(_, (marker, _, _))| !marker.is_empty())
+                .filter_map(|(i, (marker, _, _))| rest.find(marker).map(|at| (at, i)))
+                .min();
+            let Some((at, kind)) = found else { break };
+            let (marker, items, what) = kinds[kind];
+            let item = items.get(next[kind]).ok_or_else(|| mismatch(what))?;
+            next[kind] += 1;
             text.push_str(&rest[..at]);
-            text.push_str(&marker.repeat(image.tokens()));
+            text.push_str(&marker.repeat(item.tokens()));
             rest = &rest[at + marker.len()..];
         }
-        if rest.contains(marker) {
-            return Err(mismatch());
-        }
         text.push_str(rest);
+        for (kind, (_, items, what)) in kinds.iter().enumerate() {
+            if next[kind] != items.len() {
+                return Err(mismatch(what));
+            }
+        }
         let tokens = tokenizer.encode(&text)?;
-        let pad = tokenizer.encode(marker)?;
-        let [pad] = pad[..] else {
-            return Err(Error::Tokenizer(format!("{marker} is not a single token")));
+        let pad_of = |marker: &str| -> Result<u32> {
+            let pad = tokenizer.encode(marker)?;
+            match pad[..] {
+                [pad] => Ok(pad),
+                _ => Err(Error::Tokenizer(format!("{marker} is not a single token"))),
+            }
         };
-        let mut spans = Vec::with_capacity(images.len());
+        let mut pads = Vec::new();
+        for (kind, (marker, items, _)) in kinds.iter().enumerate() {
+            if !items.is_empty() {
+                pads.push((pad_of(marker)?, kind));
+            }
+        }
+        let mut spans = Vec::with_capacity(images.len() + clips.len());
+        let mut taken = [0usize; 2];
         let mut i = 0;
         while i < tokens.len() {
-            if tokens[i] != pad {
+            let Some(&(pad, kind)) = pads.iter().find(|(p, _)| *p == tokens[i]) else {
                 i += 1;
                 continue;
-            }
+            };
+            // Clips have no wrapper tokens, so two in a row make one run of
+            // pads: each takes exactly its own length from it.
             let start = i;
-            while i < tokens.len() && tokens[i] == pad {
-                i += 1;
+            let (_, items, what) = kinds[kind];
+            let item = items.get(taken[kind]).ok_or_else(|| mismatch(what))?;
+            taken[kind] += 1;
+            i += item.tokens();
+            if i > tokens.len() || tokens[start..i].iter().any(|&t| t != pad) {
+                return Err(mismatch(what));
             }
-            let image = images.get(spans.len()).ok_or_else(mismatch)?;
-            if i - start != image.tokens() {
-                return Err(mismatch());
+            // An image's run must end where the image does.
+            if kind == 0 && tokens.get(i) == Some(&pad) {
+                return Err(mismatch(what));
             }
             spans.push(ImageSpan {
                 start,
-                grid: image.grid,
-                embedding: image.rows.clone(),
-                deepstack: image.deepstack.clone(),
-                hash: image.hash,
-                linear,
+                grid: item.grid,
+                embedding: item.rows.clone(),
+                deepstack: item.deepstack.clone(),
+                hash: item.hash,
+                linear: linear || kind == 1,
             });
         }
-        if spans.len() != images.len() {
-            return Err(mismatch());
+        if taken != [images.len(), clips.len()] {
+            return Err(mismatch(if taken[0] != images.len() {
+                "image"
+            } else {
+                "audio"
+            }));
         }
         Ok((tokens, spans))
     }
 
     pub fn render(&self, request: &ChatRequest) -> Result<String> {
         let (messages, _) = media::take_images(&request.messages)?;
+        let (messages, _) = media::take_audio(&messages)?;
         self.render_messages(&messages, request)
     }
 
@@ -884,9 +1003,11 @@ impl Runtime {
     /// session whose cache shares the most of it).
     pub fn chat_prompt(&mut self, request: &ChatRequest) -> Result<ChatPrompt> {
         let (messages, encoded) = media::take_images(&request.messages)?;
+        let (messages, clips) = media::take_audio(&messages)?;
         let images = self.embed_images(&encoded, request.image_budget)?;
+        let clips = self.embed_audio(&clips)?;
         let text = self.render_messages(&messages, request)?;
-        let (tokens, spans) = self.expand_images(&text, &images)?;
+        let (tokens, spans) = self.expand_media(&text, &images, &clips)?;
         let checkpoint = self
             .reply_start(&messages, request, &text, &tokens)
             .map(|at| {
@@ -934,6 +1055,9 @@ impl Runtime {
     ) -> Result<Turn> {
         if let Some(vision) = self.vision.as_mut() {
             vision.last_encode = std::time::Duration::ZERO;
+        }
+        if let Some(audio) = self.audio.as_mut() {
+            audio.last_encode = std::time::Duration::ZERO;
         }
         let tokens = self.loaded.tokenizer.encode(prompt)?;
         self.start(

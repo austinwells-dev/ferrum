@@ -234,6 +234,8 @@ pub struct LoadInfo {
     pub drafter: Option<String>,
     /// File name of the vision projector, when images can be shown to the model.
     pub vision: Option<String>,
+    /// File name of the audio projector, when WAV clips can be played to it.
+    pub audio: Option<String>,
     pub sampling: String,
 }
 
@@ -370,6 +372,11 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
         }),
         vision: rt.vision.as_ref().map(|v| {
             v.path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+        }),
+        audio: rt.audio.as_ref().map(|a| {
+            a.path
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
         }),
@@ -1548,6 +1555,10 @@ impl Chat {
         self.info.as_ref().is_some_and(|i| i.vision.is_some())
     }
 
+    fn hears_audio(&self) -> bool {
+        self.info.as_ref().is_some_and(|i| i.audio.is_some())
+    }
+
     fn submit(&mut self, text: String) {
         self.submit_with(text.clone(), text);
     }
@@ -1557,9 +1568,18 @@ impl Chat {
         let text = body;
         let attachments = std::mem::take(&mut self.attachments);
         let sees = self.sees_images();
+        let hears = self.hears_audio();
         let mut content = String::new();
         let mut pictures = Vec::new();
         for a in &attachments {
+            if hears && a.kind == attach::Kind::Audio {
+                match std::fs::read(&a.full) {
+                    Ok(bytes) => {
+                        pictures.push(ferrum::vision::media::audio_part_from_bytes(&bytes))
+                    }
+                    Err(e) => self.note(format!("{}: {e}", a.name)),
+                }
+            }
             if sees && a.kind == attach::Kind::Image {
                 match attach::image_bytes(a) {
                     Ok(bytes) => pictures.push(ferrum::vision::media::image_part_with(
@@ -1569,7 +1589,7 @@ impl Chat {
                     Err(e) => self.note(e),
                 }
             }
-            content += &a.block(sees);
+            content += &a.block(sees, hears);
             content += "\n\n";
         }
         content += &text;
@@ -3122,6 +3142,12 @@ impl App {
                 if let Some(v) = &i.vision {
                     lines.push(Line::styled(
                         format!("👁 images are shown to the model · {v}"),
+                        Style::new().fg(GOLD),
+                    ));
+                }
+                if let Some(a) = &i.audio {
+                    lines.push(Line::styled(
+                        format!("🔊 WAV clips are played to the model · {a}"),
                         Style::new().fg(GOLD),
                     ));
                 }

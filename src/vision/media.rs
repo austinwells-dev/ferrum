@@ -1,5 +1,6 @@
-//! Images inside chat messages: finding them, decoding their payloads and
-//! replacing them with the placeholder the chat template understands.
+//! Images and audio clips inside chat messages: finding them, decoding their
+//! payloads and replacing them with the placeholder the chat template
+//! understands.
 #![forbid(unsafe_code)]
 use super::{ImageBudget, LOW_DETAIL_TOKENS};
 use crate::{Error, Result};
@@ -7,6 +8,8 @@ use serde_json::{Value as Json, json};
 
 /// Most images one request may carry.
 pub const MAX_IMAGES: usize = 16;
+/// Most audio clips one request may carry.
+pub const MAX_AUDIO_CLIPS: usize = 8;
 
 /// One image of a request: its encoded bytes and the token limits its
 /// content part asked for.
@@ -158,15 +161,13 @@ fn part_budget(part: &Json) -> Result<ImageBudget> {
 pub fn decode_data_url(url: &str) -> Result<Vec<u8>> {
     let Some(rest) = url.strip_prefix("data:") else {
         return Err(Error::Parameter(
-            "images must be sent inline as data: URLs or base64; remote and file URLs are not fetched"
+            "images and audio must be sent inline as data: URLs or base64; remote and file URLs are not fetched"
                 .into(),
         ));
     };
     match rest.split_once(',') {
         Some((head, payload)) if head.ends_with(";base64") => base64_decode(payload),
-        _ => Err(Error::Parameter(
-            "image data: URLs must be base64 encoded".into(),
-        )),
+        _ => Err(Error::Parameter("data: URLs must be base64 encoded".into())),
     }
 }
 
@@ -253,9 +254,96 @@ pub fn take_images(messages: &[Json]) -> Result<(Vec<Json>, Vec<ImageInput>)> {
     Ok((out, images))
 }
 
+/// A chat content part carrying a WAV file, as OpenAI's `input_audio`.
+pub fn audio_part_from_bytes(bytes: &[u8]) -> Json {
+    json!({"type": "input_audio", "input_audio": {"data": base64_encode(bytes), "format": "wav"}})
+}
+
+/// The encoded bytes of an audio content part, if `part` is one: OpenAI's
+/// `input_audio` (`data` as base64 or a data URL) or `audio_url` (a data URL).
+/// A bare `{"type": "input_audio"}` is the placeholder `take_audio` leaves.
+fn audio_part(part: &Json) -> Option<Result<Vec<u8>>> {
+    if let Some(input) = part.get("input_audio") {
+        let data = input
+            .get("data")
+            .or_else(|| input.get("url"))
+            .and_then(Json::as_str);
+        return Some(match data {
+            Some(d) if d.starts_with("data:") => decode_data_url(d),
+            Some(d) => base64_decode(d),
+            None => Err(Error::Parameter("input_audio part has no data".into())),
+        });
+    }
+    if part.get("type").and_then(Json::as_str) == Some("audio_url")
+        || part.get("audio_url").is_some()
+    {
+        return Some(match url_of(part, "audio_url") {
+            Some(url) => decode_data_url(&url),
+            None => Err(Error::Parameter("audio_url part has no url".into())),
+        });
+    }
+    None
+}
+
+/// How many audio parts the messages carry.
+pub fn count_audio(messages: &[Json]) -> usize {
+    messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Json::as_array))
+        .flatten()
+        .filter(|p| audio_part(p).is_some())
+        .count()
+}
+
+/// Replace every audio part with `{"type": "input_audio"}` (which LFM3
+/// templates render as `<|audio|>`) and return the clips' file bytes in
+/// prompt order.
+pub fn take_audio(messages: &[Json]) -> Result<(Vec<Json>, Vec<Vec<u8>>)> {
+    let mut clips = Vec::new();
+    let mut out = Vec::with_capacity(messages.len());
+    for message in messages {
+        let mut message = message.clone();
+        if let Some(parts) = message.get_mut("content").and_then(Json::as_array_mut) {
+            for part in parts {
+                if let Some(bytes) = audio_part(part) {
+                    if clips.len() >= MAX_AUDIO_CLIPS {
+                        return Err(Error::Parameter(format!(
+                            "at most {MAX_AUDIO_CLIPS} audio clips per request"
+                        )));
+                    }
+                    clips.push(bytes?);
+                    *part = json!({"type": "input_audio"});
+                }
+            }
+        }
+        out.push(message);
+    }
+    Ok((out, clips))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn takes_audio_parts_and_leaves_placeholders() {
+        let wav = b"RIFF....WAVE".to_vec();
+        let messages = vec![json!({"role": "user", "content": [
+            {"type": "text", "text": "transcribe"},
+            audio_part_from_bytes(&wav),
+            {"type": "audio_url", "audio_url": {"url": format!("data:audio/wav;base64,{}", base64_encode(&wav))}},
+        ]})];
+        assert_eq!(count_audio(&messages), 2);
+        let (out, clips) = take_audio(&messages).unwrap();
+        assert_eq!(clips, vec![wav.clone(), wav]);
+        assert_eq!(out[0]["content"][1], json!({"type": "input_audio"}));
+        assert_eq!(count_audio(&out), 0);
+        assert_eq!(count_images(&out), 0);
+        let remote = vec![json!({"role": "user", "content": [
+            {"type": "audio_url", "audio_url": {"url": "https://example.com/a.wav"}},
+        ]})];
+        assert!(take_audio(&remote).is_err());
+    }
 
     #[test]
     fn base64_round_trips_known_vectors() {

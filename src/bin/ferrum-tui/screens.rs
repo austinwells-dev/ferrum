@@ -259,6 +259,7 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
         mtp: false,
         mtp_why: String::new(),
         vision: None,
+        audio: false,
         problem: None,
         tokenizer: Default::default(),
     });
