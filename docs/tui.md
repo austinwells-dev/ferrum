@@ -5,7 +5,7 @@ ferrum-tui                 # or: ferrum-tui MODEL.gguf
 alias ferrum=ferrum-tui    # optional
 ```
 
-After a short startup animation, Ferrum opens on **Home**: one button per tab. The tabs run along the top of every screen: **1 Home**, **2 Chat**, **3 Agents**, **4 Serve**, **5 Bench**, **6 Models** and **7 Settings**. Press a number to switch tabs, `?` to list the keys of the current screen, and ctrl-p for a command palette. Changing tabs never stops anything: a loaded chat model, a running server and a benchmark run all keep going, and the right end of the tab bar names the model that is loaded (by a chat, an agent, the server or a benchmark run), what it is doing right now (thinking, writing, running a tool, the benchmark task or question it is on, with the newest words it wrote), and how much memory the models hold.
+After a short startup animation, Ferrum opens on **Home**: one button per tab. The tabs run along the top of every screen: **1 Home**, **2 Chat**, **3 Agents**, **4 Serve**, **5 Bench**, **6 Models**, **7 Image**, **8 Audio** and **9 Settings**. Press a number to switch tabs, `?` to list the keys of the current screen, and ctrl-p for a command palette. Changing tabs never stops anything: a loaded chat model, a running server and a benchmark run all keep going, and the right end of the tab bar names the model that is loaded (by a chat, an agent, the server or a benchmark run), what it is doing right now (thinking, writing, running a tool, the benchmark task or question it is on, with the newest words it wrote), and how much memory the models hold.
 
 Chat, Agents and Serve show your saved **favorites** (a model, its settings and an optional drafter), along with **New setup** (saved as a favorite when you launch it) and **One-time run**. The preview beside the list shows the setup's settings, how its model measured on this Mac and the exact command. Once a session or the server is running, its tab shows that instead. Only one model is loaded at a time: launching something else (a chat, an agent, the server or a benchmark) while a model is loaded asks you to press the key again to unload the first.
 
@@ -32,7 +32,7 @@ Every screen fills the window with panes, and one pane in each split takes whate
 
 They are saved in `~/.config/ferrum/tui.json` under `layout`. The key bar lists the keys for whatever is selected, and messages appear at its right end. Settings, the setup editor and Bench pin a short explanation of the selected row at the bottom of their pane.
 
-In a chat, typing goes to the message box. Esc on an empty box hands the keys to the conversation: ↑↓ scroll, the number keys (1–8) switch tabs, and typing goes back to the box. ctrl-d there unloads the model.
+In a chat, typing goes to the message box. Esc on an empty box hands the keys to the conversation: ↑↓ scroll, the number keys (1–9) switch tabs, and typing goes back to the box. ctrl-d there unloads the model.
 
 Each setup's **Model** group has *Context* and *KV cache*. *KV cache* `q8` stores the attention cache in 8 bits, which nearly halves its memory (so `auto` context grows) and speeds up long conversations; `f16` (the default) is exact. It applies to Chat, Agents, Serve and the Benchmark tab, and is saved with favorites. See [K/V cache format](server.md#kv-cache-format). *Session cache* (chat, on by default) keeps each chat's cache on disk; see [Sessions](#sessions).
 
@@ -133,6 +133,10 @@ Local models have small contexts, so the agent works to keep its context useful:
 ## Image
 
 The Image tab (key `7`, or `i` on Home) draws with a Qwen-Image checkpoint found in the usual model folders. `p` edits the prompt, ↑↓ pick a row (new picture or edit, model, size, seed, transformer and encoder quantization), ←→ change it, `r` draws a new seed and `g` or enter generates. To edit, set the first row to the picture on screen and describe the change in the prompt: the result keeps that picture's shape at the chosen size's area. The picture appears in the pane (on terminals that show images) and is saved as a PNG in `$FERRUM_IMAGES`, default `~/Pictures/Ferrum`. `o` opens it, and esc stops a running generation. Chat models are unloaded first, since the stages need most of the memory. The settings are kept in `~/.config/ferrum/image.json`. See [Image generation](server.md#image-generation).
+
+## Audio
+
+The Audio tab (key `8`, or `u` on Home) plays a WAV clip to LFM3-Audio (experimental; [experimental.md](experimental.md#lfm3-audio-2b)) and shows what it heard. It uses the first LFM3-Audio model the scan found with its `mmproj` file beside it; ←→ on the model row picks another. Choose the clip with `f` (or enter on the clip row) and type its path, or drop the file on the terminal. `r` records one from the system's default input through `ffmpeg` (if it is installed) into `$FERRUM_AUDIO`, default `~/Music/Ferrum`, and `r` again stops; a silent recording is refused, since the model would make up an answer from it, and the message says where to allow the microphone. The task row transcribes in English (Liquid's `Perform ASR in English.`), in any language (`Perform ASR.`), or asks the question you write with `q`. `g` or enter runs it: the model loads on its own thread with a 4096-token context, the reply streams into the right pane, and the model is unloaded again when it finishes. It loads beside a chat model when there is memory for both (about 2 GiB). `c` copies the reply, `o` plays the clip, and esc stops a run. Clips may be up to 120 s, and a longer one is refused before anything loads. The settings are kept in `~/.config/ferrum/audio.json`.
 
 ## Sessions
 

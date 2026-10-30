@@ -115,13 +115,15 @@ To make generation faster, add a drafter. `--draft mtp` uses the prediction head
 
 ## The TUI
 
-`ferrum-tui` opens on a home screen with six sections:
+`ferrum-tui` opens on a home screen with eight sections:
 
 - **Chat.** Streaming markdown, a separate reasoning view, file and image attachments, optional agent tools (including `view_image`, so the model can open an image file itself, and `generate_image`, which can show the model the picture it just drew), and `/new` and `/resume` for saved sessions.
 - **Agents.** A local coding agent that works in a project folder. It can read, grep, edit, run commands and checks, search the web (DuckDuckGo, SearXNG, Brave or your own endpoint), load `SKILL.md` skills from the project and keep a plan, all inside a Seatbelt sandbox and with an approval mode you choose.
 - **Serve.** Starts `ferrum-server` and shows its endpoint, health and live log.
 - **Benchmark.** Finds the fastest drafter, draft depth and draft tree (including KFlash) for a model on *your* Mac. It checks that every candidate's output matches plain decoding, and that a drafter whose output drifts late still answers the same questions right, then saves the winner as a favorite. Switched to *intelligence*, it scores the model instead: math, knowledge, instruction-following and code-reading questions, plus tool calling, long-context recall and writing code that must pass tests. Switched to *agent*, the coding agent fixes ten real bugs from open-source repos, and the tab counts the fixes that pass the projects' tests and the tokens they cost, and compares saved results across models and settings.
-- **Models.** Every GGUF found on this Mac in one table: quant, size, architecture, context, vision support, matching drafters and its best measured results. Files Ferrum can't run stay listed with the reason.
+- **Models.** Every GGUF found on this Mac in one table: quant, size, architecture, context, vision or audio support, matching drafters and its best measured results. Files Ferrum can't run stay listed with the reason.
+- **Image.** Draws and edits pictures with Qwen-Image-2.1 (experimental).
+- **Audio.** Transcribes a WAV clip or a recording with LFM3-Audio, or answers a question about it (experimental).
 - **Settings.** Model folders, favorites, the web search provider and startup options.
 
 Setups (model, sampling, drafter) are saved as favorites. The [TUI guide](docs/tui.md) covers the agent tools, the sandbox, context management and the speed and intelligence benchmarks in detail.
@@ -230,7 +232,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - Batch size 1. `ferrum-server --parallel N` serves up to 8 requests at once in separate sessions that take turns on the GPU, so their streams interleave but total throughput is that of one request.
 - The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint, Spark and LFM3. Other architectures go through the developer runner, built with `--features legacy-engine`.
-- Vision supports the Qwen3-VL projector and, experimentally, LFM3-VL still images. No video. LFM3-Audio hears WAV clips of up to 120 s each (experimental); it does not speak.
+- Vision supports the Qwen3-VL projector and, experimentally, LFM3-VL still images. No video. LFM3-Audio hears WAV clips of up to 120 s each (experimental; also the TUI's Audio tab); it does not speak.
 - Image generation and editing (`ferrum-cli image`, `ferrum-server --image-model` with `/v1/images/generations` and `/v1/images/edits`, the TUI Image tab, and the chat and agent tool `generate_image`) supports Qwen-Image-2.1-Turbo from safetensors, and the base model's transformer from GGUF; a new 1024² picture takes about 69 s. See [experimental.md](docs/experimental.md#image-generation).
 - No training and no language bindings.
 

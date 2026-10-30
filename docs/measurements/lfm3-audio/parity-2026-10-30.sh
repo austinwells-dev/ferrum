@@ -2,6 +2,7 @@
 # LFM3-Audio input vs llama.cpp: encoder rows, then greedy text through ferrum-cli and llama-mtmd-cli.
 # Run from the repo root at the branch commit:
 #   cargo build --release --bin ferrum-cli --example hybrid_audio_check
+# First run at bb1e87b; the record is from the rerun after the review fixes (see README.md).
 #   caffeinate -dims zsh docs/measurements/lfm3-audio/parity-2026-10-30.sh > docs/measurements/lfm3-audio/parity-2026-10-30.txt 2>&1
 #
 # Setup it expects in S (it creates none of it):
@@ -17,6 +18,8 @@
 #     T="Ferrum is a runtime for large language models on Apple Silicon. It loads GGUF files, plans memory so the context fits beside the weights, and runs its own Metal kernels. Speculative decoding drafts several tokens at once and verifies them in one pass. Sessions keep the cache between turns so a long conversation does not pay for its history again."
 #     say -o long.wav --data-format=LEI16@16000 "$T $T $T $T $T"
 #     say -o toolong.wav --data-format=LEI16@16000 "$T $T $T $T $T $T $T $T $T $T $T"
+#     afconvert -f WAVE -d LEF32@48000 -c 2 long.wav long48k.wav (and toolong.wav to toolong48k.wav)
+#   S/regress/picture.png: docs/measurements/parallel-slots-2026-10/concurrency-tiel.png
 set -u
 S=${S:-/private/tmp/claude-501/-Users-austinwells-Documents-ferrum/63c705ed-5e6d-4036-805c-1f0616b0bc55/scratchpad}
 L=$S/llama.cpp/build/bin
@@ -42,6 +45,14 @@ done
 echo "== toolong Q8_0 (must be refused)"
 $CHECK $M/mmproj-LFM3-Audio-2B-Q8_0.gguf $S/audio/toolong.wav 2>&1 | tail -1
 
+echo "## memory plan against Metal's allocations, and the CPU front end on 48 kHz stereo float"
+for q in BF16 Q8_0; do
+  echo "== long48k $q --memory"
+  $CHECK $M/mmproj-LFM3-Audio-2B-$q.gguf $S/audio/long48k.wav --memory
+done
+echo "== toolong48k Q8_0: refused from the header, wall time including the projector load"
+/usr/bin/time -p $CHECK $M/mmproj-LFM3-Audio-2B-Q8_0.gguf $S/audio/toolong48k.wav 2>&1 | grep -E 'Error|real'
+
 P=$M/mmproj-LFM3-Audio-2B-Q8_0.gguf
 lm() { $L/llama-mtmd-cli -m $LANG_FILE --mmproj $P --jinja --temp 0 -n 96 "$@" 2>/dev/null | sed '/^$/d' | tail -2; }
 fc() { $CLI --model $LANG_FILE --mmproj $P --temperature 0 --max-tokens 96 "$@" 2>&1 | grep -v -E '^(ferrum|model|projector|context|>|\s*$)' | tail -4; }
@@ -60,4 +71,14 @@ T="Two clips are attached. Summarise each in a few words."
 echo "== two clips"
 lm --audio $S/audio/fox.wav --audio $S/audio/weather48k.wav -p "<__media__><__media__>$T"
 printf '/audio %s\n/audio %s\n%s\n/exit\n' $S/audio/fox.wav $S/audio/weather48k.wav "$T" | fc
+
+# expand_media was split into splice_media and locate_media after the regression run:
+# the same LFM3-VL picture check as regression-2026-10-30.sh, against its answer md5
+# (5a55a681a5c85ce8813e746bd69616c5 on both builds there).
+VL=$HOME/models/hub/models--LiquidAI--LFM3-VL-2B-GGUF/snapshots/main
+echo "## LFM3-VL picture, greedy, as in the regression record"
+printf '/image %s\nDescribe this picture.\n/exit\n' $S/regress/picture.png | \
+  $CLI --model $VL/LFM3-VL-2B-Q4_K_M.gguf --mmproj $VL/mmproj-LFM3-VL-2B-Q8_0.gguf \
+    --temperature 0 --max-tokens 96 2> /dev/null | grep -v -E 'tok/s|[0-9]+(\.[0-9]+)? ?(ms|s)\b' > $S/cmp/vl.clean
+echo "answer md5 $(md5 -q $S/cmp/vl.clean)"
 echo "# end $(date -u '+%Y-%m-%d %H:%M:%S UTC')"

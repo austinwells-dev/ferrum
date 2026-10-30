@@ -47,7 +47,7 @@ projector. Numbers and the known gaps are in [experimental.md](experimental.md#l
 
 `clip.audio.projector_type = lfm3a` (`src/vision/lfm3a.rs`, front end in `src/vision/audio.rs`) is a
 one-dimensional twin of the LFM3-VL tower that turns speech into language-model rows. A WAV clip is mixed
-to mono and resampled to 16 kHz (windowed sinc), then cut into 400-sample periodic-Hann frames every 160
+to mono and resampled to 16 kHz (windowed sinc, its kernel tabulated once per phase), then cut into 400-sample periodic-Hann frames every 160
 samples, with no centring and the tail padded to a whole hop. A 400-point FFT (radix 2, then a direct
 25-point DFT) feeds 128 Slaney mel filters, and each bin becomes `(log10(max(x, 1e-12)) + 4) / 4`.
 
@@ -62,8 +62,9 @@ scores). Each block ends in a SwiGLU. A final RMSNorm, a LayerNorm and a GELU ML
 row per 80 ms of audio.
 
 `<|audio|>` is repeated once per row, and each row has its own position, as with LFM3 images. Clips
-are cached by content (the last four). One clip may
-last 120 s; attention over a clip is n×n, so the memory plan reserves activations for that length. The
+are cached by content (the last eight, as many as one request may carry). One clip may
+last 120 s, checked from the WAV header before decoding; attention over a clip is n×n, and the memory plan
+counts every activation buffer for that length (`lfm3a::activation_bytes`). The
 `a.gen.*` speech generator in the same file is not loaded. Numbers and the known gaps are in
 [experimental.md](experimental.md#lfm3-audio-2b).
 

@@ -1,11 +1,11 @@
-# 2026-10-30 19:58:27 UTC; commit bb1e87b
+# 2026-10-30 20:38:52 UTC; commit e4f76c2
 ## /props modalities
 {'vision': False, 'audio': True}
 ## chat completion: system 'Perform ASR in English.', user = weather.wav as input_audio
 Tomorrow will be mostly sunny in Chicago, with a high of 72 degrees and light winds from the west.
 prompt tokens 95
 ## server log lines about audio
-19:58:27.168 INF ferrum-server 0.1.0 starting: /Users/austinwells/models/hub/models--LiquidAI--LFM3-Audio-2B-GGUF/snapshots/main/LFM3-Audio-2B-Q4_K_M.gguf
-19:58:27.968 INF loaded LFM3-Audio-2B-Q4_K_M (Lfm3, 24 layers, 11 attention) in 0.6 s
-19:58:27.971 INF audio: /Users/austinwells/models/hub/models--LiquidAI--LFM3-Audio-2B-GGUF/snapshots/main/mmproj-LFM3-Audio-2B-Q8_0.gguf (0.21 GiB; WAV clips up to 120 s)
-19:58:28.552 INF [req 1] encoded audio in 0.04 s
+20:38:53.129 INF ferrum-server 0.1.0 starting: /Users/austinwells/models/hub/models--LiquidAI--LFM3-Audio-2B-GGUF/snapshots/main/LFM3-Audio-2B-Q4_K_M.gguf
+20:38:53.959 INF loaded LFM3-Audio-2B-Q4_K_M (Lfm3, 24 layers, 11 attention) in 0.6 s
+20:38:53.959 INF audio: /Users/austinwells/models/hub/models--LiquidAI--LFM3-Audio-2B-GGUF/snapshots/main/mmproj-LFM3-Audio-2B-Q8_0.gguf (0.21 GiB; WAV clips up to 120 s)
+20:38:55.065 INF [req 1] encoded audio in 0.06 s
