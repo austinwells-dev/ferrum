@@ -14,11 +14,20 @@ const N_FFT: usize = 400;
 const HOP: usize = 160;
 const MEL_FLOOR: f64 = 1e-12;
 
-/// Decode a WAV file to mono samples at `SAMPLE_RATE`. Channels are
-/// averaged. PCM (8, 16, 24 and 32 bit) and IEEE float (32 and 64 bit) are
-/// read; anything else is refused with a hint to convert.
-pub fn decode_wav(bytes: &[u8]) -> Result<Vec<f32>> {
-    let bad = |what: &str| Error::Parameter(format!("audio: {what}"));
+/// A WAV file's format and sample bytes, read without decoding.
+struct Wav<'a> {
+    tag: u16,
+    channels: usize,
+    rate: usize,
+    bits: usize,
+    data: &'a [u8],
+}
+
+fn bad(what: &str) -> Error {
+    Error::Parameter(format!("audio: {what}"))
+}
+
+fn parse_wav(bytes: &[u8]) -> Result<Wav<'_>> {
     if bytes.len() < 12 || &bytes[..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
         return Err(bad(
             "only WAV files are read; convert other formats first (for example `afconvert -f WAVE -d LEI16@16000 in.m4a out.wav`)",
@@ -58,9 +67,24 @@ pub fn decode_wav(bytes: &[u8]) -> Result<Vec<f32>> {
     if channels == 0 || rate == 0 {
         return Err(bad("WAV file declares no channels or no sample rate"));
     }
-    let width = bits / 8;
-    let sample = |b: &[u8]| -> Option<f32> {
-        Some(match (tag, bits) {
+    let wav = Wav {
+        tag,
+        channels,
+        rate,
+        bits,
+        data,
+    };
+    if !wav.bits.is_multiple_of(8) || wav.sample(&[0; 8]).is_none() {
+        return Err(bad(&format!(
+            "WAV sample format {tag} with {bits} bits is not read; use PCM or float"
+        )));
+    }
+    Ok(wav)
+}
+
+impl Wav<'_> {
+    fn sample(&self, b: &[u8]) -> Option<f32> {
+        Some(match (self.tag, self.bits) {
             (1, 8) => (f32::from(b[0]) - 128.) / 128.,
             (1, 16) => f32::from(i16::from_le_bytes([b[0], b[1]])) / 32768.,
             (1, 24) => (i32::from_le_bytes([0, b[0], b[1], b[2]]) >> 8) as f32 / 8_388_608.,
@@ -69,28 +93,49 @@ pub fn decode_wav(bytes: &[u8]) -> Result<Vec<f32>> {
             (3, 64) => f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32,
             _ => return None,
         })
-    };
-    if width == 0 || sample(&[0; 8]).is_none() {
-        return Err(bad(&format!(
-            "WAV sample format {tag} with {bits} bits is not read; use PCM or float"
-        )));
     }
-    let frame = width * channels;
-    let mono: Vec<f32> = data
-        .chunks_exact(frame)
+
+    fn frames(&self) -> usize {
+        self.data.len() / (self.bits / 8 * self.channels)
+    }
+}
+
+/// Length in seconds of a WAV file, from its header alone, so a clip that is
+/// too long can be refused before it is decoded and resampled.
+pub fn wav_seconds(bytes: &[u8]) -> Result<f64> {
+    let wav = parse_wav(bytes)?;
+    Ok(wav.frames() as f64 / wav.rate as f64)
+}
+
+/// Decode a WAV file to mono samples at `SAMPLE_RATE`. Channels are
+/// averaged. PCM (8, 16, 24 and 32 bit) and IEEE float (32 and 64 bit) are
+/// read; anything else is refused with a hint to convert.
+pub fn decode_wav(bytes: &[u8]) -> Result<Vec<f32>> {
+    let wav = parse_wav(bytes)?;
+    let width = wav.bits / 8;
+    let mono: Vec<f32> = wav
+        .data
+        .chunks_exact(width * wav.channels)
         .map(|f| {
-            let sum: f32 = f.chunks_exact(width).filter_map(sample).sum();
-            sum / channels as f32
+            let sum: f32 = f.chunks_exact(width).filter_map(|b| wav.sample(b)).sum();
+            sum / wav.channels as f32
         })
         .collect();
     if mono.is_empty() {
         return Err(bad("WAV file has no samples"));
     }
-    Ok(resample(&mono, rate, SAMPLE_RATE))
+    Ok(resample(&mono, wav.rate, SAMPLE_RATE))
 }
 
+/// Phase tables are built when the rates' ratio has at most this many
+/// phases (every common rate against 16 kHz); otherwise each output's taps
+/// are computed as it is made.
+const MAX_PHASES: usize = 2048;
+
 /// Windowed-sinc resampling (Blackman window, 32 zero crossings each side),
-/// low-passed at the lower Nyquist rate.
+/// low-passed at the lower Nyquist rate. Output `i` sits at input position
+/// `i * from / to`, whose fractional part cycles through `to / gcd` values,
+/// so the kernel is tabulated once per phase rather than evaluated per tap.
 pub fn resample(input: &[f32], from: usize, to: usize) -> Vec<f32> {
     if from == to || input.is_empty() {
         return input.to_vec();
@@ -101,30 +146,64 @@ pub fn resample(input: &[f32], from: usize, to: usize) -> Vec<f32> {
     let cutoff = ratio.min(1.) * 0.97;
     let half = ZEROS / cutoff;
     let len = ((input.len() as f64) * ratio).round() as usize;
-    let sinc = |x: f64| {
-        if x.abs() < 1e-9 {
-            1.
-        } else {
-            let px = std::f64::consts::PI * x;
-            px.sin() / px
-        }
-    };
-    (0..len)
-        .map(|i| {
-            let center = i as f64 / ratio;
-            let lo = (center - half).ceil().max(0.) as usize;
-            let hi = ((center + half).floor() as usize).min(input.len() - 1);
-            let mut acc = 0.;
-            for (j, &x) in input.iter().enumerate().take(hi + 1).skip(lo) {
-                let d = j as f64 - center;
+    let g = gcd(from, to);
+    let (up, down) = (to / g, from / g);
+    // Taps for an output `frac` (in [0, 1)) past input sample `base`: offsets
+    // `first..` from `base`, with their weights.
+    let taps = |frac: f64| -> (i64, Vec<f64>) {
+        let first = (frac - half).ceil() as i64;
+        let last = (frac + half).floor() as i64;
+        let weights = (first..=last)
+            .map(|k| {
+                let d = k as f64 - frac;
                 let w = 0.42
                     + 0.5 * (std::f64::consts::PI * d / half).cos()
                     + 0.08 * (2. * std::f64::consts::PI * d / half).cos();
-                acc += f64::from(x) * cutoff * sinc(cutoff * d) * w;
+                cutoff * sinc(cutoff * d) * w
+            })
+            .collect();
+        (first, weights)
+    };
+    let table: Vec<_> = if up <= MAX_PHASES {
+        (0..up).map(|p| taps(p as f64 / up as f64)).collect()
+    } else {
+        Vec::new()
+    };
+    let n = input.len() as i64;
+    (0..len)
+        .map(|i| {
+            let pos = i as u128 * down as u128;
+            let (base, phase) = ((pos / up as u128) as i64, (pos % up as u128) as usize);
+            let owned;
+            let (first, weights) = if table.is_empty() {
+                owned = taps(phase as f64 / up as f64);
+                (owned.0, &owned.1)
+            } else {
+                (table[phase].0, &table[phase].1)
+            };
+            let start = base + first;
+            let lo = (-start).max(0) as usize;
+            let hi = ((n - start).max(0) as usize).min(weights.len());
+            let mut acc = 0.;
+            for k in lo..hi {
+                acc += f64::from(input[(start + k as i64) as usize]) * weights[k];
             }
             acc as f32
         })
         .collect()
+}
+
+fn sinc(x: f64) -> f64 {
+    if x.abs() < 1e-9 {
+        1.
+    } else {
+        let px = std::f64::consts::PI * x;
+        px.sin() / px
+    }
+}
+
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
 }
 
 /// The mel filterbank and window for one bin count.
@@ -318,6 +397,95 @@ mod tests {
         );
         assert!(decode_wav(b"ID3\x04 not a wav file").is_err());
         assert!(decode_wav(&wav(2, 1, 16000, 4, &[0; 4])).is_err());
+    }
+
+    /// The resampler before its phase tables: every tap evaluated directly.
+    fn resample_direct(input: &[f32], from: usize, to: usize) -> Vec<f32> {
+        let ratio = to as f64 / from as f64;
+        let cutoff = ratio.min(1.) * 0.97;
+        let half = 32. / cutoff;
+        let len = ((input.len() as f64) * ratio).round() as usize;
+        (0..len)
+            .map(|i| {
+                let center = i as f64 / ratio;
+                let lo = (center - half).ceil().max(0.) as usize;
+                let hi = ((center + half).floor() as usize).min(input.len() - 1);
+                let mut acc = 0.;
+                for (j, &x) in input.iter().enumerate().take(hi + 1).skip(lo) {
+                    let d = j as f64 - center;
+                    let w = 0.42
+                        + 0.5 * (std::f64::consts::PI * d / half).cos()
+                        + 0.08 * (2. * std::f64::consts::PI * d / half).cos();
+                    acc += f64::from(x) * cutoff * sinc(cutoff * d) * w;
+                }
+                acc as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn phase_tables_match_direct_resampling() {
+        let input: Vec<f32> = (0..9000)
+            .map(|i| ((i * 7919) % 2003) as f32 / 1001.5 - 1.)
+            .collect();
+        // Tabulated (one, 160 and 320 phases), and a ratio with too many
+        // phases for a table.
+        for from in [48_000, 44_100, 22_050, 8_000, 47_993] {
+            let fast = resample(&input, from, SAMPLE_RATE);
+            let slow = resample_direct(&input, from, SAMPLE_RATE);
+            assert_eq!(fast.len(), slow.len(), "{from}");
+            let err = fast
+                .iter()
+                .zip(&slow)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            assert!(err < 1e-5, "{from}: max difference {err}");
+        }
+    }
+
+    #[test]
+    fn reads_pcm24_extensible_and_skips_odd_chunks() {
+        // 24-bit PCM in a WAVE_FORMAT_EXTENSIBLE fmt chunk, after a 3-byte
+        // LIST chunk (padded to 4) that comes before fmt and data.
+        let samples: [i32; 2] = [4_194_304, -8_388_608];
+        let data: Vec<u8> = samples
+            .iter()
+            .flat_map(|v| v.to_le_bytes()[..3].to_vec())
+            .collect();
+        let mut fmt = Vec::new();
+        fmt.extend_from_slice(&0xFFFEu16.to_le_bytes());
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&16000u32.to_le_bytes());
+        fmt.extend_from_slice(&48000u32.to_le_bytes());
+        fmt.extend_from_slice(&3u16.to_le_bytes());
+        fmt.extend_from_slice(&24u16.to_le_bytes());
+        fmt.extend_from_slice(&22u16.to_le_bytes());
+        fmt.extend_from_slice(&24u16.to_le_bytes());
+        fmt.extend_from_slice(&4u32.to_le_bytes());
+        // Subformat GUID: PCM (1) then the fixed tail.
+        fmt.extend_from_slice(&1u16.to_le_bytes());
+        fmt.extend_from_slice(&[0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71]);
+        let mut out = Vec::new();
+        out.extend_from_slice(b"RIFF\0\0\0\0WAVE");
+        out.extend_from_slice(b"LIST");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(b"abc\0");
+        out.extend_from_slice(b"fmt ");
+        out.extend_from_slice(&(fmt.len() as u32).to_le_bytes());
+        out.extend_from_slice(&fmt);
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        out.extend_from_slice(&data);
+        assert_eq!(decode_wav(&out).unwrap(), vec![0.5, -1.]);
+        assert_eq!(wav_seconds(&out).unwrap(), 2. / 16000.);
+    }
+
+    #[test]
+    fn duration_comes_from_the_header() {
+        let data = vec![0u8; 48_000 * 2 * 4 * 3];
+        // Three seconds of 48 kHz stereo float.
+        assert_eq!(wav_seconds(&wav(3, 2, 48_000, 32, &data)).unwrap(), 3.);
+        assert!(wav_seconds(b"not a wav").is_err());
     }
 
     #[test]

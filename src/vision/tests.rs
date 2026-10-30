@@ -411,3 +411,26 @@ fn safetensors_names_follow_transformers() {
         );
     }
 }
+
+#[test]
+fn projectors_match_their_model_by_name() {
+    let vl = "lfm3-vl-2b-q4_k_m";
+    let audio = "lfm3-audio-2b-q4_k_m";
+    assert!(named_after("mmproj-lfm3-vl-2b-q8_0.gguf", vl));
+    assert!(!named_after("mmproj-lfm3-audio-2b-q8_0.gguf", vl));
+    assert!(named_after("mmproj-lfm3-audio-2b-bf16.gguf", audio));
+    assert!(!named_after("mmproj-lfm3-vl-2b-f16.gguf", audio));
+    assert!(named_after(
+        "qwen3.8-27b-mmproj.gguf",
+        "qwen3.8-27b-ud-q4_k_xl"
+    ));
+    assert!(named_after(
+        "mmproj-swift-1.5-qwen3.8-27b-q4_k_m.gguf",
+        "swift-1.5-qwen3.8-27b-q4_k_m"
+    ));
+    assert!(!named_after(
+        "mmproj-bf16.gguf",
+        "swift-1.5-qwen3.8-27b-q4_k_m"
+    ));
+    assert!(!named_after("mmproj.gguf", "anything"));
+}

@@ -290,18 +290,15 @@ fn run() -> Result<()> {
         if let Some(path) = input.strip_prefix("/audio ") {
             let path = path.trim();
             match std::fs::read(path) {
-                Ok(bytes) if rt.supports_audio() => {
-                    match ferrum::vision::audio::decode_wav(&bytes) {
-                        Ok(samples) => {
-                            attachments.push(media::audio_part_from_bytes(&bytes));
-                            eprintln!(
-                                "(audio attached: {:.1} s; it goes with your next message)",
-                                samples.len() as f64 / ferrum::vision::audio::SAMPLE_RATE as f64
-                            );
-                        }
-                        Err(e) => eprintln!("{e}"),
+                Ok(bytes) if rt.supports_audio() => match ferrum::vision::clip_seconds(&bytes) {
+                    Ok(seconds) => {
+                        attachments.push(media::audio_part_from_bytes(&bytes));
+                        eprintln!(
+                            "(audio attached: {seconds:.1} s; it goes with your next message)"
+                        );
                     }
-                }
+                    Err(e) => eprintln!("{e}"),
+                },
                 Ok(_) => eprintln!("this model was loaded without an audio projector (--mmproj)"),
                 Err(e) => eprintln!("cannot read {path}: {e}"),
             }

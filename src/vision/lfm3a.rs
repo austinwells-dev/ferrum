@@ -102,6 +102,48 @@ enum Block {
     Attn(Box<Attn>),
 }
 
+/// Device bytes `Encoder::encode` allocates for the activations of a clip of
+/// `frames` mel frames: one buffer per entry, page-rounded as Metal allocates
+/// them. Keep in step with `encode`; `hybrid_audio_check --memory` compares the two
+/// for a full-length clip (small buffers share pages, so a tiny test cannot).
+pub(super) fn activation_bytes(c: &Config, channels: usize, frames: usize) -> usize {
+    let (h, hd) = (c.hidden, c.head_dim());
+    let t2 = frames.div_ceil(2).div_ceil(2);
+    let n = tokens_for(frames);
+    let f2 = c.n_mel.div_ceil(2).div_ceil(2);
+    let f3 = f2.div_ceil(2);
+    let kv = c.kv_heads * hd;
+    let counts = [
+        frames * c.n_mel,
+        t2 * f2 * channels,
+        t2 * f2 * channels,
+        n * f3 * channels,
+        n * f3 * channels,
+        n * h,
+        n * h,
+        n * h,
+        n * 3 * h,
+        n * h,
+        n * h,
+        n * h,
+        n * kv,
+        n * kv,
+        n * kv,
+        n * h,
+        n * c.ffn,
+        n * c.ffn,
+        n * c.ffn,
+        n * n,
+        n * hd / 2,
+        n * hd / 2,
+        n * n,
+    ];
+    counts
+        .iter()
+        .map(|&e| crate::hybrid::engine::page(e * 4))
+        .sum()
+}
+
 pub(super) struct Encoder {
     pub config: Config,
     stem: Stem,
@@ -119,6 +161,9 @@ pub(super) struct Encoder {
     /// Bound as the unused B*x tape of `h_short_conv`.
     no_tape: Tensor,
     pub weight_bytes: usize,
+    /// Device bytes the latest clip's activations took (Metal's allocated
+    /// size before and after they were made).
+    pub activation_bytes: std::cell::Cell<usize>,
 }
 
 pub(super) fn load(d: &MetalDevice, config: Config, source: &mut dyn Source) -> Result<Encoder> {
@@ -283,6 +328,7 @@ pub(super) fn load(d: &MetalDevice, config: Config, source: &mut dyn Source) -> 
         no_tape: Tensor::zeros(d, [1], DType::F32)?,
         mid,
         weight_bytes: bytes.get(),
+        activation_bytes: std::cell::Cell::new(0),
         config,
     })
 }
@@ -311,6 +357,7 @@ impl Encoder {
         let f1 = c.n_mel.div_ceil(2);
         let (f2, f3) = (f1.div_ceil(2), f1.div_ceil(2).div_ceil(2));
         let n = t3;
+        let before = d.allocated_bytes();
         let zeros = |dims: &[usize]| Tensor::zeros(d, dims, DType::F32);
         let mel = Tensor::from_f32(d, [frames, c.n_mel], DType::F32, features)?;
         let s2 = zeros(&[t2 * f2, ch])?;
@@ -337,6 +384,9 @@ impl Encoder {
         let cos = Tensor::from_f32(d, [n, hd / 2], DType::F32, &cos)?;
         let sin = Tensor::from_f32(d, [n, hd / 2], DType::F32, &sin)?;
         let mask = Tensor::from_f32(d, [n * n], DType::F32, &window_mask(n, c.window))?;
+        // Every activation is allocated above, so this is the clip's peak.
+        self.activation_bytes
+            .set(d.allocated_bytes().saturating_sub(before));
         let scale = 1. / (hd as f32).sqrt();
         let execution = d.execution_with_shared_encoder(true)?;
 

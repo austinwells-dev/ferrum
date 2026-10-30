@@ -1,19 +1,23 @@
 //! Encode a WAV clip with an LFM3-Audio projector and compare the rows with a
 //! reference dump (llama.cpp's `mtmd_get_output_embd` for the same samples).
 //!
-//! usage: hybrid_audio_check MMPROJ.gguf CLIP.wav [REF.f32] [--samples OUT.f32]
+//! usage: hybrid_audio_check MMPROJ.gguf CLIP.wav [REF.f32] [--samples OUT.f32] [--memory]
 //!
 //! `--samples` writes the decoded 16 kHz mono samples as raw little-endian
 //! f32, so the reference encoder can read exactly what Ferrum encoded (no
 //! second WAV decoder or resampler in the comparison). REF is raw f32
 //! `[rows, width]`. Reports the shapes, the encode time, and per-row cosine
-//! similarity and relative error.
-use ferrum::{MetalDevice, Result, vision::AudioModel, vision::audio};
+//! similarity and relative error. `--memory` compares the memory planner's
+//! projector budget with the device bytes the weights and the activations of
+//! a `MAX_AUDIO_SECONDS` clip really take, and times the CPU front end.
+use ferrum::{MetalDevice, Result, vision, vision::AudioModel, vision::audio};
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: hybrid_audio_check MMPROJ.gguf CLIP.wav [REF.f32] [--samples OUT.f32]");
+        eprintln!(
+            "usage: hybrid_audio_check MMPROJ.gguf CLIP.wav [REF.f32] [--samples OUT.f32] [--memory]"
+        );
         std::process::exit(2);
     }
     let samples_out = args
@@ -21,10 +25,15 @@ fn main() -> Result<()> {
         .position(|a| a == "--samples")
         .map(|i| args[i + 1].clone());
     let reference = args.get(3).filter(|a| !a.starts_with("--"));
+    let memory = args.iter().any(|a| a == "--memory");
     let d = MetalDevice::new()?;
+    let before = d.allocated_bytes();
     let model = AudioModel::load(&d, &args[1])?;
+    let loaded = d.allocated_bytes() - before;
     let bytes = std::fs::read(&args[2]).expect("read clip");
+    let start = std::time::Instant::now();
     let samples = audio::decode_wav(&bytes)?;
+    let decode = start.elapsed();
     if let Some(path) = samples_out {
         let raw: Vec<u8> = samples.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(&path, raw).expect("write samples");
@@ -41,6 +50,30 @@ fn main() -> Result<()> {
         samples.len() as f64 / audio::SAMPLE_RATE as f64,
         elapsed.as_secs_f64() * 1e3
     );
+    let mib = |b: usize| b as f64 / (1 << 20) as f64;
+    println!(
+        "CPU front end: WAV decode and resample {:.1} ms, log-mel {:.1} ms",
+        decode.as_secs_f64() * 1e3,
+        {
+            let start = std::time::Instant::now();
+            audio::MelBank::new(128).features(&samples);
+            start.elapsed().as_secs_f64() * 1e3
+        }
+    );
+    if memory {
+        let longest = vec![0.; vision::MAX_AUDIO_SECONDS * audio::SAMPLE_RATE];
+        model.encode_samples(&d, &longest, 1)?;
+        let planned = vision::projector_bytes(std::path::Path::new(&args[1]));
+        println!(
+            "memory: planned {:.1} MiB; measured weights {:.1} MiB (loader counted {:.1}) + {} s clip activations {:.1} MiB = {:.1} MiB",
+            mib(planned),
+            mib(loaded),
+            mib(model.weight_bytes()),
+            vision::MAX_AUDIO_SECONDS,
+            mib(model.activation_bytes()),
+            mib(loaded + model.activation_bytes()),
+        );
+    }
     let Some(reference) = reference else {
         return Ok(());
     };

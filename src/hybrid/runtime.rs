@@ -51,8 +51,10 @@ pub struct Vision {
     pub last_encode: std::time::Duration,
 }
 
-/// Encoded audio clips kept so conversations do not re-encode their history.
-const AUDIO_CACHE: usize = 4;
+/// Encoded audio clips kept so conversations do not re-encode their history:
+/// as many as one request may carry, since each turn walks them in order and
+/// a smaller LRU would miss on every one.
+const AUDIO_CACHE: usize = media::MAX_AUDIO_CLIPS;
 
 /// The speech encoder next to the language model (LFM3-Audio's projector),
 /// and recently encoded clips by content, shared by every session.
@@ -818,40 +820,10 @@ impl Runtime {
             .as_ref()
             .is_some_and(|v| v.model.linear_positions());
         let audio_marker = self.audio.as_ref().map(|a| a.model.marker());
-        let mismatch = |what: &str| {
-            Error::Parameter(format!(
-                "the chat template's {what} placeholders do not match the attached {what}"
-            ))
-        };
-        // Each kind keeps its own order; the prompt interleaves them.
-        let kinds = [
-            (image_marker, images, "image"),
-            (audio_marker.unwrap_or(""), clips, "audio"),
-        ];
-        let mut next = [0usize; 2];
-        let mut text = String::with_capacity(prompt.len());
-        let mut rest = prompt;
-        loop {
-            let found = kinds
-                .iter()
-                .enumerate()
-                .filter(|(_, (marker, _, _))| !marker.is_empty())
-                .filter_map(|(i, (marker, _, _))| rest.find(marker).map(|at| (at, i)))
-                .min();
-            let Some((at, kind)) = found else { break };
-            let (marker, items, what) = kinds[kind];
-            let item = items.get(next[kind]).ok_or_else(|| mismatch(what))?;
-            next[kind] += 1;
-            text.push_str(&rest[..at]);
-            text.push_str(&marker.repeat(item.tokens()));
-            rest = &rest[at + marker.len()..];
-        }
-        text.push_str(rest);
-        for (kind, (_, items, what)) in kinds.iter().enumerate() {
-            if next[kind] != items.len() {
-                return Err(mismatch(what));
-            }
-        }
+        let kinds = [(image_marker, images), (audio_marker.unwrap_or(""), clips)];
+        let lengths = kinds.map(|(_, items)| items.iter().map(|e| e.tokens()).collect::<Vec<_>>());
+        let markers = kinds.map(|(marker, _)| marker);
+        let text = splice_media(prompt, markers, [&lengths[0], &lengths[1]])?;
         let tokens = tokenizer.encode(&text)?;
         let pad_of = |marker: &str| -> Result<u32> {
             let pad = tokenizer.encode(marker)?;
@@ -860,50 +832,27 @@ impl Runtime {
                 _ => Err(Error::Tokenizer(format!("{marker} is not a single token"))),
             }
         };
-        let mut pads = Vec::new();
-        for (kind, (marker, items, _)) in kinds.iter().enumerate() {
+        let mut pads = [None; 2];
+        for (kind, (marker, items)) in kinds.iter().enumerate() {
             if !items.is_empty() {
-                pads.push((pad_of(marker)?, kind));
+                pads[kind] = Some(pad_of(marker)?);
             }
         }
-        let mut spans = Vec::with_capacity(images.len() + clips.len());
-        let mut taken = [0usize; 2];
-        let mut i = 0;
-        while i < tokens.len() {
-            let Some(&(pad, kind)) = pads.iter().find(|(p, _)| *p == tokens[i]) else {
-                i += 1;
-                continue;
-            };
-            // Clips have no wrapper tokens, so two in a row make one run of
-            // pads: each takes exactly its own length from it.
-            let start = i;
-            let (_, items, what) = kinds[kind];
-            let item = items.get(taken[kind]).ok_or_else(|| mismatch(what))?;
-            taken[kind] += 1;
-            i += item.tokens();
-            if i > tokens.len() || tokens[start..i].iter().any(|&t| t != pad) {
-                return Err(mismatch(what));
-            }
-            // An image's run must end where the image does.
-            if kind == 0 && tokens.get(i) == Some(&pad) {
-                return Err(mismatch(what));
-            }
-            spans.push(ImageSpan {
-                start,
-                grid: item.grid,
-                embedding: item.rows.clone(),
-                deepstack: item.deepstack.clone(),
-                hash: item.hash,
-                linear: linear || kind == 1,
-            });
-        }
-        if taken != [images.len(), clips.len()] {
-            return Err(mismatch(if taken[0] != images.len() {
-                "image"
-            } else {
-                "audio"
-            }));
-        }
+        let runs = locate_media(&tokens, pads, [&lengths[0], &lengths[1]])?;
+        let spans = runs
+            .into_iter()
+            .map(|(start, kind, index)| {
+                let item = &kinds[kind].1[index];
+                ImageSpan {
+                    start,
+                    grid: item.grid,
+                    embedding: item.rows.clone(),
+                    deepstack: item.deepstack.clone(),
+                    hash: item.hash,
+                    linear: linear || kind == 1,
+                }
+            })
+            .collect();
         Ok((tokens, spans))
     }
 
@@ -1608,9 +1557,118 @@ fn hold_back(text: &str, from: usize, markers: &[&str]) -> usize {
     safe.max(from)
 }
 
+const MEDIA_KINDS: [&str; 2] = ["image", "audio"];
+
+fn media_mismatch(kind: usize) -> Error {
+    let what = MEDIA_KINDS[kind];
+    Error::Parameter(format!(
+        "the chat template's {what} placeholders do not match the attached {what}"
+    ))
+}
+
+/// Repeat each placeholder in `prompt` once per token of its item. Kind 0 is
+/// images, kind 1 audio clips; each kind keeps its own order and the prompt
+/// interleaves them. An empty marker is never matched.
+fn splice_media(prompt: &str, markers: [&str; 2], lengths: [&[usize]; 2]) -> Result<String> {
+    let mut next = [0usize; 2];
+    let mut text = String::with_capacity(prompt.len());
+    let mut rest = prompt;
+    loop {
+        let found = markers
+            .iter()
+            .enumerate()
+            .filter(|(_, marker)| !marker.is_empty())
+            .filter_map(|(kind, marker)| rest.find(marker).map(|at| (at, kind)))
+            .min();
+        let Some((at, kind)) = found else { break };
+        let len = *lengths[kind]
+            .get(next[kind])
+            .ok_or_else(|| media_mismatch(kind))?;
+        next[kind] += 1;
+        text.push_str(&rest[..at]);
+        text.push_str(&markers[kind].repeat(len));
+        rest = &rest[at + markers[kind].len()..];
+    }
+    text.push_str(rest);
+    for kind in 0..2 {
+        if next[kind] != lengths[kind].len() {
+            return Err(media_mismatch(kind));
+        }
+    }
+    Ok(text)
+}
+
+/// Find each item's run of pad tokens in `tokens`: `(start, kind, index)` in
+/// prompt order. Clips have no wrapper tokens, so two in a row make one run
+/// of pads, and each takes exactly its own length from it; an image's run
+/// must end where the image does.
+fn locate_media(
+    tokens: &[u32],
+    pads: [Option<u32>; 2],
+    lengths: [&[usize]; 2],
+) -> Result<Vec<(usize, usize, usize)>> {
+    let mut runs = Vec::with_capacity(lengths[0].len() + lengths[1].len());
+    let mut taken = [0usize; 2];
+    let mut i = 0;
+    while i < tokens.len() {
+        let Some(kind) = (0..2).find(|&k| pads[k] == Some(tokens[i])) else {
+            i += 1;
+            continue;
+        };
+        let pad = tokens[i];
+        let start = i;
+        let len = *lengths[kind]
+            .get(taken[kind])
+            .ok_or_else(|| media_mismatch(kind))?;
+        runs.push((start, kind, taken[kind]));
+        taken[kind] += 1;
+        i += len;
+        if i > tokens.len() || tokens[start..i].iter().any(|&t| t != pad) {
+            return Err(media_mismatch(kind));
+        }
+        if kind == 0 && tokens.get(i) == Some(&pad) {
+            return Err(media_mismatch(kind));
+        }
+    }
+    for kind in 0..2 {
+        if taken[kind] != lengths[kind].len() {
+            return Err(media_mismatch(kind));
+        }
+    }
+    Ok(runs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn splices_and_locates_adjacent_clips_and_images() {
+        let text = splice_media("a<A><I>b<A>c", ["<I>", "<A>"], [&[2], &[3, 1]]).unwrap();
+        assert_eq!(text, "a<A><A><A><I><I>b<A>c");
+        // Tokens: text 0, image pad 7, audio pad 9. Two clips back to back
+        // form one run of pads and still split by their own lengths.
+        let tokens = [0, 9, 9, 9, 9, 7, 7, 0];
+        let runs = locate_media(&tokens, [Some(7), Some(9)], [&[2], &[3, 1]]).unwrap();
+        assert_eq!(runs, vec![(1, 1, 0), (4, 1, 1), (5, 0, 0)]);
+    }
+
+    #[test]
+    fn media_counts_and_runs_must_match() {
+        // More placeholders than clips, and fewer.
+        assert!(splice_media("<A><A>", ["<I>", "<A>"], [&[], &[1]]).is_err());
+        assert!(splice_media("<A>", ["<I>", "<A>"], [&[], &[1, 1]]).is_err());
+        // No audio marker (no projector): the text is left alone, but a clip
+        // with nowhere to go is an error.
+        assert_eq!(splice_media("<A>", ["<I>", ""], [&[], &[]]).unwrap(), "<A>");
+        assert!(splice_media("x", ["<I>", ""], [&[], &[2]]).is_err());
+        // An image run longer than its image.
+        assert!(locate_media(&[7, 7, 7], [Some(7), None], [&[2], &[]]).is_err());
+        // A clip run shorter than its clip.
+        assert!(locate_media(&[9, 9, 0], [None, Some(9)], [&[], &[3]]).is_err());
+        // A clip left over at the end.
+        assert!(locate_media(&[9, 0], [None, Some(9)], [&[], &[1, 1]]).is_err());
+    }
 
     fn run(pieces: &[&str], reasoning: bool, stop: &[&str]) -> (Vec<Delta>, Splitter) {
         let mut s = Splitter::new(

@@ -237,10 +237,41 @@ pub fn find_projectors(model: &Path) -> Vec<std::path::PathBuf> {
     // Prefer a projector named after the model, then the smallest filename.
     found.sort_by_key(|p| {
         let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase());
-        let named = name.is_some_and(|n| n.contains(&stem));
+        let named = name.is_some_and(|n| named_after(&n, &stem));
         (!named, p.clone())
     });
     found
+}
+
+/// Is the projector file `name` named after the model whose lowercase file
+/// stem is `stem`? Either it contains the whole stem, or, with `mmproj` and
+/// its quant taken off (`mmproj-LFM3-VL-2B-Q8_0.gguf` is `lfm3-vl-2b`), it
+/// starts the stem. Two projectors of one width in a folder (LFM3-VL and
+/// LFM3-Audio) are told apart this way.
+fn named_after(name: &str, stem: &str) -> bool {
+    if name.contains(stem) {
+        return true;
+    }
+    let base = name.strip_suffix(".gguf").unwrap_or(name);
+    let base = ["mmproj-", "mmproj_", "mmproj."]
+        .iter()
+        .find_map(|p| base.strip_prefix(p))
+        .or_else(|| {
+            ["-mmproj", "_mmproj", ".mmproj"]
+                .iter()
+                .find_map(|s| base.strip_suffix(s))
+        })
+        .unwrap_or(base);
+    // `q8_0`, `bf16`, `iq4_xs`: letters, then a digit.
+    let is_quant = |q: &str| {
+        let digits = q.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+        digits.len() < q.len() && digits.starts_with(|c: char| c.is_ascii_digit()) && q.len() <= 7
+    };
+    let base = match base.rfind('-') {
+        Some(at) if is_quant(&base[at + 1..]) => &base[..at],
+        _ => base,
+    };
+    base.len() >= 3 && stem.starts_with(base)
 }
 
 /// Does the projector at `projector` produce embeddings of `model`'s width?
@@ -302,22 +333,49 @@ pub fn projector_bytes(path: &Path) -> usize {
             .map(|t| t.dimensions.iter().product::<usize>() * 2)
             .sum();
         // Weights plus the transient activations of a full-size image, or of
-        // a `MAX_AUDIO_SECONDS` clip (its downsampler stages dominate).
+        // a `MAX_AUDIO_SECONDS` clip (counted buffer by buffer, as the
+        // encoder allocates them).
         weights
             + if audio {
-                AUDIO_ACTIVATION_BYTES
+                let channels = f
+                    .tensors()
+                    .get("a.conv1d.0.bias")
+                    .map(|t| t.dimensions.iter().product::<usize>());
+                match (audio_config(f.metadata()), channels) {
+                    (Ok(config), Some(channels)) => lfm3a::activation_bytes(
+                        &config,
+                        channels,
+                        audio::MelBank::frames(MAX_AUDIO_SECONDS * audio::SAMPLE_RATE),
+                    ),
+                    // AudioModel::load refuses this file anyway.
+                    _ => 0,
+                }
             } else {
                 640 << 20
             }
     })
 }
 
-/// Longest clip one request may attach. The encoder runs a clip in one pass,
+/// Longest clip, and so the longest each attached clip may be. The encoder runs a clip in one pass,
 /// so its activations grow with the clip.
 pub const MAX_AUDIO_SECONDS: usize = 120;
-/// Encoder activations of a `MAX_AUDIO_SECONDS` clip (about 380 MB measured
-/// from the buffer sizes in `lfm3a::Encoder::encode`), rounded up.
-const AUDIO_ACTIVATION_BYTES: usize = 400 << 20;
+
+/// Length of a WAV clip in seconds, read from its header, or an error when it
+/// is not a readable WAV file or is longer than `MAX_AUDIO_SECONDS`.
+pub fn clip_seconds(bytes: &[u8]) -> Result<f64> {
+    let seconds = audio::wav_seconds(bytes)?;
+    check_seconds(seconds)?;
+    Ok(seconds)
+}
+
+fn check_seconds(seconds: f64) -> Result<()> {
+    if seconds > MAX_AUDIO_SECONDS as f64 {
+        return Err(Error::Parameter(format!(
+            "a {seconds:.1} s clip is longer than the {MAX_AUDIO_SECONDS} s one clip may last; split it"
+        )));
+    }
+    Ok(())
+}
 
 /// Is `path` a speech-input projector with no vision tower (LFM3-Audio's
 /// `mmproj`)? Combined files (LFM3-Omni) load as vision projectors.
@@ -333,6 +391,22 @@ pub fn is_audio_projector(path: &Path) -> bool {
 pub struct AudioModel {
     encoder: lfm3a::Encoder,
     mel: audio::MelBank,
+}
+
+/// The `lfm3a` encoder's shape from `clip.audio.*` metadata.
+fn audio_config(md: &BTreeMap<String, MetadataValue>) -> Result<lfm3a::Config> {
+    let key = |k: &str| meta_uint(md, &format!("clip.audio.{k}"));
+    Ok(lfm3a::Config {
+        n_mel: key("num_mel_bins")?,
+        hidden: key("embedding_length")?,
+        heads: key("attention.head_count")?,
+        kv_heads: key("attention.head_count_kv")?,
+        ffn: key("feed_forward_length")?,
+        layers: key("block_count")?,
+        window: key("window_size")?,
+        eps: meta_float(md, "clip.audio.attention.layer_norm_epsilon")?,
+        out_dim: key("projection_dim")?,
+    })
 }
 
 impl AudioModel {
@@ -355,18 +429,7 @@ impl AudioModel {
             }
             _ => return unsupported("missing clip.audio.projector_type".into()),
         }
-        let key = |k: &str| meta_uint(&md, &format!("clip.audio.{k}"));
-        let config = lfm3a::Config {
-            n_mel: key("num_mel_bins")?,
-            hidden: key("embedding_length")?,
-            heads: key("attention.head_count")?,
-            kv_heads: key("attention.head_count_kv")?,
-            ffn: key("feed_forward_length")?,
-            layers: key("block_count")?,
-            window: key("window_size")?,
-            eps: meta_float(&md, "clip.audio.attention.layer_norm_epsilon")?,
-            out_dim: key("projection_dim")?,
-        };
+        let config = audio_config(&md)?;
         let mut source = GgufSource(file);
         let encoder = lfm3a::load(d, config, &mut source)?;
         Ok(Self {
@@ -397,8 +460,15 @@ impl AudioModel {
         ))
     }
 
-    /// Encode a WAV file.
+    /// Device bytes the latest clip's encoder activations took.
+    pub fn activation_bytes(&self) -> usize {
+        self.encoder.activation_bytes.get()
+    }
+
+    /// Encode a WAV file. Its length is checked from the header first, so a
+    /// clip that is too long is refused before it is decoded and resampled.
     pub fn encode(&self, d: &MetalDevice, bytes: &[u8]) -> Result<ImageEmbedding> {
+        clip_seconds(bytes)?;
         let samples = audio::decode_wav(bytes)?;
         self.encode_samples(d, &samples, content_hash(bytes))
     }
@@ -410,12 +480,7 @@ impl AudioModel {
         samples: &[f32],
         hash: u64,
     ) -> Result<ImageEmbedding> {
-        let seconds = samples.len() as f64 / audio::SAMPLE_RATE as f64;
-        if seconds > MAX_AUDIO_SECONDS as f64 {
-            return Err(Error::Parameter(format!(
-                "a {seconds:.1} s clip is longer than the {MAX_AUDIO_SECONDS} s one clip may last; split it"
-            )));
-        }
+        check_seconds(samples.len() as f64 / audio::SAMPLE_RATE as f64)?;
         self.encoder.encode(d, &self.mel.features(samples), hash)
     }
 
