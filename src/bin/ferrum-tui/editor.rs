@@ -186,6 +186,7 @@ impl App {
                 }
             }
             Editing::ImagePrompt => self.set_image_prompt(),
+            Editing::AudioClip | Editing::AudioQuestion => self.set_audio_text(),
             Editing::SearchUrl => self.search.url = self.buffer.trim().to_string(),
             Editing::SearchKey => self.search.key = self.buffer.trim().to_string(),
             Editing::RenameFav(i) => {
@@ -568,8 +569,15 @@ impl App {
                 if let Some(v) = &m.vision {
                     let file = v.file_name().map(|n| n.to_string_lossy().into_owned());
                     lines.push(row(
-                        "vision",
-                        clip(&format!("👁 {}", file.unwrap_or_default()), w),
+                        if m.audio { "audio" } else { "vision" },
+                        clip(
+                            &format!(
+                                "{} {}",
+                                if m.audio { "🔊" } else { "👁" },
+                                file.unwrap_or_default()
+                            ),
+                            w,
+                        ),
                     ));
                 }
                 lines.push(row("sampling", clip(&i.sampling, w)));

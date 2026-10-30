@@ -15,8 +15,8 @@
 //!                  (text-to-image with Qwen-Image-2.1; see `ferrum-cli image --help`)
 //!
 //! Commands: /reset, /think on|off, /image PATH [low|high|auto|N],
-//! /detail low|high|auto|N, /stats, /exit. End a line with `\` to continue the
-//! message on the next line.
+//! /audio PATH.wav, /detail low|high|auto|N, /stats, /exit. End a line with `\`
+//! to continue the message on the next line.
 //!
 //! Image detail: `low` caps an image at 256 tokens, `high` at --image-tokens, `N`
 //! at N tokens; `/detail` sets it for the images that follow, and a size after
@@ -174,6 +174,13 @@ fn run() -> Result<()> {
             vision.model.max_tokens
         );
     }
+    if let Some(audio) = rt.audio.as_ref() {
+        eprintln!(
+            "audio: {} (WAV clips up to {} s; /audio PATH attaches one)",
+            audio.path.display(),
+            ferrum::vision::MAX_AUDIO_SECONDS
+        );
+    }
     if let Some(drafter) = rt.session.drafter() {
         eprintln!(
             "speculative decoding: {} ({} drafts per step, {:.2} GiB)",
@@ -246,7 +253,7 @@ fn run() -> Result<()> {
         }
         let input = input.trim();
         match input {
-            "" => continue,
+            "" if attachments.is_empty() => continue,
             "/exit" | "/quit" => return Ok(()),
             "/reset" => {
                 attachments.clear();
@@ -280,6 +287,23 @@ fn run() -> Result<()> {
             }
             continue;
         }
+        if let Some(path) = input.strip_prefix("/audio ") {
+            let path = path.trim();
+            match std::fs::read(path) {
+                Ok(bytes) if rt.supports_audio() => match ferrum::vision::clip_seconds(&bytes) {
+                    Ok(seconds) => {
+                        attachments.push(media::audio_part_from_bytes(&bytes));
+                        eprintln!(
+                            "(audio attached: {seconds:.1} s; it goes with your next message)"
+                        );
+                    }
+                    Err(e) => eprintln!("{e}"),
+                },
+                Ok(_) => eprintln!("this model was loaded without an audio projector (--mmproj)"),
+                Err(e) => eprintln!("cannot read {path}: {e}"),
+            }
+            continue;
+        }
         if let Some(arg) = input.strip_prefix("/image ") {
             let (path, budget) = image_arg(arg);
             match std::fs::read(path) {
@@ -302,8 +326,11 @@ fn run() -> Result<()> {
         if attachments.is_empty() {
             messages.push(json!({"role": "user", "content": input}));
         } else {
+            // An empty line sends the attachments alone (a clip to transcribe).
             let mut parts = std::mem::take(&mut attachments);
-            parts.push(json!({"type": "text", "text": input}));
+            if !input.is_empty() {
+                parts.push(json!({"type": "text", "text": input}));
+            }
             messages.push(json!({"role": "user", "content": parts}));
         }
         let mut vars = Map::new();
@@ -370,6 +397,11 @@ fn run() -> Result<()> {
             && !vision.last_encode.is_zero()
         {
             last_stats += &format!("; image encode {:.2} s", vision.last_encode.as_secs_f64());
+        }
+        if let Some(audio) = rt.audio.as_ref()
+            && !audio.last_encode.is_zero()
+        {
+            last_stats += &format!("; audio encode {:.2} s", audio.last_encode.as_secs_f64());
         }
         let spec = &rt.session.spec_stats;
         if spec.steps > 0 {

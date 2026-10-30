@@ -1,8 +1,8 @@
 # Experimental: Flint, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation
 
-> **Experimental.** This page covers Flint, Spark and LFM3 support, MLX 4-bit checkpoints, KFlash speculative decoding (ported from Kapitsa), the server's parallel requests, and image generation. None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
+> **Experimental.** This page covers Flint, Spark and LFM3 support (text, still images and speech input), MLX 4-bit checkpoints, KFlash speculative decoding (ported from Kapitsa), the server's parallel requests, and image generation. None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
 
-Contents: [Flint](#what-works) · [Spark-X2.6-4B](#spark-x26-4b) · [LFM3-1.7B](#lfm3-17b) · [LFM3-VL-2B](#lfm3-vl-2b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding) · [Parallel requests](#parallel-requests) · [Image generation](#image-generation)
+Contents: [Flint](#what-works) · [Spark-X2.6-4B](#spark-x26-4b) · [LFM3-1.7B](#lfm3-17b) · [LFM3-VL-2B](#lfm3-vl-2b) · [LFM3-Audio-2B](#lfm3-audio-2b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding) · [Parallel requests](#parallel-requests) · [Image generation](#image-generation)
 
 ## What works
 
@@ -71,7 +71,7 @@ XHToken's `spark2_5` architecture: a 4.4B dense model with attention on all 36 l
 
 # LFM3-1.7B
 
-LiquidAI's text model (`general.architecture = lfm3`). The language model is one architecture. Still images are [LFM3-VL-2B](#lfm3-vl-2b). Audio is not implemented. Ferrum does not download weights. The file this section talks about is the hub-cache snapshot
+LiquidAI's text model (`general.architecture = lfm3`). The language model is one architecture. Still images are [LFM3-VL-2B](#lfm3-vl-2b) and speech input is [LFM3-Audio-2B](#lfm3-audio-2b). Speech output is not implemented. Ferrum does not download weights. The file this section talks about is the hub-cache snapshot
 
 `~/models/hub/models--LiquidAI--LFM3-1.7B-GGUF/snapshots/main/LFM3-1.7B-Q4_K_M.gguf`
 
@@ -101,7 +101,7 @@ The perplexity is on one chunk of the README, not a standard corpus. It is only 
 
 - One quant (`Q4_K_M`) is the file on disk. Other quants are not loaded.
 - No MTP head. `--draft lookup` can verify a chain; a draft tree is refused, because each row would need its parent's short-conv window.
-- This file has no projector. Still images need [LFM3-VL-2B](#lfm3-vl-2b). Audio projectors (`lfm3a`, `lfm3a_gen`) are refused.
+- This file has no projector. Still images need [LFM3-VL-2B](#lfm3-vl-2b) and speech input [LFM3-Audio-2B](#lfm3-audio-2b).
 - Liquid's card says the model is for local agents, tool calling and structured output, and is not recommended for agentic coding or complex multi-step reasoning because of its size. Use retrieval for knowledge-heavy tasks.
 
 # LFM3-VL-2B
@@ -141,10 +141,61 @@ The 256×256 image is exactly 65536 pixels, so neither side resizes it. The 770�
 ## Known gaps
 
 - One language quant (`Q4_K_M`) and one projector quant (`Q8_0`). Other pairs are not loaded.
-- Video is refused. Audio projectors are refused. The image-generation text encoder stays Qwen3-VL.
+- Video is refused. Audio input needs the [LFM3-Audio-2B](#lfm3-audio-2b) projector. The image-generation text encoder stays Qwen3-VL.
 - The language memory line does not include the projector. The planner still estimates a projector the way it does for Qwen (`v.blk` and `mm` tensors at 2 bytes each, plus 640 MiB), so that reservation did not move.
 - Draft trees stay refused, as on the text model.
 - The score buffer, not the file's pixel cap, limits an image to 1773 language tokens.
+
+# LFM3-Audio-2B
+
+Speech input for the same `lfm3` language model, through an audio projector (`clip.audio.projector_type = lfm3a`). The Hugging Face repo is [`LiquidAI/LFM3-Audio-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF). The pair checked here is
+
+`~/models/hub/models--LiquidAI--LFM3-Audio-2B-GGUF/snapshots/main/LFM3-Audio-2B-Q4_K_M.gguf` (1.1 GB)
+
+`~/models/hub/models--LiquidAI--LFM3-Audio-2B-GGUF/snapshots/main/mmproj-LFM3-Audio-2B-Q8_0.gguf` (304 MB; the BF16 projector, 571 MB, was checked too)
+
+The language file has the same tensors as LFM3-1.7B, a trained context of 128000 and greedy sampling metadata (temperature 0, top-k 1). Its template turns `input_audio`, `audio` and `audio_url` parts into `<|audio|>` (id 125031), which is repeated once per encoded row. As in llama.cpp, the rows are not wrapped in begin and end tokens. Ferrum reads the input half only: the projector file also holds the speech generator and codec (`a.gen.*`, `clip.gen.audio.projector_type = lfm3a_gen`), which are not loaded.
+
+The encoder ([vision.md](vision.md#lfm3-audio)) turns 16 kHz mono into 128 log-mel bins every 10 ms, subsamples them 8× with a convolution stem, and runs 17 blocks at width 768: 10 gated short convolutions and 7 attention layers that see the current and 31 previous rows. One row is one language token, so a second of speech is 12.5 tokens. A clip is encoded in one pass, so one clip may last at most 120 s (1500 tokens). Its length is read from the WAV header, so a longer clip is refused before it is decoded. WAV files above 384 kHz are refused. The memory plan counts the 220 MiB of weights it loads, every buffer encoding a 120 s clip allocates (363 MiB, its output rows included), and the rows of the 7 other clips the runtime keeps cached (82 MiB).
+
+```sh
+hf download LiquidAI/LFM3-Audio-2B-GGUF \
+  LFM3-Audio-2B-Q4_K_M.gguf mmproj-LFM3-Audio-2B-Q8_0.gguf --local-dir ~/models
+ferrum-cli --model ~/models/LFM3-Audio-2B-Q4_K_M.gguf \
+  --mmproj ~/models/mmproj-LFM3-Audio-2B-Q8_0.gguf --system "Perform ASR in English."
+```
+
+`/audio PATH.wav` attaches a clip, and an empty line sends it with no text. For transcription, Liquid's card puts the instruction in the system prompt and only the audio in the user turn, as above. With a question in the user turn instead of an ASR system prompt, the model answers about the clip. The server takes OpenAI `input_audio` parts ([server.md](server.md#audio)). In the TUI, a chat attaches `.wav` files, and the Audio tab ([tui.md](tui.md#audio)) transcribes a file or a recording, or answers a question about it.
+
+## Validation
+
+On a 32 GB M5, against llama.cpp at `792fcf4` (built from source, since Homebrew's build does not have `lfm3a`). The record is [measurements/lfm3-audio/](measurements/lfm3-audio/).
+
+| Check | Result |
+|---|---|
+| Encoder rows vs llama.cpp's `mtmd` output for the same samples, 3 clips (2.8 to 6.1 s; one 48 kHz stereo float), BF16 and Q8_0 projectors | cosine ≥ 0.999996 per row; relative L2 error mean 0.0012–0.0013, max 0.0029 |
+| Same, one 112 s clip (1405 rows), Q8_0 | cosine ≥ 0.999997; relative L2 mean 0.0014, max 0.0026 |
+| Greedy transcription and a question about a clip, vs `llama-mtmd-cli --jinja` | identical text on all four prompts (two ASR, one question, two clips in one turn) |
+| Server `input_audio` request | same transcript; `/props` reports `"audio": true` |
+| Encoder vs a CPU reference (`lfm3a::tests`, tiny random weights) | within 2% of the output scale |
+| Memory plan vs Metal's allocations (`hybrid_audio_check --memory`), BF16 and Q8_0 | 665.8 MiB planned, 664.9 MiB measured peak (220.0 weights + 362.9 encoding a 120 s clip + 7 × 11.7 cached clips' rows) |
+| CPU front end, 112 s of 48 kHz stereo float | decode and resample 0.18 s, log-mel 0.24 s; the encoder then takes 0.56 s |
+| Over-long clip (247 s, 48 kHz stereo) | refused from its header; 0.54 s in all, the projector load included |
+| Qwen and LFM3-VL greedy, memory and speed vs `experimental` at `8cb5110` | see the [regression record](measurements/lfm3-audio/regression-2026-10-30.txt) |
+
+`llama-mtmd-cli` must run with `--jinja`: its default ChatML prompt has no `<|startoftext|>`, and with it the two-clip and question answers differ from the GGUF template's. The clips are macOS `say` voices, not recorded speech; no word error rate on a corpus was measured. Encoding took about 20 ms for a 2.8 s clip and 0.56 s for the 112 s one (single runs).
+
+## Known gaps
+
+- WAV only (PCM 8/16/24/32-bit or float). Other formats are refused with a hint to convert them (`afconvert -f WAVE -d LEI16@16000 in.m4a out.wav`).
+- 120 s per clip. Longer audio has to be split by the caller; the encoder is not streamed and attention scores grow with the square of the clip length.
+- No speech output. `lfm3a_gen` and the codec are not loaded.
+- LFM3-Omni-2B's projector has both halves. It loads as an LFM3-VL image projector (untested); its audio half is not used.
+- The TUI chat attaches files up to 8 MB: about 4 minutes of 16 kHz mono 16-bit WAV, but only 43 s of 48 kHz stereo.
+- Transcription quality depends on the system prompt; nothing sets the ASR prompt for you.
+- Draft trees stay refused, as on the text model.
+- `--mmproj auto` tells LFM3-VL and LFM3-Audio projectors apart by name (`mmproj-LFM3-VL-2B-Q8_0.gguf` belongs to `LFM3-VL-2B-*.gguf`). Renamed files in one folder need `--mmproj FILE`.
+- The Audio tab's recording uses ffmpeg and the system's default input; it was checked through a loopback device, not a live microphone.
 
 # MLX 4-bit checkpoints
 

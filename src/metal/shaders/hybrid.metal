@@ -4014,3 +4014,71 @@ kernel void v_rope1(constant VRope1Args & p [[buffer(3)]], device const float * 
     r[pair] = x0 * c - x1 * s;
     r[pair + half_dim] = x1 * c + x0 * s;
 }
+
+// LFM3-Audio downsampler. Activations are [time, freq, channels], channels
+// fastest. Each stage is a 3x3 conv with stride 2 on both axes and one zero
+// row/column of padding on every side, so output (t, f) reads inputs
+// 2t-1..2t+1 and 2f-1..2f+1. Kernels keep ggml's layout, [channel][kf][kt].
+struct AStemArgs { uint t_in; uint f_in; uint t_mid; uint f_mid; uint t_out; uint f_out; uint ch; };
+
+// SiLU(conv0(mel) + b0) at (t, f, c), zero outside the stage-1 grid: the
+// padding of the second conv applies to its input, after the activation.
+inline float a_stem0(constant AStemArgs & p, device const float * mel, device const float * w0,
+                     device const float * b0, int t, int f, uint c) {
+    if (t < 0 || f < 0 || t >= int(p.t_mid) || f >= int(p.f_mid)) return 0.f;
+    float acc = b0[c];
+    for (int kf = 0; kf < 3; kf++) {
+        const int sf = 2 * f + kf - 1;
+        if (sf < 0 || sf >= int(p.f_in)) continue;
+        for (int kt = 0; kt < 3; kt++) {
+            const int st = 2 * t + kt - 1;
+            if (st < 0 || st >= int(p.t_in)) continue;
+            acc += mel[(ulong)st * p.f_in + uint(sf)] * w0[c * 9 + uint(kf * 3 + kt)];
+        }
+    }
+    return acc / (1.f + precise::exp(-acc));
+}
+
+// The first two stages fused: a full conv from the one mel channel to `ch`,
+// SiLU, then a depthwise conv. The stage-1 activation, the largest tensor of
+// the encoder, is recomputed per tap instead of stored.
+kernel void a_conv_stem(constant AStemArgs & p [[buffer(6)]], device const float * mel [[buffer(0)]],
+                        device const float * w0 [[buffer(1)]], device const float * b0 [[buffer(2)]],
+                        device const float * w1 [[buffer(3)]], device const float * b1 [[buffer(4)]],
+                        device float * out [[buffer(5)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.t_out * p.f_out * p.ch) return;
+    const uint c = i % p.ch;
+    const uint f = (i / p.ch) % p.f_out;
+    const uint t = i / (p.ch * p.f_out);
+    float acc = b1[c];
+    for (int kf = 0; kf < 3; kf++) {
+        for (int kt = 0; kt < 3; kt++) {
+            const float s = a_stem0(p, mel, w0, b0, int(2 * t) + kt - 1, int(2 * f) + kf - 1, c);
+            acc += s * w1[c * 9 + uint(kf * 3 + kt)];
+        }
+    }
+    out[i] = acc;
+}
+
+struct ADwArgs { uint t_in; uint f_in; uint t_out; uint f_out; uint ch; };
+
+// Depthwise stride-2 3x3 conv plus bias.
+kernel void a_dwconv_s2(constant ADwArgs & p [[buffer(4)]], device const float * in [[buffer(0)]],
+                        device const float * w [[buffer(1)]], device const float * b [[buffer(2)]],
+                        device float * out [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.t_out * p.f_out * p.ch) return;
+    const uint c = i % p.ch;
+    const uint f = (i / p.ch) % p.f_out;
+    const uint t = i / (p.ch * p.f_out);
+    float acc = b[c];
+    for (int kf = 0; kf < 3; kf++) {
+        const int sf = int(2 * f) + kf - 1;
+        if (sf < 0 || sf >= int(p.f_in)) continue;
+        for (int kt = 0; kt < 3; kt++) {
+            const int st = int(2 * t) + kt - 1;
+            if (st < 0 || st >= int(p.t_in)) continue;
+            acc += in[((ulong)st * p.f_in + uint(sf)) * p.ch + c] * w[c * 9 + uint(kf * 3 + kt)];
+        }
+    }
+    out[i] = acc;
+}

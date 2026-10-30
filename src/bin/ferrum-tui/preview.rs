@@ -841,7 +841,7 @@ fn gif(path: &Path, mode: Graphics, tx: &SyncSender<Msg>) -> Result<(), String> 
     }
 }
 
-fn which(cmd: &str) -> Option<PathBuf> {
+pub fn which(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     std::env::split_paths(&path)
         .chain(["/opt/homebrew/bin".into(), "/usr/local/bin".into()])

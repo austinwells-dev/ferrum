@@ -185,6 +185,10 @@ A request can lower the cap but never raise it past `--image-tokens`, because th
 {"type": "image", "max_tokens": 512, "source": {"type": "base64", "media_type": "image/png", "data": "..."}}
 ``` [vision.md](vision.md) describes how the encoder works.
 
+### Audio
+
+LFM3-Audio-2B (experimental) hears speech once its audio projector is loaded with the same `--mmproj` flag (auto-picked when its width matches). Send WAV clips inline as OpenAI `{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}` parts; `data` may also be a `data:audio/wav;base64,...` URL, and an `{"type": "audio_url", "audio_url": {"url": "data:..."}}` part works too. Ferrum reads PCM and float WAV at any sample rate and channel count (it mixes to mono and resamples to 16 kHz), rejects other formats and remote URLs, and refuses a clip longer than 120 s or more than 8 clips in one request. `/props` reports `modalities.audio`. For transcription, put Liquid's instruction in the system message (`"Perform ASR in English."`) and only the audio in the user message. Encoded clips are cached like images, so a conversation keeps its cache across turns. See [experimental.md](experimental.md#lfm3-audio-2b).
+
 ## Image generation
 
 Ferrum draws and edits images with Qwen-Image-2.1 and its Turbo distillation (a Hugging Face directory with `model_index.json`, `transformer/`, `text_encoder/`, `vae/` and `processor/`). The stages run one after another and only one is in memory at a time, so it fits a 32 GB Mac. See [architecture](architecture.md#image-generation) for the design and [experimental.md](experimental.md#image-generation) for what is validated.

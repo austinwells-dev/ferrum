@@ -110,6 +110,8 @@ pub struct Status {
     pub context: usize,
     /// Requests may carry images (a vision projector is loaded).
     pub vision: bool,
+    /// Requests may carry audio (a speech projector is loaded).
+    pub audio: bool,
     pub slots: Vec<SlotStatus>,
     pub requests: u64,
     pub cancelled: u64,
@@ -260,6 +262,15 @@ fn run(
             v.model.max_tokens
         );
     }
+    if let Some(a) = rt.audio.as_ref() {
+        info!(
+            None,
+            "audio: {} ({:.2} GiB; WAV clips up to {} s)",
+            a.path.display(),
+            gib(a.model.weight_bytes()),
+            ferrum::vision::MAX_AUDIO_SECONDS
+        );
+    }
     let warm = Instant::now();
     match rt.warmup() {
         Ok(()) => info!(None, "warmed up in {:.1} s", warm.elapsed().as_secs_f64()),
@@ -292,6 +303,7 @@ fn run(
         s.model = rt.model_name.clone();
         s.context = plan.context;
         s.vision = rt.supports_vision();
+        s.audio = rt.supports_audio();
         s.memory_budget_bytes = plan.budget;
         s.memory_predicted_bytes = plan.total();
         s.drafter = drafter.map(|(name, _)| name).unwrap_or_default();
@@ -484,6 +496,15 @@ impl Scheduler {
                 Some(job.id),
                 "encoded images in {:.2} s",
                 v.last_encode.as_secs_f64()
+            );
+        }
+        if let Some(a) = self.rt.audio.as_ref()
+            && !a.last_encode.is_zero()
+        {
+            info!(
+                Some(job.id),
+                "encoded audio in {:.2} s",
+                a.last_encode.as_secs_f64()
             );
         }
         match started {

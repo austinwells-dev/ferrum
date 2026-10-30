@@ -193,9 +193,10 @@ impl App {
                 Some(d) => row("drafter", format!("⚡ {d}"), Style::new().fg(GOLD)),
                 None => row("drafter", "off".into(), Style::new().fg(FAINT)),
             });
-            lines.push(match &i.vision {
-                Some(_) => row("vision", "👁 images supported".into(), text),
-                None => row("vision", "text only".into(), Style::new().fg(FAINT)),
+            lines.push(match (&i.vision, &i.audio) {
+                (Some(_), _) => row("vision", "👁 images supported".into(), text),
+                (None, Some(_)) => row("audio", "🔊 WAV clips supported".into(), text),
+                (None, None) => row("vision", "text only".into(), Style::new().fg(FAINT)),
             });
         }
         lines.push(row("tools", chat.tools.label().into(), text));

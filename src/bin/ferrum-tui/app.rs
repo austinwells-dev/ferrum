@@ -91,6 +91,7 @@ impl App {
             serve: None,
             bench: None,
             image,
+            audio: audiotab::AudioTab::load(),
             closing: Vec::new(),
             gfx: Default::default(),
             prefs: Prefs::load(&saved["layout"]),

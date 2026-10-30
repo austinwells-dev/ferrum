@@ -2,7 +2,8 @@
 //! screenshots. Everything is copied into the workspace (`.attachments/`) so
 //! the agent's tools can reach it. A model with a vision projector is shown
 //! the image itself; for any other model the text found in it with macOS
-//! Vision is sent instead.
+//! Vision is sent instead. A WAV file reaches a model with an audio
+//! projector (LFM3-Audio) as the clip itself.
 use crate::agent::Sandbox;
 use crate::*;
 
@@ -21,6 +22,7 @@ const IMAGE_EXTS: [&str; 9] = [
 pub enum Kind {
     Text,
     Image,
+    Audio,
     Video,
     Binary,
 }
@@ -50,10 +52,10 @@ impl Attachment {
         format!("{} · {size}", self.name)
     }
 
-    /// What the model receives for this attachment. `sees_images`: the image
-    /// itself travels with the message, so only a pointer to the saved copy is
-    /// written into the text.
-    pub fn block(&self, sees_images: bool) -> String {
+    /// What the model receives for this attachment. `sees_images` and
+    /// `hears_audio`: the image or clip itself travels with the message, so
+    /// only a pointer to the saved copy is written into the text.
+    pub fn block(&self, sees_images: bool, hears_audio: bool) -> String {
         match self.kind {
             Kind::Text => {
                 let text = self.text.as_deref().unwrap_or("");
@@ -89,6 +91,14 @@ impl Attachment {
                     self.name, self.rel
                 ),
             },
+            Kind::Audio if hears_audio => format!(
+                "<attachment name=\"{}\" path=\"{}\" type=\"audio\">\n[The audio is played to you in this message; a copy is saved at this path.]\n</attachment>",
+                self.name, self.rel
+            ),
+            Kind::Audio => format!(
+                "<attachment name=\"{}\" path=\"{}\" type=\"audio\">\n[An audio file of {} bytes saved in the workspace; you cannot hear it.]\n</attachment>",
+                self.name, self.rel, self.bytes
+            ),
             Kind::Video => format!(
                 "<attachment name=\"{}\" path=\"{}\" type=\"video\">\n[A video file of {} bytes saved in the workspace; you cannot watch it.]\n</attachment>",
                 self.name, self.rel, self.bytes
@@ -211,6 +221,13 @@ fn describe(sb: &Sandbox, stored: &Path, name: &str) -> Result<Attachment, Strin
     }
     if crate::preview::is_video(stored) {
         att.kind = Kind::Video;
+        return Ok(att);
+    }
+    if stored
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case("wav"))
+    {
+        att.kind = Kind::Audio;
         return Ok(att);
     }
     let bytes = fs::read(stored).map_err(|e| e.to_string())?;
@@ -419,7 +436,11 @@ mod tests {
         fs::write(&src, "fn main() {}\n").unwrap();
         let a = add_file(&sb, &src).unwrap();
         assert_eq!(a.kind, Kind::Text);
-        assert!(a.block(false).contains("fn main"), "{}", a.block(false));
+        assert!(
+            a.block(false, false).contains("fn main"),
+            "{}",
+            a.block(false, false)
+        );
         let b = add_file(&sb, &src).unwrap();
         assert_ne!(a.rel, b.rel, "second copy gets its own name");
         let bin = dir.join("data.bin");

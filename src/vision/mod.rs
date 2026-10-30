@@ -4,7 +4,10 @@
 //! becomes a grid of embeddings that replace `<|image_pad|>` rows.
 //! LFM3-VL (`clip.vision.projector_type = lfm3vl`) is the private `lfm3` module. It repeats
 //! `<|image|>` and gives each of those tokens its own position, not a 2-D grid.
-//! Audio projectors (`lfm3a`, `lfm3a_gen`) and video are refused.
+//! LFM3-Audio's speech encoder (`clip.audio.projector_type = lfm3a`) is
+//! `AudioModel` (the private `lfm3a` and public `audio` modules): its rows
+//! replace repeated `<|audio|>` tokens the same way. Speech output
+//! (`lfm3a_gen`) and video are refused.
 //!
 //! Pipeline: decode, resize to a multiple of `patch * merge`, normalise, cut
 //! into 16x16 patches (ordered so each 2x2 merge block is contiguous), embed
@@ -234,10 +237,41 @@ pub fn find_projectors(model: &Path) -> Vec<std::path::PathBuf> {
     // Prefer a projector named after the model, then the smallest filename.
     found.sort_by_key(|p| {
         let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase());
-        let named = name.is_some_and(|n| n.contains(&stem));
+        let named = name.is_some_and(|n| named_after(&n, &stem));
         (!named, p.clone())
     });
     found
+}
+
+/// Is the projector file `name` named after the model whose lowercase file
+/// stem is `stem`? Either it contains the whole stem, or, with `mmproj` and
+/// its quant taken off (`mmproj-LFM3-VL-2B-Q8_0.gguf` is `lfm3-vl-2b`), it
+/// starts the stem. Two projectors of one width in a folder (LFM3-VL and
+/// LFM3-Audio) are told apart this way.
+fn named_after(name: &str, stem: &str) -> bool {
+    if name.contains(stem) {
+        return true;
+    }
+    let base = name.strip_suffix(".gguf").unwrap_or(name);
+    let base = ["mmproj-", "mmproj_", "mmproj."]
+        .iter()
+        .find_map(|p| base.strip_prefix(p))
+        .or_else(|| {
+            ["-mmproj", "_mmproj", ".mmproj"]
+                .iter()
+                .find_map(|s| base.strip_suffix(s))
+        })
+        .unwrap_or(base);
+    // `q8_0`, `bf16`, `iq4_xs`: letters, then a digit.
+    let is_quant = |q: &str| {
+        let digits = q.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+        digits.len() < q.len() && digits.starts_with(|c: char| c.is_ascii_digit()) && q.len() <= 7
+    };
+    let base = match base.rfind('-') {
+        Some(at) if is_quant(&base[at + 1..]) => &base[..at],
+        _ => base,
+    };
+    base.len() >= 3 && stem.starts_with(base)
 }
 
 /// Does the projector at `projector` produce embeddings of `model`'s width?
@@ -253,7 +287,8 @@ fn fits_model(projector: &Path, model: &Path) -> bool {
         Some(MetadataValue::Uint64(v)) => Some(*v),
         _ => None,
     };
-    let wanted = width(&p, "clip.vision.projection_dim");
+    let wanted =
+        width(&p, "clip.vision.projection_dim").or_else(|| width(&p, "clip.audio.projection_dim"));
     wanted.is_some() && wanted == width(&m, &format!("{arch}.embedding_length"))
 }
 
@@ -279,18 +314,200 @@ pub fn resolve_projector(model: &Path, flag: Option<&str>) -> Result<Option<std:
     }
 }
 
-/// Device bytes `VisionModel::load` will take, for memory planning.
+/// Device bytes `VisionModel::load` or `AudioModel::load` will take, for
+/// memory planning.
 pub fn projector_bytes(path: &Path) -> usize {
+    let audio = is_audio_projector(path);
     GgufFile::open(path).map_or(0, |f| {
         let weights: usize = f
             .tensors()
             .values()
-            .filter(|t| t.name.starts_with("v.blk.") || t.name.starts_with("mm."))
-            .map(|t| t.dimensions.iter().product::<usize>() * 2)
+            .filter(|t| {
+                if audio {
+                    (t.name.starts_with("a.") && !t.name.starts_with("a.gen."))
+                        || t.name.starts_with("mm.a.")
+                } else {
+                    t.name.starts_with("v.blk.") || t.name.starts_with("mm.")
+                }
+            })
+            .map(|t| {
+                let bytes = t.dimensions.iter().product::<usize>() * 2;
+                // Each speech-encoder tensor is its own buffer.
+                if audio {
+                    crate::hybrid::engine::page(bytes)
+                } else {
+                    bytes
+                }
+            })
             .sum();
-        // Weights plus the transient activations of a full-size image.
-        weights + (640 << 20)
+        if !audio {
+            // Weights plus the transient activations of a full-size image.
+            return weights + (640 << 20);
+        }
+        // Weights, every buffer a `MAX_AUDIO_SECONDS` clip's encode
+        // allocates (counted as the encoder makes them), and the rows of the
+        // other clips the runtime keeps cached meanwhile.
+        let width = |name: &str| {
+            f.tensors()
+                .get(name)
+                .map(|t| t.dimensions.iter().product::<usize>())
+        };
+        let frames = audio::MelBank::frames(MAX_AUDIO_SECONDS * audio::SAMPLE_RATE);
+        match (
+            audio_config(f.metadata()),
+            width("a.conv1d.0.bias"),
+            width("mm.a.mlp.1.bias"),
+        ) {
+            (Ok(config), Some(channels), Some(mid)) => {
+                weights
+                    + lfm3a::activation_bytes(&config, channels, mid, frames)
+                    + (AUDIO_CACHE_CLIPS - 1) * lfm3a::output_bytes(&config, frames)
+            }
+            // AudioModel::load refuses this file anyway.
+            _ => weights,
+        }
     })
+}
+
+/// Encoded clips the runtime keeps, so a conversation does not re-encode its
+/// history: as many as one request may carry, since each turn walks them in
+/// order and a smaller LRU would miss on every one.
+pub const AUDIO_CACHE_CLIPS: usize = media::MAX_AUDIO_CLIPS;
+
+/// Longest clip, and so the longest each attached clip may be. The encoder runs a clip in one pass,
+/// so its activations grow with the clip.
+pub const MAX_AUDIO_SECONDS: usize = 120;
+
+/// Length of a WAV clip in seconds, read from its header, or an error when it
+/// is not a readable WAV file or is longer than `MAX_AUDIO_SECONDS`.
+pub fn clip_seconds(bytes: &[u8]) -> Result<f64> {
+    let seconds = audio::wav_seconds(bytes)?;
+    check_seconds(seconds)?;
+    Ok(seconds)
+}
+
+fn check_seconds(seconds: f64) -> Result<()> {
+    if seconds > MAX_AUDIO_SECONDS as f64 {
+        return Err(Error::Parameter(format!(
+            "a {seconds:.1} s clip is longer than the {MAX_AUDIO_SECONDS} s one clip may last; split it"
+        )));
+    }
+    Ok(())
+}
+
+/// Is `path` a speech-input projector with no vision tower (LFM3-Audio's
+/// `mmproj`)? Combined files (LFM3-Omni) load as vision projectors.
+pub fn is_audio_projector(path: &Path) -> bool {
+    GgufFile::open(path).is_ok_and(|f| {
+        let md = f.metadata();
+        matches!(md.get("clip.audio.projector_type"), Some(MetadataValue::String(t)) if t == "lfm3a")
+            && !matches!(md.get("clip.has_vision_encoder"), Some(MetadataValue::Bool(true)))
+    })
+}
+
+/// LFM3-Audio's speech encoder: WAV in, one language-model row per 80 ms.
+pub struct AudioModel {
+    encoder: lfm3a::Encoder,
+    mel: audio::MelBank,
+}
+
+/// The `lfm3a` encoder's shape from `clip.audio.*` metadata.
+fn audio_config(md: &BTreeMap<String, MetadataValue>) -> Result<lfm3a::Config> {
+    let key = |k: &str| meta_uint(md, &format!("clip.audio.{k}"));
+    Ok(lfm3a::Config {
+        n_mel: key("num_mel_bins")?,
+        hidden: key("embedding_length")?,
+        heads: key("attention.head_count")?,
+        kv_heads: key("attention.head_count_kv")?,
+        ffn: key("feed_forward_length")?,
+        layers: key("block_count")?,
+        window: key("window_size")?,
+        eps: meta_float(md, "clip.audio.attention.layer_norm_epsilon")?,
+        out_dim: key("projection_dim")?,
+    })
+}
+
+impl AudioModel {
+    pub fn load(d: &MetalDevice, path: impl AsRef<Path>) -> Result<Self> {
+        let file = GgufFile::open(path.as_ref())?;
+        let md = file.metadata().clone();
+        let unsupported = |what: String| {
+            Err(Error::Config(format!(
+                "unsupported audio projector: {what}"
+            )))
+        };
+        match md.get("general.architecture") {
+            Some(MetadataValue::String(a)) if a == "clip" => {}
+            _ => return unsupported("not a clip/mmproj GGUF".into()),
+        }
+        match md.get("clip.audio.projector_type") {
+            Some(MetadataValue::String(t)) if t == "lfm3a" => {}
+            Some(MetadataValue::String(t)) => {
+                return unsupported(format!("projector type {t} (only lfm3a is implemented)"));
+            }
+            _ => return unsupported("missing clip.audio.projector_type".into()),
+        }
+        let config = audio_config(&md)?;
+        let mut source = GgufSource(file);
+        let encoder = lfm3a::load(d, config, &mut source)?;
+        Ok(Self {
+            mel: audio::MelBank::new(encoder.config.n_mel),
+            encoder,
+        })
+    }
+
+    /// Placeholder the chat template emits once per clip, repeated once per
+    /// language-model row.
+    pub fn marker(&self) -> &'static str {
+        "<|audio|>"
+    }
+
+    /// Embedding width of the language model this projector feeds.
+    pub fn out_dim(&self) -> usize {
+        self.encoder.config.out_dim
+    }
+
+    pub fn weight_bytes(&self) -> usize {
+        self.encoder.weight_bytes
+    }
+
+    /// Most language-model rows one clip can take.
+    pub fn max_tokens(&self) -> usize {
+        lfm3a::tokens_for(audio::MelBank::frames(
+            MAX_AUDIO_SECONDS * audio::SAMPLE_RATE,
+        ))
+    }
+
+    /// Device bytes the latest clip's encoder activations took.
+    pub fn activation_bytes(&self) -> usize {
+        self.encoder.activation_bytes.get()
+    }
+
+    /// Encode a WAV file. Its length is checked from the header first, so a
+    /// clip that is too long is refused before it is decoded and resampled.
+    pub fn encode(&self, d: &MetalDevice, bytes: &[u8]) -> Result<ImageEmbedding> {
+        clip_seconds(bytes)?;
+        let samples = audio::decode_wav(bytes)?;
+        self.encode_samples(d, &samples, content_hash(bytes))
+    }
+
+    /// Encode 16 kHz mono samples.
+    pub fn encode_samples(
+        &self,
+        d: &MetalDevice,
+        samples: &[f32],
+        hash: u64,
+    ) -> Result<ImageEmbedding> {
+        check_seconds(samples.len() as f64 / audio::SAMPLE_RATE as f64)?;
+        self.encoder.encode(d, &self.mel.features(samples), hash)
+    }
+
+    /// Run a short silent clip through the encoder so its kernels are
+    /// compiled before the first request.
+    pub fn warm(&self, d: &MetalDevice) -> Result<()> {
+        self.encode_samples(d, &[0.; audio::SAMPLE_RATE / 4], 0)
+            .map(|_| ())
+    }
 }
 
 impl VisionModel {
@@ -953,41 +1170,7 @@ impl VisionModel {
         bias: Option<&Tensor>,
         c: &Tensor,
     ) -> Result<()> {
-        let kernel = match b.dtype() {
-            DType::F16 => "v_gemm_h",
-            DType::F32 => "v_gemm_f",
-            _ => return Err(Error::DType),
-        };
-        let params = Params::default()
-            .u(g.m)?
-            .u(g.n)?
-            .u(g.k)?
-            .u(g.lda)?
-            .u(g.ldb_n)?
-            .u(g.ldb_k)?
-            .u(g.ldc)?
-            .u(g.strides.0)?
-            .u(g.strides.1)?
-            .u(g.strides.2)?
-            .u(g.offsets.0)?
-            .u(g.offsets.1)?
-            .u(g.offsets.2)?
-            .u(g.epilogue as usize)?
-            .u(usize::from(bias.is_some()))?
-            .f(g.alpha);
-        d.dispatch_hybrid(
-            kernel,
-            &[
-                a.binding(),
-                b.binding(),
-                bias.unwrap_or(&self.zero).binding(),
-            ],
-            &[c.binding()],
-            &params.0,
-            [g.n.div_ceil(32), g.m.div_ceil(32), g.batch],
-            [128, 1, 1],
-            0,
-        )
+        run_gemm(d, &self.zero, g, a, b, bias, c)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1013,16 +1196,65 @@ impl VisionModel {
 
     /// `acc += y` over `count` values.
     fn add(&self, d: &MetalDevice, y: &Tensor, acc: &Tensor, count: usize) -> Result<()> {
-        d.dispatch_hybrid(
-            "v_add",
-            &[y.binding()],
-            &[acc.binding()],
-            &Params::default().u(count)?.u(1)?.0,
-            [count.div_ceil(256), 1, 1],
-            [256, 1, 1],
-            0,
-        )
+        run_add(d, y, acc, count)
     }
+}
+
+/// `c = epilogue(alpha * a b^T + bias)` through the `v_gemm_*` kernels. `zero`
+/// is bound in place of a missing bias.
+fn run_gemm(
+    d: &MetalDevice,
+    zero: &Tensor,
+    g: &Gemm,
+    a: &Tensor,
+    b: &Tensor,
+    bias: Option<&Tensor>,
+    c: &Tensor,
+) -> Result<()> {
+    let kernel = match b.dtype() {
+        DType::F16 => "v_gemm_h",
+        DType::F32 => "v_gemm_f",
+        _ => return Err(Error::DType),
+    };
+    let params = Params::default()
+        .u(g.m)?
+        .u(g.n)?
+        .u(g.k)?
+        .u(g.lda)?
+        .u(g.ldb_n)?
+        .u(g.ldb_k)?
+        .u(g.ldc)?
+        .u(g.strides.0)?
+        .u(g.strides.1)?
+        .u(g.strides.2)?
+        .u(g.offsets.0)?
+        .u(g.offsets.1)?
+        .u(g.offsets.2)?
+        .u(g.epilogue as usize)?
+        .u(usize::from(bias.is_some()))?
+        .f(g.alpha);
+    d.dispatch_hybrid(
+        kernel,
+        &[a.binding(), b.binding(), bias.unwrap_or(zero).binding()],
+        &[c.binding()],
+        &params.0,
+        [g.n.div_ceil(32), g.m.div_ceil(32), g.batch],
+        [128, 1, 1],
+        0,
+    )
+}
+
+/// `acc += y` over `count` values.
+fn run_add(d: &MetalDevice, y: &Tensor, acc: &Tensor, count: usize) -> Result<()> {
+    d.dispatch_hybrid(
+        "v_add",
+        &[y.binding()],
+        &[acc.binding()],
+        &Params::default().u(count)?.u(1)?.0,
+        [count.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
 }
 
 /// Strided batched GEMM description for the `v_gemm_*` kernels.
@@ -1375,7 +1607,9 @@ pub fn smart_resize(
     (wb as usize, hb as usize)
 }
 
+pub mod audio;
 mod lfm3;
+mod lfm3a;
 pub mod media;
 
 #[cfg(test)]
