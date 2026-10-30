@@ -413,7 +413,7 @@ impl AudioModel {
         let seconds = samples.len() as f64 / audio::SAMPLE_RATE as f64;
         if seconds > MAX_AUDIO_SECONDS as f64 {
             return Err(Error::Parameter(format!(
-                "a {seconds:.1} s clip is longer than the {MAX_AUDIO_SECONDS} s one request may attach; split it"
+                "a {seconds:.1} s clip is longer than the {MAX_AUDIO_SECONDS} s one clip may last; split it"
             )));
         }
         self.encoder.encode(d, &self.mel.features(samples), hash)
