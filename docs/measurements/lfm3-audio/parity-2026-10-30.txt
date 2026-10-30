@@ -1,46 +1,46 @@
-# start 2026-10-30 20:38:19 UTC; commit e4f76c2; llama.cpp 792fcf4
+# start 2026-10-30 20:57:37 UTC; commit 82f8485; llama.cpp 792fcf4
 Apple M5
 34359738368
 ## encoder rows vs llama.cpp mtmd_get_output_embd (same 16 kHz samples)
 == fox BF16
-2.84 s of audio -> 36 rows of 2048 in 20.7 ms
+2.84 s of audio -> 36 rows of 2048 in 21.0 ms
 CPU front end: WAV decode and resample 0.1 ms, log-mel 6.0 ms
 cosine mean 0.999999 min 0.999999; relative L2 error mean 0.0013 max 0.0017; max abs diff 0.0013
 == weather BF16
-5.99 s of audio -> 75 rows of 2048 in 32.8 ms
+5.99 s of audio -> 75 rows of 2048 in 33.3 ms
 CPU front end: WAV decode and resample 0.2 ms, log-mel 12.5 ms
 cosine mean 0.999999 min 0.999997; relative L2 error mean 0.0013 max 0.0026; max abs diff 0.0005
 == weather48k BF16
-5.99 s of audio -> 75 rows of 2048 in 34.0 ms
-CPU front end: WAV decode and resample 9.6 ms, log-mel 12.6 ms
+5.99 s of audio -> 75 rows of 2048 in 32.1 ms
+CPU front end: WAV decode and resample 9.6 ms, log-mel 12.5 ms
 cosine mean 0.999999 min 0.999997; relative L2 error mean 0.0013 max 0.0026; max abs diff 0.0006
 == fox Q8_0
 2.84 s of audio -> 36 rows of 2048 in 20.6 ms
-CPU front end: WAV decode and resample 0.1 ms, log-mel 6.1 ms
+CPU front end: WAV decode and resample 0.1 ms, log-mel 6.2 ms
 cosine mean 0.999999 min 0.999999; relative L2 error mean 0.0012 max 0.0017; max abs diff 0.0007
 == weather Q8_0
-5.99 s of audio -> 75 rows of 2048 in 32.8 ms
+5.99 s of audio -> 75 rows of 2048 in 33.0 ms
 CPU front end: WAV decode and resample 0.2 ms, log-mel 12.6 ms
 cosine mean 0.999999 min 0.999996; relative L2 error mean 0.0013 max 0.0028; max abs diff 0.0005
 == weather48k Q8_0
-5.99 s of audio -> 75 rows of 2048 in 32.9 ms
-CPU front end: WAV decode and resample 9.6 ms, log-mel 12.7 ms
+5.99 s of audio -> 75 rows of 2048 in 31.5 ms
+CPU front end: WAV decode and resample 9.6 ms, log-mel 12.5 ms
 cosine mean 0.999999 min 0.999996; relative L2 error mean 0.0013 max 0.0029; max abs diff 0.0009
 == long Q8_0
-112.40 s of audio -> 1405 rows of 2048 in 565.9 ms
-CPU front end: WAV decode and resample 3.2 ms, log-mel 236.3 ms
+112.40 s of audio -> 1405 rows of 2048 in 560.9 ms
+CPU front end: WAV decode and resample 3.2 ms, log-mel 234.2 ms
 cosine mean 0.999999 min 0.999997; relative L2 error mean 0.0014 max 0.0026; max abs diff 0.0012
 == toolong Q8_0 (must be refused)
 Error: Parameter("a 247.3 s clip is longer than the 120 s one clip may last; split it")
 ## memory plan against Metal's allocations, and the CPU front end on 48 kHz stereo float
 == long48k BF16 --memory
-112.40 s of audio -> 1405 rows of 2048 in 559.9 ms
-CPU front end: WAV decode and resample 180.3 ms, log-mel 236.7 ms
-memory: planned 559.3 MiB; measured weights 220.0 MiB (loader counted 220.0) + 120 s clip activations 339.4 MiB = 559.4 MiB
+112.40 s of audio -> 1405 rows of 2048 in 561.7 ms
+CPU front end: WAV decode and resample 177.5 ms, log-mel 236.6 ms
+memory: planned 665.8 MiB; measured weights 220.0 MiB (loader counted 220.0) + one 120 s clip's encode 362.9 MiB (its rows 11.7 MiB) + 7 more cached clips' rows = peak 664.9 MiB
 == long48k Q8_0 --memory
-112.40 s of audio -> 1405 rows of 2048 in 561.6 ms
-CPU front end: WAV decode and resample 179.1 ms, log-mel 236.5 ms
-memory: planned 559.3 MiB; measured weights 220.0 MiB (loader counted 220.0) + 120 s clip activations 339.4 MiB = 559.4 MiB
+112.40 s of audio -> 1405 rows of 2048 in 545.6 ms
+CPU front end: WAV decode and resample 178.0 ms, log-mel 236.1 ms
+memory: planned 665.8 MiB; measured weights 220.0 MiB (loader counted 220.0) + one 120 s clip's encode 362.9 MiB (its rows 11.7 MiB) + 7 more cached clips' rows = peak 664.9 MiB
 == toolong48k Q8_0: refused from the header, wall time including the projector load
 Error: Parameter("a 247.3 s clip is longer than the 120 s one clip may last; split it")
 real 0.54
@@ -49,26 +49,26 @@ real 0.54
 The quick brown fox jumps over the lazy dog.
 > (audio attached: 2.8 s; it goes with your next message)
 > The quick brown fox jumps over the lazy dog.
-[prompt 56 tokens (0 reused), prefill 903 tok/s; 10 generated at 92.9 tok/s; stop Eos; audio encode 0.02 s]
+[prompt 56 tokens (0 reused), prefill 905 tok/s; 10 generated at 92.7 tok/s; stop Eos; audio encode 0.02 s]
 > 
 == ASR weather
 Tomorrow will be mostly sunny in Chicago, with a high of 72 degrees and light winds from the west.
 > (audio attached: 6.0 s; it goes with your next message)
 > Tomorrow will be mostly sunny in Chicago, with a high of 72 degrees and light winds from the west.
-[prompt 95 tokens (0 reused), prefill 1428 tok/s; 23 generated at 91.9 tok/s; stop Eos; audio encode 0.03 s]
+[prompt 95 tokens (0 reused), prefill 1545 tok/s; 23 generated at 98.4 tok/s; stop Eos; audio encode 0.03 s]
 > 
 == question
 Chicago, with a high of 72 degrees
 > (audio attached: 6.0 s; it goes with your next message)
 > Chicago, with a high of 72 degrees
-[prompt 102 tokens (0 reused), prefill 1509 tok/s; 9 generated at 91.6 tok/s; stop Eos; audio encode 0.03 s]
+[prompt 102 tokens (0 reused), prefill 1512 tok/s; 9 generated at 91.3 tok/s; stop Eos; audio encode 0.03 s]
 > 
 == two clips
 A quick brown fox jumps over a lazy dog.
 > (audio attached: 6.0 s; it goes with your next message)
 > A quick brown fox jumps over a lazy dog.
-[prompt 134 tokens (0 reused), prefill 1326 tok/s; 10 generated at 91.4 tok/s; stop Eos; audio encode 0.06 s]
+[prompt 134 tokens (0 reused), prefill 1405 tok/s; 10 generated at 91.3 tok/s; stop Eos; audio encode 0.06 s]
 > 
 ## LFM3-VL picture, greedy, as in the regression record
 answer md5 5a55a681a5c85ce8813e746bd69616c5
-# end 2026-10-30 20:38:42 UTC
+# end 2026-10-30 20:58:08 UTC

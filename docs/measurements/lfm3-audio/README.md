@@ -6,9 +6,9 @@ Reference: llama.cpp built from source at `792fcf4` (Homebrew's build 11669 has 
 
 | File | What it is |
 |---|---|
-| [parity-2026-10-30.sh](parity-2026-10-30.sh), [.txt](parity-2026-10-30.txt) | Encoder rows against llama.cpp's `mtmd` output for the same samples, the memory plan and CPU front end, greedy text through `ferrum-cli` and `llama-mtmd-cli --jinja`, and the LFM3-VL picture check, at `e4f76c2` (after the review fixes; first run at `bb1e87b` gave the same rows and text) |
+| [parity-2026-10-30.sh](parity-2026-10-30.sh), [.txt](parity-2026-10-30.txt) | Encoder rows against llama.cpp's `mtmd` output for the same samples, the memory plan and CPU front end, greedy text through `ferrum-cli` and `llama-mtmd-cli --jinja`, and the LFM3-VL picture check, at `82f8485` (after the second review's fixes; first run at `bb1e87b` gave the same rows and text) |
 | [embdump.cpp](embdump.cpp) | The reference dumper: feeds raw 16 kHz samples to `mtmd` and writes `mtmd_get_output_embd` |
-| [server-2026-10-30.sh](server-2026-10-30.sh), [.txt](server-2026-10-30.txt) | `ferrum-server`: `/props` modalities and one `input_audio` transcription, at `e4f76c2` |
+| [server-2026-10-30.sh](server-2026-10-30.sh), [.txt](server-2026-10-30.txt) | `ferrum-server`: `/props` modalities and one `input_audio` transcription, at `82f8485` |
 | [regression-2026-10-30.sh](regression-2026-10-30.sh), [.txt](regression-2026-10-30.txt) | `experimental` `8cb5110` against the branch at `4a2fae3`: greedy and memory on Swift 27B and Tiel 35B-A3B, KLD, `hybrid_bench` A-B-B-A ×2, an LFM3-VL picture and LFM3 text |
 
 The clips are macOS `say` speech (the commands are in the parity script), not recorded voices, so they are not committed. The parity script writes Ferrum's decoded samples (`hybrid_audio_check --samples`) and gives exactly those to llama.cpp, so the comparison covers the mel front end and the encoder, not two WAV readers. `weather48k` is the `weather` clip as 48 kHz stereo float, which goes through Ferrum's resampler first.

@@ -2,7 +2,7 @@
 # LFM3-Audio input vs llama.cpp: encoder rows, then greedy text through ferrum-cli and llama-mtmd-cli.
 # Run from the repo root at the branch commit:
 #   cargo build --release --bin ferrum-cli --example hybrid_audio_check
-# First run at bb1e87b; the record is from the rerun after the review fixes (see README.md).
+# First run at bb1e87b; the record is from the rerun after the second review's fixes (see README.md).
 #   caffeinate -dims zsh docs/measurements/lfm3-audio/parity-2026-10-30.sh > docs/measurements/lfm3-audio/parity-2026-10-30.txt 2>&1
 #
 # Setup it expects in S (it creates none of it):
@@ -55,7 +55,7 @@ echo "== toolong48k Q8_0: refused from the header, wall time including the proje
 
 P=$M/mmproj-LFM3-Audio-2B-Q8_0.gguf
 lm() { $L/llama-mtmd-cli -m $LANG_FILE --mmproj $P --jinja --temp 0 -n 96 "$@" 2>/dev/null | sed '/^$/d' | tail -2; }
-fc() { $CLI --model $LANG_FILE --mmproj $P --temperature 0 --max-tokens 96 "$@" 2>&1 | grep -v -E '^(ferrum|model|projector|context|>|\s*$)' | tail -4; }
+fc() { $CLI --model $LANG_FILE --mmproj $P --temperature 0 --max-tokens 96 "$@" 2>&1 | sed $'s/\x1b\\[[0-9;]*m//g' | grep -v -E '^(ferrum|model|projector|context|\s*$)' | tail -4; }
 echo "## greedy, Q4_K_M + Q8_0 projector: llama-mtmd-cli --jinja vs ferrum-cli"
 echo "== ASR fox"
 lm --audio $S/audio/fox.wav -sys "Perform ASR in English." -p "<__media__>"
