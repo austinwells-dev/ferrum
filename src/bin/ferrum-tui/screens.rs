@@ -84,6 +84,15 @@ fn every_screen_draws_at_every_size() {
     app.editing = Editing::ImagePrompt;
     sweep(&app, "image prompt", false);
     app.editing = Editing::No;
+    app.go_tab(Tab::Audio);
+    for state in 0..4 {
+        app.audio.demo(state);
+        sweep(&app, "audio", true);
+    }
+    app.buffer = "~/Music/Ferrum/ferrum-1761850000.wav".into();
+    app.editing = Editing::AudioClip;
+    sweep(&app, "audio clip", false);
+    app.editing = Editing::No;
     for mode in [Mode::Chat, Mode::Agent, Mode::Serve] {
         app.open_pick(mode);
         sweep(&app, "setups", true);

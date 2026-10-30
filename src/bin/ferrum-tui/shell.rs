@@ -15,10 +15,11 @@ pub enum Tab {
     Bench,
     Models,
     Image,
+    Audio,
     Settings,
 }
 
-pub const TABS: [(Tab, &str); 8] = [
+pub const TABS: [(Tab, &str); 9] = [
     (Tab::Home, "Home"),
     (Tab::Chat, "Chat"),
     (Tab::Agents, "Agents"),
@@ -26,6 +27,7 @@ pub const TABS: [(Tab, &str); 8] = [
     (Tab::Bench, "Bench"),
     (Tab::Models, "Models"),
     (Tab::Image, "Image"),
+    (Tab::Audio, "Audio"),
     (Tab::Settings, "Settings"),
 ];
 
@@ -59,7 +61,7 @@ enum Cmd {
     Quit,
 }
 
-const COMMANDS: [(Cmd, &str); 20] = [
+const COMMANDS: [(Cmd, &str); 21] = [
     (Cmd::Go(Tab::Home), "Go to Home"),
     (Cmd::Go(Tab::Chat), "Go to Chat"),
     (Cmd::Go(Tab::Agents), "Go to Agents"),
@@ -68,6 +70,7 @@ const COMMANDS: [(Cmd, &str); 20] = [
     (Cmd::Go(Tab::Models), "Go to Models"),
     (Cmd::Go(Tab::Image), "Go to Image"),
     (Cmd::NewImage, "Generate an image"),
+    (Cmd::Go(Tab::Audio), "Go to Audio"),
     (Cmd::Go(Tab::Settings), "Go to Settings"),
     (Cmd::RunSpeed, "Bench: measure speed"),
     (Cmd::RunIq, "Bench: measure intelligence"),
@@ -100,6 +103,7 @@ impl App {
             Screen::Bench => Tab::Bench,
             Screen::Models => Tab::Models,
             Screen::Image => Tab::Image,
+            Screen::Audio => Tab::Audio,
             Screen::Settings => Tab::Settings,
         }
     }
@@ -124,6 +128,7 @@ impl App {
             Tab::Bench => self.open_bench(),
             Tab::Models => self.screen = Screen::Models,
             Tab::Image => self.screen = Screen::Image,
+            Tab::Audio => self.screen = Screen::Audio,
             Tab::Settings => self.screen = Screen::Settings,
         }
     }
@@ -181,7 +186,7 @@ impl App {
             return false;
         }
         match key.code {
-            KeyCode::Char(c @ '1'..='8') if !ctrl => {
+            KeyCode::Char(c @ '1'..='9') if !ctrl => {
                 self.go_tab(TABS[c as usize - '1' as usize].0);
                 true
             }

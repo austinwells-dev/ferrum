@@ -8,6 +8,7 @@ mod agentcompare;
 mod agentui;
 mod app;
 mod attach;
+mod audiotab;
 mod bench;
 mod benchui;
 mod benchview;
@@ -113,6 +114,7 @@ pub enum Screen {
     Bench,
     Models,
     Image,
+    Audio,
 }
 
 /// Why the editor is open: decides what launching does.
@@ -169,6 +171,10 @@ pub enum Editing {
     SearchUrl,
     SearchKey,
     ImagePrompt,
+    /// The Audio tab's clip path.
+    AudioClip,
+    /// The Audio tab's question about the clip.
+    AudioQuestion,
 }
 
 pub struct App {
@@ -206,6 +212,7 @@ pub struct App {
     pub serve: Option<Serve>,
     pub bench: Option<BenchState>,
     pub image: imagetab::ImageTab,
+    pub audio: audiotab::AudioTab,
     /// Chat workers that were told to stop and may still be unloading.
     pub closing: Vec<std::thread::JoinHandle<()>>,
     /// The pictures the terminal shows (kitty or iTerm2 protocol).
@@ -255,12 +262,14 @@ impl App {
             self.bench_tick();
         }
         self.image.pump();
+        self.audio.pump();
     }
 
     pub fn poll_interval(&self) -> Duration {
         let busy = self.chat.is_some()
             || self.serve.is_some()
             || self.image.running()
+            || self.audio.running()
             || self
                 .bench
                 .as_ref()
@@ -288,6 +297,7 @@ impl App {
             Screen::Bench => self.draw_bench(f, body, footer),
             Screen::Models => self.draw_models_tab(f, body, footer),
             Screen::Image => self.draw_image(f, body, footer),
+            Screen::Audio => self.draw_audio(f, body, footer),
         }
         self.draw_overlay(f);
         if self.picker.is_some() {
@@ -308,6 +318,15 @@ impl App {
             ),
             Editing::RenameFav(_) => input_popup(f, "Rename favorite", "new name", &self.buffer),
             Editing::ImagePrompt => imagetab::prompt_popup(f, &self.buffer),
+            Editing::AudioClip => input_popup(
+                f,
+                "Clip",
+                "a .wav file: type its path or drop it here",
+                &self.buffer,
+            ),
+            Editing::AudioQuestion => {
+                input_popup(f, "Question", "what to ask about the clip", &self.buffer)
+            }
             Editing::SearchUrl => input_popup(
                 f,
                 "Search URL",
@@ -359,6 +378,7 @@ impl App {
             Screen::Bench => self.bench_key(key),
             Screen::Models => self.models_key(key),
             Screen::Image => self.image_key(key),
+            Screen::Audio => self.audio_key(key),
         }
     }
 
@@ -378,6 +398,8 @@ impl App {
             } else {
                 c.insert_str(&clean);
             }
+        } else if self.screen == Screen::Audio {
+            self.audio_paste(&clean);
         }
     }
 
