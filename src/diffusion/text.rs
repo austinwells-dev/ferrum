@@ -65,6 +65,7 @@ fn hybrid_config(cfg: &TextConfig) -> Result<HybridConfig> {
         ssm_v_heads: 0,
         ssm_grouped_heads: false,
         moe: None,
+        qwen4exp: None,
         trained_context: cfg.context,
         kv_cache: KvCache::F16,
     };

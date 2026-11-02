@@ -2867,10 +2867,10 @@ impl HybridModel {
                 [256, 1, 1],
                 0,
             )?;
-            self.project_mm_id(d, &f.gate_exps, &xg, &offsets, m, &gate)?;
-            self.project_mm_id(d, &f.up_exps, &xg, &offsets, m, &up)?;
+            Self::project_mm_id(d, &f.gate_exps, &xg, &offsets, m, &gate)?;
+            Self::project_mm_id(d, &f.up_exps, &xg, &offsets, m, &up)?;
             self.glu(d, &gate, &up, &act)?;
-            self.project_mm_id(d, &f.down_exps, &act, &offsets, m, &down)?;
+            Self::project_mm_id(d, &f.down_exps, &act, &offsets, m, &down)?;
         }
         let position = ms.position.view(0, [routes])?;
         d.dispatch_hybrid(
@@ -2955,8 +2955,7 @@ impl HybridModel {
     }
 
     /// Expert GEMM over expert-sorted rows delimited by `offsets`.
-    fn project_mm_id(
-        &self,
+    pub(crate) fn project_mm_id(
         d: &MetalDevice,
         w: &Matrix,
         x: &Tensor,
@@ -2984,6 +2983,10 @@ impl HybridModel {
             Format::Iq3S => "h_mm_id_iq3_s",
             Format::Iq3Xxs => "h_mm_id_iq3_xxs",
             Format::Iq2S => "h_mm_id_iq2_s",
+            Format::Q2_0 => "h_mm_id_q2_0",
+            Format::Q5_0 => "h_mm_id_q5_0",
+            Format::Q3K => "h_mm_id_q3_k",
+            Format::Iq4Nl => "h_mm_id_iq4_nl",
             Format::F32 | Format::Bf16 | Format::Mlx4 => {
                 return Err(Error::Gguf(format!(
                     "{} experts are unsupported",
@@ -3059,6 +3062,10 @@ impl HybridModel {
             Format::Q8_0 => "h_get_rows_q8_0",
             Format::Q4_0 => "h_get_rows_q4_0",
             Format::Iq4Xs => "h_get_rows_iq4_xs",
+            Format::Q2_0 => "h_get_rows_q2_0",
+            Format::Q5_0 => "h_get_rows_q5_0",
+            Format::Q3K => "h_get_rows_q3_k",
+            Format::Iq4Nl => "h_get_rows_iq4_nl",
             Format::Bf16 => "h_get_rows_bf16",
             Format::Mlx4 => "h_get_rows_mlx4",
             f => return Err(Error::Gguf(format!("no embedding lookup for {}", f.name()))),
@@ -3246,6 +3253,10 @@ impl HybridModel {
                 Format::Iq3S => "h_mm_iq3_s",
                 Format::Iq3Xxs => "h_mm_iq3_xxs",
                 Format::Iq2S => "h_mm_iq2_s",
+                Format::Q2_0 => "h_mm_q2_0",
+                Format::Q5_0 => "h_mm_q5_0",
+                Format::Q3K => "h_mm_q3_k",
+                Format::Iq4Nl => "h_mm_iq4_nl",
                 Format::Mlx4 => "h_mm_mlx4",
             };
             return d.dispatch_hybrid(
@@ -3369,6 +3380,10 @@ fn mvb_kernel(format: Format) -> &'static str {
         Format::Iq3S => "h_mvb_iq3_s",
         Format::Iq3Xxs => "h_mvb_iq3_xxs",
         Format::Iq2S => "h_mvb_iq2_s",
+        Format::Q2_0 => "h_mvb_q2_0",
+        Format::Q5_0 => "h_mvb_q5_0",
+        Format::Q3K => "h_mvb_q3_k",
+        Format::Iq4Nl => "h_mvb_iq4_nl",
         Format::Mlx4 => "h_mvb_mlx4",
         Format::F32 => "h_mvb_f32",
         Format::Bf16 => "h_mvb_bf16",
@@ -3387,6 +3402,10 @@ fn mms_kernel(format: Format) -> &'static str {
         Format::Iq3S => "h_mms_iq3_s",
         Format::Iq3Xxs => "h_mms_iq3_xxs",
         Format::Iq2S => "h_mms_iq2_s",
+        Format::Q2_0 => "h_mms_q2_0",
+        Format::Q5_0 => "h_mms_q5_0",
+        Format::Q3K => "h_mms_q3_k",
+        Format::Iq4Nl => "h_mms_iq4_nl",
         Format::Mlx4 => "h_mms_mlx4",
         Format::F32 => "h_mms_f32",
         Format::Bf16 => "h_mms_bf16",
@@ -3408,6 +3427,11 @@ fn mv_kernel(format: Format, expert: bool) -> (&'static str, usize, usize, usize
         Format::Iq3S => (pick("h_mv_iq3_s", "h_mv_id_iq3_s"), 8, 2, 512 * 4),
         Format::Iq3Xxs => (pick("h_mv_iq3_xxs", "h_mv_id_iq3_xxs"), 8, 2, 256 * 4 + 128),
         Format::Iq2S => (pick("h_mv_iq2_s", "h_mv_id_iq2_s"), 8, 2, 0),
+        // Generic dequantizing GEMVs (`MV_DEQ`), 4 rows per SIMD group.
+        Format::Q2_0 => (pick("h_mv_q2_0", "h_mv_id_q2_0"), 8, 2, 0),
+        Format::Q5_0 => (pick("h_mv_q5_0", "h_mv_id_q5_0"), 8, 2, 0),
+        Format::Q3K => (pick("h_mv_q3_k", "h_mv_id_q3_k"), 8, 2, 0),
+        Format::Iq4Nl => (pick("h_mv_iq4_nl", "h_mv_id_iq4_nl"), 8, 2, 0),
         // Expert matrices are never MLX (`moe_ffn` refuses them first). One row
         // per SIMD group with 16-byte loads beat Kapitsa's 2 x 8 (its M4 Pro
         // tuning) on every 27B shape on the M5.

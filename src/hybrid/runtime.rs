@@ -1290,7 +1290,7 @@ pub fn generation_prefix(template: &ChatTemplate, vars: &Map<String, Json>) -> &
 fn reasoning_close(variant: Variant) -> &'static str {
     match variant {
         Variant::Flint | Variant::Spark | Variant::Lfm3 => "</think>",
-        Variant::Dense | Variant::Moe => "\n</think>\n\n",
+        Variant::Dense | Variant::Moe | Variant::Qwen4Exp => "\n</think>\n\n",
     }
 }
 

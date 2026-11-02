@@ -15,7 +15,11 @@ using namespace metal;
 
 // ---------------------------------------------------------------- blocks
 
+struct block_q2_0 { half d; uchar qs[16]; };
 struct block_q4_0 { half d; uchar qs[16]; };
+struct block_q5_0 { half d; uchar qh[4]; uchar qs[16]; };
+struct block_iq4_nl { half d; uchar qs[16]; };
+struct block_q3_K { uchar hmask[32]; uchar qs[64]; uchar scales[12]; half d; };
 struct block_q8_0 { half d; char qs[32]; };
 struct block_q4_K { half d; half dmin; uchar scales[12]; uchar qs[128]; };
 struct block_q5_K { half d; half dmin; uchar scales[12]; uchar qh[32]; uchar qs[128]; };
@@ -429,6 +433,65 @@ void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & re
     for (int i = 0; i < 8; i++) {
         reg_f[i/2][2*(i%2) + 0] = d1 * (qs[i] & mask0) + md;
         reg_f[i/2][2*(i%2) + 1] = d2 * (qs[i] & mask1) + md;
+    }
+    reg = (type4x4) reg_f;
+}
+
+// Q2_0 (ggml type 42, 64 values): four 2-bit codes per byte, low bits
+// first; a value is d * (code - 1).
+template <typename type4x4>
+void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
+    device const uchar * qs = xb->qs + 4*il;
+    const float d = xb->d;
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) reg_f[i/4][i%4] = d * (float((qs[i/4] >> (2*(i%4))) & 3) - 1.f);
+    reg = (type4x4) reg_f;
+}
+
+// Q5_0: value j is (low nibble of qs[j] | bit j of qh << 4) - 16, value
+// j + 16 the high nibble with bit j + 16.
+template <typename type4x4>
+void dequantize_q5_0(device const block_q5_0 * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+    const uint qh = uint(xb->qh[0]) | uint(xb->qh[1]) << 8 | uint(xb->qh[2]) << 16 | uint(xb->qh[3]) << 24;
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        const uint q = il ? (xb->qs[i] >> 4) : (xb->qs[i] & 15);
+        const uint h = (qh >> (i + 16*il)) & 1;
+        reg_f[i/4][i%4] = d * (float(q | (h << 4)) - 16.f);
+    }
+    reg = (type4x4) reg_f;
+}
+
+// IQ4_NL: byte j holds values j (low nibble) and j + 16 (high), codebook
+// lookups times d.
+template <typename type4x4>
+void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        reg_f[i/4][i%4] = d * kvalues_iq4nl_f[il ? (xb->qs[i] >> 4) : (xb->qs[i] & 15)];
+    }
+    reg = (type4x4) reg_f;
+}
+
+// Q3_K: 16-value chunk il is half il % 2 of 2-bit plane (il / 2) % 4 of the
+// block's 128-value half il / 8, minus 4 where its hmask bit is clear, with
+// 6-bit scale il (low 4 bits from scales[il % 8], high 2 from scales[8 + il % 4]).
+template <typename type4x4>
+void dequantize_q3_K(device const block_q3_K * xb, short il, thread type4x4 & reg) {
+    const short n = il / 8, plane = (il / 2) % 4, half_ = il % 2;
+    device const uchar * q = xb->qs + 32*n + 16*half_;
+    device const uchar * hm = xb->hmask + 16*half_;
+    const uchar m = uchar(1 << (4*n + plane));
+    device const uchar * sc = xb->scales;
+    const int lo = il < 8 ? (sc[il % 8] & 15) : (sc[il % 8] >> 4);
+    const int hi = (sc[8 + il % 4] >> (2 * (il / 4))) & 3;
+    const float dl = float(xb->d) * float((lo | (hi << 4)) - 32);
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        const int v = int((q[i] >> (2*plane)) & 3) - ((hm[i] & m) ? 0 : 4);
+        reg_f[i/4][i%4] = dl * float(v);
     }
     reg = (type4x4) reg_f;
 }
@@ -1293,6 +1356,25 @@ MVB_FORMAT(iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MVB_FORMAT(iq2_s, block_iq2_s, 16, dequantize_iq2_s)
 MVB_FORMAT(f32, float4x4, 1, dequantize_f32)
 MVB_FORMAT(bf16, block_bf16, 1, dequantize_bf16)
+MVB_FORMAT(q2_0, block_q2_0, 4, dequantize_q2_0)
+MVB_FORMAT(q5_0, block_q5_0, 2, dequantize_q5_0)
+MVB_FORMAT(iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MVB_FORMAT(q3_k, block_q3_K, 16, dequantize_q3_K)
+
+// Generic M=1 GEMV for formats without a hand-tuned kernel: the small-batch
+// loop with one activation row. NR0 rows per SIMD group; grid (ceil(n /
+// (NR0*NSG)), m) as for the other M=1 kernels.
+#define MV_DEQ(FMT, BLOCK, NL, DEQ) \
+template<short NR0, short NSG> \
+void mv_##FMT(constant ProjArgs & a, device const char * w, device const float * x, device float * y, \
+              uint3 tgpig, ushort tiisg, ushort sgitg) { \
+    mvb_impl<BLOCK, NL, DEQ<float4x4>, NR0, 1>(a, w, x, y, tgpig, tiisg, sgitg, NSG); \
+} \
+MV_KERNEL(h_mv_##FMT, mv_##FMT, 4, 2)
+MV_DEQ(q2_0, block_q2_0, 4, dequantize_q2_0)
+MV_DEQ(q5_0, block_q5_0, 2, dequantize_q5_0)
+MV_DEQ(iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MV_DEQ(q3_k, block_q3_K, 16, dequantize_q3_K)
 
 // TensorOps GEMM after llama.cpp's kernel_mul_mm (tensor path): a 64-row
 // weight tile is dequantized to F16 in threadgroup memory; 128 activation
@@ -1375,6 +1457,10 @@ MMS_FORMAT(iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MMS_FORMAT(iq2_s, block_iq2_s, 16, dequantize_iq2_s)
 MMS_FORMAT(f32, float4x4, 1, dequantize_f32)
 MMS_FORMAT(bf16, block_bf16, 1, dequantize_bf16)
+MMS_FORMAT(q2_0, block_q2_0, 4, dequantize_q2_0)
+MMS_FORMAT(q5_0, block_q5_0, 2, dequantize_q5_0)
+MMS_FORMAT(iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MMS_FORMAT(q3_k, block_q3_K, 16, dequantize_q3_K)
 MM_KERNEL(h_mm_q4_k, block_q4_K, 16, dequantize_q4_K)
 MM_KERNEL(h_mm_q5_k, block_q5_K, 16, dequantize_q5_K)
 MM_KERNEL(h_mm_q6_k, block_q6_K, 16, dequantize_q6_K)
@@ -1386,6 +1472,10 @@ MM_KERNEL(h_mm_iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MM_KERNEL(h_mm_iq2_s, block_iq2_s, 16, dequantize_iq2_s)
 MM_KERNEL(h_mm_f32, float4x4, 1, dequantize_f32)
 MM_KERNEL(h_mm_bf16, block_bf16, 1, dequantize_bf16)
+MM_KERNEL(h_mm_q2_0, block_q2_0, 4, dequantize_q2_0)
+MM_KERNEL(h_mm_q5_0, block_q5_0, 2, dequantize_q5_0)
+MM_KERNEL(h_mm_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MM_KERNEL(h_mm_q3_k, block_q3_K, 16, dequantize_q3_K)
 
 // ---------------------------------------------------------------- embedding
 
@@ -1418,6 +1508,10 @@ GET_ROWS_KERNEL(h_get_rows_q8_0, block_q8_0, 2, dequantize_q8_0)
 GET_ROWS_KERNEL(h_get_rows_q4_0, block_q4_0, 2, dequantize_q4_0)
 GET_ROWS_KERNEL(h_get_rows_iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
 GET_ROWS_KERNEL(h_get_rows_bf16, block_bf16, 1, dequantize_bf16)
+GET_ROWS_KERNEL(h_get_rows_q2_0, block_q2_0, 4, dequantize_q2_0)
+GET_ROWS_KERNEL(h_get_rows_q5_0, block_q5_0, 2, dequantize_q5_0)
+GET_ROWS_KERNEL(h_get_rows_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+GET_ROWS_KERNEL(h_get_rows_q3_k, block_q3_K, 16, dequantize_q3_K)
 
 // ---------------------------------------------------------------- norms and elementwise
 
@@ -2294,6 +2388,10 @@ MV_ID_KERNEL_SHMEM(h_mv_id_iq4_xs, mv_iq4_xs, 2, 2, float)
 MV_ID_KERNEL_SHMEM(h_mv_id_iq3_s, mv_iq3_s, 4, 2, uint)
 MV_ID_KERNEL_SHMEM(h_mv_id_iq3_xxs, mv_iq3_xxs, 4, 2, uint)
 MV_ID_KERNEL(h_mv_id_iq2_s, mv_iq2_s, 4, 2)
+MV_ID_KERNEL(h_mv_id_q2_0, mv_q2_0, 4, 2)
+MV_ID_KERNEL(h_mv_id_q5_0, mv_q5_0, 4, 2)
+MV_ID_KERNEL(h_mv_id_iq4_nl, mv_iq4_nl, 4, 2)
+MV_ID_KERNEL(h_mv_id_q3_k, mv_q3_k, 4, 2)
 
 // Expert GEMM over expert-sorted rows: z = expert; rows offsets[z]..offsets[z+1]
 // of x (gathered) and y. grid (ceil(max_rows/128), ceil(expert_rows/64), experts).
@@ -2363,6 +2461,10 @@ MM_ID_KERNEL(h_mm_id_iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
 MM_ID_KERNEL(h_mm_id_iq3_s, block_iq3_s, 16, dequantize_iq3_s)
 MM_ID_KERNEL(h_mm_id_iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MM_ID_KERNEL(h_mm_id_iq2_s, block_iq2_s, 16, dequantize_iq2_s)
+MM_ID_KERNEL(h_mm_id_q2_0, block_q2_0, 4, dequantize_q2_0)
+MM_ID_KERNEL(h_mm_id_q5_0, block_q5_0, 2, dequantize_q5_0)
+MM_ID_KERNEL(h_mm_id_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MM_ID_KERNEL(h_mm_id_q3_k, block_q3_K, 16, dequantize_q3_K)
 
 // ---------------------------------------------------------------- flash attention
 

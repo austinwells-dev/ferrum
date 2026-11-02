@@ -310,6 +310,7 @@ pub fn config(dir: &Path) -> Result<HybridConfig> {
         ssm_v_heads: u("linear_num_value_heads")?,
         ssm_grouped_heads: true,
         moe: None,
+        qwen4exp: None,
         trained_context: u("max_position_embeddings")?,
         kv_cache: KvCache::F16,
     };

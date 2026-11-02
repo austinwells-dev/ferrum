@@ -16,14 +16,20 @@ pub enum Format {
     /// Only MoE routers, embeddings, LM heads and Spark's head gates load as
     /// BF16 (see `Loader::matrix_or_bf16`).
     Bf16,
+    /// 64 values per block: an F16 scale, then 2-bit codes worth
+    /// `scale * (code - 1)` (ISTA-DASLab's GSQ-RCO packs of Qwen3.8).
+    Q2_0,
     Q4_0,
+    Q5_0,
     Q8_0,
+    Q3K,
     Q4K,
     Q5K,
     Q6K,
     Iq3Xxs,
     Iq3S,
     Iq2S,
+    Iq4Nl,
     Iq4Xs,
     /// MLX affine 4-bit, group 64: each row holds its `cols / 8` code words,
     /// then its `cols / 64` bf16 scales, then as many bf16 biases
@@ -36,29 +42,59 @@ impl Format {
         Some(match type_id {
             0 => Self::F32,
             2 => Self::Q4_0,
+            6 => Self::Q5_0,
             8 => Self::Q8_0,
+            11 => Self::Q3K,
             12 => Self::Q4K,
             13 => Self::Q5K,
             14 => Self::Q6K,
             18 => Self::Iq3Xxs,
+            20 => Self::Iq4Nl,
             21 => Self::Iq3S,
             22 => Self::Iq2S,
             23 => Self::Iq4Xs,
+            42 => Self::Q2_0,
             _ => return None,
+        })
+    }
+    /// The GGML type id this format is stored as (none for MLX).
+    #[cfg(test)]
+    pub(crate) fn type_id(self) -> Option<u32> {
+        Some(match self {
+            Self::F32 => 0,
+            Self::Bf16 => 30,
+            Self::Q2_0 => 42,
+            Self::Q4_0 => 2,
+            Self::Q5_0 => 6,
+            Self::Q8_0 => 8,
+            Self::Q3K => 11,
+            Self::Q4K => 12,
+            Self::Q5K => 13,
+            Self::Q6K => 14,
+            Self::Iq3Xxs => 18,
+            Self::Iq3S => 21,
+            Self::Iq2S => 22,
+            Self::Iq4Nl => 20,
+            Self::Iq4Xs => 23,
+            Self::Mlx4 => return None,
         })
     }
     pub fn name(self) -> &'static str {
         match self {
             Self::F32 => "f32",
             Self::Bf16 => "bf16",
+            Self::Q2_0 => "q2_0",
             Self::Q4_0 => "q4_0",
+            Self::Q5_0 => "q5_0",
             Self::Q8_0 => "q8_0",
+            Self::Q3K => "q3_k",
             Self::Q4K => "q4_k",
             Self::Q5K => "q5_k",
             Self::Q6K => "q6_k",
             Self::Iq3Xxs => "iq3_xxs",
             Self::Iq3S => "iq3_s",
             Self::Iq2S => "iq2_s",
+            Self::Iq4Nl => "iq4_nl",
             Self::Iq4Xs => "iq4_xs",
             Self::Mlx4 => "mlx4",
         }
@@ -324,7 +360,7 @@ impl Loader<'_> {
         }
         if info.dimensions != [cols, rows]
             || info.byte_len != rows * cols * 2
-            || !cols.is_multiple_of(256)
+            || !cols.is_multiple_of(PROJECTION_K_STEP)
         {
             return Err(Error::Weight {
                 name: name.into(),
@@ -370,7 +406,7 @@ impl Loader<'_> {
                 info.dimensions
             )));
         }
-        if !cols.is_multiple_of(256) || row_bytes * rows != info.byte_len {
+        if !cols.is_multiple_of(PROJECTION_K_STEP) || row_bytes * rows != info.byte_len {
             return Err(bad("byte length differs from geometry".into()));
         }
         let mut bytes = vec![0; info.byte_len];
@@ -451,8 +487,7 @@ pub(crate) fn gguf_matrix(
         message: format!("GGML type {} has no hybrid kernel", info.type_id),
     })?;
     let layout = block_layout(info.type_id)?;
-    if !cols.is_multiple_of(layout.elements) || (format != Format::F32 && !cols.is_multiple_of(256))
-    {
+    if !cols.is_multiple_of(layout.elements) || !cols.is_multiple_of(PROJECTION_K_STEP) {
         return Err(Error::Weight {
             name: name.into(),
             message: "row width is not a whole number of blocks".into(),
@@ -487,6 +522,11 @@ pub(crate) fn gguf_matrix(
         storage,
     })
 }
+
+/// Projection inputs are whole 64-value steps: the narrow TensorOps tiles
+/// (`h_mms_*`) read K 64 at a time with no tail, and every other projection
+/// kernel's step divides 64. Block formats add their own block width.
+pub(crate) const PROJECTION_K_STEP: usize = 64;
 
 pub const Q3K: u32 = 11;
 const Q6K: u32 = 14;
@@ -572,6 +612,14 @@ fn load_weights(
     c: &HybridConfig,
     head: bool,
 ) -> Result<Weights> {
+    if c.variant == Variant::Qwen4Exp {
+        return Err(Error::Config(
+            "qwen4exp (Qwen3.8-Flash-Next) is parsed and planned but not runnable yet: it needs \
+             hyper-connections, the n-gram embedding, indexer attention and expert streaming \
+             (docs/history/qwen4exp-plan.md)"
+                .into(),
+        ));
+    }
     let mut l = Loader {
         device,
         file,
@@ -599,6 +647,7 @@ fn load_weights(
             Variant::Dense | Variant::Moe => {
                 l.vector(&n("post_attention_norm.weight"), c.hidden)?
             }
+            Variant::Qwen4Exp => unreachable!("refused above"),
         };
         // LFM3 sandwich norms sit on the branch, after the operator and
         // before the residual add. Both or neither.
@@ -1000,21 +1049,9 @@ impl Matrix {
         format: Format,
         bytes: &[u8],
     ) -> Result<Self> {
-        let type_id = match format {
-            Format::Q4K => 12,
-            Format::Q5K => 13,
-            Format::Q6K => 14,
-            Format::Iq3Xxs => 18,
-            Format::Iq3S => 21,
-            Format::Iq2S => 22,
-            Format::Bf16 => 30,
-            f => {
-                return Err(Error::Parameter(format!(
-                    "no raw test path for {}",
-                    f.name()
-                )));
-            }
-        };
+        let type_id = format
+            .type_id()
+            .ok_or_else(|| Error::Parameter(format!("no raw test path for {}", format.name())))?;
         let layout = block_layout(type_id)?;
         let row_bytes = cols / layout.elements * layout.bytes;
         if row_bytes * rows * experts != bytes.len() {

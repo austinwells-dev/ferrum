@@ -1,0 +1,9 @@
+# hybrid_plan, 2026-11-02, Apple M5 32 GB (recommended working set 25769803776 B)
+command: cargo run --release --example hybrid_plan -- Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+
+| model | K/V | weights (experts) | KiB/token | auto context | K/V at auto context |
+|---|---|---|---|---|---|
+| Qwen3.8-Flash-Next GSQ-RCO | f16 | 35.03 GiB (31.64) | | does not fit: invalid model configuration: model needs 36614 MiB before any context; budget is 23552 MiB | |
+| Qwen3.8-Flash-Next GSQ-RCO | q8 | 35.03 GiB (31.64) | | does not fit: invalid model configuration: model needs 36614 MiB before any context; budget is 23552 MiB | |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | f16 | 17.44 GiB (15.94) | 20.0 | 262144 | 5.00 GiB |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | q8 | 17.44 GiB (15.94) | 10.6 | 262144 | 2.66 GiB |

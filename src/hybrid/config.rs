@@ -1,4 +1,5 @@
-//! Hybrid-engine geometry read from GGUF metadata (Qwen3.5 family, Flint, Spark, LFM3).
+//! Hybrid-engine geometry read from GGUF metadata (Qwen3.5 family, Flint, Spark,
+//! LFM3, and the not yet runnable Qwen3.8-Flash-Next).
 #![forbid(unsafe_code)]
 use crate::{
     Error, Result,
@@ -24,6 +25,11 @@ pub enum Variant {
     /// attention on the rest, sandwich RMSNorms, and partial RoPE on the
     /// full-attention layers via a frequency-factor vector.
     Lfm3,
+    /// `qwen4exp` (Qwen3.8-Flash-Next): the `qwen35moe` layout plus four-stream
+    /// hyper-connections, indexer-selected sparse attention and an n-gram
+    /// embedding on layer 1 (`Qwen4ExpConfig`). Parsed and planned only: the
+    /// loader refuses it (docs/history/qwen4exp-plan.md).
+    Qwen4Exp,
 }
 
 /// How one attention layer masks, rotates and gates its keys and queries.
@@ -117,6 +123,61 @@ pub struct MoeConfig {
     pub shared_gate: bool,
 }
 
+/// What `qwen4exp` adds to the `qwen35moe` geometry, from its GGUF metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Qwen4ExpConfig {
+    /// Residual streams (`hyper_connection.count`): the residual is
+    /// `hc_streams * hidden` wide, and every sublayer reads one mix of them.
+    pub hc_streams: usize,
+    /// Width of each hyper-connection's low-rank gate (`hyper_connection.low_rank`).
+    pub hc_low_rank: usize,
+    pub indexer: IndexerConfig,
+    pub ple: PleConfig,
+}
+
+/// The sparse-attention indexer on the full-attention layers: each query
+/// attends to the `top_k` cells whose `block`-cell group scores highest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexerConfig {
+    pub heads: usize,
+    pub key_dim: usize,
+    /// Cells pooled into one indexer key (`attention.compress_ratios`).
+    pub block: usize,
+    pub top_k: usize,
+}
+
+/// The per-layer n-gram embedding ("PLE"): for each token, `ngram - 1`
+/// n-gram orders times `heads_per_ngram` hashed rows of `row_dim` values,
+/// read from `per_layer_token_embd.weight` in the second GGUF shard.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PleConfig {
+    /// Layers that add the embedding to their residual (`[1]`).
+    pub layers: Vec<usize>,
+    /// Longest n-gram (3: bigrams and trigrams).
+    pub ngram: usize,
+    pub heads_per_ngram: usize,
+    /// Values per table row (`embedding_length_per_layer_input`).
+    pub row_dim: usize,
+    pub conv_kernel: usize,
+    /// A token that cuts the n-gram context (with everything before it).
+    pub eos: u32,
+    /// Per-position hash multipliers, one per n-gram position.
+    pub multipliers: Vec<u64>,
+    /// Each head's table size (primes, not powers of two) and first row.
+    pub vocab_sizes: Vec<u64>,
+    pub offsets: Vec<u64>,
+}
+
+impl PleConfig {
+    pub fn heads(&self) -> usize {
+        (self.ngram - 1) * self.heads_per_ngram
+    }
+    /// Rows the table must hold: the last head's offset plus its size.
+    pub fn table_rows(&self) -> u64 {
+        self.offsets.last().copied().unwrap_or(0) + self.vocab_sizes.last().copied().unwrap_or(0)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HybridConfig {
     pub variant: Variant,
@@ -158,6 +219,7 @@ pub struct HybridConfig {
     /// h % k_heads.
     pub ssm_grouped_heads: bool,
     pub moe: Option<MoeConfig>,
+    pub qwen4exp: Option<Qwen4ExpConfig>,
     pub trained_context: usize,
     /// K/V cache format (a load option, not GGUF metadata).
     pub kv_cache: KvCache,
@@ -173,6 +235,7 @@ impl HybridConfig {
             "flint" => Variant::Flint,
             "spark2_5" => Variant::Spark,
             "lfm3" => Variant::Lfm3,
+            "qwen4exp" => Variant::Qwen4Exp,
             other => {
                 return Err(Error::Config(format!(
                     "GGUF architecture {other:?} is not a supported hybrid"
@@ -282,7 +345,7 @@ impl HybridConfig {
         };
         let moe = match variant {
             Variant::Dense | Variant::Spark | Variant::Lfm3 => None,
-            Variant::Moe => Some(MoeConfig {
+            Variant::Moe | Variant::Qwen4Exp => Some(MoeConfig {
                 experts: uint(md, &key("expert_count"))?,
                 experts_used: uint(md, &key("expert_used_count"))?,
                 expert_ffn: uint(md, &key("expert_feed_forward_length"))?,
@@ -330,7 +393,7 @@ impl HybridConfig {
         };
         let leading_dense = match variant {
             Variant::Dense | Variant::Spark | Variant::Lfm3 => layers,
-            Variant::Moe => 0,
+            Variant::Moe | Variant::Qwen4Exp => 0,
             Variant::Flint => uint_or(md, &key("leading_dense_block_count"), 0)?,
         };
         let attn = attention_specs(md, &key, variant, layers)?;
@@ -364,7 +427,7 @@ impl HybridConfig {
         let embedding = file.tensor("token_embd.weight")?.logical_matrix_shape()?;
         let rope_dims = match variant {
             Variant::Flint | Variant::Spark => uint_or(md, &key("rope.dimension_count"), head_dim)?,
-            Variant::Dense | Variant::Moe | Variant::Lfm3 => {
+            Variant::Dense | Variant::Moe | Variant::Lfm3 | Variant::Qwen4Exp => {
                 uint(md, &key("rope.dimension_count"))?
             }
         };
@@ -381,6 +444,10 @@ impl HybridConfig {
             // Sliding layers rotate the full head; full-attention layers keep
             // `rope_theta` and divide by `rope_freqs`.
             Variant::Lfm3 => Some((rope_dims, float(md, &key("rope.freq_base_swa"))?)),
+            _ => None,
+        };
+        let qwen4exp = match variant {
+            Variant::Qwen4Exp => Some(qwen4exp(md, &key, &attention_layers)?),
             _ => None,
         };
         let config = Self {
@@ -407,7 +474,7 @@ impl HybridConfig {
             rope_sections: rope_sections(md, &key("rope.dimension_sections")),
             eps: float(md, &key("attention.layer_norm_rms_epsilon"))?,
             ffn: match variant {
-                Variant::Moe => 0,
+                Variant::Moe | Variant::Qwen4Exp => 0,
                 Variant::Dense | Variant::Flint | Variant::Spark | Variant::Lfm3 => {
                     uint(md, &key("feed_forward_length"))?
                 }
@@ -419,6 +486,7 @@ impl HybridConfig {
             ssm_v_heads,
             ssm_grouped_heads: false,
             moe,
+            qwen4exp,
             trained_context: uint(md, &key("context_length"))?,
             kv_cache: KvCache::F16,
         };
@@ -434,7 +502,7 @@ impl HybridConfig {
         let head_dim_ok = match self.variant {
             Variant::Flint | Variant::Spark => matches!(self.head_dim, 128 | 256),
             Variant::Lfm3 => self.head_dim == 128 && self.rope_dims == self.head_dim,
-            Variant::Dense | Variant::Moe => self.head_dim == 256,
+            Variant::Dense | Variant::Moe | Variant::Qwen4Exp => self.head_dim == 256,
         };
         let rope_ok = |dims: usize| dims <= self.head_dim && dims.is_multiple_of(2);
         if !head_dim_ok
@@ -464,19 +532,36 @@ impl HybridConfig {
         if self.attn.len() != self.layers || self.leading_dense > self.layers {
             return bad("per-layer attention options and dense layer count");
         }
-        if !self.hidden.is_multiple_of(256)
-            || (self.variant != Variant::Moe && !self.ffn.is_multiple_of(256))
-        {
+        if !self.hidden.is_multiple_of(256) || !self.ffn.is_multiple_of(256) {
             return bad("projection widths must be multiples of 256");
         }
+        // Expert widths only feed projections (Qwen3.8's are 640).
+        let step = super::weights::PROJECTION_K_STEP;
         if let Some(moe) = self.moe
             && (moe.experts == 0
                 || moe.experts_used == 0
                 || moe.experts_used > moe.experts
-                || !moe.expert_ffn.is_multiple_of(256)
-                || !moe.shared_ffn.is_multiple_of(256))
+                || !moe.expert_ffn.is_multiple_of(step)
+                || !moe.shared_ffn.is_multiple_of(step))
         {
             return bad("expert geometry");
+        }
+        if let Some(q) = &self.qwen4exp {
+            let ple = &q.ple;
+            if q.hc_streams == 0
+                || !q.hc_low_rank.is_multiple_of(step)
+                || q.indexer.heads == 0
+                || q.indexer.block == 0
+                || q.indexer.top_k == 0
+                || ple.ngram < 2
+                || ple.heads() * ple.row_dim != self.hidden
+                || ple.multipliers.len() != ple.ngram
+                || ple.vocab_sizes.len() != ple.heads()
+                || ple.offsets.len() != ple.heads()
+                || ple.layers.iter().any(|&l| l >= self.layers)
+            {
+                return bad("qwen4exp hyper-connection, indexer or n-gram geometry");
+            }
         }
         Ok(())
     }
@@ -549,9 +634,81 @@ fn attention_specs(
             window: sliding.as_ref().filter(|p| p[i]).and(window),
             rope: rope.as_ref().is_none_or(|p| p[i]),
             sinks: variant == Variant::Flint,
-            gated: matches!(variant, Variant::Dense | Variant::Moe),
+            gated: matches!(variant, Variant::Dense | Variant::Moe | Variant::Qwen4Exp),
         })
         .collect())
+}
+
+/// The `qwen4exp` additions. The full-attention layers are given twice, by
+/// `full_attention_interval` and by the non-zero `attention.compress_ratios`
+/// entries (each the indexer's block), and the two must agree.
+fn qwen4exp(
+    md: &BTreeMap<String, MetadataValue>,
+    key: &dyn Fn(&str) -> String,
+    attention_layers: &[bool],
+) -> Result<Qwen4ExpConfig> {
+    let ratios = u64_array(md, &key("attention.compress_ratios"))?;
+    if ratios.len() != attention_layers.len()
+        || ratios
+            .iter()
+            .zip(attention_layers)
+            .any(|(&r, &a)| (r != 0) != a)
+    {
+        return Err(Error::Config(
+            "attention.compress_ratios disagrees with full_attention_interval".into(),
+        ));
+    }
+    let mut blocks = ratios.iter().filter(|&&r| r != 0);
+    let block = blocks.next().copied().unwrap_or(0);
+    if blocks.any(|&r| r != block) {
+        return Err(Error::Config(
+            "attention.compress_ratios differ between layers".into(),
+        ));
+    }
+    let to_usize = |v: Vec<u64>| v.into_iter().map(|v| v as usize).collect();
+    Ok(Qwen4ExpConfig {
+        hc_streams: uint(md, &key("hyper_connection.count"))?,
+        hc_low_rank: uint(md, &key("hyper_connection.low_rank"))?,
+        indexer: IndexerConfig {
+            heads: uint(md, &key("attention.indexer.head_count"))?,
+            key_dim: uint(md, &key("attention.indexer.key_length"))?,
+            block: block as usize,
+            top_k: uint(md, &key("attention.indexer.top_k"))?,
+        },
+        ple: PleConfig {
+            layers: to_usize(u64_array(md, &key("ple.layers"))?),
+            ngram: uint(md, &key("ple.ngram_size"))?,
+            heads_per_ngram: uint(md, &key("ple.heads_per_ngram"))?,
+            row_dim: uint(md, &key("embedding_length_per_layer_input"))?,
+            conv_kernel: uint(md, &key("ple.conv_kernel"))?,
+            eos: u32::try_from(uint(md, &key("ple.eos_token_id"))?)
+                .map_err(|_| Error::Config("ple.eos_token_id exceeds u32".into()))?,
+            multipliers: u64_array(md, &key("ple.layer_multipliers"))?,
+            vocab_sizes: u64_array(md, &key("ple.head_vocab_sizes"))?,
+            offsets: u64_array(md, &key("ple.head_offsets"))?,
+        },
+    })
+}
+
+/// A metadata array of non-negative integers of any width.
+fn u64_array(md: &BTreeMap<String, MetadataValue>, key: &str) -> Result<Vec<u64>> {
+    let Some(MetadataValue::Array { values, .. }) = md.get(key) else {
+        return Err(Error::Config(format!("missing GGUF metadata array {key}")));
+    };
+    values
+        .iter()
+        .map(|v| match *v {
+            MetadataValue::Uint8(n) => Ok(u64::from(n)),
+            MetadataValue::Uint16(n) => Ok(u64::from(n)),
+            MetadataValue::Uint32(n) => Ok(u64::from(n)),
+            MetadataValue::Uint64(n) => Ok(n),
+            MetadataValue::Int32(n) if n >= 0 => Ok(n as u64),
+            MetadataValue::Int64(n) if n >= 0 => Ok(n as u64),
+            _ => Err(Error::Config(format!(
+                "{key} must hold non-negative integers"
+            ))),
+        })
+        .collect()
 }
 
 fn i32_array(md: &BTreeMap<String, MetadataValue>, key: &str, layers: usize) -> Result<Vec<i32>> {
@@ -667,5 +824,172 @@ fn float(md: &BTreeMap<String, MetadataValue>, key: &str) -> Result<f32> {
         _ => Err(Error::Config(format!(
             "missing or invalid GGUF metadata {key}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    enum Meta {
+        U32(u32),
+        F32(f32),
+        Str(&'static str),
+        U64s(Vec<u64>),
+    }
+
+    /// A GGUF holding `md` and one F32 `token_embd.weight` of `[vocab, hidden]`.
+    fn gguf(md: &[(String, Meta)], vocab: usize, hidden: usize) -> Vec<u8> {
+        let s = |b: &mut Vec<u8>, v: &str| {
+            b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+            b.extend_from_slice(v.as_bytes());
+        };
+        let mut b = b"GGUF".to_vec();
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&(md.len() as u64).to_le_bytes());
+        for (k, v) in md {
+            s(&mut b, k);
+            match v {
+                Meta::U32(x) => {
+                    b.extend_from_slice(&4u32.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                Meta::F32(x) => {
+                    b.extend_from_slice(&6u32.to_le_bytes());
+                    b.extend_from_slice(&x.to_le_bytes());
+                }
+                Meta::Str(x) => {
+                    b.extend_from_slice(&8u32.to_le_bytes());
+                    s(&mut b, x);
+                }
+                Meta::U64s(xs) => {
+                    b.extend_from_slice(&9u32.to_le_bytes());
+                    b.extend_from_slice(&10u32.to_le_bytes());
+                    b.extend_from_slice(&(xs.len() as u64).to_le_bytes());
+                    for x in xs {
+                        b.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+            }
+        }
+        s(&mut b, "token_embd.weight");
+        b.extend_from_slice(&2u32.to_le_bytes());
+        b.extend_from_slice(&(hidden as u64).to_le_bytes());
+        b.extend_from_slice(&(vocab as u64).to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.resize(b.len().div_ceil(32) * 32, 0);
+        b.resize(b.len() + vocab * hidden * 4, 0);
+        b
+    }
+
+    /// Qwen3.8-Flash-Next's metadata keys at a small scale: 8 layers (full
+    /// attention on 3 and 7), 640-wide experts, 16 n-gram heads of 16 values.
+    fn qwen4exp_metadata(ratios: Vec<u64>) -> Vec<(String, Meta)> {
+        use Meta::*;
+        let k = |s: &str| format!("qwen4exp.{s}");
+        let heads = 16u64;
+        let sizes: Vec<u64> = (0..heads).map(|i| 1009 + 10 * i).collect();
+        let offsets = sizes
+            .iter()
+            .scan(0, |at, n| {
+                let o = *at;
+                *at += n;
+                Some(o)
+            })
+            .collect();
+        vec![
+            ("general.architecture".into(), Str("qwen4exp")),
+            ("general.name".into(), Str("tiny qwen4exp")),
+            (k("block_count"), U32(8)),
+            (k("context_length"), U32(4096)),
+            (k("embedding_length"), U32(256)),
+            (k("attention.head_count"), U32(2)),
+            (k("attention.head_count_kv"), U32(1)),
+            (k("attention.key_length"), U32(256)),
+            (k("attention.value_length"), U32(256)),
+            (k("attention.layer_norm_rms_epsilon"), F32(1e-6)),
+            (k("rope.dimension_count"), U32(64)),
+            (k("rope.freq_base"), F32(1e7)),
+            (k("full_attention_interval"), U32(4)),
+            (k("ssm.conv_kernel"), U32(4)),
+            (k("ssm.state_size"), U32(128)),
+            (k("ssm.group_count"), U32(2)),
+            (k("ssm.time_step_rank"), U32(4)),
+            (k("ssm.inner_size"), U32(512)),
+            (k("expert_count"), U32(8)),
+            (k("expert_used_count"), U32(2)),
+            (k("expert_feed_forward_length"), U32(640)),
+            (k("expert_shared_feed_forward_length"), U32(640)),
+            (k("hyper_connection.count"), U32(4)),
+            (k("hyper_connection.low_rank"), U32(320)),
+            (k("attention.indexer.head_count"), U32(4)),
+            (k("attention.indexer.key_length"), U32(128)),
+            (k("attention.indexer.top_k"), U32(2048)),
+            (k("attention.compress_ratios"), U64s(ratios)),
+            (k("ple.layers"), U64s(vec![1])),
+            (k("ple.ngram_size"), U32(3)),
+            (k("ple.heads_per_ngram"), U32(8)),
+            (k("ple.conv_kernel"), U32(4)),
+            (k("ple.eos_token_id"), U32(3)),
+            (k("embedding_length_per_layer_input"), U32(16)),
+            (
+                k("ple.layer_multipliers"),
+                U64s(vec![23703573157769, 20109073645365, 8052911324071]),
+            ),
+            (k("ple.head_vocab_sizes"), U64s(sizes)),
+            (k("ple.head_offsets"), U64s(offsets)),
+        ]
+    }
+
+    fn parse(md: &[(String, Meta)]) -> Result<HybridConfig> {
+        let file = GgufReader::from_reader(Cursor::new(gguf(md, 4, 256)))?;
+        HybridConfig::from_gguf(&file)
+    }
+
+    #[test]
+    fn qwen4exp_parses_its_additions() {
+        let c = parse(&qwen4exp_metadata(vec![0, 0, 0, 4, 0, 0, 0, 4])).unwrap();
+        assert_eq!(c.variant, Variant::Qwen4Exp);
+        assert_eq!(
+            c.attention_layers,
+            [false, false, false, true, false, false, false, true]
+        );
+        assert!(
+            c.attn
+                .iter()
+                .all(|a| a.gated && a.rope && a.window.is_none())
+        );
+        let moe = c.moe.unwrap();
+        assert_eq!((moe.experts, moe.experts_used, moe.expert_ffn), (8, 2, 640));
+        assert!(!moe.sigmoid && moe.norm_weights && moe.shared_gate);
+        let q = c.qwen4exp.unwrap();
+        assert_eq!((q.hc_streams, q.hc_low_rank), (4, 320));
+        assert_eq!(
+            q.indexer,
+            IndexerConfig {
+                heads: 4,
+                key_dim: 128,
+                block: 4,
+                top_k: 2048
+            }
+        );
+        assert_eq!(q.ple.layers, [1]);
+        assert_eq!(q.ple.heads(), 16);
+        assert_eq!(q.ple.multipliers[0], 23703573157769);
+        assert_eq!(
+            q.ple.table_rows(),
+            (0..16).map(|i| 1009 + 10 * i).sum::<u64>()
+        );
+    }
+
+    #[test]
+    fn qwen4exp_layer_lists_must_agree() {
+        let err = parse(&qwen4exp_metadata(vec![0, 0, 4, 0, 0, 0, 0, 4])).unwrap_err();
+        assert!(err.to_string().contains("compress_ratios"), "{err}");
+        let err = parse(&qwen4exp_metadata(vec![0, 0, 0, 4, 0, 0, 0, 8])).unwrap_err();
+        assert!(err.to_string().contains("differ"), "{err}");
     }
 }

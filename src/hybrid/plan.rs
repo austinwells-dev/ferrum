@@ -149,6 +149,23 @@ pub fn weight_bytes(file: &GgufFile, c: &HybridConfig) -> usize {
     total
 }
 
+/// The part of `weight_bytes` that is routed experts (`*_exps` tensors): what
+/// a model too large for the working set would have to stream from disk.
+pub fn routed_expert_bytes(file: &GgufFile, c: &HybridConfig) -> usize {
+    file.tensors()
+        .values()
+        .filter(|t| t.name.contains("_exps."))
+        .filter(|t| {
+            t.name
+                .strip_prefix("blk.")
+                .and_then(|rest| rest.split('.').next())
+                .and_then(|l| l.parse::<usize>().ok())
+                .is_some_and(|l| l < c.layers)
+        })
+        .map(|t| page(t.byte_len))
+        .sum()
+}
+
 pub fn plan(
     file: &GgufFile,
     c: &HybridConfig,

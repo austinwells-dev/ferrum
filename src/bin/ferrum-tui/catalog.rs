@@ -508,16 +508,17 @@ pub fn type_name(id: u32) -> String {
         23 => "IQ4_XS",
         29 => "IQ1_M",
         30 => "BF16",
+        42 => "Q2_0",
         n => return format!("type {n}"),
     }
     .to_string()
 }
 
 /// Weight types the hybrid engine has kernels for (see `hybrid::weights`).
-pub const SUPPORTED: [u32; 10] = [0, 2, 8, 12, 13, 14, 18, 21, 22, 23];
+pub const SUPPORTED: [u32; 14] = [0, 2, 6, 8, 11, 12, 13, 14, 18, 20, 21, 22, 23, 42];
 
 /// Types the token-embedding lookup reads (`HybridModel::get_rows`).
-const EMBEDDING: [u32; 7] = [2, 8, 12, 13, 14, 23, 30];
+const EMBEDDING: [u32; 11] = [2, 6, 8, 11, 12, 13, 14, 20, 23, 30, 42];
 
 /// Mirrors what `Runtime::load` requires, without reading any weights.
 pub fn check(path: &Path) -> Checked {
@@ -650,7 +651,7 @@ pub fn check(path: &Path) -> Checked {
         && !EMBEDDING.contains(&t.type_id)
     {
         result.problem = Some(format!(
-            "embedding quant {} has no lookup kernel (needs Q4_0 Q8_0 Q4_K Q5_K Q6_K IQ4_XS BF16)",
+            "embedding quant {} has no lookup kernel (needs Q2_0 Q4_0 Q5_0 Q8_0 Q3_K Q4_K Q5_K Q6_K IQ4_NL IQ4_XS BF16)",
             type_name(t.type_id)
         ));
         return result;
@@ -681,10 +682,7 @@ pub fn check(path: &Path) -> Checked {
             .and_then(|r| r.split('.').next())
             .and_then(|n| n.parse::<usize>().ok());
         if layer.is_some_and(|l| l >= config.layers) {
-            // Q3_K MTP experts (the 35B MoE GGUFs) load as Q6_K.
-            if t.type_id != ferrum::hybrid::weights::Q3K {
-                head.push(t.type_id);
-            }
+            head.push(t.type_id);
         } else {
             trunk.push(t.type_id);
         }
