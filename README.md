@@ -19,7 +19,7 @@ You give it a model file and then either chat in the terminal, use the full-scre
 > - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts. A request can also lower an image's token budget below `--image-tokens` ([per-request image sizes](docs/server.md#image-size-per-request)).
 > - **Image generation.** Qwen-Image-2.1-Turbo drawing and editing in the CLI, server and TUI, and the TUI tools `generate_image` and `view_image`.
 > - **LFM3.** LiquidAI LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input (WAV).
-> - **Qwen3.8-Flash-Next.** The 35 GiB Q2_0 pack runs on a 32 GB Mac: its experts stream from the SSD. 16.8–18.4 tok/s decode and 232–315 tok/s prefill on an M5, ahead of Strata on the same Mac; up to 23 tok/s with a DFlash2 drafter on short prompts ([details](docs/experimental.md#qwen38-flash-next)).
+> - **Qwen3.8-Flash-Next.** The 35 GiB Q2_0 pack runs on a 32 GB Mac: its experts stream from the SSD. 16.8–18.4 tok/s decode and 232–315 tok/s prefill on an M5, ahead of Strata on the same Mac; with a DFlash2 drafter, 23 tok/s on a short raw prompt and 26.5 tok/s (1.42×) in the TUI's chat benchmark ([details](docs/experimental.md#qwen38-flash-next)).
 >
 > Everything else behaves as on `main`. Details and known gaps: [docs/experimental.md](docs/experimental.md).
 

@@ -62,7 +62,7 @@ Qwen's `qwen4exp` architecture in ISTA-DASLab's GSQ-RCO Q2_0 pack: 48 layers (De
 | `hybrid_spec_check` (oracle drafts in blocks of 8, a third of them corrupted) | speculative output equals greedy; replay after commit exact |
 | Speed against Strata 0.1.55 (Metal, its own config), interleaved, best of four ([record](measurements/qwen4exp/strata-abba-2026-11-02.txt)) | decode 16.8 vs 14.8 tok/s (short prompt), 18.2 vs 15.0 and prefill 232 vs 190 tok/s (1,155 tokens), 18.4 vs 15.8 and 315 vs 282 tok/s (3,815 tokens) |
 | DFlash2 drafter (2 drafts per check), interleaved with plain decoding ([record](measurements/qwen4exp/drafters-abba-2026-11-02.txt)) | 23.2 vs 17.1 tok/s (1.36×) on the short prompt, 21.1 vs 18.2 (1.16×) after 1,155 tokens, 18.8 vs 18.6 after 3,815 |
-| `ferrum-tui` | chat with thinking and tools, a follow-up turn from the cache, an image through the BF16 `mmproj`, DFlash2 at 23 tok/s; no swap-outs during the run |
+| `ferrum-tui` | chat with thinking and tools, a follow-up turn from the cache, an image through the BF16 `mmproj`, no swap-outs during the run. Its Speed benchmark recommends DFlash2 at 2 drafts: 26.5 vs 18.6 tok/s (1.42×) on its three chat prompts, DSpark 25.5 ([record](measurements/qwen4exp/tui-bench-2026-11-02.txt)) |
 
 ## Known gaps
 
