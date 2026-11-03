@@ -11,6 +11,8 @@ pub mod config;
 pub mod draft;
 pub mod engine;
 #[cfg(test)]
+mod hc_tests;
+#[cfg(test)]
 mod iq_tests;
 pub mod kflash;
 pub mod lookup;
@@ -19,9 +21,11 @@ pub mod mlx;
 mod mlx_tests;
 pub mod mtp;
 pub mod plan;
+pub mod ple;
 pub mod runtime;
 pub mod session;
 pub mod speculative;
+pub mod stream;
 #[cfg(test)]
 mod tree_tests;
 pub mod weights;
@@ -111,15 +115,19 @@ pub fn load_with(
     if mlx::is_mlx_dir(path.as_ref()) {
         return load_mlx(device, path.as_ref(), options, start);
     }
-    let mut file = GgufFile::open(path)?;
+    let mut file = GgufFile::open(path.as_ref())?;
     let mut config = HybridConfig::from_gguf(&file)?;
     config.kv_cache = options.kv_cache;
-    let plan = plan::plan(
+    let mut options = options;
+    options.chunk = plan::model_chunk(&config, options.chunk);
+    let mut plan = plan::plan(
         &file,
         &config,
         device.recommended_max_working_set() as usize,
         options,
     )?;
+    // The arena is one buffer: no larger than the device allocates at once.
+    plan.arena = plan.arena.min(device.max_buffer_length());
     let (tokenizer, eos_ids) = tokenizer(&file, config.vocab)?;
     let chat_template = match file.metadata_value("tokenizer.chat_template") {
         Some(MetadataValue::String(t)) => Some(t.clone()),
@@ -127,7 +135,25 @@ pub fn load_with(
     };
     let chat_special_tokens = special_tokens(file.metadata());
     let before = device.allocated_bytes();
-    let weights = weights::load(device, &mut file, &config)?;
+    let weights = if streams_experts(&config) {
+        let slot = plan.streamed / (config.layers * config.moe.map_or(1, |m| m.experts));
+        let experts = stream::StreamedExperts::open(
+            device,
+            path.as_ref(),
+            &file,
+            &config,
+            plan.arena / slot.max(1),
+            stream_threads(),
+            options.chunk,
+        )?;
+        let table = match &config.qwen4exp {
+            Some(_) => Some(ple::PleTable::open(path.as_ref(), &config)?),
+            None => None,
+        };
+        weights::load_streamed(device, &mut file, &config, experts, table)?
+    } else {
+        weights::load(device, &mut file, &config)?
+    };
     let model = HybridModel::new(device, config, weights, options.chunk, options.logit_rows)?;
     Ok(LoadedHybrid {
         model,
@@ -141,6 +167,22 @@ pub fn load_with(
     })
 }
 
+/// Whether `c`'s routed experts stay in the file and stream into an arena:
+/// always for qwen4exp (larger than any Mac it targets), and for any MoE
+/// model under `FERRUM_STREAM_EXPERTS=1` (to compare against it resident).
+pub fn streams_experts(c: &HybridConfig) -> bool {
+    c.variant == config::Variant::Qwen4Exp
+        || (c.moe.is_some() && std::env::var("FERRUM_STREAM_EXPERTS").is_ok_and(|v| v == "1"))
+}
+
+/// I/O threads reading experts (`FERRUM_STREAM_THREADS`, default 6).
+fn stream_threads() -> usize {
+    std::env::var("FERRUM_STREAM_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6)
+}
+
 /// `load_with` for an MLX checkpoint directory (`mlx`).
 fn load_mlx(
     device: &MetalDevice,
@@ -150,6 +192,8 @@ fn load_mlx(
 ) -> Result<LoadedHybrid> {
     let mut config = mlx::config(dir)?;
     config.kv_cache = options.kv_cache;
+    let mut options = options;
+    options.chunk = plan::model_chunk(&config, options.chunk);
     let plan = plan::plan_for_weights(
         mlx::weight_bytes(dir, &config)?,
         &config,

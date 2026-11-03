@@ -317,6 +317,7 @@ impl HybridModel {
             let mut times = Vec::new();
             for rep in 0..reps + 2 {
                 state.restore_snapshot(d, &saved, context, written)?;
+                state.set_ple_context(&tokens[..context]);
                 let start = std::time::Instant::now();
                 self.forward(d, &mut state, &tokens[context..context + m], Output::Argmax)?;
                 if rep >= 2 {

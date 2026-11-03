@@ -338,6 +338,7 @@ impl Tensor {
 #[derive(Clone)]
 pub(crate) struct PackedStorage {
     storage: Rc<MetalBuffer>,
+    offset: usize,
     byte_len: usize,
 }
 impl PackedStorage {
@@ -353,11 +354,22 @@ impl PackedStorage {
         storage.with_bytes_mut(fill)?;
         Ok(Self {
             storage: Rc::new(storage),
+            offset: 0,
             byte_len,
         })
     }
+    /// `byte_len` bytes at `offset` of `storage`, which is never mapped (an
+    /// expert arena region the host fills outside the tensor rules).
+    pub(crate) fn region(storage: Rc<MetalBuffer>, offset: usize, byte_len: usize) -> Self {
+        assert!(offset + byte_len <= storage.len_bytes());
+        Self {
+            storage,
+            offset,
+            byte_len,
+        }
+    }
     pub(crate) fn binding(&self) -> (&MetalBuffer, usize, usize) {
-        (&self.storage, 0, self.byte_len)
+        (&self.storage, self.offset, self.byte_len)
     }
     #[cfg(feature = "legacy-engine")]
     pub(crate) fn buffer(&self) -> &MetalBuffer {
@@ -368,6 +380,6 @@ impl PackedStorage {
     }
     #[cfg(test)]
     pub(crate) fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
-        self.storage.with_bytes(0, self.byte_len, f)
+        self.storage.with_bytes(self.offset, self.byte_len, f)
     }
 }

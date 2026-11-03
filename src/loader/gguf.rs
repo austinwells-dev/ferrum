@@ -394,6 +394,10 @@ impl<R: Read + Seek> GgufReader<R> {
     pub fn file_len(&self) -> u64 {
         self.file_len
     }
+    /// File offset of the tensor-data section, which `TensorInfo::offset` is relative to.
+    pub fn tensor_data_offset(&self) -> u64 {
+        self.tensor_data_offset
+    }
     pub fn metadata(&self) -> &BTreeMap<String, MetadataValue> {
         &self.metadata
     }

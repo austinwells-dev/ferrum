@@ -1760,6 +1760,33 @@ fn gsq_formats_project_experts_like_the_cpu_dequant() {
             })
             .collect();
         assert_close(&yt.to_f32(), &want, &format!("{name} sorted experts"));
+
+        // Streamed: group z is stored at slot table[z]. Rows 0..3 read slot
+        // 2, rows 3..5 slot 0, as the arena path numbers a layer's experts.
+        let (table, offsets): ([u32; 2], [u32; 3]) = ([2, 0], [0, 3, 5]);
+        let sorted = 5;
+        let x = random(sorted * cols, 13);
+        let xt = Tensor::from_f32(&d, [sorted * cols], DType::F32, &x).unwrap();
+        let yt = Tensor::zeros(&d, [sorted * rows], DType::F32).unwrap();
+        let slots = u32s(&table);
+        HybridModel::project_mm_id_in(
+            &d,
+            &w,
+            &xt,
+            &u32s(&offsets),
+            Some((&slots, table.len())),
+            sorted,
+            &yt,
+        )
+        .unwrap();
+        let want: Vec<f32> = (0..sorted * rows)
+            .map(|i| {
+                let (row, r) = (i / rows, i % rows);
+                let slot = table[usize::from(row >= 3)] as usize;
+                dot_rows(&x[row * cols..], &dense, cols, slot * rows + r)
+            })
+            .collect();
+        assert_close(&yt.to_f32(), &want, &format!("{name} arena slots"));
     }
 }
 

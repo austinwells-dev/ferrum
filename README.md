@@ -19,6 +19,7 @@ You give it a model file and then either chat in the terminal, use the full-scre
 > - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts. A request can also lower an image's token budget below `--image-tokens` ([per-request image sizes](docs/server.md#image-size-per-request)).
 > - **Image generation.** Qwen-Image-2.1-Turbo drawing and editing in the CLI, server and TUI, and the TUI tools `generate_image` and `view_image`.
 > - **LFM3.** LiquidAI LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input (WAV).
+> - **Qwen3.8-Flash-Next.** The 35 GiB Q2_0 pack runs on a 32 GB Mac: its experts stream from the SSD. 16.8–18.4 tok/s decode and 232–315 tok/s prefill on an M5, ahead of Strata on the same Mac; up to 23 tok/s with a DFlash2 drafter on short prompts ([details](docs/experimental.md#qwen38-flash-next)).
 >
 > Everything else behaves as on `main`. Details and known gaps: [docs/experimental.md](docs/experimental.md).
 
@@ -67,11 +68,12 @@ hf download peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP \
   Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf --local-dir ~/models
 ```
 
-**Experimental:** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks), Spark-X2.6-4B (XHToken, dense, sliding windows and per-head gates) and LFM3 (LiquidAI: LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input). One quant of Flint and of Spark is validated. LFM3's checks are in [experimental.md](docs/experimental.md#lfm3-17b), [experimental.md](docs/experimental.md#lfm3-vl-2b) and [experimental.md](docs/experimental.md#lfm3-audio-2b):
+**Experimental:** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks), Qwen3.8-Flash-Next (ISTA-DASLab's Q2_0 pack, [experts streamed from the SSD](docs/experimental.md#qwen38-flash-next)), Spark-X2.6-4B (XHToken, dense, sliding windows and per-head gates) and LFM3 (LiquidAI: LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input). One quant of Flint and of Spark is validated. LFM3's checks are in [experimental.md](docs/experimental.md#lfm3-17b), [experimental.md](docs/experimental.md#lfm3-vl-2b) and [experimental.md](docs/experimental.md#lfm3-audio-2b):
 
 | Model | Hugging Face repo | File | Size |
 |---|---|---|---|
 | Flint Preview (MoE, experimental) | [`unsloth/flint-GGUF`](https://huggingface.co/unsloth/flint-GGUF) | `flint-UD-Q3_K_XL.gguf` | 18.5 GB |
+| Qwen3.8-Flash-Next (MoE, experts streamed, experimental) | [`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` and `-00002-of-00002.gguf` | 37.6 + 28.8 GB |
 | Spark-X2.6-4B (dense, experimental) | [`XHToken/Spark-X2.6-4B-GGUF`](https://huggingface.co/XHToken/Spark-X2.6-4B-GGUF) | `Spark-X2.6-4B-Q4_K_M.gguf` | 3.5 GB |
 | LFM3-1.7B (text, experimental) | [`LiquidAI/LFM3-1.7B-GGUF`](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) | `LFM3-1.7B-Q4_K_M.gguf` | 1.1 GB |
 | LFM3-VL-2B (still images, experimental) | [`LiquidAI/LFM3-VL-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF) | `LFM3-VL-2B-Q4_K_M.gguf` and `mmproj-LFM3-VL-2B-Q8_0.gguf` | 1.1 GB + 194 MB |
@@ -223,7 +225,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | [Development](docs/development.md) | Building, testing (including Metal validation layers), profiling, using Ferrum as a library |
 | [Architecture](docs/architecture.md) | Tensor and storage model, Metal backend, safety argument, the hybrid engine |
 | [Vision](docs/vision.md) | How image and speech input is encoded and positioned |
-| [Experimental](docs/experimental.md) | Flint, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation: status, validation numbers, known gaps |
+| [Experimental](docs/experimental.md) | Flint, Qwen3.8-Flash-Next, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation: status, validation numbers, known gaps |
 | [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
 | [Contributing](AGENTS.md) | Branch and PR flow (topic → `experimental` → `main`), checks, docs and regression rules |
 
@@ -231,7 +233,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - Batch size 1. `ferrum-server --parallel N` serves up to 8 requests at once in separate sessions that take turns on the GPU, so their streams interleave but total throughput is that of one request.
-- The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint, Spark and LFM3. Other architectures go through the developer runner, built with `--features legacy-engine`.
+- The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint, Qwen3.8-Flash-Next, Spark and LFM3. Other architectures go through the developer runner, built with `--features legacy-engine`.
 - Vision supports the Qwen3-VL projector and, experimentally, LFM3-VL still images. No video. LFM3-Audio hears WAV clips of up to 120 s each (experimental; also the TUI's Audio tab); it does not speak.
 - Image generation and editing (`ferrum-cli image`, `ferrum-server --image-model` with `/v1/images/generations` and `/v1/images/edits`, the TUI Image tab, and the chat and agent tool `generate_image`) supports Qwen-Image-2.1-Turbo from safetensors, and the base model's transformer from GGUF; a new 1024² picture takes about 69 s. See [experimental.md](docs/experimental.md#image-generation).
 - No training and no language bindings.

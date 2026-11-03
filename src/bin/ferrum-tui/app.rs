@@ -352,10 +352,7 @@ impl App {
         }
         self.mode = fav.mode;
         let name = fav.name.clone();
-        let found = self
-            .models
-            .iter()
-            .position(|m| m.path.display().to_string() == fav.model);
+        let found = self.fav_model_index(fav);
         self.sel = 0;
         match found {
             Some(at) if self.models[at].problem.is_some() => {

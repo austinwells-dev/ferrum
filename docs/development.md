@@ -4,10 +4,10 @@
 
 | Path | Contents |
 |---|---|
-| `src/metal/` | Metal backend: device, pipeline cache, command batching, residency. The only module allowed to use `unsafe`. `metal/legacy.rs` holds the general engine's dispatcher and kernel switches |
+| `src/metal/` | Metal backend: device, pipeline cache, command batching, residency, and the expert arena that streams experts from the SSD (`stream.rs`). The only module allowed to use `unsafe`. `metal/legacy.rs` holds the general engine's dispatcher and kernel switches |
 | `src/metal/shaders/` | All GPU kernels (`hybrid.metal` and `hybrid_mlx.metal` for the hybrid engine; `ops.metal` and `project_mpp.metal` for the general engine, plus the keep-alive kernel) |
 | `src/tensor/`, `src/loader/` | Tensors; safetensors and GGUF parsing |
-| `src/hybrid/` | The engine the apps run: Qwen3.5-family hybrids (and, experimentally, Flint, Spark and LFM3): memory planner, forward pass, sessions, drafters |
+| `src/hybrid/` | The engine the apps run: Qwen3.5-family hybrids (and, experimentally, Flint, Spark and LFM3): memory planner, forward pass, sessions, drafters. Experimental Qwen3.8-Flash-Next: hyper-connection layer stack in `engine/qwen4exp.rs`, n-gram embedding table in `ple.rs`, expert streaming in `stream.rs`; kernel parity in `hc_tests.rs` and `iq_tests.rs` |
 | `src/diffusion/` | Qwen-Image-2.1 drawing and editing: transformer, VAE decoder and encoder (`vae_encoder.rs`), text-encoder and vision-tower glue, staged pipeline (kernels in `diffusion.metal`, `diffusion_vae.metal`; compiled only for image runs) |
 | `src/vision/`, `src/tokenizer/` | Qwen3-VL and LFM3-VL image encoders (from a GGUF projector; Qwen DeepStack from safetensors), the LFM3-Audio speech encoder (`lfm3a.rs`) and its WAV and mel front end (`audio.rs`); tokenizers |
 | `src/model/`, `src/ops/`, `src/nn/`, `src/generation.rs`, `src/sampling.rs`, `src/quantization.rs`, `src/reference/` | The general transformer engine (Qwen2.5/3, Granite, OLMo 2, LFM2) and its CPU test oracles. Built only with `--features legacy-engine` |
@@ -55,6 +55,7 @@ cargo run --release -- hybrid --model /path/to/model.gguf --raw --prompt 'The ca
 - `FERRUM_NATIVE_MATMUL=0` switches to a slower diagnostic matrix-multiply fallback.
 - `FERRUM_KV_CACHE=q8` makes every tool and front end default to the 8-bit K/V cache (an explicit `--kv-cache` or TUI setting wins).
 - `FERRUM_EARLY_COMMIT=N` commits each execution's first command buffer after N kernels (default 32) without waiting, so the GPU starts while the CPU encodes the rest of the step. `0` restores one command buffer per step. Worth about 2–3% decode on the 35B MoE; neutral on the dense 27B.
+- Streamed experts (Qwen3.8-Flash-Next always; [architecture.md](architecture.md#the-hybrid-engine)): `FERRUM_STREAM_EXPERTS=1` streams any MoE model's experts, to compare against it loaded whole; `FERRUM_EXPERT_ARENA_GIB=N` sets the arena size (default: all the memory the plan leaves); `FERRUM_STREAM_THREADS=N` sets the I/O threads (default 6); `FERRUM_STREAM_AHEAD=0` turns read-ahead off; `FERRUM_HC_BF16=1` keeps the hyper-connection projections BF16 instead of Q8_0.
 - `FERRUM_HYBRID_LEGACY_ATTENTION=1` restores the Phase 9 attention routing (simdgroup kernels for 2–15 query rows, unstaged TensorOps prompt attention) for A/B runs. It reads only an F16 cache.
 - Native BF16 kernels need a capable Metal compiler and GPU, and `info` reports whether yours qualifies. Devices older than the M5 have not been validated.
 

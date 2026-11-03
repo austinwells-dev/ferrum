@@ -46,5 +46,7 @@ pub enum Error {
     Cancelled,
     #[error("numerical validation: {0}")]
     Validation(String),
+    #[error("I/O: {0}")]
+    Io(#[from] std::io::Error),
 }
 pub type Result<T> = std::result::Result<T, Error>;

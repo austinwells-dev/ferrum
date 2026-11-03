@@ -1259,6 +1259,38 @@ MV_KERNEL(h_mv_q4_0, mv_q4_0, 4, 2)
 MV_KERNEL(h_mv_f32, mv_f32, 4, 2)
 MV_KERNEL(h_mv_bf16, mv_bf16, 4, 2)
 
+// BF16 with 16-byte loads (eight values per lane) and NR0 rows per SIMD
+// group: the hyper-connection matrices are 320 rows of 10240 or 10240 of
+// 320, too few rows or too short for the 4-row, 8-byte-load kernel above to
+// keep the GPU busy. K must be a multiple of 8.
+template<short NR0, short NSG>
+void mv_bf16_wide(constant ProjArgs & a, device const char * w, device const float * x, device float * y,
+                  uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
+    const int nrows = min(int(NR0), int(a.n) - first_row);
+    if (nrows <= 0) return;
+    device const float4 * xv = (device const float4 *)(x + (ulong)tgpig.y * a.x_stride);
+    float sumf[NR0] = {0.f};
+    for (uint i = tiisg; i < a.k / 8; i += 32) {
+        const float4 x0 = xv[2 * i], x1 = xv[2 * i + 1];
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            if (row >= nrows) break;
+            const uint4 b = ((device const uint4 *)(w + (ulong)(first_row + row) * a.row_bytes))[i];
+            const float4 w0 = float4(as_type<float>(b.x << 16), as_type<float>(b.x & 0xffff0000u),
+                                     as_type<float>(b.y << 16), as_type<float>(b.y & 0xffff0000u));
+            const float4 w1 = float4(as_type<float>(b.z << 16), as_type<float>(b.z & 0xffff0000u),
+                                     as_type<float>(b.w << 16), as_type<float>(b.w & 0xffff0000u));
+            sumf[row] += dot(x0, w0) + dot(x1, w1);
+        }
+    }
+    device float * out = y + (ulong)tgpig.y * a.y_stride;
+    for (int row = 0; row < nrows; ++row) {
+        const float t = simd_sum(sumf[row]);
+        if (tiisg == 0) out[first_row + row] = t;
+    }
+}
+MV_KERNEL(h_mv_bf16_wide, mv_bf16_wide, 1, 4)
+
 kernel void h_mv_q8_0(constant ProjArgs & a [[buffer(3)]], device const char * w [[buffer(0)]],
                       device const float * x [[buffer(1)]], device float * y [[buffer(2)]],
                       threadgroup float * shmem [[threadgroup(0)]],
@@ -1825,9 +1857,10 @@ kernel void h_gdn_recurrent_tree(constant DeltaArgs & p [[buffer(6)]],
     gdn_recurrent_tree_impl<4>(p, qkv, g, b, state, tree, out, tgpig, tpitg);
 }
 
-struct GatedNormArgs { uint heads; uint head_dim; float eps; };
+struct GatedNormArgs { uint heads; uint head_dim; float eps; uint sigmoid; };
 
-// y = rmsnorm(o) * w * silu(z) per (token, head); one threadgroup of head_dim threads.
+// y = rmsnorm(o) * w * silu(z) per (token, head), or * sigmoid(z) (qwen4exp);
+// one threadgroup of head_dim threads.
 kernel void h_gated_rmsnorm(constant GatedNormArgs & p [[buffer(4)]],
                             device const float * o [[buffer(0)]], device const float * z [[buffer(1)]],
                             device const float * w [[buffer(2)]], device float * y [[buffer(3)]],
@@ -1838,7 +1871,8 @@ kernel void h_gated_rmsnorm(constant GatedNormArgs & p [[buffer(4)]],
     const float ss = block_sum(v * v, scratch, tid, p.head_dim);
     const float scale = rsqrt(ss / float(p.head_dim) + p.eps);
     const float zv = z[idx];
-    y[idx] = v * scale * w[tid] * (zv / (1.f + exp(-zv)));
+    const float gate = 1.f / (1.f + exp(-zv));
+    y[idx] = v * scale * w[tid] * (p.sigmoid ? gate : zv * gate);
 }
 
 // ---------------------------------------------------------------- gated attention
@@ -2402,7 +2436,7 @@ constant constexpr int MM_ID_NRB = 32;
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
 void mm_id_impl(constant MoeMmArgs & a, device const char * w, device const float * x,
                 device const uint * offsets, device float * y,
-                threadgroup half * sa, uint3 tgpig, ushort tiitg) {
+                threadgroup half * sa, uint3 tgpig, ushort tiitg, uint stored) {
     const uint e = tgpig.z;
     const uint first = offsets[e];
     const int count = int(offsets[e + 1] - first);
@@ -2411,7 +2445,7 @@ void mm_id_impl(constant MoeMmArgs & a, device const char * w, device const floa
     const int M = a.expert_rows;
     const int ra = tgpig.y * MM_NRA;
     const int rb = tgpig.x * MM_ID_NRB;
-    device const char * we = w + (ulong)e * a.expert_rows * a.p.row_bytes;
+    device const char * we = w + (ulong)stored * a.expert_rows * a.p.row_bytes;
     auto tA = tensor(sa, dextents<int32_t, 2>(MM_NK, MM_NRA));
     auto tB = tensor((device float *)(x + (ulong)first * a.p.x_stride), dextents<int32_t, 2>(K, count),
                      array<int, 2>({1, int(a.p.x_stride)}));
@@ -2450,7 +2484,16 @@ kernel void NAME(constant MoeMmArgs & a [[buffer(4)]], device const char * w [[b
                  device const float * x [[buffer(1)]], device const uint * offsets [[buffer(2)]], \
                  device float * y [[buffer(3)]], threadgroup half * sa [[threadgroup(0)]], \
                  uint3 tgpig [[threadgroup_position_in_grid]], ushort tiitg [[thread_index_in_threadgroup]]) { \
-    mm_id_impl<BLOCK, NL, DEQ<half4x4>>(a, w, x, offsets, y, sa, tgpig, tiitg); \
+    mm_id_impl<BLOCK, NL, DEQ<half4x4>>(a, w, x, offsets, y, sa, tgpig, tiitg, tgpig.z); \
+}
+// The same over streamed experts: group z's expert is stored at arena slot slots[z].
+#define MM_ID_SLOT_KERNEL(NAME, BLOCK, NL, DEQ) \
+kernel void NAME(constant MoeMmArgs & a [[buffer(5)]], device const char * w [[buffer(0)]], \
+                 device const float * x [[buffer(1)]], device const uint * offsets [[buffer(2)]], \
+                 device const uint * slots [[buffer(3)]], \
+                 device float * y [[buffer(4)]], threadgroup half * sa [[threadgroup(0)]], \
+                 uint3 tgpig [[threadgroup_position_in_grid]], ushort tiitg [[thread_index_in_threadgroup]]) { \
+    mm_id_impl<BLOCK, NL, DEQ<half4x4>>(a, w, x, offsets, y, sa, tgpig, tiitg, slots[tgpig.z]); \
 }
 MM_ID_KERNEL(h_mm_id_q4_k, block_q4_K, 16, dequantize_q4_K)
 MM_ID_KERNEL(h_mm_id_q5_k, block_q5_K, 16, dequantize_q5_K)
@@ -2465,6 +2508,19 @@ MM_ID_KERNEL(h_mm_id_q2_0, block_q2_0, 4, dequantize_q2_0)
 MM_ID_KERNEL(h_mm_id_q5_0, block_q5_0, 2, dequantize_q5_0)
 MM_ID_KERNEL(h_mm_id_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
 MM_ID_KERNEL(h_mm_id_q3_k, block_q3_K, 16, dequantize_q3_K)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q4_k, block_q4_K, 16, dequantize_q4_K)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q5_k, block_q5_K, 16, dequantize_q5_K)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q6_k, block_q6_K, 16, dequantize_q6_K)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q8_0, block_q8_0, 2, dequantize_q8_0)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q4_0, block_q4_0, 2, dequantize_q4_0)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq3_s, block_iq3_s, 16, dequantize_iq3_s)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq2_s, block_iq2_s, 16, dequantize_iq2_s)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q2_0, block_q2_0, 4, dequantize_q2_0)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q5_0, block_q5_0, 2, dequantize_q5_0)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q3_k, block_q3_K, 16, dequantize_q3_K)
 
 // ---------------------------------------------------------------- flash attention
 
@@ -4183,4 +4239,176 @@ kernel void a_dwconv_s2(constant ADwArgs & p [[buffer(4)]], device const float *
         }
     }
     out[i] = acc;
+}
+
+// ---------------------------------------------------------------- qwen4exp hyper-connections
+
+struct GroupNormArgs { uint n; float eps; uint rows; uint groups; };
+
+// y = rmsnorm(x) * w per row of n; row r takes gamma row r % groups (the
+// residual stream it belongs to). One threadgroup (256 threads) per row.
+kernel void h_group_rmsnorm(constant GroupNormArgs & a [[buffer(3)]], device const float * x [[buffer(0)]],
+                            device const float * w [[buffer(1)]], device float * y [[buffer(2)]],
+                            uint row [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    device const float * xr = x + (ulong)row * a.n;
+    device const float * wr = w + (ulong)(row % a.groups) * a.n;
+    float ss = 0.f;
+    for (uint i = tid; i < a.n; i += 256) ss += xr[i] * xr[i];
+    ss = block_sum(ss, scratch, tid, 256);
+    const float scale = rsqrt(ss / float(a.n) + a.eps);
+    device float * yr = y + (ulong)row * a.n;
+    for (uint i = tid; i < a.n; i += 256) yr[i] = xr[i] * scale * wr[i];
+}
+
+struct ScaleArgs { uint n; float scale; };
+
+// x = silu(x * scale), in place.
+kernel void h_scaled_silu(constant ScaleArgs & a [[buffer(1)]], device float * x [[buffer(0)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i >= a.n) return;
+    const float v = x[i] * a.scale;
+    x[i] = v / (1.f + exp(-v));
+}
+
+struct HcArgs { uint n; uint streams; uint rows; };
+
+// y[t] = mean over streams s of xn[t][s] * sigmoid(gate[t][s]).
+kernel void h_hc_mix(constant HcArgs & a [[buffer(3)]], device const float * xn [[buffer(0)]],
+                     device const float * gate [[buffer(1)]], device float * y [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= a.n * a.rows) return;
+    const uint t = i / a.n, c = i % a.n;
+    float sum = 0.f;
+    for (uint s = 0; s < a.streams; s++) {
+        const ulong at = ((ulong)t * a.streams + s) * a.n + c;
+        sum += xn[at] / (1.f + exp(-gate[at]));
+    }
+    y[i] = sum / float(a.streams);
+}
+
+// y[t] = the mean of the streams res[t][s]: what drafters read of a layer.
+kernel void h_hc_mean(constant HcArgs & a [[buffer(2)]], device const float * res [[buffer(0)]],
+                      device float * y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i >= a.n * a.rows) return;
+    const uint t = i / a.n, c = i % a.n;
+    float sum = 0.f;
+    for (uint s = 0; s < a.streams; s++) sum += res[((ulong)t * a.streams + s) * a.n + c];
+    y[i] = sum / float(a.streams);
+}
+
+// res[t][s] += out[t] * 2 sigmoid(inject[t][s] / streams), in place.
+kernel void h_hc_write(constant HcArgs & a [[buffer(3)]], device const float * out [[buffer(0)]],
+                       device const float * inject [[buffer(1)]], device float * res [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= a.n * a.rows) return;
+    const uint t = i / a.n, c = i % a.n;
+    const float o = out[i];
+    for (uint s = 0; s < a.streams; s++) {
+        const float w = 2.f / (1.f + exp(-inject[t * a.streams + s] / float(a.streams)));
+        res[((ulong)t * a.streams + s) * a.n + c] += o * w;
+    }
+}
+
+// res[t][s] = x[t]: the residual starts as copies of the embedding.
+kernel void h_hc_expand(constant HcArgs & a [[buffer(2)]], device const float * x [[buffer(0)]],
+                        device float * res [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i >= a.n * a.rows) return;
+    const uint t = i / a.n, c = i % a.n;
+    for (uint s = 0; s < a.streams; s++) res[((ulong)t * a.streams + s) * a.n + c] = x[i];
+}
+
+// ---------------------------------------------------------------- qwen4exp n-gram embedding
+
+struct PleGateArgs { uint n; uint streams; uint rows; float eps; };
+
+// Per (token t, stream s), one threadgroup of 256: the gate of the stream is
+// sigmoid(signed sqrt(rmsnorm(key)·nk · rmsnorm(res)·nq / sqrt(n))); the
+// value broadcast to it, scaled by the gate, is `gated`, and its rmsnorm
+// times nc is `normed` (the conv input).
+kernel void h_ple_gate(constant PleGateArgs & a [[buffer(8)]], device const float * key [[buffer(0)]],
+                       device const float * res [[buffer(1)]], device const float * value [[buffer(2)]],
+                       device const float * nk [[buffer(3)]], device const float * nq [[buffer(4)]],
+                       device const float * nc [[buffer(5)]],
+                       device float * gated [[buffer(6)]], device float * normed [[buffer(7)]],
+                       uint row [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    const uint t = row / a.streams, s = row % a.streams;
+    device const float * kr = key + (ulong)row * a.n;
+    device const float * qr = res + (ulong)row * a.n;
+    device const float * vr = value + (ulong)t * a.n;
+    device const float * nkr = nk + (ulong)s * a.n;
+    device const float * nqr = nq + (ulong)s * a.n;
+    device const float * ncr = nc + (ulong)s * a.n;
+    float kk = 0.f, qq = 0.f, kq = 0.f, vv = 0.f;
+    for (uint i = tid; i < a.n; i += 256) {
+        const float k = kr[i], q = qr[i], v = vr[i];
+        kk += k * k; qq += q * q; kq += k * nkr[i] * q * nqr[i]; vv += v * v;
+    }
+    kk = block_sum(kk, scratch, tid, 256);
+    qq = block_sum(qq, scratch, tid, 256);
+    kq = block_sum(kq, scratch, tid, 256);
+    vv = block_sum(vv, scratch, tid, 256);
+    const float n = float(a.n);
+    const float score = kq * rsqrt(kk / n + a.eps) * rsqrt(qq / n + a.eps) / sqrt(n);
+    const float mag = sqrt(max(abs(score), 1e-6f));
+    const float gate = 1.f / (1.f + exp(-(score > 0.f ? mag : score < 0.f ? -mag : 0.f)));
+    // rmsnorm(value * gate) = value * gate / sqrt(gate^2 mean(value^2) + eps)
+    const float scale = gate * rsqrt(gate * gate * vv / n + a.eps);
+    device float * gr = gated + (ulong)row * a.n;
+    device float * nr = normed + (ulong)row * a.n;
+    for (uint i = tid; i < a.n; i += 256) {
+        gr[i] = vr[i] * gate;
+        nr[i] = vr[i] * scale * ncr[i];
+    }
+}
+
+struct PleConvArgs { uint channels; uint rows; uint kernel_size; uint dilation; uint keep; };
+
+// Depthwise causal conv dilated by the n-gram size over the history
+// (`hist`, (kernel_size - 1) * dilation rows, oldest first) followed by the
+// rows of `normed`; res[t] += gated[t] + silu(conv[t]). One thread per
+// channel walks the tokens; the history keeps the newest rows.
+kernel void h_ple_conv(constant PleConvArgs & a [[buffer(5)]], device const float * normed [[buffer(0)]],
+                       device const float * gated [[buffer(1)]], device const float * w [[buffer(2)]],
+                       device float * hist [[buffer(3)]], device float * res [[buffer(4)]],
+                       uint c [[thread_position_in_grid]]) {
+    if (c >= a.channels) return;
+    const uint h = (a.kernel_size - 1) * a.dilation;
+    // P[j] for j < h is history row j, else normed row j - h.
+    for (uint t = 0; t < a.rows; t++) {
+        float acc = 0.f;
+        for (uint k = 0; k < a.kernel_size; k++) {
+            const uint j = t + k * a.dilation;
+            const float x = j < h ? hist[(ulong)j * a.channels + c] : normed[(ulong)(j - h) * a.channels + c];
+            acc += w[(ulong)c * a.kernel_size + k] * x;
+        }
+        const ulong at = (ulong)t * a.channels + c;
+        res[at] += gated[at] + acc / (1.f + exp(-acc));
+    }
+    // The newest h rows of P become the history (a verify leaves it to
+    // `h_ple_push` at commit).
+    if (a.keep) return;
+    if (a.rows >= h) {
+        for (uint j = 0; j < h; j++) hist[(ulong)j * a.channels + c] = normed[(ulong)(a.rows - h + j) * a.channels + c];
+    } else {
+        for (uint j = 0; j < h - a.rows; j++) hist[(ulong)j * a.channels + c] = hist[(ulong)(j + a.rows) * a.channels + c];
+        for (uint j = 0; j < a.rows; j++) hist[(ulong)(h - a.rows + j) * a.channels + c] = normed[(ulong)j * a.channels + c];
+    }
+}
+
+struct PlePushArgs { uint channels; uint rows; uint history; };
+
+// Commit: the first `rows` rows of a verify's conv inputs join the history,
+// which keeps its newest `history` rows.
+kernel void h_ple_push(constant PlePushArgs & a [[buffer(2)]], device const float * rows [[buffer(0)]],
+                       device float * hist [[buffer(1)]], uint c [[thread_position_in_grid]]) {
+    if (c >= a.channels) return;
+    const uint h = a.history;
+    if (a.rows >= h) {
+        for (uint j = 0; j < h; j++) hist[(ulong)j * a.channels + c] = rows[(ulong)(a.rows - h + j) * a.channels + c];
+    } else {
+        for (uint j = 0; j < h - a.rows; j++) hist[(ulong)j * a.channels + c] = hist[(ulong)(j + a.rows) * a.channels + c];
+        for (uint j = 0; j < a.rows; j++) hist[(ulong)(h - a.rows + j) * a.channels + c] = rows[(ulong)j * a.channels + c];
+    }
 }

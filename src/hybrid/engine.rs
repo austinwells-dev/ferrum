@@ -10,6 +10,8 @@ use super::{
 use crate::{DType, Error, MetalDevice, Result, Tensor, metal::MetalBuffer};
 use std::cell::RefCell;
 
+mod qwen4exp;
+
 type Binding<'a> = (&'a MetalBuffer, usize, usize);
 
 /// Little-endian kernel parameter block.
@@ -232,6 +234,15 @@ pub struct HybridState {
     written: usize,
     /// Format of the K/V caches (`kv_planes`).
     kv_cache: KvCache,
+    /// qwen4exp: the n-gram embedding's conv history (its last
+    /// `(conv_kernel - 1) * ngram` input rows) and the tokens before `len`
+    /// its hash reads (at most `ngram - 1`).
+    ple: Option<Tensor>,
+    ple_tokens: Vec<u32>,
+    /// The tokens of the latest verify, until `commit` takes the accepted ones.
+    ple_pending: Vec<u32>,
+    /// The n-gram length (0 without the embedding).
+    ple_ngram: usize,
 }
 
 /// Rows of the K/V ring of sliding-window `layer` when a forward adds at most
@@ -289,6 +300,17 @@ impl HybridState {
             max_rows,
             written: 0,
             kv_cache: c.kv_cache,
+            ple: match &c.qwen4exp {
+                Some(q) if !q.ple.layers.is_empty() => Some(Tensor::zeros_resident(
+                    d,
+                    [(q.ple.conv_kernel - 1) * q.ple.ngram * q.hc_streams * c.hidden],
+                    DType::F32,
+                )?),
+                _ => None,
+            },
+            ple_tokens: Vec::new(),
+            ple_pending: Vec::new(),
+            ple_ngram: c.qwen4exp.as_ref().map_or(0, |q| q.ple.ngram),
         };
         for layer in 0..c.layers {
             let ring = if c.is_attention(layer) {
@@ -345,6 +367,7 @@ impl HybridState {
         [&self.k, &self.v, &self.conv, &self.ssm]
             .iter()
             .flat_map(|v| v.iter().flatten())
+            .chain(&self.ple)
             .map(|t| page(t.byte_size()))
             .sum()
     }
@@ -356,6 +379,8 @@ impl HybridState {
         self.verified_tree.clear();
         self.written = 0;
         self.media.clear();
+        self.ple_tokens.clear();
+        self.ple_pending.clear();
     }
     /// Whether every K/V row a forward at `position` reads is still intact:
     /// a ring layer must not have overwritten the start of that window.
@@ -453,7 +478,26 @@ impl HybridState {
     }
     /// Recurrent tensors (conv windows then delta-rule matrices) in a fixed order.
     pub(crate) fn recurrent(&self) -> impl Iterator<Item = &Tensor> {
-        self.conv.iter().flatten().chain(self.ssm.iter().flatten())
+        self.conv
+            .iter()
+            .flatten()
+            .chain(self.ssm.iter().flatten())
+            .chain(self.ple.iter())
+    }
+    /// After a restore to the end of `before`: the tokens an n-gram embedding
+    /// hashes the next token with (its conv history is restored with the
+    /// recurrent state).
+    /// Append `tokens` to the n-gram context, which keeps the newest
+    /// `ngram - 1`.
+    pub(crate) fn push_ple_tokens(&mut self, tokens: &[u32]) {
+        let keep = self.ple_ngram.saturating_sub(1);
+        self.ple_tokens.extend_from_slice(tokens);
+        let drop = self.ple_tokens.len().saturating_sub(keep);
+        self.ple_tokens.drain(..drop);
+    }
+    pub(crate) fn set_ple_context(&mut self, before: &[u32]) {
+        let keep = self.ple_ngram.saturating_sub(1);
+        self.ple_tokens = before[before.len().saturating_sub(keep)..].to_vec();
     }
     /// Whether the model has recurrent state (only attention-only models, such
     /// as Flint, have none: their append-only K/V cache can resume anywhere).
@@ -611,6 +655,7 @@ pub(crate) struct Scratch {
     pub(crate) token: Tensor,
     pub(crate) candidates: Tensor,
     moe: Option<MoeScratch>,
+    hc: Option<qwen4exp::HcScratch>,
 }
 
 /// Routing and expert buffers for `chunk * experts_used` routes.
@@ -666,6 +711,8 @@ pub(crate) struct Spec {
     tape_qkv: Vec<Tensor>,
     tape_g: Vec<Tensor>,
     tape_b: Vec<Tensor>,
+    /// `[rows, streams * hidden]`: the n-gram conv inputs of the verify rows.
+    tape_ple: Option<Tensor>,
     /// Recurrent-layer index of each layer (None for attention layers).
     recurrent_index: Vec<Option<usize>>,
     logits: Tensor,
@@ -683,6 +730,7 @@ impl Spec {
             .chain(&self.tape_qkv)
             .chain(&self.tape_g)
             .chain(&self.tape_b)
+            .chain(&self.tape_ple)
             .chain([&self.logits, &self.candidates, &self.tokens, &self.gather])
             .map(|t| page(t.byte_size()))
             .sum()
@@ -719,6 +767,7 @@ pub fn spec_bytes(c: &HybridConfig, chunk: usize, g: &SpecGeometry) -> usize {
             * (f32s(g.rows * c.conv_channels()) + 2 * f32s(g.rows * c.ssm_v_heads))
     };
     total
+        + qwen4exp::ple_tape_bytes(c, g.rows)
         + f32s(g.rows * c.vocab)
         + f32s(g.rows * c.vocab.div_ceil(1024) * 64)
         + f32s(g.rows)
@@ -960,7 +1009,11 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
             total += f32s(n);
         }
     }
-    total
+    let ahead = match super::streams_experts(c) {
+        true => super::stream::ahead_bytes(c, chunk),
+        false => 0,
+    };
+    total + qwen4exp::scratch_bytes(c, chunk) + ahead
 }
 
 /// Bytes of a `HybridState` for `capacity` positions, page-rounded.
@@ -1002,7 +1055,7 @@ pub fn recurrent_bytes(c: &HybridConfig) -> usize {
     }
     let conv = page((c.conv_kernel - 1) * c.conv_channels() * 4);
     let ssm = page(c.ssm_v_heads * c.ssm_head_dim * c.ssm_head_dim * 4);
-    c.recurrent_layer_count() * (conv + ssm)
+    c.recurrent_layer_count() * (conv + ssm) + qwen4exp::ple_state_bytes(c)
 }
 
 /// Width of the packed QKV / short-conv in-projection scratch.
@@ -1070,6 +1123,7 @@ impl Scratch {
             logits: f(&[logit_rows, c.vocab])?,
             token: f(&[1])?,
             candidates: f(&[c.vocab.div_ceil(1024) * 64])?,
+            hc: qwen4exp::HcScratch::new(d, c, chunk)?,
             moe: match c.moe {
                 None => None,
                 Some(moe) => {
@@ -1131,6 +1185,7 @@ impl Scratch {
                 .moe
                 .as_ref()
                 .map_or(0, |m| m.tensors().iter().map(|t| page(t.byte_size())).sum())
+            + self.hc.as_ref().map_or(0, qwen4exp::HcScratch::byte_size)
     }
 }
 
@@ -1271,6 +1326,10 @@ impl HybridModel {
             tape_qkv,
             tape_g,
             tape_b,
+            tape_ple: match qwen4exp::ple_tape_bytes(c, g.rows) {
+                0 => None,
+                _ => Some(f(&[g.rows, qwen4exp::ple_width(c)])?),
+            },
             recurrent_index,
             logits: f(&[g.rows, c.vocab])?,
             candidates: f(&[g.rows, c.vocab.div_ceil(1024) * 64])?,
@@ -1289,6 +1348,16 @@ impl HybridModel {
     }
     pub fn weight_bytes(&self) -> usize {
         self.weights.byte_size()
+    }
+    /// Expert streaming counters since the last reset (None when the
+    /// experts are resident).
+    pub fn stream_stats(&self) -> Option<super::stream::StreamStats> {
+        self.weights.stream.as_ref().map(|s| s.stats())
+    }
+    pub fn reset_stream_stats(&self) {
+        if let Some(s) = &self.weights.stream {
+            s.reset_stats();
+        }
     }
     pub fn scratch_bytes(&self) -> usize {
         self.scratch.borrow().byte_size()
@@ -1496,6 +1565,7 @@ impl HybridModel {
         state.valid = false;
         let e = d.execution_with_shared_encoder(true)?;
         self.replay(d, &s, spec, state, n, None)?;
+        self.commit_ple(d, spec, state, n)?;
         e.finish()?;
         state.len += n;
         state.verified = 0;
@@ -1842,9 +1912,17 @@ impl HybridModel {
         state.written = state.written.max(pos + m);
         let execution = d.execution_with_shared_encoder(true)?;
         if pos == 0 {
-            for t in state.conv.iter().chain(&state.ssm).flatten() {
+            for t in state
+                .conv
+                .iter()
+                .chain(&state.ssm)
+                .flatten()
+                .chain(&state.ple)
+            {
                 self.fill_zero(d, t)?;
             }
+            state.ple_tokens.clear();
+            state.ple_pending.clear();
         }
         let ids = Tensor::from_le_bytes(
             d,
@@ -1890,82 +1968,93 @@ impl HybridModel {
             Some(parents) => state.tree_plan(d, pos, parents)?,
             None => state.rope_plan(d, pos, m)?,
         };
-        self.rmsnorm(d, &x0, &self.weights.layers[0].attn_norm, &xn, m)?;
         let spec = self.spec.borrow();
         let spec = spec.as_ref();
-        let (mut cur, mut next) = (&x0, &x1);
-        for (i, layer) in self.weights.layers.iter().enumerate() {
-            match &layer.mixer {
-                Mixer::Attention(a) => {
-                    self.attention(d, &s, a, state, i, &xn, &mix, m, pos, &rope)?
+        if self.weights.hc_head.is_some() {
+            if tree.is_some() {
+                return Err(Error::Parameter(
+                    "draft trees are not available for hyper-connection models".into(),
+                ));
+            }
+            self.hc_layers(
+                d, &s, state, tokens, &x0, &xn, &mix, m, pos, &rope, verify, spec,
+            )?;
+        } else {
+            self.rmsnorm(d, &x0, &self.weights.layers[0].attn_norm, &xn, m)?;
+            let (mut cur, mut next) = (&x0, &x1);
+            for (i, layer) in self.weights.layers.iter().enumerate() {
+                match &layer.mixer {
+                    Mixer::Attention(a) => {
+                        self.attention(d, &s, a, state, i, &xn, &mix, m, pos, &rope)?
+                    }
+                    Mixer::ShortConv(w) => {
+                        let tape = match (verify, spec) {
+                            (true, Some(sp)) => {
+                                let r = sp.recurrent_index[i].expect("short conv is recurrent");
+                                Some(&sp.tape_qkv[r])
+                            }
+                            _ => None,
+                        };
+                        run_short_conv(d, c, &s, w, state, i, &xn, &mix, m, tape)?;
+                    }
+                    Mixer::Delta(w) => {
+                        let tape = match (verify, spec) {
+                            (true, Some(sp)) => {
+                                let r = sp.recurrent_index[i].expect("delta layer is recurrent");
+                                Some((&sp.tape_qkv[r], &sp.tape_g[r], &sp.tape_b[r]))
+                            }
+                            _ => None,
+                        };
+                        self.delta(d, &s, w, state, i, &xn, &mix, m, tape, rope.tree.as_ref())?
+                    }
                 }
-                Mixer::ShortConv(w) => {
-                    let tape = match (verify, spec) {
-                        (true, Some(sp)) => {
-                            let r = sp.recurrent_index[i].expect("short conv is recurrent");
-                            Some(&sp.tape_qkv[r])
-                        }
-                        _ => None,
-                    };
-                    run_short_conv(d, c, &s, w, state, i, &xn, &mix, m, tape)?;
+                // LFM3 sandwich: norm the branch, then the fused residual + next
+                // pre-norm. The dispatcher rejects an input that aliases an
+                // output, so the fused norm lands in `mix` and is copied back to
+                // `xn`, which is where the rest of the loop reads it.
+                if let Some(post) = &layer.post_attn {
+                    self.rmsnorm(d, &mix, post, &xn, m)?;
+                    self.add_rmsnorm(d, cur, &xn, &layer.post_norm, next, &mix, m)?;
+                    copy(d, &mix, &xn)?;
+                } else {
+                    self.add_rmsnorm(d, cur, &mix, &layer.post_norm, next, &xn, m)?;
                 }
-                Mixer::Delta(w) => {
-                    let tape = match (verify, spec) {
-                        (true, Some(sp)) => {
-                            let r = sp.recurrent_index[i].expect("delta layer is recurrent");
-                            Some((&sp.tape_qkv[r], &sp.tape_g[r], &sp.tape_b[r]))
-                        }
-                        _ => None,
-                    };
-                    self.delta(d, &s, w, state, i, &xn, &mix, m, tape, rope.tree.as_ref())?
+                std::mem::swap(&mut cur, &mut next);
+                match &layer.ffn {
+                    Ffn::Dense(f) => self.dense_ffn(d, &s, f, &xn, &mix, m)?,
+                    Ffn::Moe(f) => {
+                        self.dump(d, "attn_post_norm", i, &xn)?;
+                        self.moe_ffn(d, &s, f, Some(i), &xn, &mix, m)?;
+                        self.dump(d, "ffn_out", i, &mix)?;
+                    }
+                }
+                let norm = self
+                    .weights
+                    .layers
+                    .get(i + 1)
+                    .map_or(&self.weights.output_norm, |l| &l.attn_norm);
+                if let Some(post) = &layer.post_ffw {
+                    self.rmsnorm(d, &mix, post, &xn, m)?;
+                    self.add_rmsnorm(d, cur, &xn, norm, next, &mix, m)?;
+                    copy(d, &mix, &xn)?;
+                } else {
+                    self.add_rmsnorm(d, cur, &mix, norm, next, &xn, m)?;
+                }
+                std::mem::swap(&mut cur, &mut next);
+                if self.add_deepstack(d, state, i, cur, pos, m)? {
+                    self.rmsnorm(d, cur, norm, &xn, m)?;
+                }
+                self.dump(d, "l_out", i, cur)?;
+                if let Some(sp) = spec
+                    && let Some(features) = &sp.features
+                    && let Some(column) = sp.aux.iter().position(|&l| l == i)
+                {
+                    self.capture(d, cur, features, column, m)?;
                 }
             }
-            // LFM3 sandwich: norm the branch, then the fused residual + next
-            // pre-norm. The dispatcher rejects an input that aliases an
-            // output, so the fused norm lands in `mix` and is copied back to
-            // `xn`, which is where the rest of the loop reads it.
-            if let Some(post) = &layer.post_attn {
-                self.rmsnorm(d, &mix, post, &xn, m)?;
-                self.add_rmsnorm(d, cur, &xn, &layer.post_norm, next, &mix, m)?;
-                copy(d, &mix, &xn)?;
-            } else {
-                self.add_rmsnorm(d, cur, &mix, &layer.post_norm, next, &xn, m)?;
+            if let Some(hidden) = spec.and_then(|sp| sp.hidden.as_ref()) {
+                self.capture(d, &xn, hidden, 0, m)?;
             }
-            std::mem::swap(&mut cur, &mut next);
-            match &layer.ffn {
-                Ffn::Dense(f) => self.dense_ffn(d, &s, f, &xn, &mix, m)?,
-                Ffn::Moe(f) => {
-                    self.dump(d, "attn_post_norm", i, &xn)?;
-                    self.moe_ffn(d, &s, f, &xn, &mix, m)?;
-                    self.dump(d, "ffn_out", i, &mix)?;
-                }
-            }
-            let norm = self
-                .weights
-                .layers
-                .get(i + 1)
-                .map_or(&self.weights.output_norm, |l| &l.attn_norm);
-            if let Some(post) = &layer.post_ffw {
-                self.rmsnorm(d, &mix, post, &xn, m)?;
-                self.add_rmsnorm(d, cur, &xn, norm, next, &mix, m)?;
-                copy(d, &mix, &xn)?;
-            } else {
-                self.add_rmsnorm(d, cur, &mix, norm, next, &xn, m)?;
-            }
-            std::mem::swap(&mut cur, &mut next);
-            if self.add_deepstack(d, state, i, cur, pos, m)? {
-                self.rmsnorm(d, cur, norm, &xn, m)?;
-            }
-            self.dump(d, "l_out", i, cur)?;
-            if let Some(sp) = spec
-                && let Some(features) = &sp.features
-                && let Some(column) = sp.aux.iter().position(|&l| l == i)
-            {
-                self.capture(d, cur, features, column, m)?;
-            }
-        }
-        if let Some(hidden) = spec.and_then(|sp| sp.hidden.as_ref()) {
-            self.capture(d, &xn, hidden, 0, m)?;
         }
         // xn now holds output_norm(final hidden) for every position.
         let produced = if let Some(all) = all_logits {
@@ -2653,7 +2742,12 @@ impl HybridModel {
             "h_gated_rmsnorm",
             &[delta.binding(), z.binding(), w.norm.binding()],
             &[gated.binding()],
-            &Params::default().u(heads)?.u(c.ssm_head_dim)?.f(c.eps).0,
+            &Params::default()
+                .u(heads)?
+                .u(c.ssm_head_dim)?
+                .f(c.eps)
+                .u(usize::from(c.variant == Variant::Qwen4Exp))?
+                .0,
             [m * heads, 1, 1],
             [c.ssm_head_dim, 1, 1],
             0,
@@ -2781,11 +2875,15 @@ impl HybridModel {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// The routed and shared experts of trunk layer `layer` (`None`: a block
+    /// outside the trunk, whose experts are always resident).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn moe_ffn(
         &self,
         d: &MetalDevice,
         s: &Scratch,
         f: &MoeFfn,
+        layer: Option<usize>,
         xn: &Tensor,
         out: &Tensor,
         m: usize,
@@ -2838,13 +2936,106 @@ impl HybridModel {
         self.dump(d, "ffn_moe_weights", 0, &weights)?;
         self.dump(d, "ffn_shexp", 0, &shared)?;
         self.dump(d, "shared_expert_gate_sigmoid", 0, &shared_gate)?;
+        // Streamed experts: read the routes back, make their experts resident
+        // and route through their arena slots instead. Expert-sorted prompt
+        // rows number the layer's experts 0..k and look their slots up.
         let identity = routes <= MV_ID_MAX_ROUTES || exact_math();
+        let u32s = |d: &MetalDevice, v: &[u32]| {
+            Tensor::from_le_bytes(
+                d,
+                [v.len()],
+                DType::F32,
+                &v.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<_>>(),
+            )
+        };
+        let streamed = match (&self.weights.stream, layer) {
+            (Some(stream), Some(layer)) => {
+                // Guess the next layer's experts from this layer's input, to
+                // read them while this layer and the next mixer run.
+                let next = self
+                    .weights
+                    .layers
+                    .get(layer + 1)
+                    .and_then(|l| match &l.ffn {
+                        Ffn::Moe(f) => Some(f),
+                        Ffn::Dense(_) => None,
+                    })
+                    .zip(stream.ahead_scratch.as_ref())
+                    .filter(|(_, a)| m <= a.rows);
+                let k = |a: &super::stream::AheadScratch| match m <= super::stream::AHEAD_ROWS {
+                    true => a.k,
+                    false => used,
+                };
+                if let Some((nf, a)) = next {
+                    let k = k(a);
+                    let logits = rows(&a.logits, 0, m, experts)?;
+                    Self::project(d, &nf.router, xn, m, &logits)?;
+                    d.dispatch_hybrid(
+                        "h_moe_route",
+                        &[
+                            logits.binding(),
+                            xn.binding(),
+                            nf.shared_gate_inp.as_ref().unwrap_or(xn).binding(),
+                        ],
+                        &[
+                            a.ids.view(0, [m * k])?.binding(),
+                            a.weights.view(0, [m * k])?.binding(),
+                            a.shared_gate.view(0, [m])?.binding(),
+                        ],
+                        &Params::default()
+                            .u(experts)?
+                            .u(k)?
+                            .u(hidden)?
+                            .u(m)?
+                            .u(usize::from(moe.sigmoid))?
+                            .u(usize::from(moe.norm_weights))?
+                            .u(0)?
+                            .0,
+                        [m, 1, 1],
+                        [experts, 1, 1],
+                        0,
+                    )?;
+                }
+                d.synchronize()?;
+                let picked: Vec<u32> = ids.to_f32().iter().map(|v| v.to_bits()).collect();
+                // Verify rows are decode: their wrong guesses are often the next
+                // tokens' experts.
+                let slots = stream.place(d, layer, &picked, m > MMS_MAX_ROWS)?;
+                if let Some((_, a)) = next {
+                    let guess: Vec<u32> = a
+                        .ids
+                        .view(0, [m * k(a)])?
+                        .to_f32()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect();
+                    stream.read_ahead(d, layer + 1, &guess)?;
+                }
+                if identity {
+                    Some((u32s(d, &slots)?, None))
+                } else {
+                    let mut table = slots.clone();
+                    table.sort_unstable();
+                    table.dedup();
+                    let local: Vec<u32> = slots
+                        .iter()
+                        .map(|s| table.binary_search(s).expect("listed") as u32)
+                        .collect();
+                    let k = table.len();
+                    Some((u32s(d, &local)?, Some((u32s(d, &table)?, k))))
+                }
+            }
+            _ => None,
+        };
+        let ids = streamed.as_ref().map_or(&ids, |(t, _)| t);
+        let table = streamed.as_ref().and_then(|(_, t)| t.as_ref());
         if identity {
-            Self::project_id(d, &f.gate_exps, xn, &ids, routes, used, &gate)?;
-            Self::project_id(d, &f.up_exps, xn, &ids, routes, used, &up)?;
+            Self::project_id(d, &f.gate_exps, xn, ids, routes, used, &gate)?;
+            Self::project_id(d, &f.up_exps, xn, ids, routes, used, &up)?;
             self.glu(d, &gate, &up, &act)?;
-            Self::project_id(d, &f.down_exps, &act, &ids, routes, 1, &down)?;
+            Self::project_id(d, &f.down_exps, &act, ids, routes, 1, &down)?;
         } else {
+            let experts = table.map_or(experts, |&(_, k)| k);
             let offsets = ms.offsets.view(0, [experts + 1])?;
             let sorted = ms.sorted.view(0, [routes])?;
             let position = ms.position.view(0, [routes])?;
@@ -2867,10 +3058,11 @@ impl HybridModel {
                 [256, 1, 1],
                 0,
             )?;
-            Self::project_mm_id(d, &f.gate_exps, &xg, &offsets, m, &gate)?;
-            Self::project_mm_id(d, &f.up_exps, &xg, &offsets, m, &up)?;
+            let slots = table.map(|(t, k)| (t, *k));
+            Self::project_mm_id_in(d, &f.gate_exps, &xg, &offsets, slots, m, &gate)?;
+            Self::project_mm_id_in(d, &f.up_exps, &xg, &offsets, slots, m, &up)?;
             self.glu(d, &gate, &up, &act)?;
-            Self::project_mm_id(d, &f.down_exps, &act, &offsets, m, &down)?;
+            Self::project_mm_id_in(d, &f.down_exps, &act, &offsets, slots, m, &down)?;
         }
         let position = ms.position.view(0, [routes])?;
         d.dispatch_hybrid(
@@ -2955,11 +3147,26 @@ impl HybridModel {
     }
 
     /// Expert GEMM over expert-sorted rows delimited by `offsets`.
+    #[cfg(test)]
     pub(crate) fn project_mm_id(
         d: &MetalDevice,
         w: &Matrix,
         x: &Tensor,
         offsets: &Tensor,
+        max_rows: usize,
+        y: &Tensor,
+    ) -> Result<()> {
+        Self::project_mm_id_in(d, w, x, offsets, None, max_rows, y)
+    }
+
+    /// `project_mm_id`, or with `slots` (table, k) over k groups whose experts
+    /// are stored at `table[z]` (streamed experts' arena slots).
+    pub(crate) fn project_mm_id_in(
+        d: &MetalDevice,
+        w: &Matrix,
+        x: &Tensor,
+        offsets: &Tensor,
+        slots: Option<(&Tensor, usize)>,
         max_rows: usize,
         y: &Tensor,
     ) -> Result<()> {
@@ -2973,20 +3180,20 @@ impl HybridModel {
             .u(rows_e)?
             .u(rows_e)?
             .0;
-        let name = match w.format {
-            Format::Q4K => "h_mm_id_q4_k",
-            Format::Q5K => "h_mm_id_q5_k",
-            Format::Q6K => "h_mm_id_q6_k",
-            Format::Q8_0 => "h_mm_id_q8_0",
-            Format::Q4_0 => "h_mm_id_q4_0",
-            Format::Iq4Xs => "h_mm_id_iq4_xs",
-            Format::Iq3S => "h_mm_id_iq3_s",
-            Format::Iq3Xxs => "h_mm_id_iq3_xxs",
-            Format::Iq2S => "h_mm_id_iq2_s",
-            Format::Q2_0 => "h_mm_id_q2_0",
-            Format::Q5_0 => "h_mm_id_q5_0",
-            Format::Q3K => "h_mm_id_q3_k",
-            Format::Iq4Nl => "h_mm_id_iq4_nl",
+        let (plain, slotted) = match w.format {
+            Format::Q4K => ("h_mm_id_q4_k", "h_mm_id_slot_q4_k"),
+            Format::Q5K => ("h_mm_id_q5_k", "h_mm_id_slot_q5_k"),
+            Format::Q6K => ("h_mm_id_q6_k", "h_mm_id_slot_q6_k"),
+            Format::Q8_0 => ("h_mm_id_q8_0", "h_mm_id_slot_q8_0"),
+            Format::Q4_0 => ("h_mm_id_q4_0", "h_mm_id_slot_q4_0"),
+            Format::Iq4Xs => ("h_mm_id_iq4_xs", "h_mm_id_slot_iq4_xs"),
+            Format::Iq3S => ("h_mm_id_iq3_s", "h_mm_id_slot_iq3_s"),
+            Format::Iq3Xxs => ("h_mm_id_iq3_xxs", "h_mm_id_slot_iq3_xxs"),
+            Format::Iq2S => ("h_mm_id_iq2_s", "h_mm_id_slot_iq2_s"),
+            Format::Q2_0 => ("h_mm_id_q2_0", "h_mm_id_slot_q2_0"),
+            Format::Q5_0 => ("h_mm_id_q5_0", "h_mm_id_slot_q5_0"),
+            Format::Q3K => ("h_mm_id_q3_k", "h_mm_id_slot_q3_k"),
+            Format::Iq4Nl => ("h_mm_id_iq4_nl", "h_mm_id_slot_iq4_nl"),
             Format::F32 | Format::Bf16 | Format::Mlx4 => {
                 return Err(Error::Gguf(format!(
                     "{} experts are unsupported",
@@ -2994,15 +3201,26 @@ impl HybridModel {
                 )));
             }
         };
-        d.dispatch_hybrid(
-            name,
-            &[w.binding(), x.binding(), offsets.binding()],
-            &[y.binding()],
-            &args,
-            [max_rows.div_ceil(32), rows_e.div_ceil(64), w.experts],
-            [128, 1, 1],
-            64 * 32 * 2,
-        )
+        match slots {
+            None => d.dispatch_hybrid(
+                plain,
+                &[w.binding(), x.binding(), offsets.binding()],
+                &[y.binding()],
+                &args,
+                [max_rows.div_ceil(32), rows_e.div_ceil(64), w.experts],
+                [128, 1, 1],
+                64 * 32 * 2,
+            ),
+            Some((table, k)) => d.dispatch_hybrid(
+                slotted,
+                &[w.binding(), x.binding(), offsets.binding(), table.binding()],
+                &[y.binding()],
+                &args,
+                [max_rows.div_ceil(32), rows_e.div_ceil(64), k],
+                [128, 1, 1],
+                64 * 32 * 2,
+            ),
+        }
     }
 
     pub(crate) fn dense_ffn(
@@ -3421,7 +3639,7 @@ fn mv_kernel(format: Format, expert: bool) -> (&'static str, usize, usize, usize
         Format::Q6K => (pick("h_mv_q6_k", "h_mv_id_q6_k"), 4, 2, 0),
         Format::Q4_0 => (pick("h_mv_q4_0", "h_mv_id_q4_0"), 8, 2, 0),
         Format::F32 => ("h_mv_f32", 8, 2, 0),
-        Format::Bf16 => ("h_mv_bf16", 8, 2, 0),
+        Format::Bf16 => ("h_mv_bf16_wide", 4, 4, 0),
         Format::Q8_0 => (pick("h_mv_q8_0", "h_mv_id_q8_0"), 2, 4, 32 * 2 * 4),
         Format::Iq4Xs => (pick("h_mv_iq4_xs", "h_mv_id_iq4_xs"), 4, 2, 32 * 4),
         Format::Iq3S => (pick("h_mv_iq3_s", "h_mv_id_iq3_s"), 8, 2, 512 * 4),
@@ -3493,6 +3711,10 @@ mod tests {
             max_rows: 1,
             written: 0,
             kv_cache: KvCache::F16,
+            ple: None,
+            ple_tokens: Vec::new(),
+            ple_pending: Vec::new(),
+            ple_ngram: 0,
         };
         // Text only: a plain offset.
         let plan = state.rope_plan(&d, 17, 4).unwrap();
@@ -4094,6 +4316,10 @@ mod tests {
             max_rows: 512,
             written,
             kv_cache: KvCache::F16,
+            ple: None,
+            ple_tokens: Vec::new(),
+            ple_pending: Vec::new(),
+            ple_ngram: 0,
         };
         // Nothing overwritten yet: any position resumes.
         assert!(state(1000).can_resume(10));

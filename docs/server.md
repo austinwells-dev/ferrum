@@ -87,7 +87,7 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 | `-c`, `--context N\|auto` | `auto` | Context length of each slot |
 | `--kv-cache f16\|q8` | `f16` | K/V cache format (also `-ctk`/`-ctv`). `q8` nearly halves K/V memory, so `auto` fits about twice the context, and decodes faster at long context. See [K/V cache format](#kv-cache-format) |
 | `--reserve-mib N` | `1024` | GPU memory left free for the system |
-| `--chunk N` | `512` | Prompt tokens per forward pass |
+| `--chunk N` | `512` | Prompt tokens per forward pass (`2048` for a model whose experts stream from the SSD) |
 | `--max-tokens N` | context | Per-request cap when the client sends none |
 | `--temp`, `--top-p`, `--top-k`, `--min-p`, ... | from the GGUF | Sampling defaults |
 

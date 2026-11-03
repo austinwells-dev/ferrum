@@ -1,0 +1,27 @@
+# DFlash2 at 3 drafts vs plain decoding on Qwen3.8-Flash-Next, 2026-11-02
+machine: Apple M5, 32 GB; branch feat/qwen4exp-formats, the commit that adds this file
+command: [FERRUM_HYBRID_EXACT=1] hybrid_spec SHARD1 --drafter DFLASH2_DIR --drafts 3 --prompts 4 --tokens 192 --baseline
+
+## FERRUM_HYBRID_EXACT=0
+prompt 0: baseline 192 tokens, 18.2 tok/s
+prompt 0 chain: 192 tokens, 19.8 tok/s, acceptance 2.49 (77 steps), diverges at 33 (target top-2 margin 0.0002)
+prompt 1: baseline 192 tokens, 18.3 tok/s
+prompt 1 chain: 192 tokens, 29.0 tok/s, acceptance 3.41 (56 steps), diverges at 133 (target top-2 margin 0.0026)
+prompt 2: baseline 192 tokens, 18.8 tok/s
+prompt 2 chain: 192 tokens, 18.3 tok/s, acceptance 2.08 (92 steps), diverges at 97 (target top-2 margin 0.0240)
+prompt 3: baseline 192 tokens, 18.6 tok/s
+prompt 3 chain: 192 tokens, 23.3 tok/s, acceptance 2.56 (75 steps), diverges at 106 (target top-2 margin 0.0184)
+baseline: 18.48 tok/s
+chain: 21.92 tok/s, acceptance length 2.553, 3.0 drafts/step, draft 9.1 ms/step, verify 104.8 ms/step, accepted by depth 75% 49% 31%, speedup 1.19x, greedy mismatches 4
+
+## FERRUM_HYBRID_EXACT=1
+prompt 0: baseline 192 tokens, 18.2 tok/s
+prompt 0 chain: 192 tokens, 17.8 tok/s, acceptance 2.58 (74 steps), identical
+prompt 1: baseline 192 tokens, 18.1 tok/s
+prompt 1 chain: 192 tokens, 23.0 tok/s, acceptance 3.41 (56 steps), identical
+prompt 2: baseline 192 tokens, 18.8 tok/s
+prompt 2 chain: 192 tokens, 13.2 tok/s, acceptance 1.87 (102 steps), identical
+prompt 3: baseline 192 tokens, 17.4 tok/s
+prompt 3 chain: 192 tokens, 17.9 tok/s, acceptance 2.55 (75 steps), identical
+baseline: 18.12 tok/s
+chain: 17.28 tok/s, acceptance length 2.489, 3.0 drafts/step, draft 15.4 ms/step, verify 126.4 ms/step, accepted by depth 70% 46% 32%, speedup 0.95x, greedy mismatches 0

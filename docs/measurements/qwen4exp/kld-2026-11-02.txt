@@ -1,0 +1,31 @@
+# qwen4exp KL divergence against llama.cpp, 2026-11-02
+machine: Apple M5, 32 GB, macOS 27.0.1
+model: ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF, Qwen3.8-Flash-Next-GSQ-RCO-Q2_0 (2 shards)
+branch: feat/qwen4exp-formats, the commit that adds this file (experts streamed; arena ~17.8 GiB)
+reference: llama.cpp vendored in Strata c62d5e3a (third_party/llama.cpp), CPU, mmap
+corpus: README.md and docs/*.md of ferrum at ec14e94, concatenated (114,853 bytes)
+base: llama-perplexity -m ~/Documents/Strata-data/models/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf -f corpus.txt -c 512 --chunks 8 -ngl 0 --kl-divergence-base q38-cpu.kld
+      Final estimate: PPL = 7.0860 +/- 0.44688
+ferrum: cargo run --release --example hybrid_kld -- ~/Documents/Strata-data/models/Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf q38-cpu.kld 8
+
+## Hyper-connections Q8_0 (default)
+chunk 0: ppl 15.1568 (llama.cpp 15.1931) mean KLD 0.013115 same top 94.12%
+chunk 1: ppl 11.4771 (llama.cpp 11.4130) mean KLD 0.014722 same top 95.29%
+chunk 2: ppl 7.7746 (llama.cpp 7.7758) mean KLD 0.013549 same top 95.69%
+chunk 3: ppl 6.7746 (llama.cpp 6.7600) mean KLD 0.013066 same top 95.88%
+chunk 4: ppl 6.4804 (llama.cpp 6.4860) mean KLD 0.013183 same top 95.76%
+chunk 5: ppl 7.1204 (llama.cpp 7.1433) mean KLD 0.015119 same top 95.42%
+chunk 6: ppl 6.7853 (llama.cpp 6.8404) mean KLD 0.023302 same top 95.01%
+chunk 7: ppl 7.0210 (llama.cpp 7.0641) mean KLD 0.022736 same top 94.75%
+positions 2040; Ferrum PPL 7.0210; llama.cpp PPL 7.0641; mean KLD 0.022736; median 0.004361; p99 0.166762; max 9.055787; same top-1 94.75%; 36.5 s
+
+## FERRUM_HC_BF16=1 (hyper-connections as stored)
+chunk 0: ppl 15.4039 (llama.cpp 15.1931) mean KLD 0.009395 same top 94.12%
+chunk 1: ppl 11.5952 (llama.cpp 11.4130) mean KLD 0.013350 same top 93.73%
+chunk 2: ppl 7.8484 (llama.cpp 7.7758) mean KLD 0.011756 same top 94.51%
+chunk 3: ppl 6.7914 (llama.cpp 6.7600) mean KLD 0.012624 same top 94.90%
+chunk 4: ppl 6.5032 (llama.cpp 6.4860) mean KLD 0.012721 same top 95.14%
+chunk 5: ppl 7.1714 (llama.cpp 7.1433) mean KLD 0.014184 same top 95.10%
+chunk 6: ppl 6.8296 (llama.cpp 6.8404) mean KLD 0.022970 same top 94.90%
+chunk 7: ppl 7.0571 (llama.cpp 7.0641) mean KLD 0.022208 same top 94.66%
+positions 2040; Ferrum PPL 7.0571; llama.cpp PPL 7.0641; mean KLD 0.022208; median 0.004104; p99 0.188175; max 9.659293; same top-1 94.66%; 38.8 s

@@ -438,6 +438,8 @@ pub(crate) fn load_weights(d: &MetalDevice, dir: &Path, c: &HybridConfig) -> Res
             post_ffw: None,
             mixer,
             ffn,
+            hc: None,
+            ple: None,
         });
     }
     Ok(Weights {
@@ -446,6 +448,9 @@ pub(crate) fn load_weights(d: &MetalDevice, dir: &Path, c: &HybridConfig) -> Res
         output,
         rope_freqs: None,
         layers,
+        hc_head: None,
+        stream: None,
+        ple_table: None,
     })
 }
 

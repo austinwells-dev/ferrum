@@ -1,13 +1,18 @@
 //! Packed GGUF weights for the hybrid engine. Matrices keep their GGML block
 //! encoding for the model lifetime and are read directly into Metal storage.
 #![forbid(unsafe_code)]
-use super::config::{HybridConfig, Variant};
+use super::{
+    config::{HybridConfig, Variant},
+    ple::PleTable,
+    stream::{PARTS, StreamedExperts},
+};
 use crate::{
     DType, Error, MetalDevice, Result, Tensor,
     loader::gguf::{GgufFile, block_layout},
     metal::MetalBuffer,
     tensor::PackedStorage,
 };
+use std::rc::Rc;
 
 /// GGML encodings with hybrid-engine kernels.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -224,7 +229,58 @@ impl Ffn {
     }
 }
 
+/// One qwen4exp hyper-connection mixer over the `streams × hidden` residual:
+/// a per-stream RMSNorm with gammas `norm` (`streams × hidden`, folded to
+/// `1 + w` by the converter), the low-rank gate `up(silu(down(x) / streams))`,
+/// and `inject`, the `streams` weights of the residual write after the
+/// sublayer (absent on the mixer before the LM head).
+pub struct HcWeights {
+    pub norm: Tensor,
+    pub down: Matrix,
+    pub up: Matrix,
+    pub inject: Option<Matrix>,
+}
+
+impl HcWeights {
+    fn byte_size(&self) -> usize {
+        self.norm.byte_size()
+            + self.down.byte_size()
+            + self.up.byte_size()
+            + self.inject.as_ref().map_or(0, Matrix::byte_size)
+    }
+}
+
+/// The qwen4exp n-gram embedding block of one layer: `key` (`streams ×
+/// hidden` rows) and `value` project the gathered n-gram rows; three
+/// per-stream norms; `conv` is the F32 depthwise kernel, tap `k` of channel
+/// `c` at `c * K + k` (oldest tap first).
+pub struct PleWeights {
+    pub key: Matrix,
+    pub value: Matrix,
+    pub norm_key: Tensor,
+    pub norm_query: Tensor,
+    pub norm_conv: Tensor,
+    pub conv: Tensor,
+}
+
+impl PleWeights {
+    fn byte_size(&self) -> usize {
+        self.key.byte_size()
+            + self.value.byte_size()
+            + [
+                &self.norm_key,
+                &self.norm_query,
+                &self.norm_conv,
+                &self.conv,
+            ]
+            .iter()
+            .map(|t| t.byte_size())
+            .sum::<usize>()
+    }
+}
+
 pub struct Layer {
+    /// The pre-norm; on qwen4exp the hyper-connection gammas of `hc[0]`.
     pub attn_norm: Tensor,
     /// Next pre-norm fused into the residual add: Qwen's post-attention norm,
     /// or `ffn_norm` for Flint, Spark and LFM3.
@@ -235,6 +291,9 @@ pub struct Layer {
     pub post_ffw: Option<Tensor>,
     pub mixer: Mixer,
     pub ffn: Ffn,
+    /// qwen4exp: the mixers before the token mixer and before the FFN.
+    pub hc: Option<Box<[HcWeights; 2]>>,
+    pub ple: Option<PleWeights>,
 }
 
 pub struct Weights {
@@ -245,6 +304,13 @@ pub struct Weights {
     /// layers only. Length `head_dim / 2`. Absent except on LFM3.
     pub rope_freqs: Option<Tensor>,
     pub layers: Vec<Layer>,
+    /// qwen4exp: the mixer that stands in for the output norm.
+    pub hc_head: Option<HcWeights>,
+    /// qwen4exp: the routed experts, read from the file into an arena; every
+    /// MoE layer's expert matrices are views of its regions.
+    pub stream: Option<Rc<StreamedExperts>>,
+    /// qwen4exp: the n-gram embedding table, read on the host.
+    pub ple_table: Option<PleTable>,
 }
 
 impl Weights {
@@ -284,6 +350,26 @@ impl Weights {
                 Mixer::ShortConv(s) => m(&s.in_proj) + s.conv.byte_size() + m(&s.out_proj),
             };
             total += layer.ffn.byte_size();
+            total += layer
+                .hc
+                .as_ref()
+                .map_or(0, |h| h[0].byte_size() + h[1].byte_size());
+            total += layer.ple.as_ref().map_or(0, PleWeights::byte_size);
+        }
+        total += self.hc_head.as_ref().map_or(0, HcWeights::byte_size);
+        // Every layer's expert views share the arena: count it once.
+        if let Some(stream) = &self.stream {
+            let views: usize = self
+                .layers
+                .iter()
+                .map(|l| match &l.ffn {
+                    Ffn::Moe(f) => {
+                        f.gate_exps.byte_size() + f.up_exps.byte_size() + f.down_exps.byte_size()
+                    }
+                    Ffn::Dense(_) => 0,
+                })
+                .sum();
+            total = total - views + stream.arena.byte_size();
         }
         total
     }
@@ -299,7 +385,7 @@ struct Loader<'a> {
 
 impl Loader<'_> {
     fn matrix(&mut self, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
-        self.stacked(name, 1, rows, cols)
+        self.matrix_or_bf16(name, rows, cols)
     }
 
     fn stacked(&mut self, name: &str, experts: usize, rows: usize, cols: usize) -> Result<Matrix> {
@@ -315,29 +401,33 @@ impl Loader<'_> {
     }
 
     /// The routed and shared experts of the block whose tensor names `n` gives.
-    fn moe(&mut self, n: &dyn Fn(&str) -> String, c: &HybridConfig) -> Result<MoeFfn> {
+    /// With `stream`, the routed experts are views of its arena, whose
+    /// experts are slots.
+    fn moe(
+        &mut self,
+        n: &dyn Fn(&str) -> String,
+        c: &HybridConfig,
+        stream: Option<&StreamedExperts>,
+    ) -> Result<MoeFfn> {
         let moe = c.moe.expect("expert layer carries expert geometry");
+        let mut experts = |part: usize, rows: usize, cols: usize| match stream {
+            Some(s) => self.arena_view(s, &n(&format!("{}.weight", PARTS[part])), part, rows, cols),
+            None => self.stacked(
+                &n(&format!("{}.weight", PARTS[part])),
+                moe.experts,
+                rows,
+                cols,
+            ),
+        };
+        let gate_exps = experts(0, moe.expert_ffn, c.hidden)?;
+        let up_exps = experts(1, moe.expert_ffn, c.hidden)?;
+        let down_exps = experts(2, c.hidden, moe.expert_ffn)?;
         Ok(MoeFfn {
             // `HybridConfig::from_gguf` refuses a selection bias (`exp_probs_b`).
             router: self.matrix_or_bf16(&n("ffn_gate_inp.weight"), moe.experts, c.hidden)?,
-            gate_exps: self.stacked(
-                &n("ffn_gate_exps.weight"),
-                moe.experts,
-                moe.expert_ffn,
-                c.hidden,
-            )?,
-            up_exps: self.stacked(
-                &n("ffn_up_exps.weight"),
-                moe.experts,
-                moe.expert_ffn,
-                c.hidden,
-            )?,
-            down_exps: self.stacked(
-                &n("ffn_down_exps.weight"),
-                moe.experts,
-                c.hidden,
-                moe.expert_ffn,
-            )?,
+            gate_exps,
+            up_exps,
+            down_exps,
             shared_gate_inp: match moe.shared_gate {
                 true => Some(self.vector(&n("ffn_gate_inp_shexp.weight"), c.hidden)?),
                 false => None,
@@ -356,7 +446,7 @@ impl Loader<'_> {
     fn matrix_or_bf16(&mut self, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
         let info = self.file.tensor(name)?.clone();
         if info.type_id != 30 {
-            return self.matrix(name, rows, cols);
+            return self.stacked(name, 1, rows, cols);
         }
         if info.dimensions != [cols, rows]
             || info.byte_len != rows * cols * 2
@@ -432,8 +522,130 @@ impl Loader<'_> {
             .collect()
     }
 
+    /// Part `part` of `stream`'s arena as the stacked expert matrix `name`
+    /// would load as, with one expert per slot.
+    fn arena_view(
+        &mut self,
+        stream: &StreamedExperts,
+        name: &str,
+        part: usize,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Matrix> {
+        let info = self.file.tensor(name)?.clone();
+        let format = Format::from_type(info.type_id).ok_or_else(|| Error::Weight {
+            name: name.into(),
+            message: format!("GGML type {} has no hybrid kernel", info.type_id),
+        })?;
+        let layout = block_layout(info.type_id)?;
+        let row_bytes = cols / layout.elements * layout.bytes;
+        let slots = stream.arena.slots();
+        if info.dimensions.len() != 3
+            || info.dimensions[..2] != [cols, rows]
+            || !cols.is_multiple_of(layout.elements.max(PROJECTION_K_STEP))
+            || row_bytes * rows != stream.arena.part_bytes()
+        {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: "streamed expert geometry differs from the arena's".into(),
+            });
+        }
+        let (buffer, offset, len) = stream.arena.region(part);
+        Ok(Matrix {
+            rows: rows * slots,
+            cols,
+            experts: slots,
+            format,
+            row_bytes,
+            storage: PackedStorage::region(buffer, offset, len),
+        })
+    }
+
+    /// An F16 or BF16 vector widened to F32.
+    fn f16_vector(&mut self, name: &str, len: usize) -> Result<Tensor> {
+        let info = self.file.tensor(name)?.clone();
+        let bf16 = info.type_id == 30;
+        if !matches!(info.type_id, 1 | 30) || info.dimensions.iter().product::<usize>() != len {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: format!("expected {len} F16 or BF16 values"),
+            });
+        }
+        let mut raw = vec![0u8; len * 2];
+        self.file.read_tensor_into(name, &mut raw)?;
+        let values: Vec<f32> = raw
+            .chunks_exact(2)
+            .map(|b| match bf16 {
+                true => half::bf16::from_le_bytes([b[0], b[1]]).to_f32(),
+                false => half::f16::from_le_bytes([b[0], b[1]]).to_f32(),
+            })
+            .collect();
+        if values.iter().any(|v| !v.is_finite()) {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: "non-finite value".into(),
+            });
+        }
+        Tensor::from_f32(self.device, [len], DType::F32, &values)
+    }
+
+    /// The hyper-connection mixer `prefix` (`blk.N.hc_attn`, `output_hc`).
+    fn hc(&mut self, prefix: &str, c: &HybridConfig, inject: bool) -> Result<HcWeights> {
+        let q = c.qwen4exp.as_ref().expect("qwen4exp geometry");
+        let wide = q.hc_streams * c.hidden;
+        Ok(HcWeights {
+            norm: self.vector(&format!("{prefix}_norm.weight"), wide)?,
+            down: self.hc_matrix(&format!("{prefix}_down.weight"), q.hc_low_rank, wide)?,
+            up: self.hc_matrix(&format!("{prefix}_up.weight"), wide, q.hc_low_rank)?,
+            inject: match inject {
+                true => Some(self.matrix_or_bf16(
+                    &format!("{prefix}_inject.weight"),
+                    q.hc_streams,
+                    wide,
+                )?),
+                false => None,
+            },
+        })
+    }
+
+    /// A hyper-connection projection: BF16 in the file, Q8_0 on the device
+    /// unless `FERRUM_HC_BF16=1`. These are read twice per layer per token, and
+    /// at BF16 they were the largest share of a decode step.
+    fn hc_matrix(&mut self, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
+        let info = self.file.tensor(name)?.clone();
+        if !quantizes_hc(&info.name, info.type_id) {
+            return self.matrix_or_bf16(name, rows, cols);
+        }
+        if info.dimensions != [cols, rows] || info.byte_len != rows * cols * 2 {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: format!("expected a BF16 [{rows}, {cols}] matrix"),
+            });
+        }
+        let mut bytes = vec![0u8; info.byte_len];
+        self.file.read_tensor_into(name, &mut bytes)?;
+        Matrix::from_bf16(self.device, rows, cols, &bytes, Format::Q8_0)
+    }
+
+    fn ple(&mut self, n: &dyn Fn(&str) -> String, c: &HybridConfig) -> Result<PleWeights> {
+        let q = c.qwen4exp.as_ref().expect("qwen4exp geometry");
+        let wide = q.hc_streams * c.hidden;
+        let rows = q.ple.heads() * q.ple.row_dim;
+        Ok(PleWeights {
+            key: self.matrix_or_bf16(&n("ple_key.weight"), wide, rows)?,
+            value: self.matrix_or_bf16(&n("ple_value.weight"), c.hidden, rows)?,
+            norm_key: self.vector(&n("ple_norm_key.weight"), wide)?,
+            norm_query: self.vector(&n("ple_norm_query.weight"), wide)?,
+            norm_conv: self.vector(&n("ple_norm_conv.weight"), wide)?,
+            conv: self.f16_vector(&n("ple_conv1d.weight"), wide * q.ple.conv_kernel)?,
+        })
+    }
+
     fn vector(&mut self, name: &str, len: usize) -> Result<Tensor> {
         let info = self.file.tensor(name)?.clone();
+        if matches!(info.type_id, 1 | 30) {
+            return self.f16_vector(name, len);
+        }
         if info.type_id != 0 || info.dimensions.iter().product::<usize>() != len {
             return Err(Error::Weight {
                 name: name.into(),
@@ -593,7 +805,28 @@ pub(crate) fn q3k_to_q6k(src: &[u8], dst: &mut [u8]) {
 }
 
 pub fn load(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> Result<Weights> {
-    load_weights(device, file, c, true)
+    load_weights(device, file, c, true, None)
+}
+
+/// `load` with the routed experts left in the file and read into `stream`'s
+/// arena as they are routed.
+pub fn load_streamed(
+    device: &MetalDevice,
+    file: &mut GgufFile,
+    c: &HybridConfig,
+    stream: StreamedExperts,
+    ple_table: Option<PleTable>,
+) -> Result<Weights> {
+    let mut w = load_weights(device, file, c, true, Some(Rc::new(stream)))?;
+    if c.qwen4exp
+        .as_ref()
+        .is_some_and(|q| !q.ple.layers.is_empty())
+        && ple_table.is_none()
+    {
+        return Err(Error::Config("the n-gram embedding needs its table".into()));
+    }
+    w.ple_table = ple_table;
+    Ok(w)
 }
 
 /// Like `load` for a model that is only run for its hidden states: the LM head
@@ -603,7 +836,7 @@ pub(crate) fn load_without_head(
     file: &mut GgufFile,
     c: &HybridConfig,
 ) -> Result<Weights> {
-    load_weights(device, file, c, false)
+    load_weights(device, file, c, false, None)
 }
 
 fn load_weights(
@@ -611,13 +844,12 @@ fn load_weights(
     file: &mut GgufFile,
     c: &HybridConfig,
     head: bool,
+    stream: Option<Rc<StreamedExperts>>,
 ) -> Result<Weights> {
-    if c.variant == Variant::Qwen4Exp {
+    let qwen4exp = c.variant == Variant::Qwen4Exp;
+    if qwen4exp && (stream.is_none() || !head) {
         return Err(Error::Config(
-            "qwen4exp (Qwen3.8-Flash-Next) is parsed and planned but not runnable yet: it needs \
-             hyper-connections, the n-gram embedding, indexer attention and expert streaming \
-             (docs/history/qwen4exp-plan.md)"
-                .into(),
+            "qwen4exp (Qwen3.8-Flash-Next) runs only with its experts streamed".into(),
         ));
     }
     let mut l = Loader {
@@ -626,7 +858,15 @@ fn load_weights(
         q3k_as_q6k: false,
     };
     let embedding = l.matrix_or_bf16("token_embd.weight", c.vocab, c.hidden)?;
-    let output_norm = l.vector("output_norm.weight", c.hidden)?;
+    // qwen4exp has no output norm: the head's hyper-connection mixer is one.
+    let hc_head = match qwen4exp {
+        true => Some(l.hc("output_hc", c, false)?),
+        false => None,
+    };
+    let output_norm = match &hc_head {
+        Some(h) => h.norm.clone(),
+        None => l.vector("output_norm.weight", c.hidden)?,
+    };
     let output = if !head {
         Matrix::bf16_with(device, 1, c.hidden, |_| Ok(()))?
     } else if l.file.tensors().contains_key("output.weight") {
@@ -637,17 +877,29 @@ fn load_weights(
     let mut layers = Vec::with_capacity(c.layers);
     for i in 0..c.layers {
         let n = |s: &str| format!("blk.{i}.{s}");
-        let attn_norm = l.vector(&n("attn_norm.weight"), c.hidden)?;
+        let hc = match qwen4exp {
+            true => Some(Box::new([
+                l.hc(&n("hc_attn"), c, true)?,
+                l.hc(&n("hc_ffn"), c, true)?,
+            ])),
+            false => None,
+        };
+        let ple = match &c.qwen4exp {
+            Some(q) if q.ple.layers.contains(&i) => Some(l.ple(&n, c)?),
+            _ => None,
+        };
         // Flint, Spark and LFM3 fuse `ffn_norm` with the residual add. Qwen
         // stores its post-attention norm there instead.
-        let post_norm = match c.variant {
-            Variant::Flint | Variant::Spark | Variant::Lfm3 => {
-                l.vector(&n("ffn_norm.weight"), c.hidden)?
-            }
-            Variant::Dense | Variant::Moe => {
-                l.vector(&n("post_attention_norm.weight"), c.hidden)?
-            }
-            Variant::Qwen4Exp => unreachable!("refused above"),
+        let (attn_norm, post_norm) = match (c.variant, &hc) {
+            (Variant::Qwen4Exp, Some(hc)) => (hc[0].norm.clone(), hc[1].norm.clone()),
+            (Variant::Flint | Variant::Spark | Variant::Lfm3, _) => (
+                l.vector(&n("attn_norm.weight"), c.hidden)?,
+                l.vector(&n("ffn_norm.weight"), c.hidden)?,
+            ),
+            _ => (
+                l.vector(&n("attn_norm.weight"), c.hidden)?,
+                l.vector(&n("post_attention_norm.weight"), c.hidden)?,
+            ),
         };
         // LFM3 sandwich norms sit on the branch, after the operator and
         // before the residual add. Both or neither.
@@ -760,7 +1012,7 @@ fn load_weights(
                 down: l.matrix(&n("ffn_down.weight"), c.hidden, c.ffn)?,
             })
         } else {
-            Ffn::Moe(l.moe(&n, c)?)
+            Ffn::Moe(l.moe(&n, c, stream.as_deref())?)
         };
         layers.push(Layer {
             attn_norm,
@@ -769,6 +1021,8 @@ fn load_weights(
             post_ffw,
             mixer,
             ffn,
+            hc,
+            ple,
         });
     }
     let rope_freqs = if c.variant == Variant::Lfm3 {
@@ -782,6 +1036,9 @@ fn load_weights(
         output,
         rope_freqs,
         layers,
+        hc_head,
+        stream,
+        ple_table: None,
     })
 }
 
@@ -866,7 +1123,7 @@ pub fn load_mtp(device: &MetalDevice, file: &mut GgufFile, c: &HybridConfig) -> 
             head_gate: None,
         },
         ffn: match routed {
-            true => Ffn::Moe(l.moe(&n, c)?),
+            true => Ffn::Moe(l.moe(&n, c, None)?),
             false => Ffn::Dense(DenseFfn {
                 gate: l.matrix(&n("ffn_gate.weight"), ffn_width, c.hidden)?,
                 up: l.matrix(&n("ffn_up.weight"), ffn_width, c.hidden)?,
@@ -1125,6 +1382,15 @@ impl Matrix {
     pub(crate) fn packed_bytes(&self) -> Vec<u8> {
         self.storage.with_bytes(<[u8]>::to_vec)
     }
+}
+
+/// Whether the tensor `name` of type `type_id` is a BF16 hyper-connection
+/// down or up projection that loads as Q8_0 (`Loader::hc_matrix`).
+pub(crate) fn quantizes_hc(name: &str, type_id: u32) -> bool {
+    type_id == 30
+        && (name.contains("hc_attn_") || name.contains("hc_ffn_") || name.starts_with("output_hc_"))
+        && (name.ends_with("_down.weight") || name.ends_with("_up.weight"))
+        && !std::env::var("FERRUM_HC_BF16").is_ok_and(|v| v == "1")
 }
 
 /// ggml's reference Q8_0 / Q4_0 row quantization.

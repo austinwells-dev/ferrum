@@ -1,6 +1,7 @@
 //! The only module allowed to interact with Objective-C or raw memory.
 #[cfg(feature = "legacy-engine")]
 mod legacy;
+pub mod stream;
 use crate::{Error, Result};
 use objc2::{
     rc::{Retained, autoreleasepool},

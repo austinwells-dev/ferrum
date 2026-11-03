@@ -1,8 +1,8 @@
-# Experimental: Flint, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation
+# Experimental: Flint, Qwen3.8-Flash-Next, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation
 
-> **Experimental.** This page covers Flint, Spark and LFM3 support (text, still images and speech input), MLX 4-bit checkpoints, KFlash speculative decoding (ported from Kapitsa), the server's parallel requests, and image generation. None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
+> **Experimental.** This page covers Flint, Qwen3.8-Flash-Next, Spark and LFM3 support (text, still images and speech input), MLX 4-bit checkpoints, KFlash speculative decoding (ported from Kapitsa), the server's parallel requests, and image generation. None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
 
-Contents: [Flint](#what-works) · [Spark-X2.6-4B](#spark-x26-4b) · [LFM3-1.7B](#lfm3-17b) · [LFM3-VL-2B](#lfm3-vl-2b) · [LFM3-Audio-2B](#lfm3-audio-2b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding) · [Parallel requests](#parallel-requests) · [Image generation](#image-generation)
+Contents: [Flint](#what-works) · [Qwen3.8-Flash-Next](#qwen38-flash-next) · [Spark-X2.6-4B](#spark-x26-4b) · [LFM3-1.7B](#lfm3-17b) · [LFM3-VL-2B](#lfm3-vl-2b) · [LFM3-Audio-2B](#lfm3-audio-2b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding) · [Parallel requests](#parallel-requests) · [Image generation](#image-generation)
 
 ## What works
 
@@ -44,6 +44,33 @@ cargo run --release --bin ferrum-tui
 ```
 
 Pick the model in the Models tab. It shows as runnable once the quant check passes.
+
+# Qwen3.8-Flash-Next
+
+Qwen's `qwen4exp` architecture in ISTA-DASLab's GSQ-RCO Q2_0 pack: 48 layers (DeltaNet and attention, as in Qwen3.5), 512 routed experts with 10 used per token, a residual of four hyper-connection streams, and an n-gram hash embedding read from a second GGUF shard. Its 35 GiB of weights don't fit a 32 GB Mac, so the routed experts stay in the file and stream from the SSD into an expert arena (see [architecture.md](architecture.md#overview)). Load the first shard; the second must sit beside it.
+
+## Validation
+
+`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`, files `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-0000{1,2}-of-00002.gguf` (37.6 + 28.8 GB), on a 32 GB M5 with `iogpu.wired_limit_mb` at 24,576. The memory plan takes 23,552 MiB (the limit less the 1 GiB reserve): 2.9 GiB of resident weights and an 17.4 GiB expert arena, measured within 2 MiB of the prediction. The planner defaults to a 32K context to keep the arena large; the full trained 262,144 fits too, with the arena at 12.1 GiB (f16 K/V) or 14.9 GiB (`FERRUM_KV_CACHE=q8`), and decode after a short prompt goes from 16.6 to 16.2 and 16.6 tok/s ([record](measurements/qwen4exp/context-2026-11-02.txt)).
+
+| Check | Result |
+|---|---|
+| KLD vs llama.cpp CPU (Strata's vendored build, `c62d5e3a`), 2,040 positions | mean 0.0227, median 0.0044, top-1 94.75%; PPL 7.021 vs 7.064 ([record](measurements/qwen4exp/kld-2026-11-02.txt)) |
+| Same, hyper-connection weights left in BF16 (`FERRUM_HC_BF16=1`) | mean 0.0222, top-1 94.66% |
+| Kernel parity (`hc_tests.rs`: hyper-connection and n-gram kernels; `iq_tests.rs`: Q2_0, Q3_K, Q5_0, IQ4_NL, arena slots) | pass |
+| `hybrid_session_check`, `hybrid_session_disk` (3K, 12K, 52K tokens) | identical |
+| `hybrid_spec_check` (oracle drafts in blocks of 8, a third of them corrupted) | speculative output equals greedy; replay after commit exact |
+| Speed against Strata 0.1.55 (Metal, its own config), interleaved, best of four ([record](measurements/qwen4exp/strata-abba-2026-11-02.txt)) | decode 16.8 vs 14.8 tok/s (short prompt), 18.2 vs 15.0 and prefill 232 vs 190 tok/s (1,155 tokens), 18.4 vs 15.8 and 315 vs 282 tok/s (3,815 tokens) |
+| DFlash2 drafter (2 drafts per check), interleaved with plain decoding ([record](measurements/qwen4exp/drafters-abba-2026-11-02.txt)) | 23.2 vs 17.1 tok/s (1.36×) on the short prompt, 21.1 vs 18.2 (1.16×) after 1,155 tokens, 18.8 vs 18.6 after 3,815 |
+| `ferrum-tui` | chat with thinking and tools, a follow-up turn from the cache, an image through the BF16 `mmproj`, DFlash2 at 23 tok/s; no swap-outs during the run |
+
+## Known gaps
+
+- The sparse-attention (QSA) indexer is not loaded. Up to its top-k of 2,048 positions it selects every position, so attention there is exact; beyond 2,048 positions Ferrum attends to all of them, which the model was not trained to do. Contexts past 2,048 are not validated, though memory allows the full 262,144.
+- Draft trees are refused; chains work. Greedy drafted output can drift from plain decoding at near ties, from the rounding of multi-row verification, which the expert routing amplifies (as on Flint). With 3 drafts, all four `hybrid_spec` chat prompts diverged at top-2 margins of 0.0002–0.024 and all four were identical with `FERRUM_HYBRID_EXACT=1` ([record](measurements/qwen4exp/verify-rounding-2026-11-02.txt)). At 2 drafts the TUI benchmark saw a late flip (after a quarter of the answer) and its answer check passed. Each verify row routes to its own experts, many of them not in the arena, so a check grows 25–40 ms per extra row: drafters default to 2 drafts. DSpark (`shadowpa0327`) peaks at 22.1 tok/s at 2 drafts, below DFlash2. The separate MTP head (`qwen4exp-mtp`, a full layer with its own 512 experts) does not load.
+- Decode speed depends on what the arena holds: the first tokens of a new topic read more experts from the SSD. Long-context drafting gains little, because acceptance falls (1.79 tokens per step at 3,815 tokens).
+- Vision answers questions about one test image correctly; it has no parity check against llama.cpp's `mtmd`.
+- One quant (`Q2_0`) is validated.
 
 # Spark-X2.6-4B
 
