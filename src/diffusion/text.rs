@@ -65,6 +65,7 @@ fn hybrid_config(cfg: &TextConfig) -> Result<HybridConfig> {
         ssm_v_heads: 0,
         ssm_grouped_heads: false,
         moe: None,
+        qwen4exp: None,
         trained_context: cfg.context,
         kv_cache: KvCache::F16,
     };
@@ -120,6 +121,8 @@ impl TextEncoder {
                     up: matrix(&format!("{p}mlp.up_proj.weight"), cfg.ffn, hidden)?,
                     down: matrix(&format!("{p}mlp.down_proj.weight"), hidden, cfg.ffn)?,
                 }),
+                hc: None,
+                ple: None,
             });
         }
         let weights = Weights {
@@ -135,6 +138,9 @@ impl TextEncoder {
             output: Matrix::bf16_with(d, 1, hidden, |_| Ok(()))?,
             rope_freqs: None,
             layers,
+            hc_head: None,
+            stream: None,
+            ple_table: None,
         };
         Self::with_weights(d, config, weights, cfg, max_tokens)
     }

@@ -10,6 +10,8 @@
 //!        [--vocab N]  (draft among the first N token ids)
 //!        [--block N]  (DFlash drafting block rows, wider than trained)
 //!        [--depth N --filler FILE]  (generate after N tokens of FILE in the prompt)
+//!        [--prompt-file FILE [--raw]]  (FILE's text as the only prompt; --raw:
+//!        tokenized as is, without the chat template)
 //!
 //! Each prompt is rendered with the model's chat template (thinking on) and
 //! generated with speculation. With --baseline the same prompt is first
@@ -163,13 +165,17 @@ fn main() -> Result<()> {
             auto_nodes + 1,
         )
     });
-    let selected: Vec<usize> =
-        list("--only").unwrap_or_else(|| (0..prompts.min(PROMPTS.len())).collect());
+    let file_prompt = has("--prompt-file")
+        .then(|| std::fs::read_to_string(get("--prompt-file", "")).expect("--prompt-file FILE"));
+    let selected: Vec<usize> = match &file_prompt {
+        Some(_) => vec![0],
+        None => list("--only").unwrap_or_else(|| (0..prompts.min(PROMPTS.len())).collect()),
+    };
     let (mut base_tokens, mut base_secs) = (0usize, 0f64);
     // Per configuration: tokens, seconds, statistics, greedy mismatches.
     let mut totals = vec![(0usize, 0f64, SpecStats::default(), 0usize); configs.len()];
     for &index in &selected {
-        let prompt = PROMPTS[index];
+        let prompt = file_prompt.as_deref().unwrap_or(PROMPTS[index]);
         let content = if depth > 0 {
             format!("Reference material:\n\n{filler}\n\n---\n\n{prompt}")
         } else {
@@ -179,7 +185,11 @@ fn main() -> Result<()> {
             vec![json!({"role": "user", "content": content})],
             sampling.clone(),
         );
-        let text = rt.render(&request)?;
+        let text = if has("--raw") {
+            content
+        } else {
+            rt.render(&request)?
+        };
         let tokens = rt.loaded.tokenizer.encode(&text)?;
         let eos = rt.loaded.eos_ids.clone();
         let run = |rt: &mut Runtime, speculate: bool| -> Result<(Vec<u32>, f64)> {

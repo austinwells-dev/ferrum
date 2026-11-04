@@ -1,4 +1,5 @@
-//! Parity of the IQ2_S, IQ3_XXS and IQ3_S projection kernels, and of Q3_K
+//! Parity of the IQ2_S, IQ3_XXS and IQ3_S projection kernels, of the Q2_0,
+//! Q5_0, IQ4_NL and Q3_K kernels Qwen3.8's GSQ-RCO packs need, and of Q3_K
 //! weights loaded as Q6_K, against a CPU dequantizer ported from llama.cpp
 //! (ggml-quants.c). The grids are generated from ggml-common.h and the Metal
 //! shader, so the tables match byte for byte.
@@ -1574,4 +1575,240 @@ fn q3_k_projections_match_the_cpu_dequant() {
         })
         .collect();
     assert_close(&yt.to_f32(), &want, "q3_k as q6_k routes");
+}
+
+/// ggml's `dequantize_row_q2_0`: four 2-bit codes per byte, low bits first,
+/// each worth `d * (code - 1)`.
+fn dequant_q2_0(x: &[u8], out: &mut [f32]) {
+    for (b, y) in x.chunks_exact(18).zip(out.chunks_exact_mut(64)) {
+        let d = f16_at(b, 0);
+        for (j, v) in y.iter_mut().enumerate() {
+            let code = (b[2 + j / 4] >> (2 * (j % 4))) & 3;
+            *v = (code as f32 - 1.) * d;
+        }
+    }
+}
+
+/// ggml's `dequantize_row_q5_0`.
+fn dequant_q5_0(x: &[u8], out: &mut [f32]) {
+    for (b, y) in x.chunks_exact(22).zip(out.chunks_exact_mut(32)) {
+        let d = f16_at(b, 0);
+        let qh = u32::from_le_bytes(b[2..6].try_into().unwrap());
+        for j in 0..16 {
+            let lo = (b[6 + j] & 15) as u32 | ((qh >> j) << 4) & 0x10;
+            let hi = (b[6 + j] >> 4) as u32 | (qh >> (j + 12)) & 0x10;
+            y[j] = (lo as i32 - 16) as f32 * d;
+            y[j + 16] = (hi as i32 - 16) as f32 * d;
+        }
+    }
+}
+
+/// ggml's `dequantize_row_iq4_nl`: byte j holds values j and j + 16.
+fn dequant_iq4_nl(x: &[u8], out: &mut [f32]) {
+    const VALUES: [i8; 16] = [
+        -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+    ];
+    for (b, y) in x.chunks_exact(18).zip(out.chunks_exact_mut(32)) {
+        let d = f16_at(b, 0);
+        for j in 0..16 {
+            y[j] = d * VALUES[(b[2 + j] & 15) as usize] as f32;
+            y[j + 16] = d * VALUES[(b[2 + j] >> 4) as usize] as f32;
+        }
+    }
+}
+
+/// A block format of the Qwen3.8 GSQ-RCO pack: `elements` values in `block`
+/// bytes, with its F16 scale at byte `scale_at`.
+#[derive(Clone, Copy)]
+struct Packed {
+    format: Format,
+    elements: usize,
+    block: usize,
+    scale_at: usize,
+    dequant: fn(&[u8], &mut [f32]),
+}
+
+const PACKED: [Packed; 4] = [
+    Packed {
+        format: Format::Q2_0,
+        elements: 64,
+        block: 18,
+        scale_at: 0,
+        dequant: dequant_q2_0,
+    },
+    Packed {
+        format: Format::Q5_0,
+        elements: 32,
+        block: 22,
+        scale_at: 0,
+        dequant: dequant_q5_0,
+    },
+    Packed {
+        format: Format::Iq4Nl,
+        elements: 32,
+        block: 18,
+        scale_at: 0,
+        dequant: dequant_iq4_nl,
+    },
+    Packed {
+        format: Format::Q3K,
+        elements: 256,
+        block: 110,
+        scale_at: 108,
+        dequant: dequant_q3_k,
+    },
+];
+
+impl Packed {
+    /// Random blocks with small positive scales, and their CPU decode.
+    fn blocks(self, values: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+        let mut bytes = random_blocks(values / self.elements, self.block, seed);
+        for b in bytes.chunks_exact_mut(self.block) {
+            let scale = half::f16::from_f32(0.002 + 0.001 * b[2] as f32 / 255.);
+            b[self.scale_at..self.scale_at + 2].copy_from_slice(&scale.to_le_bytes());
+        }
+        let mut dense = vec![0f32; values];
+        (self.dequant)(&bytes, &mut dense);
+        (bytes, dense)
+    }
+    /// 640 is the Qwen3.8 expert width; Q3_K's 256-value blocks need 1,280.
+    fn cols(self) -> usize {
+        if self.elements == 256 { 1280 } else { 640 }
+    }
+}
+
+fn dot_rows(x: &[f32], dense: &[f32], cols: usize, row: usize) -> f32 {
+    (0..cols)
+        .map(|c| x[c] as f64 * dense[row * cols + c] as f64)
+        .sum::<f64>() as f32
+}
+
+/// Q2_0, Q5_0, IQ4_NL and Q3_K on every dense path (M = 1, 3, 16 and 64:
+/// the GEMV, batched GEMV, narrow-tile and tensor-op kernels) against the
+/// CPU decode, at widths that are not multiples of 256.
+#[test]
+fn gsq_formats_project_like_the_cpu_dequant() {
+    let d = MetalDevice::new().unwrap();
+    let rows = 13;
+    for kind in PACKED {
+        let cols = kind.cols();
+        let (bytes, dense) = kind.blocks(rows * cols, kind.block as u64);
+        let w = Matrix::from_packed(&d, rows, cols, 1, kind.format, &bytes).unwrap();
+        for m in [1, 3, 16, 64] {
+            let x = random(m * cols, m as u64);
+            let xt = Tensor::from_f32(&d, [m * cols], DType::F32, &x).unwrap();
+            let yt = Tensor::zeros(&d, [m * rows], DType::F32).unwrap();
+            HybridModel::project(&d, &w, &xt, m, &yt).unwrap();
+            let want: Vec<f32> = (0..m * rows)
+                .map(|i| dot_rows(&x[i / rows * cols..], &dense, cols, i % rows))
+                .collect();
+            assert_close(
+                &yt.to_f32(),
+                &want,
+                &format!("{} m={m}", kind.format.name()),
+            );
+        }
+    }
+}
+
+/// The same formats as experts: per-route GEMVs and the expert-sorted GEMM.
+#[test]
+fn gsq_formats_project_experts_like_the_cpu_dequant() {
+    let d = MetalDevice::new().unwrap();
+    let (experts, rows) = (3, 13);
+    for kind in PACKED {
+        let cols = kind.cols();
+        let (bytes, dense) = kind.blocks(experts * rows * cols, 7 + kind.block as u64);
+        let w = Matrix::from_packed(&d, rows, cols, experts, kind.format, &bytes).unwrap();
+        let u32s = |v: &[u32]| {
+            let b: Vec<u8> = v.iter().flat_map(|v| v.to_le_bytes()).collect();
+            Tensor::from_le_bytes(&d, [v.len()], DType::F32, &b).unwrap()
+        };
+
+        let ids: [u32; 5] = [2, 0, 1, 1, 2];
+        let routes = ids.len();
+        let x = random(routes * cols, 11);
+        let xt = Tensor::from_f32(&d, [routes * cols], DType::F32, &x).unwrap();
+        let yt = Tensor::zeros(&d, [routes * rows], DType::F32).unwrap();
+        HybridModel::project_id(&d, &w, &xt, &u32s(&ids), routes, 1, &yt).unwrap();
+        let want: Vec<f32> = (0..routes * rows)
+            .map(|i| {
+                let (route, r) = (i / rows, i % rows);
+                dot_rows(
+                    &x[route * cols..],
+                    &dense,
+                    cols,
+                    ids[route] as usize * rows + r,
+                )
+            })
+            .collect();
+        let name = kind.format.name();
+        assert_close(&yt.to_f32(), &want, &format!("{name} routes"));
+
+        // Rows 0..2 use expert 0, 2..2 none of expert 1, 2..7 expert 2.
+        let offsets: [u32; 4] = [0, 2, 2, 7];
+        let sorted = 7;
+        let x = random(sorted * cols, 12);
+        let xt = Tensor::from_f32(&d, [sorted * cols], DType::F32, &x).unwrap();
+        let yt = Tensor::zeros(&d, [sorted * rows], DType::F32).unwrap();
+        HybridModel::project_mm_id(&d, &w, &xt, &u32s(&offsets), sorted, &yt).unwrap();
+        let expert = |i: usize| if i < 2 { 0 } else { 2 };
+        let want: Vec<f32> = (0..sorted * rows)
+            .map(|i| {
+                let (row, r) = (i / rows, i % rows);
+                dot_rows(&x[row * cols..], &dense, cols, expert(row) * rows + r)
+            })
+            .collect();
+        assert_close(&yt.to_f32(), &want, &format!("{name} sorted experts"));
+
+        // Streamed: group z is stored at slot table[z]. Rows 0..3 read slot
+        // 2, rows 3..5 slot 0, as the arena path numbers a layer's experts.
+        let (table, offsets): ([u32; 2], [u32; 3]) = ([2, 0], [0, 3, 5]);
+        let sorted = 5;
+        let x = random(sorted * cols, 13);
+        let xt = Tensor::from_f32(&d, [sorted * cols], DType::F32, &x).unwrap();
+        let yt = Tensor::zeros(&d, [sorted * rows], DType::F32).unwrap();
+        let slots = u32s(&table);
+        HybridModel::project_mm_id_in(
+            &d,
+            &w,
+            &xt,
+            &u32s(&offsets),
+            Some((&slots, table.len())),
+            sorted,
+            &yt,
+        )
+        .unwrap();
+        let want: Vec<f32> = (0..sorted * rows)
+            .map(|i| {
+                let (row, r) = (i / rows, i % rows);
+                let slot = table[usize::from(row >= 3)] as usize;
+                dot_rows(&x[row * cols..], &dense, cols, slot * rows + r)
+            })
+            .collect();
+        assert_close(&yt.to_f32(), &want, &format!("{name} arena slots"));
+    }
+}
+
+/// Embedding lookups decode each looked-up row exactly as the CPU does.
+#[test]
+fn gsq_formats_look_up_rows_like_the_cpu_dequant() {
+    let d = MetalDevice::new().unwrap();
+    let rows = 37;
+    for kind in PACKED {
+        let cols = kind.cols();
+        let (bytes, dense) = kind.blocks(rows * cols, 3 + kind.block as u64);
+        let w = Matrix::from_packed(&d, rows, cols, 1, kind.format, &bytes).unwrap();
+        let ids: [u32; 4] = [36, 0, 17, 17];
+        let b: Vec<u8> = ids.iter().flat_map(|i| i.to_le_bytes()).collect();
+        let ids_t = Tensor::from_le_bytes(&d, [ids.len()], DType::F32, &b).unwrap();
+        let y = Tensor::zeros(&d, [ids.len() * cols], DType::F32).unwrap();
+        HybridModel::get_rows(&d, &w, &ids_t, &y).unwrap();
+        let want: Vec<f32> = ids
+            .iter()
+            .flat_map(|&r| &dense[r as usize * cols..(r as usize + 1) * cols])
+            .copied()
+            .collect();
+        assert_eq!(y.to_f32(), want, "{}", kind.format.name());
+    }
 }

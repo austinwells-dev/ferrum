@@ -210,10 +210,16 @@ pub struct Plan {
 /// models (and Flint, which routes experts too) every tree row routes to its
 /// own experts, so a tree costs more than it saves and the wide verify's
 /// rounding drifts from plain decoding (the runtime keeps them on 2-draft
-/// chains for the same reason).
+/// chains for the same reason). Qwen3.8-Flash-Next streams its experts and
+/// its verify refuses trees.
 pub fn tree_target(config: Option<&ferrum::hybrid::HybridConfig>) -> bool {
     use ferrum::hybrid::config::Variant;
-    config.is_some_and(|c| !matches!(c.variant, Variant::Moe | Variant::Flint | Variant::Lfm3))
+    config.is_some_and(|c| {
+        !matches!(
+            c.variant,
+            Variant::Moe | Variant::Flint | Variant::Lfm3 | Variant::Qwen4Exp
+        )
+    })
 }
 
 impl Plan {

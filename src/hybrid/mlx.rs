@@ -310,6 +310,7 @@ pub fn config(dir: &Path) -> Result<HybridConfig> {
         ssm_v_heads: u("linear_num_value_heads")?,
         ssm_grouped_heads: true,
         moe: None,
+        qwen4exp: None,
         trained_context: u("max_position_embeddings")?,
         kv_cache: KvCache::F16,
     };
@@ -437,6 +438,8 @@ pub(crate) fn load_weights(d: &MetalDevice, dir: &Path, c: &HybridConfig) -> Res
             post_ffw: None,
             mixer,
             ffn,
+            hc: None,
+            ple: None,
         });
     }
     Ok(Weights {
@@ -445,6 +448,9 @@ pub(crate) fn load_weights(d: &MetalDevice, dir: &Path, c: &HybridConfig) -> Res
         output,
         rope_freqs: None,
         layers,
+        hc_head: None,
+        stream: None,
+        ple_table: None,
     })
 }
 

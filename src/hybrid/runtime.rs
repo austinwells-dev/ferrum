@@ -216,7 +216,9 @@ impl SpecOptions {
                 (DraftSource::Mtp, Variant::Moe) => 2,
                 (DraftSource::Mtp, _) => 3,
                 (DraftSource::Lookup, _) => LOOKUP_DRAFTS,
-                (_, Variant::Moe | Variant::Flint) => trained.min(2),
+                // Qwen3.8 streams its experts: DFlash2 there is 1.40x at 2,
+                // 1.31x at 3 and 1.08x at 7 (docs/measurements/qwen4exp).
+                (_, Variant::Moe | Variant::Flint | Variant::Qwen4Exp) => trained.min(2),
                 _ => trained,
             })
     }
@@ -536,12 +538,20 @@ impl Runtime {
             if super::mlx::is_mlx_dir(path) {
                 let mut config = super::mlx::config(path)?;
                 config.kv_cache = options.kv_cache;
-                options.draft = spec.memory(None, &config, options.chunk.max(1))?;
+                options.draft = spec.memory(
+                    None,
+                    &config,
+                    super::plan::model_chunk(&config, options.chunk),
+                )?;
             } else {
                 let file = GgufFile::open(path)?;
                 let mut config = HybridConfig::from_gguf(&file)?;
                 config.kv_cache = options.kv_cache;
-                options.draft = spec.memory(Some(&file), &config, options.chunk.max(1))?;
+                options.draft = spec.memory(
+                    Some(&file),
+                    &config,
+                    super::plan::model_chunk(&config, options.chunk),
+                )?;
             }
         }
         let loaded = super::load_with(&device, path, options)?;
@@ -1290,7 +1300,7 @@ pub fn generation_prefix(template: &ChatTemplate, vars: &Map<String, Json>) -> &
 fn reasoning_close(variant: Variant) -> &'static str {
     match variant {
         Variant::Flint | Variant::Spark | Variant::Lfm3 => "</think>",
-        Variant::Dense | Variant::Moe => "\n</think>\n\n",
+        Variant::Dense | Variant::Moe | Variant::Qwen4Exp => "\n</think>\n\n",
     }
 }
 

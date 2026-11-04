@@ -31,10 +31,24 @@ impl App {
             .collect()
     }
 
-    fn fav_model(&self, fav: &Fav) -> Option<&Model> {
+    pub fn fav_model(&self, fav: &Fav) -> Option<&Model> {
+        self.fav_model_index(fav).map(|i| &self.models[i])
+    }
+
+    /// The scanned model a favorite names. The saved path may be spelled
+    /// differently from the scan's (`~/Models` against `~/models` on a
+    /// case-insensitive disk, or through a symlink), so an inexact match
+    /// compares resolved paths.
+    pub fn fav_model_index(&self, fav: &Fav) -> Option<usize> {
         self.models
             .iter()
-            .find(|m| m.path.display().to_string() == fav.model)
+            .position(|m| m.path.display().to_string() == fav.model)
+            .or_else(|| {
+                let want = std::fs::canonicalize(&fav.model).ok()?;
+                self.models
+                    .iter()
+                    .position(|m| std::fs::canonicalize(&m.path).is_ok_and(|p| p == want))
+            })
     }
 
     pub fn pick_key(&mut self, key: KeyEvent) {

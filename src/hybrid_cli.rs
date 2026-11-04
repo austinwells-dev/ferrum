@@ -26,7 +26,8 @@ fn parse() -> Result<Options> {
         raw: false,
         max_new: 32,
         context: None,
-        chunk: 512,
+        // 0: the model's default (`plan::model_chunk`).
+        chunk: 0,
         repeat: 1,
     };
     let mut args = std::env::args().skip(2);
@@ -108,10 +109,18 @@ pub fn run(d: &MetalDevice) -> Result<()> {
     )?;
     let plan = &loaded.plan;
     let mib = |b: usize| b as f64 / (1u64 << 20) as f64;
+    if plan.streamed > 0 {
+        eprintln!(
+            "expert arena: {:.0} MiB of the {:.0} MiB of routed experts, the rest read from the SSD as they are routed",
+            mib(plan.arena),
+            mib(plan.streamed)
+        );
+    }
     eprintln!(
-        "memory plan: budget {:.0} MiB = weights {:.0} + scratch {:.0} + recurrent {:.0} + snapshots {:.0} + overhead {:.0} + KV {:.0} ({:.1} KiB/token x {}); max context {} (trained {})",
+        "memory plan: budget {:.0} MiB = weights {:.0} + experts {:.0} + scratch {:.0} + recurrent {:.0} + snapshots {:.0} + overhead {:.0} + KV {:.0} ({:.1} KiB/token x {}); max context {} (trained {})",
         mib(plan.budget),
         mib(plan.weights),
+        mib(plan.arena),
         mib(plan.scratch),
         mib(plan.recurrent),
         mib(plan.snapshots),
@@ -155,7 +164,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
     eprintln!(
         "measured: weights+scratch {:.0} MiB (predicted {:.0}), state {:.0} MiB (predicted {:.0})",
         mib(loaded.loaded_bytes),
-        mib(plan.weights + plan.scratch),
+        mib(plan.weights + plan.arena + plan.scratch),
         mib(state_measured),
         mib(plan.recurrent + plan.kv(plan.context)),
     );
@@ -169,6 +178,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         state.reset();
         d.set_profiling(profile && round + 1 == o.repeat);
         d.take_profile();
+        model.reset_stream_stats();
         let start = Instant::now();
         let Produced::Token(mut token) = model.forward(d, &mut state, &prompt, Output::Argmax)?
         else {
@@ -190,6 +200,8 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             print!("{piece}");
         }
         let gpu_before = d.counters().gpu;
+        let prefill_stream = model.stream_stats();
+        model.reset_stream_stats();
         while generated.len() < o.max_new && !loaded.eos_ids.contains(&token) {
             let t = Instant::now();
             let Produced::Token(next) = model.forward(d, &mut state, &[token], Output::Argmax)?
@@ -229,6 +241,25 @@ pub fn run(d: &MetalDevice) -> Result<()> {
             sorted.get(sorted.len() / 2).map_or(0., |&d| ms(d)),
             ms(gpu) / steps.len().max(1) as f64,
         );
+        for (phase, st) in [
+            ("prefill", prefill_stream),
+            ("decode", model.stream_stats()),
+        ] {
+            if let Some(st) = st {
+                eprintln!(
+                    "experts ({phase}): {} lookups, {:.1}% hits ({} read ahead); {} read ({:.0} MiB), {} ahead; waited {:.1} ms on misses, {:.1} ms on read-ahead",
+                    st.lookups,
+                    100. * st.hits as f64 / st.lookups.max(1) as f64,
+                    st.ahead_hits,
+                    st.reads,
+                    st.read_bytes as f64 / (1u64 << 20) as f64,
+                    st.ahead_reads,
+                    ms(st.read_time),
+                    ms(st.ahead_wait),
+                );
+            }
+        }
+        model.reset_stream_stats();
         if round == 0 {
             eprintln!("generated IDs: {generated:?}");
         }

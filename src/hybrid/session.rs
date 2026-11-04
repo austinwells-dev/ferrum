@@ -485,6 +485,7 @@ impl Session {
                         .restore_snapshot(d, &s.tensors, common, s.written)?,
                     None => self.state.restore_snapshot(d, &[], common, 0)?,
                 }
+                self.state.set_ple_context(&self.tokens[..common]);
                 self.tokens.truncate(common);
                 if self.drafter.is_some() {
                     self.drafter_rewind = Some(common);
@@ -518,6 +519,7 @@ impl Session {
                 let position = snapshot.position;
                 self.state
                     .restore_snapshot(d, &snapshot.tensors, position, snapshot.written)?;
+                self.state.set_ple_context(&self.tokens[..position]);
                 self.tokens.truncate(position);
                 if self.drafter.is_some() {
                     self.drafter_rewind = Some(position);

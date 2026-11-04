@@ -327,7 +327,7 @@ impl Mtp {
         t.add_rmsnorm(d, &x1, &mix, &w.post_norm, &x0, &xn, m)?;
         match &w.ffn {
             Ffn::Dense(f) => t.dense_ffn(d, s, f, &xn, &mix, m)?,
-            Ffn::Moe(f) => t.moe_ffn(d, s, f, &xn, &mix, m)?,
+            Ffn::Moe(f) => t.moe_ffn(d, s, f, None, &xn, &mix, m)?,
         }
         t.add_rmsnorm(d, &x0, &mix, &w.head_norm, &x1, &xn, m)?;
         Ok(xn)

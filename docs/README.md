@@ -29,6 +29,7 @@ Ferrum was built in phases, with each phase's experiments recorded as they happe
 | 10 | Long-context attention: Q8 K/V cache, TensorOps verify and staged prompt attention | [Journal](history/phase10-journal.md) |
 | 11 | Tree speculative decoding: tree-masked verify, path commit, MTP draft trees | [Plan](history/phase11-plan.md), [journal](history/phase11-journal.md) |
 | 12 | Image generation: Qwen-Image-2.1 on the Metal backend | [Journal](history/image-gen-journal.md) |
+| 13 | Qwen3.8-Flash-Next (`qwen4exp`) with experts streamed from the SSD (in progress) | [Plan and journal](history/qwen4exp-plan.md) |
 | 1–4 | The original runtime design: tensor ABI, kernel dispatch, batching (formerly the second half of architecture.md) | [Runtime internals by phase](history/architecture-by-phase.md) |
 | — | Image input (Qwen3-VL and LFM3-VL projectors) | [vision.md](vision.md) |
 | — | Re-check of every documented claim against llama.cpp build 11669 (October 2026) | [Record](measurements/verification-2026-10/README.md) |

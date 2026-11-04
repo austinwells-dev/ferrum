@@ -1,0 +1,16 @@
+Greedy regression: experimental (0417b3d) vs feat/qwen4exp-formats (a233bef + uncommitted tree, committed with this record)
+Machine: Apple M5, 32 GB; date 2026-11-03; caffeinate -dims
+Command (each binary, each model):
+  ferrum hybrid --model MODEL --raw --prompt 'The three laws of thermodynamics are' --max-new-tokens 64 --context 4096
+Result: stdout byte-compared with cmp
+
+== Spark-X2.6-4B-Q4_K_M: IDENTICAL
+-- output:
+:
+1. The First Law of Thermodynamics: Energy cannot be created or destroyed, only transformed from one form to another.
+2. The Second Law of Thermodynamics: The entropy of an isolated system always increases or remains constant over time.
+3. The Third Law of Thermodynamics: The entropy of a
+
+== Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS: IDENTICAL
+-- output:
+ fundamental principles that govern the behavior of energy and matter in the universe. The first law, also known as the law of conservation of energy, states that energy can neither be created nor destroyed, only altered in form. This means that the total energy of an isolated system remains constant, and energy can be transformed from one form

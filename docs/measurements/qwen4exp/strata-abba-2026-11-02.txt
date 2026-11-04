@@ -1,0 +1,74 @@
+# Strata vs Ferrum on Qwen3.8-Flash-Next, interleaved, 2026-11-02
+machine: Apple M5, 32 GB, macOS 27.0.1; caffeinate -dims, screen unlocked, one model in memory,
+  scripts/phase7a_cpu_preflight.py passed (PHASE7A_PREFLIGHT_IGNORE=dasd)
+model: Qwen3.8-Flash-Next-GSQ-RCO-Q2_0 (ISTA-DASLab), greedy, 128 new tokens, raw prompt (no chat template)
+prompts: short = 'The three laws of thermodynamics are' (7 tokens);
+  long = first 4,200 bytes of docs/architecture.md at a233bef (1,155 tokens); long4k = first 15,500 bytes (3,815 tokens)
+Strata: engine 0.1.55-metal, commit c62d5e3a, its own config (strata-q2_0.json):
+  STRATA_METAL_STREAM=1 strata --pack packs/q2_0 --native SHARD1 --ple-gguf SHARD2 --expert-profile data/expert-profile.bin
+  --expert-cache 64 --prefill auto --spec 2 --suffix-draft 0 --max-context 32768 --mmap-experts --tokens-file P.ids --max-new 128
+  (its arena: 12.89 GB, 9256 slots, filled from the expert profile; prompt chunks of 1024)
+Ferrum: ferrum hybrid --model SHARD1 --raw --prompt-file P.txt --max-new-tokens 128
+  (branch feat/qwen4exp-formats, the commit that adds this file; arena 17,802 MiB; chunk 2048; context 32768)
+order per prompt and round: Strata a, Ferrum a, Ferrum b, Strata b; two rounds
+Strata's decode tok/s counts 128 tokens; Ferrum's counts the 127 after the first (the first comes from prefill).
+
+## short
+s-short-1-a: decode 128 tokens in 8736.3 ms -> 14.65 tok/s;prefill 6 tokens in 2237.3 ms -> 2.68 tok/s (time to first token 2738.2 ms);
+f-short-1-a: round 0: prefill 7 tok in 1553.6 ms (4.5 tok/s); decode 127 tok in 7785.0 ms (16.31 tok/s, median 57.0 ms, GPU 41.75 ms/tok)
+   experts (prefill): 1915 lookups, 69.2% hits (1326 read ahead); 2396 read (3159 MiB), 1807 ahead; waited 135.5 ms on misses, 154.2 ms on read-ahead
+   experts (decode): 60960 lookups, 96.1% hits (5539 read ahead); 11427 read (15065 MiB), 9030 ahead; waited 853.9 ms on misses, 195.0 ms on read-ahead
+f-short-1-b: round 0: prefill 7 tok in 1182.3 ms (5.9 tok/s); decode 127 tok in 7614.8 ms (16.68 tok/s, median 56.1 ms, GPU 40.63 ms/tok)
+   experts (prefill): 1915 lookups, 69.2% hits (1326 read ahead); 2396 read (3159 MiB), 1807 ahead; waited 133.4 ms on misses, 101.5 ms on read-ahead
+   experts (decode): 60960 lookups, 96.1% hits (5539 read ahead); 11427 read (15065 MiB), 9030 ahead; waited 843.0 ms on misses, 216.4 ms on read-ahead
+s-short-1-b: decode 128 tokens in 8668.3 ms -> 14.77 tok/s;prefill 6 tokens in 2281.6 ms -> 2.63 tok/s (time to first token 2793.7 ms);
+s-short-2-a: decode 128 tokens in 10580.5 ms -> 12.10 tok/s;prefill 6 tokens in 1509.9 ms -> 3.97 tok/s (time to first token 1987.9 ms);
+f-short-2-a: round 0: prefill 7 tok in 1769.0 ms (4.0 tok/s); decode 127 tok in 7630.4 ms (16.64 tok/s, median 56.2 ms, GPU 40.63 ms/tok)
+   experts (prefill): 1915 lookups, 69.2% hits (1326 read ahead); 2396 read (3159 MiB), 1807 ahead; waited 135.0 ms on misses, 78.0 ms on read-ahead
+   experts (decode): 60960 lookups, 96.1% hits (5539 read ahead); 11427 read (15065 MiB), 9030 ahead; waited 841.1 ms on misses, 218.7 ms on read-ahead
+f-short-2-b: round 0: prefill 7 tok in 1292.5 ms (5.4 tok/s); decode 127 tok in 7573.8 ms (16.77 tok/s, median 55.7 ms, GPU 40.28 ms/tok)
+   experts (prefill): 1915 lookups, 69.2% hits (1326 read ahead); 2396 read (3159 MiB), 1807 ahead; waited 132.8 ms on misses, 158.2 ms on read-ahead
+   experts (decode): 60960 lookups, 96.1% hits (5539 read ahead); 11427 read (15065 MiB), 9030 ahead; waited 833.6 ms on misses, 222.4 ms on read-ahead
+s-short-2-b: decode 128 tokens in 8648.9 ms -> 14.80 tok/s;prefill 6 tokens in 2264.3 ms -> 2.65 tok/s (time to first token 2758.1 ms);
+
+## long
+s-long-1-a: decode 128 tokens in 9199.9 ms -> 13.91 tok/s;prefill 1154 tokens in 6111.3 ms -> 188.83 tok/s (time to first token 6609.9 ms);
+f-long-1-a: round 0: prefill 1155 tok in 5738.2 ms (201.3 tok/s); decode 127 tok in 7246.3 ms (17.53 tok/s, median 55.7 ms, GPU 41.68 ms/tok)
+   experts (prefill): 16151 lookups, 88.7% hits (14327 read ahead); 17960 read (23678 MiB), 16136 ahead; waited 404.2 ms on misses, 681.2 ms on read-ahead
+   experts (decode): 60960 lookups, 98.1% hits (2462 read ahead); 5971 read (7872 MiB), 4817 ahead; waited 375.7 ms on misses, 156.6 ms on read-ahead
+f-long-1-b: round 0: prefill 1155 tok in 5074.6 ms (227.6 tok/s); decode 127 tok in 7339.9 ms (17.30 tok/s, median 56.2 ms, GPU 42.15 ms/tok)
+   experts (prefill): 16151 lookups, 88.7% hits (14327 read ahead); 17960 read (23678 MiB), 16136 ahead; waited 409.6 ms on misses, 752.7 ms on read-ahead
+   experts (decode): 60960 lookups, 98.1% hits (2462 read ahead); 5971 read (7872 MiB), 4817 ahead; waited 373.6 ms on misses, 151.4 ms on read-ahead
+s-long-1-b: decode 128 tokens in 8724.9 ms -> 14.67 tok/s;prefill 1154 tokens in 6558.8 ms -> 175.95 tok/s (time to first token 7092.9 ms);
+s-long-2-a: decode 128 tokens in 9039.6 ms -> 14.16 tok/s;prefill 1154 tokens in 6075.3 ms -> 189.95 tok/s (time to first token 6540.6 ms);
+f-long-2-a: round 0: prefill 1155 tok in 5555.5 ms (207.9 tok/s); decode 127 tok in 7030.0 ms (18.07 tok/s, median 53.5 ms, GPU 40.31 ms/tok)
+   experts (prefill): 16151 lookups, 88.7% hits (14327 read ahead); 17960 read (23678 MiB), 16136 ahead; waited 431.5 ms on misses, 914.3 ms on read-ahead
+   experts (decode): 60960 lookups, 98.1% hits (2462 read ahead); 5971 read (7872 MiB), 4817 ahead; waited 374.1 ms on misses, 157.8 ms on read-ahead
+f-long-2-b: round 0: prefill 1155 tok in 4982.7 ms (231.8 tok/s); decode 127 tok in 6978.4 ms (18.20 tok/s, median 53.5 ms, GPU 39.92 ms/tok)
+   experts (prefill): 16151 lookups, 88.7% hits (14327 read ahead); 17960 read (23678 MiB), 16136 ahead; waited 402.4 ms on misses, 819.4 ms on read-ahead
+   experts (decode): 60960 lookups, 98.1% hits (2462 read ahead); 5971 read (7872 MiB), 4817 ahead; waited 370.9 ms on misses, 164.2 ms on read-ahead
+s-long-2-b: decode 128 tokens in 8521.1 ms -> 15.02 tok/s;prefill 1154 tokens in 6546.8 ms -> 176.27 tok/s (time to first token 7062.0 ms);
+
+## long4k
+s-long4k-1-a: decode 128 tokens in 9171.9 ms -> 13.96 tok/s;prefill 3814 tokens in 13700.8 ms -> 278.38 tok/s (time to first token 14192.6 ms);
+f-long4k-1-a: round 0: prefill 3815 tok in 12835.3 ms (297.2 tok/s); decode 127 tok in 6900.4 ms (18.40 tok/s, median 53.1 ms, GPU 40.04 ms/tok)
+   experts (prefill): 33076 lookups, 89.7% hits (29657 read ahead); 37013 read (48796 MiB), 33594 ahead; waited 769.2 ms on misses, 0.1 ms on read-ahead
+   experts (decode): 60960 lookups, 98.6% hits (1473 read ahead); 4023 read (5304 MiB), 3181 ahead; waited 270.2 ms on misses, 89.8 ms on read-ahead
+f-long4k-1-b: round 0: prefill 3815 tok in 12110.1 ms (315.0 tok/s); decode 127 tok in 7092.5 ms (17.91 tok/s, median 55.1 ms, GPU 41.78 ms/tok)
+   experts (prefill): 33076 lookups, 89.7% hits (29657 read ahead); 37013 read (48796 MiB), 33594 ahead; waited 783.4 ms on misses, 3.2 ms on read-ahead
+   experts (decode): 60960 lookups, 98.6% hits (1473 read ahead); 4023 read (5304 MiB), 3181 ahead; waited 275.4 ms on misses, 93.1 ms on read-ahead
+s-long4k-1-b: decode 128 tokens in 8516.4 ms -> 15.03 tok/s;prefill 3814 tokens in 13855.3 ms -> 275.27 tok/s (time to first token 14395.7 ms);
+s-long4k-2-a: decode 128 tokens in 9038.4 ms -> 14.16 tok/s;prefill 3814 tokens in 13754.1 ms -> 277.30 tok/s (time to first token 14247.8 ms);
+f-long4k-2-a: round 0: prefill 3815 tok in 12730.0 ms (299.7 tok/s); decode 127 tok in 6974.2 ms (18.21 tok/s, median 53.6 ms, GPU 40.94 ms/tok)
+   experts (prefill): 33076 lookups, 89.7% hits (29657 read ahead); 37013 read (48796 MiB), 33594 ahead; waited 780.2 ms on misses, 7.3 ms on read-ahead
+   experts (decode): 60960 lookups, 98.6% hits (1473 read ahead); 4023 read (5304 MiB), 3181 ahead; waited 272.9 ms on misses, 88.6 ms on read-ahead
+f-long4k-2-b: round 0: prefill 3815 tok in 12155.5 ms (313.9 tok/s); decode 127 tok in 6940.6 ms (18.30 tok/s, median 53.7 ms, GPU 40.63 ms/tok)
+   experts (prefill): 33076 lookups, 89.7% hits (29657 read ahead); 37013 read (48796 MiB), 33594 ahead; waited 764.1 ms on misses, 3.9 ms on read-ahead
+   experts (decode): 60960 lookups, 98.6% hits (1473 read ahead); 4023 read (5304 MiB), 3181 ahead; waited 272.3 ms on misses, 95.6 ms on read-ahead
+s-long4k-2-b: decode 128 tokens in 8107.1 ms -> 15.79 tok/s;prefill 3814 tokens in 13548.4 ms -> 281.51 tok/s (time to first token 14078.7 ms);
+
+## Strata's stream stats (long4k-1-a)
+expert stream prompts    4 chunks: 58294 distinct lookups (303.6 per layer), in the arena 0.2268, streamed ahead 0.7484, missed 0.0247; 81615 streamed in; host 859.4 ms per chunk, of it waiting 835.8 ms
+expert stream            128 windows: 107009 distinct lookups (836.0 per window), hits 0.8645, read-ahead hits 0.0743 (1762 of them late), misses 0.0611 (51.1 per window); read-aheads 12456 (97.3 per window, 15689 dropped); 992.2 MB read per window (91872 reads); host 17.43 ms per window, of it waiting 16.42 ms
+stream windows T=1     1 (decode): 86.35 ms each (GPU incl. the host's turns 82.27 ms)
+stream windows T=2     127 (decode): 71.50 ms each (GPU incl. the host's turns 70.25 ms)

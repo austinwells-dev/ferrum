@@ -412,6 +412,7 @@ impl Session {
             self.state
                 .restore_snapshot(d, &s.tensors, resume, s.written)?;
         }
+        self.state.set_ple_context(&self.tokens);
         Ok(())
     }
 }

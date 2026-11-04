@@ -1,0 +1,78 @@
+# Drafters on Qwen3.8-Flash-Next, interleaved with Strata, 2026-11-02
+machine: Apple M5, 32 GB, macOS 27.0.1; caffeinate -dims, screen unlocked, one model in memory,
+  scripts/phase7a_cpu_preflight.py passed (PHASE7A_PREFLIGHT_IGNORE=dasd)
+model: Qwen3.8-Flash-Next-GSQ-RCO-Q2_0 (ISTA-DASLab), greedy, 128 new tokens, raw prompts (as in strata-abba-2026-11-02.txt)
+drafter: incoai DFlash2 for Qwen3.8-Flash-Next (safetensors), 2 drafts per check (the qwen4exp default)
+Strata: engine 0.1.55-metal, c62d5e3a, as in strata-abba-2026-11-02.txt;
+  s2 = its config (--spec 2 --suffix-draft 0; no --mtp, so nothing is drafted: 0 of 127 accepted);
+  s1 = without --spec/--suffix-draft (its default: suffix lookup drafts, windows of 4)
+Ferrum: f = ferrum hybrid --model SHARD1 --raw --prompt-file P --max-new-tokens 128
+  d = hybrid_spec SHARD1 --drafter DFLASH2_DIR --prompt-file P --raw --tokens 128 --context 32768
+  (branch feat/qwen4exp-formats, the commit that adds this file)
+order per prompt and round: s2 a, s1 a, f a, d a, d b, f b, s1 b, s2 b; two rounds
+Strata's decode counts 128 tokens; Ferrum's counts the 127 after the first.
+
+Best of four (decode tok/s; prefill tok/s for f and Strata):
+  short    s2 15.23  s1 15.04  f 17.05  d 23.17 (1.36x f)
+  long     s2 14.61  s1 16.89  f 18.23  d 21.14 (1.16x f)   prefill s2 196.6  s1 193.3  f 239.5
+  long4k   s2 14.74  s1 16.27  f 18.58  d 18.79 (1.01x f)   prefill s2 283.5  s1 287.6  f 323.2
+DFlash2 acceptance length: short 2.35, long 2.10, long4k 1.79; verify 82-93 ms per 3-row step.
+Earlier single runs with --baseline gave DFlash2 27.9 tok/s on short: the baseline pass had just loaded the
+same experts into the arena. These interleaved runs start every drafted run as cold as the others.
+
+## Ferrum and DFlash2 lines
+f-short-1-a: round 0: prefill 7 tok in 2795.4 ms (2.5 tok/s); decode 127 tok in 7811.4 ms (16.26 tok/s, median 59.0 ms, GPU 42.35 ms/tok)
+d-short-1-a: chain: 22.96 tok/s, acceptance length 2.352, 2.0 drafts/step, draft 7.9 ms/step, verify 92.5 ms/step, accepted by depth 78% 57%
+d-short-1-b: chain: 22.83 tok/s, acceptance length 2.352, 2.0 drafts/step, draft 8.0 ms/step, verify 93.0 ms/step, accepted by depth 78% 57%
+f-short-1-b: round 0: prefill 7 tok in 1158.9 ms (6.0 tok/s); decode 127 tok in 7788.7 ms (16.31 tok/s, median 58.9 ms, GPU 42.27 ms/tok)
+f-long-1-a: round 0: prefill 1155 tok in 5567.3 ms (207.5 tok/s); decode 127 tok in 7007.2 ms (18.12 tok/s, median 53.6 ms, GPU 39.94 ms/tok)
+d-long-1-a: chain: 20.48 tok/s, acceptance length 2.098, 2.0 drafts/step, draft 10.1 ms/step, verify 89.5 ms/step, accepted by depth 67% 43%
+d-long-1-b: chain: 20.53 tok/s, acceptance length 2.098, 2.0 drafts/step, draft 10.1 ms/step, verify 89.3 ms/step, accepted by depth 67% 43%
+f-long-1-b: round 0: prefill 1155 tok in 4975.2 ms (232.2 tok/s); decode 127 tok in 7166.2 ms (17.72 tok/s, median 54.9 ms, GPU 41.05 ms/tok)
+f-long4k-1-a: round 0: prefill 3815 tok in 12543.8 ms (304.1 tok/s); decode 127 tok in 6884.9 ms (18.45 tok/s, median 52.9 ms, GPU 39.97 ms/tok)
+d-long4k-1-a: chain: 18.77 tok/s, acceptance length 1.789, 2.0 drafts/step, draft 10.9 ms/step, verify 82.4 ms/step, accepted by depth 58% 21%
+d-long4k-1-b: chain: 18.79 tok/s, acceptance length 1.789, 2.0 drafts/step, draft 10.9 ms/step, verify 82.3 ms/step, accepted by depth 58% 21%
+f-long4k-1-b: round 0: prefill 3815 tok in 11824.1 ms (322.6 tok/s); decode 127 tok in 6834.9 ms (18.58 tok/s, median 52.7 ms, GPU 39.67 ms/tok)
+f-short-2-a: round 0: prefill 7 tok in 1701.4 ms (4.1 tok/s); decode 127 tok in 7567.2 ms (16.78 tok/s, median 56.2 ms, GPU 40.46 ms/tok)
+d-short-2-a: chain: 23.15 tok/s, acceptance length 2.352, 2.0 drafts/step, draft 7.7 ms/step, verify 91.9 ms/step, accepted by depth 78% 57%
+d-short-2-b: chain: 23.17 tok/s, acceptance length 2.352, 2.0 drafts/step, draft 7.6 ms/step, verify 91.8 ms/step, accepted by depth 78% 57%
+f-short-2-b: round 0: prefill 7 tok in 1135.4 ms (6.2 tok/s); decode 127 tok in 7446.8 ms (17.05 tok/s, median 55.9 ms, GPU 39.58 ms/tok)
+f-long-2-a: round 0: prefill 1155 tok in 5175.7 ms (223.2 tok/s); decode 127 tok in 6967.1 ms (18.23 tok/s, median 53.5 ms, GPU 39.36 ms/tok)
+d-long-2-a: chain: 21.12 tok/s, acceptance length 2.098, 2.0 drafts/step, draft 9.5 ms/step, verify 87.1 ms/step, accepted by depth 67% 43%
+d-long-2-b: chain: 21.14 tok/s, acceptance length 2.098, 2.0 drafts/step, draft 9.4 ms/step, verify 87.0 ms/step, accepted by depth 67% 43%
+f-long-2-b: round 0: prefill 1155 tok in 4823.1 ms (239.5 tok/s); decode 127 tok in 7001.9 ms (18.14 tok/s, median 53.6 ms, GPU 39.31 ms/tok)
+f-long4k-2-a: round 0: prefill 3815 tok in 12208.9 ms (312.5 tok/s); decode 127 tok in 6864.9 ms (18.50 tok/s, median 53.2 ms, GPU 39.71 ms/tok)
+d-long4k-2-a: chain: 18.73 tok/s, acceptance length 1.789, 2.0 drafts/step, draft 10.9 ms/step, verify 82.6 ms/step, accepted by depth 58% 21%
+d-long4k-2-b: chain: 18.70 tok/s, acceptance length 1.789, 2.0 drafts/step, draft 10.9 ms/step, verify 82.8 ms/step, accepted by depth 58% 21%
+f-long4k-2-b: round 0: prefill 3815 tok in 11802.3 ms (323.2 tok/s); decode 127 tok in 6861.5 ms (18.51 tok/s, median 52.9 ms, GPU 39.55 ms/tok)
+
+## Strata lines
+s1-long-1-a: decode 128 tokens in 9120.6 ms -> 14.03 tok/s;prefill 1154 tokens in 5969.3 ms -> 193.32 tok/s (time to first token 6475.1 ms); speculation 114 rounds of 4, drafts accepted 14 of 116 (0.121), 1.12 tokens per round
+s1-long-1-b: decode 128 tokens in 7803.2 ms -> 16.40 tok/s;prefill 1154 tokens in 6535.9 ms -> 176.56 tok/s (time to first token 7069.6 ms); speculation 114 rounds of 4, drafts accepted 14 of 116 (0.121), 1.12 tokens per round
+s1-long-2-a: decode 128 tokens in 8618.5 ms -> 14.85 tok/s;prefill 1154 tokens in 5974.7 ms -> 193.15 tok/s (time to first token 6437.8 ms); speculation 114 rounds of 4, drafts accepted 14 of 116 (0.121), 1.12 tokens per round
+s1-long-2-b: decode 128 tokens in 7580.3 ms -> 16.89 tok/s;prefill 1154 tokens in 6434.9 ms -> 179.34 tok/s (time to first token 6914.5 ms); speculation 114 rounds of 4, drafts accepted 14 of 116 (0.121), 1.12 tokens per round
+s1-long4k-1-a: decode 128 tokens in 8920.3 ms -> 14.35 tok/s;prefill 3814 tokens in 13632.1 ms -> 279.78 tok/s (time to first token 14110.7 ms); speculation 125 rounds of 4, drafts accepted 3 of 127 (0.024), 1.02 tokens per round
+s1-long4k-1-b: decode 128 tokens in 7866.7 ms -> 16.27 tok/s;prefill 3814 tokens in 13259.8 ms -> 287.64 tok/s (time to first token 13750.8 ms); speculation 125 rounds of 4, drafts accepted 3 of 127 (0.024), 1.02 tokens per round
+s1-long4k-2-a: decode 128 tokens in 8992.7 ms -> 14.23 tok/s;prefill 3814 tokens in 13541.4 ms -> 281.65 tok/s (time to first token 13990.3 ms); speculation 125 rounds of 4, drafts accepted 3 of 127 (0.024), 1.02 tokens per round
+s1-long4k-2-b: decode 128 tokens in 7907.8 ms -> 16.19 tok/s;prefill 3814 tokens in 13420.3 ms -> 284.20 tok/s (time to first token 13910.5 ms); speculation 125 rounds of 4, drafts accepted 3 of 127 (0.024), 1.02 tokens per round
+s1-short-1-a: decode 128 tokens in 9912.2 ms -> 12.91 tok/s;prefill 6 tokens in 1540.1 ms -> 3.90 tok/s (time to first token 2018.2 ms); speculation 126 rounds of 4, drafts accepted 2 of 126 (0.016), 1.02 tokens per round
+s1-short-1-b: decode 128 tokens in 8640.9 ms -> 14.81 tok/s;prefill 6 tokens in 2249.0 ms -> 2.67 tok/s (time to first token 2760.8 ms); speculation 126 rounds of 4, drafts accepted 2 of 126 (0.016), 1.02 tokens per round
+s1-short-2-a: decode 128 tokens in 10545.1 ms -> 12.14 tok/s;prefill 6 tokens in 1351.8 ms -> 4.44 tok/s (time to first token 1793.6 ms); speculation 126 rounds of 4, drafts accepted 2 of 127 (0.016), 1.02 tokens per round
+s1-short-2-b: decode 128 tokens in 8512.7 ms -> 15.04 tok/s;prefill 6 tokens in 2131.7 ms -> 2.81 tok/s (time to first token 2583.9 ms); speculation 126 rounds of 4, drafts accepted 2 of 126 (0.016), 1.02 tokens per round
+s2-long-1-a: decode 128 tokens in 8949.9 ms -> 14.30 tok/s;prefill 1154 tokens in 6024.1 ms -> 191.56 tok/s (time to first token 6508.3 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-long-1-b: decode 128 tokens in 9308.5 ms -> 13.75 tok/s;prefill 1154 tokens in 6043.0 ms -> 190.96 tok/s (time to first token 6553.9 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-long-2-a: decode 128 tokens in 8761.2 ms -> 14.61 tok/s;prefill 1154 tokens in 6022.3 ms -> 191.62 tok/s (time to first token 6466.7 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-long-2-b: decode 128 tokens in 9094.6 ms -> 14.07 tok/s;prefill 1154 tokens in 5870.0 ms -> 196.59 tok/s (time to first token 6326.4 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-long4k-1-a: decode 128 tokens in 9000.3 ms -> 14.22 tok/s;prefill 3814 tokens in 13652.5 ms -> 279.36 tok/s (time to first token 14149.2 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-long4k-1-b: decode 128 tokens in 8917.5 ms -> 14.35 tok/s;prefill 3814 tokens in 13570.8 ms -> 281.05 tok/s (time to first token 14032.1 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-long4k-2-a: decode 128 tokens in 8683.8 ms -> 14.74 tok/s;prefill 3814 tokens in 13453.6 ms -> 283.49 tok/s (time to first token 13901.5 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-long4k-2-b: decode 128 tokens in 8755.4 ms -> 14.62 tok/s;prefill 3814 tokens in 13528.3 ms -> 281.93 tok/s (time to first token 13985.9 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-short-1-a: decode 128 tokens in 8406.6 ms -> 15.23 tok/s;prefill 6 tokens in 2306.4 ms -> 2.60 tok/s (time to first token 2829.2 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-short-1-b: decode 128 tokens in 9204.5 ms -> 13.91 tok/s;prefill 6 tokens in 1602.0 ms -> 3.75 tok/s (time to first token 2069.7 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-short-2-a: decode 128 tokens in 10438.4 ms -> 12.26 tok/s;prefill 6 tokens in 1396.2 ms -> 4.30 tok/s (time to first token 1888.0 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+s2-short-2-b: decode 128 tokens in 9268.3 ms -> 13.81 tok/s;prefill 6 tokens in 1529.9 ms -> 3.92 tok/s (time to first token 1972.3 ms); speculation 128 rounds of 2, drafts accepted 0 of 127 (0.000), 1.00 tokens per round
+
+## DSpark (shadowpa0327), hybrid_spec --prompts 2 --tokens 128 (chat prompts), by drafts per check
+k=2: 22.14 tok/s, acceptance 2.134, draft 10.0 ms, verify 84.4 ms
+k=3: 19.04 tok/s, acceptance 2.318, draft 11.8 ms, verify 107.5 ms
+k=4: 15.29 tok/s, acceptance 2.550, draft 14.4 ms, verify 150.1 ms
