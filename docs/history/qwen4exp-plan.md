@@ -1,6 +1,8 @@
 # Qwen3.8-Flash-Next (`qwen4exp`) on Ferrum: a design from Strata (2026-11-02)
 
-A plan, not a guide. Nothing here is implemented yet. Numbers marked **Strata** were measured by Strata's authors on their machines and are quoted from its docs. Numbers marked **est.** are arithmetic from the GGUF header and are not measurements. Everything else was read from the files on this Mac.
+The Q2_0 pack loads and runs. What it does now, including the sparse-attention indexer that is still not loaded, is in [models.md](../models.md#qwen38-flash-next). This page is the design as written on 2026-11-02. Sentences below that say nothing is implemented, or that the loader refuses the variant, describe that day.
+
+A plan, not a guide. Numbers marked **Strata** were measured by Strata's authors on their machines and are quoted from its docs. Numbers marked **est.** are arithmetic from the GGUF header and are not measurements. Everything else was read from the files on this Mac.
 
 ## Why the port is back on the table
 

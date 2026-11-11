@@ -1,6 +1,6 @@
 # Session reuse: snapshots keep sliding-window rings, pinned reply-header checkpoint
 
-Branch `fix/session-cache-reuse` against `experimental` `ab8f57e`, 29 October 2026. Machine: MacBook Pro Mac17,2, Apple M5, 10 CPU cores, 32 GB, Metal 4, macOS 27.0.1. One model in memory at a time, screen unlocked (checked before every run), `caffeinate -dims`, `scripts/phase7a_cpu_preflight.py` passed first with `PHASE7A_PREFLIGHT_IGNORE=dasd`.
+Branch `fix/session-cache-reuse` against `experimental` `ab8f57e`, 29 October 2026. The branch behavior in this file is what the tree does as of `15fb296`. Every mention of `experimental` below means that base commit, not later `experimental`: on `ab8f57e`, LFM3 lost its cache once a turn moved past the live sliding-window ring. Machine: MacBook Pro Mac17,2, Apple M5, 10 CPU cores, 32 GB, Metal 4, macOS 27.0.1. One model in memory at a time, screen unlocked (checked before every run), `caffeinate -dims`, `scripts/phase7a_cpu_preflight.py` passed first with `PHASE7A_PREFLIGHT_IGNORE=dasd`.
 
 Models (this machine's paths are in [regression-2026-10-29.sh](regression-2026-10-29.sh)): Swift-1.5-Qwen3.8-27B Q4_K_M (dense), Tiel-Coder-35B-A3B UD-IQ4_XS and Qwen3.6-35B-A3B IQ4_XS (MoE), LFM3-VL-2B Q4_K_M and LFM3-1.7B Q4_K_M (short-conv with sliding-window attention), Spark-X2.6-4B Q4_K_M and Flint UD-Q3_K_XL (attention only, sliding-window layers).
 
@@ -28,7 +28,7 @@ Models (this machine's paths are in [regression-2026-10-29.sh](regression-2026-1
 | Tiel-Coder-35B-A3B + DFlash2 (`--draft-max 2`) | 0 | 0 |
 | Swift 27B (4 turns, 300 tokens) | 0 | 0 |
 
-On `experimental`, LFM3 loses its cache once a turn adds more than about 570 tokens after a snapshot (the sliding-window ring has overwritten what the snapshot needed). Qwen3.6 loses it when the template drops a past reply's reasoning, one token before the end-of-prompt snapshot. The few tokens the branch still redoes are the rewritten reply header after the pinned checkpoint.
+On `ab8f57e`, LFM3 loses its cache once a turn adds more than about 570 tokens after a snapshot (the sliding-window ring has overwritten what the snapshot needed). Qwen3.6 loses it when the template drops a past reply's reasoning, one token before the end-of-prompt snapshot. The few tokens the branch still redoes are the rewritten reply header after the pinned checkpoint. That branch column is the behavior as of `15fb296` ([models.md](../../models.md#sessions)).
 
 Replies differ from `experimental` on some turns (the hash column). Models with recurrent state now split the prefill at the checkpoint, and a chunk boundary rounds differently from the middle of a chunk; a near-tie later in a 600-token greedy reply then picks the other token. The session check below compares each reuse against a reference that splits at the same place, and those match exactly.
 

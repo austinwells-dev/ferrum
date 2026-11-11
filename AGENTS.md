@@ -44,7 +44,7 @@ The guides (`README.md`, `docs/*.md` outside `history/` and `measurements/`) des
 |---|---|
 | A flag, endpoint, env var or default | [docs/server.md](docs/server.md), [docs/tui.md](docs/tui.md) or [docs/development.md](docs/development.md), whichever documents it |
 | Engine design: memory planning, sessions, speculative decoding, kernels, safety boundary | [docs/architecture.md](docs/architecture.md) |
-| A supported model, quant, architecture or format | README tables and [docs/experimental.md](docs/experimental.md) if it isn't production-ready |
+| A supported model, quant, architecture or format | README tables and [docs/models.md](docs/models.md) when the check is narrow or the behaviour can still change |
 | A performance or accuracy number | The number in the README or guide, with its new measurement record (below) |
 | A module, binary or tool added, removed or moved | [docs/development.md](docs/development.md) layout table, and this file if the overview above changes |
 | The number of `unsafe` blocks | The count in architecture.md's "Safety boundary" |
@@ -54,7 +54,7 @@ Rules:
 - **No claim without evidence.** Every number in the README or a guide comes from a run recorded under `docs/measurements/<topic>/`, with machine, model, quant, commit and command. Don't round in Ferrum's favour, and don't keep a number the code no longer produces.
 - **The README is the front door.** After any user-visible change, reread its Install, Quick start, Performance and Limitations sections and fix what is no longer true.
 - **History is frozen.** Don't edit files in `docs/history/` except to fix links. Ongoing multi-PR work keeps a journal in `docs/history/` (date each entry). When it lands, move what is true into the guides.
-- New experimental features go in [docs/experimental.md](docs/experimental.md) with their validation and known gaps until they meet the bar below.
+- A model or feature that is not production-ready is documented in [docs/models.md](docs/models.md): what runs, what was checked, and the gaps that remain. Validation logs go under `docs/measurements/`. Do not open a second manual whose subject is the `experimental` branch. Being merged toward `main` does not by itself close a gap. [docs/history/experimental-branch-notes.md](docs/history/experimental-branch-notes.md) is the retired note, kept for its numbers.
 
 ## Regression checks for large changes
 

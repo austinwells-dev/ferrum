@@ -8,7 +8,7 @@
 | [tui.md](tui.md) | The full-screen launcher: chat, the sandboxed coding agent, the speed and intelligence benchmarks |
 | [development.md](development.md) | Building, testing, profiling and using the crate as a library |
 | [architecture.md](architecture.md) | How the system fits together, and the runtime's safety argument |
-| [experimental.md](experimental.md) | **Experimental** Flint, Spark and LFM3 support: status, validation numbers, known gaps |
+| [models.md](models.md) | Flint, Qwen3.8-Flash-Next, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation: checked files and open gaps. LFM3-Omni is not supported |
 | [vision.md](vision.md) | The image encoder and how image tokens are positioned |
 
 ## Engineering journals
@@ -29,7 +29,8 @@ Ferrum was built in phases, with each phase's experiments recorded as they happe
 | 10 | Long-context attention: Q8 K/V cache, TensorOps verify and staged prompt attention | [Journal](history/phase10-journal.md) |
 | 11 | Tree speculative decoding: tree-masked verify, path commit, MTP draft trees | [Plan](history/phase11-plan.md), [journal](history/phase11-journal.md) |
 | 12 | Image generation: Qwen-Image-2.1 on the Metal backend | [Journal](history/image-gen-journal.md) |
-| 13 | Qwen3.8-Flash-Next (`qwen4exp`) with experts streamed from the SSD (in progress) | [Plan and journal](history/qwen4exp-plan.md) |
+| 13 | Qwen3.8-Flash-Next (`qwen4exp`): the Q2_0 pack runs, experts streamed from the SSD; the sparse-attention indexer is not loaded | [Plan and journal](history/qwen4exp-plan.md) |
+| — | Validation record formerly kept in `docs/experimental.md` (not a manual; promotion to `main` had not happened) | [Experimental branch notes](history/experimental-branch-notes.md) |
 | 1–4 | The original runtime design: tensor ABI, kernel dispatch, batching (formerly the second half of architecture.md) | [Runtime internals by phase](history/architecture-by-phase.md) |
 | — | Image input (Qwen3-VL and LFM3-VL projectors) | [vision.md](vision.md) |
 | — | Re-check of every documented claim against llama.cpp build 11669 (October 2026) | [Record](measurements/verification-2026-10/README.md) |

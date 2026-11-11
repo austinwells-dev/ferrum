@@ -145,7 +145,7 @@ pub fn weight_bytes(file: &GgufFile, c: &HybridConfig) -> usize {
         .tensors()
         .values()
         .filter(|t| trunk(&t.name))
-        // qwen4exp's sparse-attention indexer is not loaded yet: below its
+        // qwen4exp's sparse-attention indexer is not loaded: below its
         // top-k of 2048 positions, its attention is dense attention.
         .filter(|t| !t.name.contains(".indexer."))
         .map(|t| match super::weights::quantizes_hc(&t.name, t.type_id) {

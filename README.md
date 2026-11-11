@@ -13,20 +13,17 @@ Ferrum runs 27B–35B language models on a 32 GB Mac, at llama.cpp's speed on th
 
 You give it a model file and then either chat in the terminal, use the full-screen TUI (chat, a sandboxed coding agent, and a benchmarking tool), or run a local server that speaks the **OpenAI** and **Anthropic** APIs, so existing clients and coding agents work with it unchanged.
 
-> **Experimental branch.** These additions are not on `main` yet and are not production-ready; their flags and behaviour may change:
+> **Narrow checks, not a stability promise.** These run in the apps. Each was validated on the files named in [docs/models.md](docs/models.md), and the gaps there are still open. Which branch the commit is on does not close them.
 > - **MLX checkpoints.** MLX 4-bit Qwen3.5-family checkpoint directories load, but only the 27B is validated.
-> - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets, 16-row DFlash2 blocks, and sampled output identical to plain decoding.
-> - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts. A request can also lower an image's token budget below `--image-tokens` ([per-request image sizes](docs/server.md#image-size-per-request)).
+> - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets and 16-row DFlash2 blocks. It keeps the same tokens as plain sampling for a given seed (near-tie flips remain under default kernels; [models.md](docs/models.md#kflash)).
+> - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts. A request can also lower an image's token budget below `--image-tokens` ([per-request image sizes](docs/server.md#image-size-per-request)). Slots take turns on the GPU.
 > - **Image generation.** Qwen-Image-2.1-Turbo drawing and editing in the CLI, server and TUI, and the TUI tools `generate_image` and `view_image`.
-> - **LFM3.** LiquidAI LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input (WAV).
-> - **Qwen3.8-Flash-Next.** The 35 GiB Q2_0 pack runs on a 32 GB Mac: its experts stream from the SSD. 16.8–18.4 tok/s decode and 232–315 tok/s prefill on an M5, ahead of Strata on the same Mac; with a DFlash2 drafter, 23 tok/s on a short raw prompt and 26.5 tok/s (1.42×) in the TUI's chat benchmark ([details](docs/experimental.md#qwen38-flash-next)).
->
-> Everything else behaves as on `main`. Details and known gaps: [docs/experimental.md](docs/experimental.md).
+> - **LFM3.** LiquidAI LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input (WAV). LFM3-Omni is not supported.
 
 ## Highlights
 
 - **Competitive with llama.cpp on the same files.** Against llama.cpp build 11669 on an M5: 10–12% faster prefill and 2–6% faster decode on a dense 27B model; on a 35B mixture-of-experts, 3–5% faster decode and 2–7% slower prefill. [Numbers below](#performance).
-- **Lossless speculative decoding, up to 3.3× faster.** Supports MTP heads, DFlash/DFlash2 and DSpark drafters, and model-free prompt lookup. Every drafter model can draft trees of guesses (`--draft-tree N`) that the model checks in one pass. With KFlash (`--draft-tree auto`, experimental, from Kapitsa), each step checks as many guesses as are expected to pay off, learned on your Mac. Output is identical with and without speculation, sampled output too (for the same seed). On the dense 27B, Ferrum checks 8 drafted tokens for 1.4× the cost of one token, where llama.cpp pays 1.8×, so DFlash2 and DSpark blocks run 1.6–2.7× faster than in llama.cpp.
+- **Lossless speculative decoding, up to 3.3× faster.** Supports MTP heads, DFlash/DFlash2 and DSpark drafters, and model-free prompt lookup. Every drafter model can draft trees of guesses (`--draft-tree N`) that the model checks in one pass. With KFlash (`--draft-tree auto`, from Kapitsa; [gaps](docs/models.md#kflash)), each step checks as many guesses as are expected to pay off, learned on your Mac. The acceptance rule keeps the same tokens as plain decoding, sampled output included, for the same seed. Default kernels can still flip a near-tie; that showed up on KFlash at T 0.6 and on wide verifies of Flint and Qwen3.8 ([models.md](docs/models.md#kflash)). On the dense 27B, Ferrum checks 8 drafted tokens for 1.4× the cost of one token, where llama.cpp pays 1.8×, so DFlash2 and DSpark blocks run 1.6–2.7× faster than in llama.cpp.
 - **Plans memory before loading weights.** Every buffer is predicted from GGUF metadata, and Ferrum picks the largest context that fits: 101K tokens for the 27B model (190K with the optional 8-bit KV cache, `--kv-cache q8`), the full 262K for the 35B MoE. Predictions match Metal's own accounting to within a few MiB.
 - **Matches llama.cpp's output.** Mean KL divergence against llama.cpp's own logits is 1.2×10⁻⁴ on the 27B model, with the same top token at 99.5% of positions.
 - **Drop-in server.** OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`, tool calls, reasoning controls, image input, and conversation caching that only processes the new suffix of each request.
@@ -68,22 +65,24 @@ hf download peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP \
   Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf --local-dir ~/models
 ```
 
-**Experimental:** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks), Qwen3.8-Flash-Next (ISTA-DASLab's Q2_0 pack, [experts streamed from the SSD](docs/experimental.md#qwen38-flash-next)), Spark-X2.6-4B (XHToken, dense, sliding windows and per-head gates) and LFM3 (LiquidAI: LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input). One quant of Flint and of Spark is validated. LFM3's checks are in [experimental.md](docs/experimental.md#lfm3-17b), [experimental.md](docs/experimental.md#lfm3-vl-2b) and [experimental.md](docs/experimental.md#lfm3-audio-2b):
+**Qwen3.8-Flash-Next is supported.** The Q2_0 pack loads in the CLI, server and TUI, with its experts streamed from the SSD: 16.8–18.4 tok/s decode and 232–315 tok/s prefill on a 32 GB M5, and 26.5 tok/s (1.42×) with a DFlash2 drafter in the TUI chat benchmark. The sparse-attention indexer is not loaded, so past 2,048 tokens Ferrum attends to every position, which the model was not trained to do. Contexts past 2,048 are not validated ([details](docs/models.md#qwen38-flash-next)).
+
+**Also supported, with the gaps in [models.md](docs/models.md):** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks), Spark-X2.6-4B (XHToken, dense, sliding windows and per-head gates) and LFM3 (LiquidAI: LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input). One quant of Flint and of Spark is validated. LFM3's checks are in [models.md](docs/models.md#lfm3-17b), [models.md](docs/models.md#lfm3-vl-2b) and [models.md](docs/models.md#lfm3-audio-2b). LFM3-Omni is not supported.
 
 | Model | Hugging Face repo | File | Size |
 |---|---|---|---|
-| Flint Preview (MoE, experimental) | [`unsloth/flint-GGUF`](https://huggingface.co/unsloth/flint-GGUF) | `flint-UD-Q3_K_XL.gguf` | 18.5 GB |
-| Qwen3.8-Flash-Next (MoE, experts streamed, experimental) | [`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` and `-00002-of-00002.gguf` | 37.6 + 28.8 GB |
-| Spark-X2.6-4B (dense, experimental) | [`XHToken/Spark-X2.6-4B-GGUF`](https://huggingface.co/XHToken/Spark-X2.6-4B-GGUF) | `Spark-X2.6-4B-Q4_K_M.gguf` | 3.5 GB |
-| LFM3-1.7B (text, experimental) | [`LiquidAI/LFM3-1.7B-GGUF`](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) | `LFM3-1.7B-Q4_K_M.gguf` | 1.1 GB |
-| LFM3-VL-2B (still images, experimental) | [`LiquidAI/LFM3-VL-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF) | `LFM3-VL-2B-Q4_K_M.gguf` and `mmproj-LFM3-VL-2B-Q8_0.gguf` | 1.1 GB + 194 MB |
-| LFM3-Audio-2B (speech input, experimental) | [`LiquidAI/LFM3-Audio-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF) | `LFM3-Audio-2B-Q4_K_M.gguf` and `mmproj-LFM3-Audio-2B-Q8_0.gguf` | 1.1 GB + 304 MB |
+| Flint Preview (MoE) | [`unsloth/flint-GGUF`](https://huggingface.co/unsloth/flint-GGUF) | `flint-UD-Q3_K_XL.gguf` | 18.5 GB |
+| Qwen3.8-Flash-Next (MoE, experts streamed) | [`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` and `-00002-of-00002.gguf` | 37.6 + 28.8 GB |
+| Spark-X2.6-4B (dense) | [`XHToken/Spark-X2.6-4B-GGUF`](https://huggingface.co/XHToken/Spark-X2.6-4B-GGUF) | `Spark-X2.6-4B-Q4_K_M.gguf` | 3.5 GB |
+| LFM3-1.7B (text) | [`LiquidAI/LFM3-1.7B-GGUF`](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) | `LFM3-1.7B-Q4_K_M.gguf` | 1.1 GB |
+| LFM3-VL-2B (still images) | [`LiquidAI/LFM3-VL-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF) | `LFM3-VL-2B-Q4_K_M.gguf` and `mmproj-LFM3-VL-2B-Q8_0.gguf` | 1.1 GB + 194 MB |
+| LFM3-Audio-2B (speech input) | [`LiquidAI/LFM3-Audio-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF) | `LFM3-Audio-2B-Q4_K_M.gguf` and `mmproj-LFM3-Audio-2B-Q8_0.gguf` | 1.1 GB + 304 MB |
 
 ```sh
 hf download unsloth/flint-GGUF flint-UD-Q3_K_XL.gguf --local-dir ~/models
 ```
 
-**Experimental: MLX checkpoints.** A directory holding an MLX affine 4-bit (group 64) conversion of a dense Qwen3.5-family model loads directly: `config.json`, `model*.safetensors`, `tokenizer.json` and `chat_template.jinja`. The validated one is the Qwen3.8-27B 4-bit conversion that Kapitsa downloads (`kapitsa serve --model 27b`, LM Studio's community quant), together with the DFlash2 drafter stored beside it:
+**MLX checkpoints** (one dense 27B file checked; [gaps](docs/models.md#mlx-4-bit-checkpoints)). A directory holding an MLX affine 4-bit (group 64) conversion of a dense Qwen3.5-family model loads directly: `config.json`, `model*.safetensors`, `tokenizer.json` and `chat_template.jinja`. The validated one is the Qwen3.8-27B 4-bit conversion that Kapitsa downloads (`kapitsa serve --model 27b`, LM Studio's community quant), together with the DFlash2 drafter stored beside it:
 
 ```sh
 ferrum-server --model ~/.cache/kapitsa/models/qwen3.8-27b-4bit \
@@ -113,7 +112,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Write a haiku about Rust."}]}'
 ```
 
-To make generation faster, add a drafter. `--draft mtp` uses the prediction head inside the GGUF and needs no extra download. On the dense 27B a DFlash2 drafter with draft trees is faster still: `--draft <dir> --draft-tree 15`, or the experimental `--draft-tree auto`. On the MoE, keep chains: MTP reaches 1.47× plain decoding on Tiel-Coder, and a DFlash2 drafter is slightly faster (1.52× with `incoai/Qwen3.6-35B-A3B-DFlash2`; `jzinno/Ornith-1.5-35B-A3B-DFlash2` also works). See [speculative decoding](docs/server.md#speculative-decoding).
+To make generation faster, add a drafter. `--draft mtp` uses the prediction head inside the GGUF and needs no extra download. On the dense 27B GGUF a DFlash2 drafter with a fixed draft tree is faster still: `--draft <dir> --draft-tree 15`. On the Q4_K_XL file, `--draft-tree auto` is 3–5% behind that tree ([KFlash](docs/models.md#kflash)). On the MoE, keep chains: MTP reaches 1.47× plain decoding on Tiel-Coder, and a DFlash2 drafter is slightly faster (1.52× with `incoai/Qwen3.6-35B-A3B-DFlash2`; `jzinno/Ornith-1.5-35B-A3B-DFlash2` also works). See [speculative decoding](docs/server.md#speculative-decoding).
 
 ## The TUI
 
@@ -124,8 +123,8 @@ To make generation faster, add a drafter. `--draft mtp` uses the prediction head
 - **Serve.** Starts `ferrum-server` and shows its endpoint, health and live log.
 - **Benchmark.** Finds the fastest drafter, draft depth and draft tree (including KFlash) for a model on *your* Mac. It checks that every candidate's output matches plain decoding, and that a drafter whose output drifts late still answers the same questions right, then saves the winner as a favorite. Switched to *intelligence*, it scores the model instead: math, knowledge, instruction-following and code-reading questions, plus tool calling, long-context recall and writing code that must pass tests. Switched to *agent*, the coding agent fixes ten real bugs from open-source repos, and the tab counts the fixes that pass the projects' tests and the tokens they cost, and compares saved results across models and settings.
 - **Models.** Every GGUF found on this Mac in one table: quant, size, architecture, context, vision or audio support, matching drafters and its best measured results. Files Ferrum can't run stay listed with the reason.
-- **Image.** Draws and edits pictures with Qwen-Image-2.1 (experimental).
-- **Audio.** Transcribes a WAV clip or a recording with LFM3-Audio, or answers a question about it (experimental).
+- **Image.** Draws and edits pictures with Qwen-Image-2.1 ([gaps](docs/models.md#image-generation)).
+- **Audio.** Transcribes a WAV clip or a recording with LFM3-Audio, or answers a question about it ([limits](docs/models.md#lfm3-audio-2b)). LFM3-Omni is not this model.
 - **Settings.** Model folders, favorites, the web search provider and startup options.
 
 Setups (model, sampling, drafter) are saved as favorites. The [TUI guide](docs/tui.md) covers the agent tools, the sandbox, context management and the speed and intelligence benchmarks in detail.
@@ -154,7 +153,7 @@ These are measured on a 32 GB Apple M5 in October 2026, with Ferrum and llama.cp
 
 Both engines accept the same share of drafts (within two points), so the differences are the cost of verifying them. One forward of 9 rows (8 drafts) costs Ferrum 1.36× a decode step and llama.cpp 1.82×; 17 rows cost 2.42× and 3.69×. At MTP's 4 rows llama.cpp is cheaper, 1.17× against Ferrum's 1.31×.
 
-**Against Kapitsa** (experimental KFlash port, October 2026). Same 4 chat prompts through each server, Qwen3.8-27B with its DFlash2 drafter, one slot. Kapitsa 0.2.16 runs its defaults; Ferrum runs `--draft-tree auto`.
+**Against Kapitsa** (KFlash port, October 2026). Same 4 chat prompts through each server, Qwen3.8-27B with its DFlash2 drafter, one slot. Kapitsa 0.2.16 runs its defaults; Ferrum runs `--draft-tree auto`.
 
 | Setup (tok/s) | Greedy | T 0.6 |
 |---|---|---|
@@ -225,7 +224,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | [Development](docs/development.md) | Building, testing (including Metal validation layers), profiling, using Ferrum as a library |
 | [Architecture](docs/architecture.md) | Tensor and storage model, Metal backend, safety argument, the hybrid engine |
 | [Vision](docs/vision.md) | How image and speech input is encoded and positioned |
-| [Experimental](docs/experimental.md) | Flint, Qwen3.8-Flash-Next, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation: status, validation numbers, known gaps |
+| [Models](docs/models.md) | Flint, Qwen3.8-Flash-Next, Spark, LFM3 (not Omni), MLX checkpoints, KFlash, parallel requests and image generation: what is checked and what is still open |
 | [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
 | [Contributing](AGENTS.md) | Branch and PR flow (topic → `experimental` → `main`), checks, docs and regression rules |
 
@@ -233,9 +232,9 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - Batch size 1. `ferrum-server --parallel N` serves up to 8 requests at once in separate sessions that take turns on the GPU, so their streams interleave but total throughput is that of one request.
-- The server and TUI run Qwen3.5-family hybrids (GGUF, and experimentally dense MLX 4-bit checkpoints) and, experimentally, Flint, Qwen3.8-Flash-Next, Spark and LFM3. Other architectures go through the developer runner, built with `--features legacy-engine`.
-- Vision supports the Qwen3-VL projector and, experimentally, LFM3-VL still images. No video. LFM3-Audio hears WAV clips of up to 120 s each (experimental; also the TUI's Audio tab); it does not speak.
-- Image generation and editing (`ferrum-cli image`, `ferrum-server --image-model` with `/v1/images/generations` and `/v1/images/edits`, the TUI Image tab, and the chat and agent tool `generate_image`) supports Qwen-Image-2.1-Turbo from safetensors, and the base model's transformer from GGUF; a new 1024² picture takes about 69 s. See [experimental.md](docs/experimental.md#image-generation).
+- The server and TUI run Qwen3.5-family hybrids (GGUF, and dense MLX 4-bit checkpoints, one of which is checked), Qwen3.8-Flash-Next (the Q2_0 pack; its sparse-attention indexer is not loaded, and contexts past 2,048 are not validated), and Flint, Spark and LFM3 text, still images and speech input. LFM3-Omni is not supported. Other architectures go through the developer runner, built with `--features legacy-engine`. Open gaps: [models.md](docs/models.md).
+- Vision supports the Qwen3-VL projector and LFM3-VL still images. No video. LFM3-Audio hears WAV clips of up to 120 s each (also the TUI's Audio tab); it does not speak.
+- Image generation and editing (`ferrum-cli image`, `ferrum-server --image-model` with `/v1/images/generations` and `/v1/images/edits`, the TUI Image tab, and the chat and agent tool `generate_image`) supports Qwen-Image-2.1-Turbo from safetensors, and the base model's transformer from GGUF; a new 1024² picture takes about 69 s ([server.md](docs/server.md#image-generation)). The base schedule has no guidance and is not checked against diffusers.
 - No training and no language bindings.
 
 ## License
