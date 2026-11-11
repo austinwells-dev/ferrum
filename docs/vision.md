@@ -41,7 +41,9 @@ and runs a GELU MLP. A still image fills both patch-embedding taps, so they add.
 `<|image|>` is repeated once per language token. Any LFM3 prompt containing `<|video|>`
 is refused, projector or not. The checked pair is
 `LFM3-VL-2B-Q4_K_M.gguf` with `mmproj-LFM3-VL-2B-Q8_0.gguf`; that repo has no Q4_K_M
-projector. Numbers and the known gaps are in [experimental.md](experimental.md#lfm3-vl-2b).
+projector. The score buffer caps one image at 1773 language tokens.
+LFM3-Omni's combined projector is not a checked vision model
+([models.md](models.md#lfm3-omni)). Numbers: [measurements/lfm3](measurements/lfm3/README.md).
 
 ## LFM3-Audio
 
@@ -66,8 +68,11 @@ are cached by content (the last eight, as many as one request may carry). One cl
 last 120 s, checked from the WAV header before decoding; attention over a clip is n×n, and the memory plan
 counts every buffer encoding that length allocates (`lfm3a::activation_bytes`) plus the rows of the other
 seven cached clips (`lfm3a::output_bytes`). The
-`a.gen.*` speech generator in the same file is not loaded. Numbers and the known gaps are in
-[experimental.md](experimental.md#lfm3-audio-2b).
+`a.gen.*` speech generator in the same file is not loaded. A projector with
+`clip.has_vision_encoder` set (LFM3-Omni) is not this loader. WAV only, 120 s,
+at most 8 clips. Numbers and the other limits:
+[models.md](models.md#lfm3-audio-2b),
+[measurements/lfm3-audio](measurements/lfm3-audio/README.md).
 
 ## Validation
 
@@ -96,5 +101,5 @@ to speed this up.
 
 ## Not covered
 
-Video (including LFM3 `<|video|>`), speech output and audio formats other than WAV, other projector types (Gemma, LLaVA, Pixtral), DeepStack layers in chat, remote image URLs, and images on
-the shared-transformer models (Qwen2.5/3, Granite, OLMo, LFM2).
+Video (including LFM3 `<|video|>`), speech output (`lfm3a_gen`, including the generator half of LFM3-Audio and LFM3-Omni), audio formats other than WAV, other projector types (Gemma, LLaVA, Pixtral), DeepStack layers in chat, remote image URLs, and images on
+the shared-transformer models (Qwen2.5/3, Granite, OLMo, LFM2). LFM3-Omni has not been loaded.

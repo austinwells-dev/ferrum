@@ -1,6 +1,8 @@
-# Experimental: Flint, Qwen3.8-Flash-Next, Spark, LFM3, MLX checkpoints, KFlash, parallel requests and image generation
+# Experimental branch notes
 
-> **Experimental.** This page covers Flint, Qwen3.8-Flash-Next, Spark and LFM3 support (text, still images and speech input), MLX 4-bit checkpoints, KFlash speculative decoding (ported from Kapitsa), the server's parallel requests, and image generation. None of it is production-ready. Expect rough edges, and expect the behaviour, the flags and the parsing to change.
+> **History.** This is the validation record that used to live in `docs/experimental.md`, kept so the numbers, commands and files stay findable. It is not a manual. Current support, usage and limits are in [models.md](../models.md) and the guides. Written from the tree at `15fb296` (11 November 2026). At that commit `main` was `50378fd`, an ancestor 87 commits behind, and no promotion pull request had been opened. Do not read this page as a report that `experimental` has merged to `main`.
+
+> The checks below were real runs. They do not make a feature stable, and moving the branch onto `main` later would not either. Two sentences in the old manual were already out of date when it was retired; they are corrected in place and marked. Session wording in the October parallel-request note predates the ring snapshots in [session reuse](../measurements/session-reuse/README.md).
 
 Contents: [Flint](#what-works) · [Qwen3.8-Flash-Next](#qwen38-flash-next) · [Spark-X2.6-4B](#spark-x26-4b) · [LFM3-1.7B](#lfm3-17b) · [LFM3-VL-2B](#lfm3-vl-2b) · [LFM3-Audio-2B](#lfm3-audio-2b) · [MLX checkpoints](#mlx-4-bit-checkpoints) · [KFlash](#kflash-speculative-decoding) · [Parallel requests](#parallel-requests) · [Image generation](#image-generation)
 
@@ -30,7 +32,7 @@ Ferrum sits closer to llama.cpp's Metal output than llama.cpp's own CPU backend 
 
 - One quant (`UD-Q3_K_XL`) is validated. Other Flint files may use quant types the kernels do not cover; the TUI lists the supported set when it refuses a file.
 - Flint's template has no thinking switch, so the prompt itself ends in `<think>` (thinking on) or `<think></think>` (off), written the way the template writes past reasoning so later turns reuse the cached prefix. A budget-cut reasoning closes with a bare `</think>`.
-- Sliding-window layers keep their K/V in a ring of 1,088 rows (window 513 plus one prompt chunk), so only the 14 full-attention layers grow with the context: 28 KiB per token plus 76 MiB of rings, against 98 KiB per token before. A session can rewind only while the rings still hold the rewind point's window; further back it recomputes from the start.
+- Sliding-window layers keep their K/V in a ring of 1,088 rows (window 513 plus one prompt chunk), so only the 14 full-attention layers grow with the context: 28 KiB per token plus 76 MiB of rings, against 98 KiB per token before. Snapshots copy those rings, so a rewind can restore a copy taken at or past the divergence ([session reuse](../measurements/session-reuse/README.md), branch behavior after `aa2b402`). The manual previously said a rewind past the live ring always recomputed from the start. That described the tree before those snapshots, not the code this record now sits next to.
 - The legacy attention kernels (`FERRUM_HYBRID_LEGACY_ATTENTION`, `FERRUM_HYBRID_SIMD_ATTENTION`) reject Flint's and Spark's geometry.
 - No trained drafter (MTP, DFlash) exists for Flint. Prompt lookup (`--draft lookup`) works (1.12× on the `hybrid_spec` chat prompts) but is less exact than on the Qwen3.5 models: verifying 4 or more rows goes through F16 TensorOps tiles, and Flint's expert routing amplifies that rounding, so 4 of 8 greedy prompts drifted from plain decoding (one at a top-2 margin of 0.32). With `FERRUM_HYBRID_EXACT=1` only one near-tie flip (margin 0.035) remains, so this is rounding, not a verify error. The TUI's speed benchmark marks such rows `≈` and checks their answers before recommending them.
 - Expert routing implements neither a selection bias on the scores (`exp_probs_b.bias`) nor an `expert_weights_scale` other than 1.0; this GGUF has neither, and a file that does is refused at load.
@@ -47,27 +49,27 @@ Pick the model in the Models tab. It shows as runnable once the quant check pass
 
 # Qwen3.8-Flash-Next
 
-Qwen's `qwen4exp` architecture in ISTA-DASLab's GSQ-RCO Q2_0 pack: 48 layers (DeltaNet and attention, as in Qwen3.5), 512 routed experts with 10 used per token, a residual of four hyper-connection streams, and an n-gram hash embedding read from a second GGUF shard. Its 35 GiB of weights don't fit a 32 GB Mac, so the routed experts stay in the file and stream from the SSD into an expert arena (see [architecture.md](architecture.md#overview)). Load the first shard; the second must sit beside it.
+Qwen's `qwen4exp` architecture in ISTA-DASLab's GSQ-RCO Q2_0 pack: 48 layers (DeltaNet and attention, as in Qwen3.5), 512 routed experts with 10 used per token, a residual of four hyper-connection streams, and an n-gram hash embedding read from a second GGUF shard. Its 35 GiB of weights don't fit a 32 GB Mac, so the routed experts stay in the file and stream from the SSD into an expert arena (see [architecture.md](../architecture.md#overview)). Load the first shard; the second must sit beside it.
 
 ## Validation
 
-`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`, files `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-0000{1,2}-of-00002.gguf` (37.6 + 28.8 GB), on a 32 GB M5 with `iogpu.wired_limit_mb` at 24,576. The memory plan takes 23,552 MiB (the limit less the 1 GiB reserve): 2.9 GiB of resident weights and an 17.4 GiB expert arena, measured within 2 MiB of the prediction. The planner defaults to a 32K context to keep the arena large; the full trained 262,144 fits too, with the arena at 12.1 GiB (f16 K/V) or 14.9 GiB (`FERRUM_KV_CACHE=q8`), and decode after a short prompt goes from 16.6 to 16.2 and 16.6 tok/s ([record](measurements/qwen4exp/context-2026-11-02.txt)).
+`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`, files `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-0000{1,2}-of-00002.gguf` (37.6 + 28.8 GB), on a 32 GB M5 with `iogpu.wired_limit_mb` at 24,576. The memory plan takes 23,552 MiB (the limit less the 1 GiB reserve): 2.9 GiB of resident weights and an 17.4 GiB expert arena, measured within 2 MiB of the prediction. The planner defaults to a 32K context to keep the arena large; the full trained 262,144 fits too, with the arena at 12.1 GiB (f16 K/V) or 14.9 GiB (`FERRUM_KV_CACHE=q8`), and decode after a short prompt goes from 16.6 to 16.2 and 16.6 tok/s ([record](../measurements/qwen4exp/context-2026-11-02.txt)).
 
 | Check | Result |
 |---|---|
-| KLD vs llama.cpp CPU (Strata's vendored build, `c62d5e3a`), 2,040 positions | mean 0.0227, median 0.0044, top-1 94.75%; PPL 7.021 vs 7.064 ([record](measurements/qwen4exp/kld-2026-11-02.txt)) |
+| KLD vs llama.cpp CPU (Strata's vendored build, `c62d5e3a`), 2,040 positions | mean 0.0227, median 0.0044, top-1 94.75%; PPL 7.021 vs 7.064 ([record](../measurements/qwen4exp/kld-2026-11-02.txt)) |
 | Same, hyper-connection weights left in BF16 (`FERRUM_HC_BF16=1`) | mean 0.0222, top-1 94.66% |
 | Kernel parity (`hc_tests.rs`: hyper-connection and n-gram kernels; `iq_tests.rs`: Q2_0, Q3_K, Q5_0, IQ4_NL, arena slots) | pass |
 | `hybrid_session_check`, `hybrid_session_disk` (3K, 12K, 52K tokens) | identical |
 | `hybrid_spec_check` (oracle drafts in blocks of 8, a third of them corrupted) | speculative output equals greedy; replay after commit exact |
-| Speed against Strata 0.1.55 (Metal, its own config), interleaved, best of four ([record](measurements/qwen4exp/strata-abba-2026-11-02.txt)) | decode 16.8 vs 14.8 tok/s (short prompt), 18.2 vs 15.0 and prefill 232 vs 190 tok/s (1,155 tokens), 18.4 vs 15.8 and 315 vs 282 tok/s (3,815 tokens) |
-| DFlash2 drafter (2 drafts per check), interleaved with plain decoding ([record](measurements/qwen4exp/drafters-abba-2026-11-02.txt)) | 23.2 vs 17.1 tok/s (1.36×) on the short prompt, 21.1 vs 18.2 (1.16×) after 1,155 tokens, 18.8 vs 18.6 after 3,815 |
-| `ferrum-tui` | chat with thinking and tools, a follow-up turn from the cache, an image through the BF16 `mmproj`, no swap-outs during the run. Its Speed benchmark recommends DFlash2 at 2 drafts: 26.5 vs 18.6 tok/s (1.42×) on its three chat prompts, DSpark 25.5 ([record](measurements/qwen4exp/tui-bench-2026-11-02.txt)) |
+| Speed against Strata 0.1.55 (Metal, its own config), interleaved, best of four ([record](../measurements/qwen4exp/strata-abba-2026-11-02.txt)) | decode 16.8 vs 14.8 tok/s (short prompt), 18.2 vs 15.0 and prefill 232 vs 190 tok/s (1,155 tokens), 18.4 vs 15.8 and 315 vs 282 tok/s (3,815 tokens) |
+| DFlash2 drafter (2 drafts per check), interleaved with plain decoding ([record](../measurements/qwen4exp/drafters-abba-2026-11-02.txt)) | 23.2 vs 17.1 tok/s (1.36×) on the short prompt, 21.1 vs 18.2 (1.16×) after 1,155 tokens, 18.8 vs 18.6 after 3,815 |
+| `ferrum-tui` | chat with thinking and tools, a follow-up turn from the cache, an image through the BF16 `mmproj`, no swap-outs during the run. Its Speed benchmark recommends DFlash2 at 2 drafts: 26.5 vs 18.6 tok/s (1.42×) on its three chat prompts, DSpark 25.5 ([record](../measurements/qwen4exp/tui-bench-2026-11-02.txt)) |
 
 ## Known gaps
 
 - The sparse-attention (QSA) indexer is not loaded. Up to its top-k of 2,048 positions it selects every position, so attention there is exact; beyond 2,048 positions Ferrum attends to all of them, which the model was not trained to do. Contexts past 2,048 are not validated, though memory allows the full 262,144.
-- Draft trees are refused; chains work. Greedy drafted output can drift from plain decoding at near ties, from the rounding of multi-row verification, which the expert routing amplifies (as on Flint). With 3 drafts, all four `hybrid_spec` chat prompts diverged at top-2 margins of 0.0002–0.024 and all four were identical with `FERRUM_HYBRID_EXACT=1` ([record](measurements/qwen4exp/verify-rounding-2026-11-02.txt)). At 2 drafts the TUI benchmark saw a late flip (after a quarter of the answer) and its answer check passed. Each verify row routes to its own experts, many of them not in the arena, so a check grows 25–40 ms per extra row: drafters default to 2 drafts. DSpark (`shadowpa0327`) peaks at 22.1 tok/s at 2 drafts, below DFlash2. The separate MTP head (`qwen4exp-mtp`, a full layer with its own 512 experts) does not load.
+- Draft trees are refused; chains work. Greedy drafted output can drift from plain decoding at near ties, from the rounding of multi-row verification, which the expert routing amplifies (as on Flint). With 3 drafts, all four `hybrid_spec` chat prompts diverged at top-2 margins of 0.0002–0.024 and all four were identical with `FERRUM_HYBRID_EXACT=1` ([record](../measurements/qwen4exp/verify-rounding-2026-11-02.txt)). At 2 drafts the TUI benchmark saw a late flip (after a quarter of the answer) and its answer check passed. Each verify row routes to its own experts, many of them not in the arena, so a check grows 25–40 ms per extra row: drafters default to 2 drafts. DSpark (`shadowpa0327`) peaks at 22.1 tok/s at 2 drafts, below DFlash2. The separate MTP head (`qwen4exp-mtp`, a full layer with its own 512 experts) does not load.
 - Decode speed depends on what the arena holds: the first tokens of a new topic read more experts from the SSD. Long-context drafting gains little, because acceptance falls (1.79 tokens per step at 3,815 tokens).
 - Vision answers questions about one test image correctly; it has no parity check against llama.cpp's `mtmd`.
 - One quant (`Q2_0`) is validated.
@@ -110,7 +112,7 @@ The chat template is the GGUF's own Jinja. It emits `<|startoftext|>` itself (`a
 
 ## Validation
 
-`LFM3-1.7B-Q4_K_M.gguf` on a 32 GB M5, against llama.cpp build 11962. The record is [measurements/lfm3/](measurements/lfm3/). Homebrew llama.cpp build 11669 cannot load this file.
+`LFM3-1.7B-Q4_K_M.gguf` on a 32 GB M5, against llama.cpp build 11962. The record is [measurements/lfm3/](../measurements/lfm3/). Homebrew llama.cpp build 11669 cannot load this file.
 
 | Check | Result |
 |---|---|
@@ -154,7 +156,7 @@ ferrum-cli --model ~/models/LFM3-VL-2B-Q4_K_M.gguf \
 
 ## Validation
 
-On a 32 GB M5, against llama.cpp build 11962. The record is [measurements/lfm3/](measurements/lfm3/).
+On a 32 GB M5, against llama.cpp build 11962. The record is [measurements/lfm3/](../measurements/lfm3/).
 
 | Check | Result |
 |---|---|
@@ -183,7 +185,7 @@ Speech input for the same `lfm3` language model, through an audio projector (`cl
 
 The language file has the same tensors as LFM3-1.7B, a trained context of 128000 and greedy sampling metadata (temperature 0, top-k 1). Its template turns `input_audio`, `audio` and `audio_url` parts into `<|audio|>` (id 125031), which is repeated once per encoded row. As in llama.cpp, the rows are not wrapped in begin and end tokens. Ferrum reads the input half only: the projector file also holds the speech generator and codec (`a.gen.*`, `clip.gen.audio.projector_type = lfm3a_gen`), which are not loaded.
 
-The encoder ([vision.md](vision.md#lfm3-audio)) turns 16 kHz mono into 128 log-mel bins every 10 ms, subsamples them 8× with a convolution stem, and runs 17 blocks at width 768: 10 gated short convolutions and 7 attention layers that see the current and 31 previous rows. One row is one language token, so a second of speech is 12.5 tokens. A clip is encoded in one pass, so one clip may last at most 120 s (1500 tokens). Its length is read from the WAV header, so a longer clip is refused before it is decoded. WAV files above 384 kHz are refused. The memory plan counts the 220 MiB of weights it loads, every buffer encoding a 120 s clip allocates (363 MiB, its output rows included), and the rows of the 7 other clips the runtime keeps cached (82 MiB).
+The encoder ([vision.md](../vision.md#lfm3-audio)) turns 16 kHz mono into 128 log-mel bins every 10 ms, subsamples them 8× with a convolution stem, and runs 17 blocks at width 768: 10 gated short convolutions and 7 attention layers that see the current and 31 previous rows. One row is one language token, so a second of speech is 12.5 tokens. A clip is encoded in one pass, so one clip may last at most 120 s (1500 tokens). Its length is read from the WAV header, so a longer clip is refused before it is decoded. WAV files above 384 kHz are refused. The memory plan counts the 220 MiB of weights it loads, every buffer encoding a 120 s clip allocates (363 MiB, its output rows included), and the rows of the 7 other clips the runtime keeps cached (82 MiB).
 
 ```sh
 hf download LiquidAI/LFM3-Audio-2B-GGUF \
@@ -192,11 +194,11 @@ ferrum-cli --model ~/models/LFM3-Audio-2B-Q4_K_M.gguf \
   --mmproj ~/models/mmproj-LFM3-Audio-2B-Q8_0.gguf --system "Perform ASR in English."
 ```
 
-`/audio PATH.wav` attaches a clip, and an empty line sends it with no text. For transcription, Liquid's card puts the instruction in the system prompt and only the audio in the user turn, as above. With a question in the user turn instead of an ASR system prompt, the model answers about the clip. The server takes OpenAI `input_audio` parts ([server.md](server.md#audio)). In the TUI, a chat attaches `.wav` files, and the Audio tab ([tui.md](tui.md#audio)) transcribes a file or a recording, or answers a question about it.
+`/audio PATH.wav` attaches a clip, and an empty line sends it with no text. For transcription, Liquid's card puts the instruction in the system prompt and only the audio in the user turn, as above. With a question in the user turn instead of an ASR system prompt, the model answers about the clip. The server takes OpenAI `input_audio` parts ([server.md](../server.md#audio)). In the TUI, a chat attaches `.wav` files, and the Audio tab ([tui.md](../tui.md#audio)) transcribes a file or a recording, or answers a question about it.
 
 ## Validation
 
-On a 32 GB M5, against llama.cpp at `792fcf4` (built from source, since Homebrew's build does not have `lfm3a`). The record is [measurements/lfm3-audio/](measurements/lfm3-audio/).
+On a 32 GB M5, against llama.cpp at `792fcf4` (built from source, since Homebrew's build does not have `lfm3a`). The record is [measurements/lfm3-audio/](../measurements/lfm3-audio/).
 
 | Check | Result |
 |---|---|
@@ -208,7 +210,7 @@ On a 32 GB M5, against llama.cpp at `792fcf4` (built from source, since Homebrew
 | Memory plan vs Metal's allocations (`hybrid_audio_check --memory`), BF16 and Q8_0 | 665.8 MiB planned, 664.9 MiB measured peak (220.0 weights + 362.9 encoding a 120 s clip + 7 × 11.7 cached clips' rows) |
 | CPU front end, 112 s of 48 kHz stereo float | decode and resample 0.18 s, log-mel 0.24 s; the encoder then takes 0.56 s |
 | Over-long clip (247 s, 48 kHz stereo) | refused from its header; 0.54 s in all, the projector load included |
-| Qwen and LFM3-VL greedy, memory and speed vs `experimental` at `8cb5110` | see the [regression record](measurements/lfm3-audio/regression-2026-10-30.txt) |
+| Qwen and LFM3-VL greedy, memory and speed vs `experimental` at `8cb5110` | see the [regression record](../measurements/lfm3-audio/regression-2026-10-30.txt) |
 
 `llama-mtmd-cli` must run with `--jinja`: its default ChatML prompt has no `<|startoftext|>`, and with it the two-clip and question answers differ from the GGUF template's. The clips are macOS `say` voices, not recorded speech; no word error rate on a corpus was measured. Encoding took about 20 ms for a 2.8 s clip and 0.56 s for the 112 s one (single runs).
 
@@ -217,7 +219,7 @@ On a 32 GB M5, against llama.cpp at `792fcf4` (built from source, since Homebrew
 - WAV only (PCM 8/16/24/32-bit or float). Other formats are refused with a hint to convert them (`afconvert -f WAVE -d LEI16@16000 in.m4a out.wav`).
 - 120 s per clip. Longer audio has to be split by the caller; the encoder is not streamed and attention scores grow with the square of the clip length.
 - No speech output. `lfm3a_gen` and the codec are not loaded.
-- LFM3-Omni-2B's projector has both halves. It loads as an LFM3-VL image projector (untested); its audio half is not used.
+- LFM3-Omni-2B is not a checked model. The published `mmproj` (Hugging Face file viewer for `LiquidAI/LFM3-Omni-2B-GGUF`, `mmproj-LFM3-Omni-2B`) sets `clip.has_vision_encoder`, `clip.vision.projector_type = lfm3vl`, `clip.audio.projector_type = lfm3a` and `clip.gen.audio.projector_type = lfm3a_gen`, and does not set `clip.projector_type`. `is_audio_projector` is false when the vision flag is set, so this file is not speech input. `VisionModel::load` would follow `clip.vision.projector_type` and would not load the audio or speech-output tensors. That load has not been run. The manual's earlier sentence, "it loads as an LFM3-VL image projector", was not a test result. Video stays refused. Current wording: [models.md](../models.md#lfm3-omni).
 - The TUI chat attaches files up to 8 MB: about 4 minutes of 16 kHz mono 16-bit WAV, but only 43 s of 48 kHz stereo.
 - Transcription quality depends on the system prompt; nothing sets the ASR prompt for you.
 - Draft trees stay refused, as on the text model.
@@ -226,7 +228,7 @@ On a 32 GB M5, against llama.cpp at `792fcf4` (built from source, since Homebrew
 
 # MLX 4-bit checkpoints
 
-A directory holding an MLX affine 4-bit (group 64) conversion of a dense Qwen3.5-family model loads in `ferrum-cli`, `ferrum-server` and `ferrum-tui`, with no conversion step. The directory needs `config.json`, `model*.safetensors`, `tokenizer.json` and `chat_template.jinja`, and `generation_config.json` gives the default sampling. The decode GEMV and the verify-width GEMMs (integer codes on the matrix units) are adapted from [Kapitsa](https://github.com/nace-ai/kapitsa); those files are Apache-2.0 only ([THIRD_PARTY_NOTICES](../THIRD_PARTY_NOTICES)).
+A directory holding an MLX affine 4-bit (group 64) conversion of a dense Qwen3.5-family model loads in `ferrum-cli`, `ferrum-server` and `ferrum-tui`, with no conversion step. The directory needs `config.json`, `model*.safetensors`, `tokenizer.json` and `chat_template.jinja`, and `generation_config.json` gives the default sampling. The decode GEMV and the verify-width GEMMs (integer codes on the matrix units) are adapted from [Kapitsa](https://github.com/nace-ai/kapitsa); those files are Apache-2.0 only ([THIRD_PARTY_NOTICES](../../THIRD_PARTY_NOTICES)).
 
 ## Validation
 
@@ -265,7 +267,7 @@ MLX 4-bit 27B with its DFlash2 drafter, `hybrid_spec`, 8 chat prompts × 256 tok
 | T 0.6, `FERRUM_HYBRID_EXACT=1`, the 3 that parted | identical: rounding, not the acceptance rule (one draw fell 0.001 from a token edge) |
 | Budget's expected tokens per step vs measured | 5.03 vs 5.02 |
 
-Against Kapitsa through each server (same prompts): 82–91% of its greedy speed and 75–93% at T 0.6 on the same MLX checkpoint ([README](../README.md#performance), [Phase 11 journal](history/phase11-journal.md)).
+Against Kapitsa through each server (same prompts): 82–91% of its greedy speed and 75–93% at T 0.6 on the same MLX checkpoint ([README](../../README.md#performance), [Phase 11 journal](phase11-journal.md)).
 
 ## Known gaps
 
@@ -277,11 +279,11 @@ Against Kapitsa through each server (same prompts): 82–91% of its greedy speed
 
 # Parallel requests
 
-`ferrum-server --parallel N` (1–8) gives each of N concurrent requests its own session (a *slot*) with its own K/V cache, recurrent state and snapshots, on shared weights. Requests go to the slot whose cache suits them best, so each conversation keeps its cache while others run. Usage and routing: [server.md](server.md#parallel-requests).
+`ferrum-server --parallel N` (1–8) gives each of N concurrent requests its own session (a *slot*) with its own K/V cache, recurrent state and snapshots, on shared weights. Requests go to the slot whose cache suits them best, so each conversation keeps its cache while others run. Usage and routing: [server.md](../server.md#parallel-requests).
 
 ## Validation
 
-Measured on `feat/parallel-slots-image-options`, with `experimental` at `12a6e09` as the base, on a 32 GB M5, with Qwen3.8-27B UD-Q4_K_XL, Tiel-Coder-35B-A3B UD-IQ4_XS and Spark-X2.6-4B Q4_K_M ([parallel-slots-2026-10](measurements/parallel-slots-2026-10/README.md)):
+Measured on `feat/parallel-slots-image-options`, with `experimental` at `12a6e09` as the base, on a 32 GB M5, with Qwen3.8-27B UD-Q4_K_XL, Tiel-Coder-35B-A3B UD-IQ4_XS and Spark-X2.6-4B Q4_K_M ([parallel-slots-2026-10](../measurements/parallel-slots-2026-10/README.md)):
 
 - Greedy server output is identical to the base with 1, 4 and 8 slots (sent all at once for 4 and 8), and on Tiel with a DFlash drafter at 1 and 4 slots.
 - KLD against llama.cpp, `hybrid_session_check`, `hybrid_spec_check` and the memory plan (within 3 MiB) are unchanged.
@@ -295,13 +297,13 @@ Measured on `feat/parallel-slots-image-options`, with `experimental` at `12a6e09
 
 # Image generation
 
-Qwen-Image-2.1-Turbo (8 steps, no guidance) on a 32 GB M5, drawing and editing, through `ferrum-cli image`, `ferrum-server --image-model`, the TUI Image tab and the chat and agent tool `generate_image`. Usage: [server.md](server.md#image-generation).
+Qwen-Image-2.1-Turbo (8 steps, no guidance) on a 32 GB M5, drawing and editing, through `ferrum-cli image`, `ferrum-server --image-model`, the TUI Image tab and the chat and agent tool `generate_image`. Usage: [server.md](../server.md#image-generation).
 
 With a vision projector loaded, the chat and agent tools close the loop: `generate_image` adds the picture it just made to its own reply (`inject: true`, the default; `inject: false` for a call that only needs the file), and `view_image` opens any image file the sandbox allows. The model sees its output as pixels and can correct it in the next call. Without a projector both still save or read the file, and the reply says the picture was not shown.
 
 ## Validation
 
-All against diffusers at 512², with diffusers' own noise, and repeatable with the ignored tests in `src/diffusion/reference_tests.rs` ([edit-parity-2026-10-26.txt](measurements/image-gen/edit-parity-2026-10-26.txt)). Errors are relative RMS.
+All against diffusers at 512², with diffusers' own noise, and repeatable with the ignored tests in `src/diffusion/reference_tests.rs` ([edit-parity-2026-10-26.txt](../measurements/image-gen/edit-parity-2026-10-26.txt)). Errors are relative RMS.
 
 - **Drawing**, against an fp16 run: prompt embeddings 1.0% (Q8_0 encoder 2.7%, Q4_0 33%, the UD-Q4_K_XL GGUF 26%), transformer blocks 0.05–0.7%, final latents 0.9%, decoded image 0.065% (the decoder alone, on diffusers' latents). A bf16 reference is itself 4.8% and 6.2% from the fp16 one on embeddings and latents, so it is the looser ruler.
 - **Editing**, one 512² condition image, against a bf16 run: the VAE encoder 0.36% from diffusers' in float32; the vision tower 2.0% and its DeepStack features 0.25–1.1% from Transformers' in float32 (diffusers' own bf16 tower is 5.4% from that); the text encoder's rows after the image 2.2%; the transformer's condition-image prefix 0.3–2.2% across its blocks, and the final latents 2.2%. The prompt tokenizes identically.
@@ -314,7 +316,7 @@ All against diffusers at 512², with diffusers' own noise, and repeatable with t
 - Seeds do not reproduce diffusers' images (ChaCha8 and Box-Muller, not torch's generator).
 - Editing is checked with one condition image; two to four follow the same code but have no reference run.
 - Transformer weights load from BF16 safetensors (quantized to Q8_0 or Q4_0 on load) or from an unsloth-style GGUF (`--transformer-file`) whose block matrices are Q4_K, Q5_K, Q6_K, Q8_0, Q4_0 or BF16; other types are refused at load. A text-encoder GGUF (`--text-file`) must be a Qwen3-VL-8B language-model file with the usual `blk.N` names. MLX-quantized checkpoints do not load.
-- GGUF runs are validated by tensor mapping against Turbo's weights, memory estimates and pictures (Q4_K_M within 32.0 dB of Q8_0 at one seed), not against a diffusers dump of the base model ([gguf-2026-10-26.txt](measurements/image-gen/gguf-2026-10-26.txt)).
-- Denoising takes about 7 s a step at 1024². The projections run at 10–12 TFLOPS, near the best the TensorOps tiles reached in a sweep, and attention at about 4.5 TFLOPS is the part left to tune ([gemm-2026-10-26.txt](measurements/image-gen/gemm-2026-10-26.txt)).
+- GGUF runs are validated by tensor mapping against Turbo's weights, memory estimates and pictures (Q4_K_M within 32.0 dB of Q8_0 at one seed), not against a diffusers dump of the base model ([gguf-2026-10-26.txt](../measurements/image-gen/gguf-2026-10-26.txt)).
+- Denoising takes about 7 s a step at 1024². The projections run at 10–12 TFLOPS, near the best the TensorOps tiles reached in a sweep, and attention at about 4.5 TFLOPS is the part left to tune ([gemm-2026-10-26.txt](../measurements/image-gen/gemm-2026-10-26.txt)).
 - Cancelling waits for the current denoising step to end, and decoding cannot be cancelled. With `n` above 1, a failure discards the pictures already made.
 - The decoder has no tiling, so very large images are bounded by memory.

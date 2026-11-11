@@ -55,7 +55,7 @@ Main against this branch (Qwen3.5 models): both issue the same dispatches per de
 
 ## Server, vision and sandbox
 
-`ferrum-server` on Spark passed 45 of 45 checks: every endpoint; cache reuse (identical retry reuses all but one token, extensions reuse the prefix, and past Spark's 1,088-row K/V ring a late divergence resumes while an early one recomputes, both matching a fresh server); every thinking control including Anthropic `thinking`; `include_usage`, `return_progress` and disconnect handling; tool calls with schema-typed arguments; a clear 400 for images without a projector; `--api-key`, `--cors`, foreign-origin 403 and DNS-rebinding 403.
+`ferrum-server` on Spark passed 45 of 45 checks: every endpoint; cache reuse (identical retry reuses all but one token, extensions reuse the prefix, and past Spark's 1,088-row K/V ring a late divergence resumes while an early one recomputes, both matching a fresh server; ring snapshots later changed that early-divergence case, see [session reuse](../session-reuse/README.md)); every thinking control including Anthropic `thinking`; `include_usage`, `return_progress` and disconnect handling; tool calls with schema-typed arguments; a clear 400 for images without a projector; `--api-key`, `--cors`, foreign-origin 403 and DNS-rebinding 403.
 
 Vision on Tiel with its BF16 projector (0.83 GiB) passed 11 of 11: PNG, JPEG, GIF, WebP and BMP; Anthropic base64 blocks; remote URLs refused; the image cached across turns. Encoding took 0.79–0.85 s for 640×480 and 4.37 s for 1024×1024, and the description agreed with `llama-mtmd-cli`.
 

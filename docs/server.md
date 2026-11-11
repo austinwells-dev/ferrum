@@ -1,6 +1,6 @@
 # Server and CLI guide
 
-`ferrum-server` and `ferrum-cli` run Qwen3.5-family GGUF models (`qwen35` dense and `qwen35moe` hybrids) on the hybrid engine, and, experimentally, Flint and Spark ([experimental.md](experimental.md)). Both of them:
+`ferrum-server` and `ferrum-cli` run Qwen3.5-family GGUF models (`qwen35` dense and `qwen35moe` hybrids) on the hybrid engine, and also Flint, Spark, LFM3 and Qwen3.8-Flash-Next ([models.md](models.md)). LFM3-Omni is not supported. Both of them:
 
 - render the chat template embedded in the GGUF, the same way Hugging Face's `apply_chat_template` does,
 - stream the model's reasoning separately from its answer (as `reasoning_content`),
@@ -48,7 +48,7 @@ With several slots, a request goes to the free slot that suits its cache best, s
 3. Otherwise, the free slot that last served the same cache key: `prompt_cache_key` (OpenAI's field) or `session_id`, and for `/v1/messages` `metadata.user_id`.
 4. Otherwise, the least recently used free slot, empty ones first.
 
-Hybrid models can't rewind their linear-attention state the way a KV cache can, so each slot keeps recurrent-state snapshots (`--snapshots N`, default 2) to restore from when a request diverges.
+Hybrid models can't rewind linear-attention state the way a KV cache can, and a sliding-window layer's ring overwrites its oldest rows, so each slot snapshots both (`--snapshots N`, default 2): the recurrent state and a copy of every ring. A request that diverges restores the deepest snapshot at or before that point. Full-attention K/V rows stay valid. Chat templates that drop a past reply's reasoning diverge a few tokens before the end of the previous prompt; the session also snapshots there. See [architecture](architecture.md#the-hybrid-engine) and [models.md](models.md#sessions).
 
 ### Thinking controls
 
@@ -153,7 +153,7 @@ Responses include `draft_n` and `draft_n_accepted` in `timings`, as llama-server
 
 ## Vision (images)
 
-The Qwen3.5-family models can read images once you load their vision projector (the `mmproj*.gguf` published alongside the model). If a projector with a matching width sits in the same folder as the model, Ferrum loads it automatically. It takes about 1 GiB of the memory budget, and the auto-fitted context shrinks to make room. LFM3-VL uses the same flags. The pair checked here is `LFM3-VL-2B-Q4_K_M.gguf` with `mmproj-LFM3-VL-2B-Q8_0.gguf` (that repo publishes no Q4_K_M projector). Its template marker is `<|image|>`, and a prompt that contains `<|video|>` is refused. See [experimental.md](experimental.md#lfm3-vl-2b).
+The Qwen3.5-family models can read images once you load their vision projector (the `mmproj*.gguf` published alongside the model). If a projector with a matching width sits in the same folder as the model, Ferrum loads it automatically. It takes about 1 GiB of the memory budget, and the auto-fitted context shrinks to make room. LFM3-VL uses the same flags. The pair checked here is `LFM3-VL-2B-Q4_K_M.gguf` with `mmproj-LFM3-VL-2B-Q8_0.gguf` (that repo publishes no Q4_K_M projector). Its template marker is `<|image|>`, and a prompt that contains `<|video|>` is refused. LFM3-Omni's combined projector is not this path. Limits: [models.md](models.md#lfm3-vl-2b).
 
 | Flag | Effect |
 |---|---|
@@ -187,11 +187,11 @@ A request can lower the cap but never raise it past `--image-tokens`, because th
 
 ### Audio
 
-LFM3-Audio-2B (experimental) hears speech once its audio projector is loaded with the same `--mmproj` flag (auto-picked when its width matches). Send WAV clips inline as OpenAI `{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}` parts; `data` may also be a `data:audio/wav;base64,...` URL, and an `{"type": "audio_url", "audio_url": {"url": "data:..."}}` part works too. Ferrum reads PCM and float WAV at any sample rate and channel count (it mixes to mono and resamples to 16 kHz), rejects other formats and remote URLs, and refuses a clip longer than 120 s or more than 8 clips in one request. `/props` reports `modalities.audio`. For transcription, put Liquid's instruction in the system message (`"Perform ASR in English."`) and only the audio in the user message. Encoded clips are cached like images, so a conversation keeps its cache across turns. See [experimental.md](experimental.md#lfm3-audio-2b).
+LFM3-Audio-2B hears speech once its audio projector is loaded with the same `--mmproj` flag (auto-picked when its width matches the language model and the filename matches the model; a renamed file needs an explicit path). Send WAV clips inline as OpenAI `{"type": "input_audio", "input_audio": {"data": "<base64>", "format": "wav"}}` parts; `data` may also be a `data:audio/wav;base64,...` URL, and an `{"type": "audio_url", "audio_url": {"url": "data:..."}}` part works too. Ferrum reads PCM and float WAV at any sample rate and channel count (it mixes to mono and resamples to 16 kHz), rejects other formats and remote URLs, and refuses a clip longer than 120 s or more than 8 clips in one request. `/props` reports `modalities.audio`. For transcription, put Liquid's instruction in the system message (`"Perform ASR in English."`) and only the audio in the user message. Encoded clips are cached like images, so a conversation keeps its cache across turns. The speech generator in the same projector is not loaded. A projector that also has a vision tower (LFM3-Omni) is not loaded as audio. Limits: [models.md](models.md#lfm3-audio-2b).
 
 ## Image generation
 
-Ferrum draws and edits images with Qwen-Image-2.1 and its Turbo distillation (a Hugging Face directory with `model_index.json`, `transformer/`, `text_encoder/`, `vae/` and `processor/`). The stages run one after another and only one is in memory at a time, so it fits a 32 GB Mac. See [architecture](architecture.md#image-generation) for the design and [experimental.md](experimental.md#image-generation) for what is validated.
+Ferrum draws and edits images with Qwen-Image-2.1 and its Turbo distillation (a Hugging Face directory with `model_index.json`, `transformer/`, `text_encoder/`, `vae/` and `processor/`). The stages run one after another and only one is in memory at a time, so it fits a 32 GB Mac. See [architecture](architecture.md#image-generation) for the design and [models.md](models.md#image-generation) for what is validated and what is not.
 
 ```sh
 ferrum-cli image -m DIR -p "a red fox in snow" --size 1024x1024 --seed 7 -o fox.png
