@@ -15,7 +15,7 @@ You give it a model file and then either chat in the terminal, use the full-scre
 
 > **Narrow checks, not a stability promise.** These run in the apps. Each was validated on the files named in [docs/models.md](docs/models.md), and the gaps there are still open. Which branch the commit is on does not close them.
 > - **MLX checkpoints.** MLX 4-bit Qwen3.5-family checkpoint directories load, but only the 27B is validated.
-> - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets, 16-row DFlash2 blocks, and sampled output identical to plain decoding.
+> - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets, 16-row DFlash2 blocks, and the same acceptance rule as plain sampling for a given seed (near-tie flips remain under default kernels; [models.md](docs/models.md#kflash)).
 > - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts. A request can also lower an image's token budget below `--image-tokens` ([per-request image sizes](docs/server.md#image-size-per-request)). Slots take turns on the GPU.
 > - **Image generation.** Qwen-Image-2.1-Turbo drawing and editing in the CLI, server and TUI, and the TUI tools `generate_image` and `view_image`.
 > - **LFM3.** LiquidAI LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input (WAV). LFM3-Omni is not supported.
@@ -112,7 +112,7 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   -d '{"messages": [{"role": "user", "content": "Write a haiku about Rust."}]}'
 ```
 
-To make generation faster, add a drafter. `--draft mtp` uses the prediction head inside the GGUF and needs no extra download. On the dense 27B a DFlash2 drafter with draft trees is faster still: `--draft <dir> --draft-tree 15`, or `--draft-tree auto` ([KFlash](docs/models.md#kflash)). On the MoE, keep chains: MTP reaches 1.47× plain decoding on Tiel-Coder, and a DFlash2 drafter is slightly faster (1.52× with `incoai/Qwen3.6-35B-A3B-DFlash2`; `jzinno/Ornith-1.5-35B-A3B-DFlash2` also works). See [speculative decoding](docs/server.md#speculative-decoding).
+To make generation faster, add a drafter. `--draft mtp` uses the prediction head inside the GGUF and needs no extra download. On the dense 27B GGUF a DFlash2 drafter with a fixed draft tree is faster still: `--draft <dir> --draft-tree 15`. On the Q4_K_XL file, `--draft-tree auto` is 3–5% behind that tree ([KFlash](docs/models.md#kflash)). On the MoE, keep chains: MTP reaches 1.47× plain decoding on Tiel-Coder, and a DFlash2 drafter is slightly faster (1.52× with `incoai/Qwen3.6-35B-A3B-DFlash2`; `jzinno/Ornith-1.5-35B-A3B-DFlash2` also works). See [speculative decoding](docs/server.md#speculative-decoding).
 
 ## The TUI
 
