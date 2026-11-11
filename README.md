@@ -15,7 +15,7 @@ You give it a model file and then either chat in the terminal, use the full-scre
 
 > **Narrow checks, not a stability promise.** These run in the apps. Each was validated on the files named in [docs/models.md](docs/models.md), and the gaps there are still open. Which branch the commit is on does not close them.
 > - **MLX checkpoints.** MLX 4-bit Qwen3.5-family checkpoint directories load, but only the 27B is validated.
-> - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets, 16-row DFlash2 blocks, and the same acceptance rule as plain sampling for a given seed (near-tie flips remain under default kernels; [models.md](docs/models.md#kflash)).
+> - **KFlash (`--draft-tree auto`).** Speculative decoding ported from [Kapitsa](https://github.com/nace-ai/kapitsa) (Nace AI): learned draft-tree budgets and 16-row DFlash2 blocks. It keeps the same tokens as plain sampling for a given seed (near-tie flips remain under default kernels; [models.md](docs/models.md#kflash)).
 > - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts. A request can also lower an image's token budget below `--image-tokens` ([per-request image sizes](docs/server.md#image-size-per-request)). Slots take turns on the GPU.
 > - **Image generation.** Qwen-Image-2.1-Turbo drawing and editing in the CLI, server and TUI, and the TUI tools `generate_image` and `view_image`.
 > - **LFM3.** LiquidAI LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input (WAV). LFM3-Omni is not supported.
