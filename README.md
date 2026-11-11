@@ -65,7 +65,7 @@ hf download peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP \
   Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf --local-dir ~/models
 ```
 
-**Qwen3.8-Flash-Next is supported.** The Q2_0 pack loads in the CLI, server and TUI, with its experts streamed from the SSD: 16.8–18.4 tok/s decode and 232–315 tok/s prefill on a 32 GB M5, and 26.5 tok/s (1.42×) with a DFlash2 drafter in the TUI chat benchmark. The sparse-attention indexer is not loaded, so past 2,048 tokens Ferrum attends to every position ([details](docs/models.md#qwen38-flash-next)).
+**Qwen3.8-Flash-Next is supported.** The Q2_0 pack loads in the CLI, server and TUI, with its experts streamed from the SSD: 16.8–18.4 tok/s decode and 232–315 tok/s prefill on a 32 GB M5, and 26.5 tok/s (1.42×) with a DFlash2 drafter in the TUI chat benchmark. The sparse-attention indexer is not loaded, so past 2,048 tokens Ferrum attends to every position, which the model was not trained to do. Contexts past 2,048 are not validated ([details](docs/models.md#qwen38-flash-next)).
 
 **Also supported, with the gaps in [models.md](docs/models.md):** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks), Spark-X2.6-4B (XHToken, dense, sliding windows and per-head gates) and LFM3 (LiquidAI: LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input). One quant of Flint and of Spark is validated. LFM3's checks are in [models.md](docs/models.md#lfm3-17b), [models.md](docs/models.md#lfm3-vl-2b) and [models.md](docs/models.md#lfm3-audio-2b). LFM3-Omni is not supported.
 
@@ -232,7 +232,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - Batch size 1. `ferrum-server --parallel N` serves up to 8 requests at once in separate sessions that take turns on the GPU, so their streams interleave but total throughput is that of one request.
-- The server and TUI run Qwen3.5-family hybrids (GGUF, and dense MLX 4-bit checkpoints, one of which is checked), Qwen3.8-Flash-Next (the Q2_0 pack; its sparse-attention indexer is not loaded), and Flint, Spark and LFM3 text, still images and speech input. LFM3-Omni is not supported. Other architectures go through the developer runner, built with `--features legacy-engine`. Open gaps: [models.md](docs/models.md).
+- The server and TUI run Qwen3.5-family hybrids (GGUF, and dense MLX 4-bit checkpoints, one of which is checked), Qwen3.8-Flash-Next (the Q2_0 pack; its sparse-attention indexer is not loaded, and contexts past 2,048 are not validated), and Flint, Spark and LFM3 text, still images and speech input. LFM3-Omni is not supported. Other architectures go through the developer runner, built with `--features legacy-engine`. Open gaps: [models.md](docs/models.md).
 - Vision supports the Qwen3-VL projector and LFM3-VL still images. No video. LFM3-Audio hears WAV clips of up to 120 s each (also the TUI's Audio tab); it does not speak.
 - Image generation and editing (`ferrum-cli image`, `ferrum-server --image-model` with `/v1/images/generations` and `/v1/images/edits`, the TUI Image tab, and the chat and agent tool `generate_image`) supports Qwen-Image-2.1-Turbo from safetensors, and the base model's transformer from GGUF; a new 1024² picture takes about 69 s ([server.md](docs/server.md#image-generation)). The base schedule has no guidance and is not checked against diffusers.
 - No training and no language bindings.
