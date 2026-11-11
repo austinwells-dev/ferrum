@@ -49,6 +49,8 @@ Pick the model in the Models tab. It shows as runnable once the quant check pass
 
 # Qwen3.8-Flash-Next
 
+The Q2_0 pack runs. The limits under Known gaps below were open when this record was written, and they are the ones still listed in [models.md](../models.md#qwen38-flash-next).
+
 Qwen's `qwen4exp` architecture in ISTA-DASLab's GSQ-RCO Q2_0 pack: 48 layers (DeltaNet and attention, as in Qwen3.5), 512 routed experts with 10 used per token, a residual of four hyper-connection streams, and an n-gram hash embedding read from a second GGUF shard. Its 35 GiB of weights don't fit a 32 GB Mac, so the routed experts stay in the file and stream from the SSD into an expert arena (see [architecture.md](../architecture.md#overview)). Load the first shard; the second must sit beside it.
 
 ## Validation

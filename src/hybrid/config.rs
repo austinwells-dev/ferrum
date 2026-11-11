@@ -1,5 +1,5 @@
 //! Hybrid-engine geometry read from GGUF metadata (Qwen3.5 family, Flint, Spark,
-//! LFM3, and the not yet runnable Qwen3.8-Flash-Next).
+//! LFM3, and Qwen3.8-Flash-Next).
 #![forbid(unsafe_code)]
 use crate::{
     Error, Result,
@@ -26,9 +26,10 @@ pub enum Variant {
     /// full-attention layers via a frequency-factor vector.
     Lfm3,
     /// `qwen4exp` (Qwen3.8-Flash-Next): the `qwen35moe` layout plus four-stream
-    /// hyper-connections, indexer-selected sparse attention and an n-gram
-    /// embedding on layer 1 (`Qwen4ExpConfig`). Parsed and planned only: the
-    /// loader refuses it (docs/history/qwen4exp-plan.md).
+    /// hyper-connections, an n-gram embedding on layer 1 (`Qwen4ExpConfig`),
+    /// and indexer metadata. The Q2_0 pack loads with its experts streamed.
+    /// Indexer tensors stay in the file: attention is dense, which matches
+    /// the indexer only up to its top-k of 2,048 positions.
     Qwen4Exp,
 }
 
