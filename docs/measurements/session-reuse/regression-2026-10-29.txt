@@ -1,0 +1,335 @@
+# start 2026-10-29 18:26:02 UTC; macOS 27.0.1; "IOConsoleLocked" = No
+base = experimental ab8f57e, branch = aa2b402
+Apple M5
+34359738368
+## preflight
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 175.7% of one core; largest process 64.2% of one core.
+preflight exit 0
+## greedy text and memory: ferrum hybrid --model MODEL --raw --prompt 'The capital of France is' --max-new-tokens 48
+== base Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 16679 MiB (predicted 16682), state 6470 MiB (predicted 6471)
+stdout md5 83d343513ccf45f2d3d9e48af6c1fe10 bytes      198
+== branch Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 16679 MiB (predicted 16682), state 6470 MiB (predicted 6471)
+stdout md5 83d343513ccf45f2d3d9e48af6c1fe10 bytes      198
+greedy output identical
+== base Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 17114 MiB (predicted 17116), state 5183 MiB (predicted 5184)
+stdout md5 b7587183510804ec010b930f941ed75f bytes      239
+== branch Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 17114 MiB (predicted 17116), state 5183 MiB (predicted 5184)
+stdout md5 b7587183510804ec010b930f941ed75f bytes      239
+greedy output identical
+== base LFM3-VL-2B-Q4_K_M.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 1344 MiB (predicted 1345), state 1509 MiB (predicted 1510)
+stdout md5 d4aa1b4312f8b323ce38b3f81edc18d8 bytes      145
+== branch LFM3-VL-2B-Q4_K_M.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 1344 MiB (predicted 1345), state 1509 MiB (predicted 1510)
+stdout md5 d4aa1b4312f8b323ce38b3f81edc18d8 bytes      145
+greedy output identical
+== base Spark-X2.6-4B-Q4_K_M.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 3496 MiB (predicted 3496), state 19960 MiB (predicted 19961)
+stdout md5 c7397fd44e4549e8896067519e9f9458 bytes      155
+== branch Spark-X2.6-4B-Q4_K_M.gguf
+   ("IOConsoleLocked" = No)
+exit 0
+measured: weights+scratch 3496 MiB (predicted 3496), state 19726 MiB (predicted 19727)
+stdout md5 c7397fd44e4549e8896067519e9f9458 bytes      155
+greedy output identical
+## KLD against llama.cpp (version: 0.7.0 (build 11669, commit 620d2225c)), corpus = README.md + docs/*.md at ab8f57e, -c 512, 8 chunks
+   ("IOConsoleLocked" = No)
+llama-perplexity exit 0 for Swift-1.5-Qwen3.8-27B-Q4_K_M
+== base Swift-1.5-Qwen3.8-27B-Q4_K_M
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 10.9816 (llama.cpp 10.9850) mean KLD 0.000112 same top 99.61%
+chunk 1: ppl 12.1718 (llama.cpp 12.1492) mean KLD 0.000121 same top 99.61%
+chunk 2: ppl 8.8979 (llama.cpp 8.8779) mean KLD 0.000114 same top 99.74%
+chunk 3: ppl 7.5956 (llama.cpp 7.5821) mean KLD 0.000105 same top 99.71%
+chunk 4: ppl 7.8416 (llama.cpp 7.8329) mean KLD 0.000115 same top 99.53%
+chunk 5: ppl 7.7987 (llama.cpp 7.7922) mean KLD 0.000113 same top 99.61%
+chunk 6: ppl 7.4338 (llama.cpp 7.4268) mean KLD 0.000123 same top 99.50%
+chunk 7: ppl 7.3996 (llama.cpp 7.3922) mean KLD 0.000126 same top 99.56%
+positions 2040; Ferrum PPL 7.3996; llama.cpp PPL 7.3922; mean KLD 0.000126; median 0.000048; p99 0.001480; max 0.011844; same top-1 99.56%; 42.2 s
+== branch Swift-1.5-Qwen3.8-27B-Q4_K_M
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 10.9816 (llama.cpp 10.9850) mean KLD 0.000112 same top 99.61%
+chunk 1: ppl 12.1718 (llama.cpp 12.1492) mean KLD 0.000121 same top 99.61%
+chunk 2: ppl 8.8979 (llama.cpp 8.8779) mean KLD 0.000114 same top 99.74%
+chunk 3: ppl 7.5956 (llama.cpp 7.5821) mean KLD 0.000105 same top 99.71%
+chunk 4: ppl 7.8416 (llama.cpp 7.8329) mean KLD 0.000115 same top 99.53%
+chunk 5: ppl 7.7987 (llama.cpp 7.7922) mean KLD 0.000113 same top 99.61%
+chunk 6: ppl 7.4338 (llama.cpp 7.4268) mean KLD 0.000123 same top 99.50%
+chunk 7: ppl 7.3996 (llama.cpp 7.3922) mean KLD 0.000126 same top 99.56%
+positions 2040; Ferrum PPL 7.3996; llama.cpp PPL 7.3922; mean KLD 0.000126; median 0.000048; p99 0.001480; max 0.011844; same top-1 99.56%; 41.7 s
+   ("IOConsoleLocked" = No)
+llama-perplexity exit 0 for Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS
+== base Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 17.5089 (llama.cpp 17.6436) mean KLD 0.006566 same top 95.69%
+chunk 1: ppl 19.2883 (llama.cpp 19.4714) mean KLD 0.009008 same top 95.29%
+chunk 2: ppl 12.7813 (llama.cpp 12.8862) mean KLD 0.008130 same top 95.95%
+chunk 3: ppl 10.6954 (llama.cpp 10.7781) mean KLD 0.006701 same top 96.47%
+chunk 4: ppl 11.1611 (llama.cpp 11.2432) mean KLD 0.006497 same top 96.08%
+chunk 5: ppl 11.2372 (llama.cpp 11.3112) mean KLD 0.006140 same top 96.14%
+chunk 6: ppl 10.8215 (llama.cpp 10.8645) mean KLD 0.006840 same top 96.19%
+chunk 7: ppl 10.6813 (llama.cpp 10.7243) mean KLD 0.006947 same top 96.08%
+positions 2040; Ferrum PPL 10.6813; llama.cpp PPL 10.7243; mean KLD 0.006947; median 0.002632; p99 0.075186; max 0.266574; same top-1 96.08%; 14.2 s
+== branch Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 17.5089 (llama.cpp 17.6436) mean KLD 0.006566 same top 95.69%
+chunk 1: ppl 19.2883 (llama.cpp 19.4714) mean KLD 0.009008 same top 95.29%
+chunk 2: ppl 12.7813 (llama.cpp 12.8862) mean KLD 0.008130 same top 95.95%
+chunk 3: ppl 10.6954 (llama.cpp 10.7781) mean KLD 0.006701 same top 96.47%
+chunk 4: ppl 11.1611 (llama.cpp 11.2432) mean KLD 0.006497 same top 96.08%
+chunk 5: ppl 11.2372 (llama.cpp 11.3112) mean KLD 0.006140 same top 96.14%
+chunk 6: ppl 10.8215 (llama.cpp 10.8645) mean KLD 0.006840 same top 96.19%
+chunk 7: ppl 10.6813 (llama.cpp 10.7243) mean KLD 0.006947 same top 96.08%
+positions 2040; Ferrum PPL 10.6813; llama.cpp PPL 10.7243; mean KLD 0.006947; median 0.002632; p99 0.075186; max 0.266574; same top-1 96.08%; 15.8 s
+## KLD LFM3-1.7B against the docs/measurements/lfm3 base file (1 chunk)
+== base LFM3-1.7B-Q4_K_M
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 158.0000 (llama.cpp 160.4486) mean KLD 0.001009 same top 99.22%
+positions 255; Ferrum PPL 158.0000; llama.cpp PPL 160.4486; mean KLD 0.001009; median 0.000822; p99 0.004870; max 0.006760; same top-1 99.22%; 0.6 s
+== branch LFM3-1.7B-Q4_K_M
+   ("IOConsoleLocked" = No)
+chunk 0: ppl 158.0000 (llama.cpp 160.4486) mean KLD 0.001009 same top 99.22%
+positions 255; Ferrum PPL 158.0000; llama.cpp PPL 160.4486; mean KLD 0.001009; median 0.000822; p99 0.004870; max 0.006760; same top-1 99.22%; 0.6 s
+## chat reuse per turn: hybrid_chat_reuse (5 turns, tool round, 600 new tokens per turn, temperature 0)
+== base LFM3-VL-2B with a picture
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 93 | 0 | 0 | 0 | 0.06 | 6acfec1d |
+| 1 | 1313 | 257 | 257 | 0 | 0.43 | 0316fc4b |
+| 2 | 1323 | 93 | 0 | 93 | 0.53 | 603748a8 |
+| 3 | 1817 | 1323 | 0 | 1323 | 0.75 | 4c1e834d |
+| 4 | 1864 | 1817 | 0 | 1817 | 0.76 | 798f32ff |
+lost 3233 tokens in all, 1817 at worst
+== branch LFM3-VL-2B with a picture
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 93 | 0 | 0 | 0 | 0.07 | 6acfec1d |
+| 1 | 1313 | 257 | 257 | 0 | 0.46 | 0316fc4b |
+| 2 | 1323 | 93 | 89 | 4 | 0.55 | 603748a8 |
+| 3 | 1817 | 1323 | 1322 | 1 | 0.22 | 4c1e834d |
+| 4 | 1864 | 1817 | 1816 | 1 | 0.07 | 798f32ff |
+lost 6 tokens in all, 4 at worst
+== base LFM3-VL-2B text
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 88 | 0 | 0 | 0 | 0.06 | 1a49025c |
+| 1 | 1718 | 139 | 139 | 0 | 0.76 | 9585f134 |
+| 2 | 1714 | 88 | 0 | 88 | 0.81 | 81b48f58 |
+| 3 | 1851 | 1714 | 0 | 1714 | 0.84 | 0a954b0d |
+| 4 | 1875 | 1851 | 0 | 1851 | 0.83 | 2311a208 |
+lost 3653 tokens in all, 1851 at worst
+== branch LFM3-VL-2B text
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 88 | 0 | 0 | 0 | 0.07 | 1a49025c |
+| 1 | 1706 | 139 | 139 | 0 | 0.67 | 1cb58f5a |
+| 2 | 2130 | 2109 | 2109 | 0 | 0.05 | 2bb99abf |
+| 3 | 2529 | 2508 | 2508 | 0 | 0.05 | 81acf23e |
+| 4 | 1790 | 88 | 84 | 4 | 0.75 | d1c84d4c |
+lost 4 tokens in all, 4 at worst
+== base Qwen3.6-35B-A3B
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 291 | 0 | 0 | 0 | 0.46 | c229ce5f |
+| 1 | 2029 | 401 | 401 | 0 | 2.45 | ed45f71e |
+| 2 | 2129 | 2107 | 2107 | 0 | 0.15 | 91410a46 |
+| 3 | 2485 | 2463 | 2463 | 0 | 0.15 | d1acc1b4 |
+| 4 | 2064 | 289 | 0 | 289 | 2.98 | 0b4abd4b |
+lost 289 tokens in all, 289 at worst
+== branch Qwen3.6-35B-A3B
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 291 | 0 | 0 | 0 | 0.53 | c229ce5f |
+| 1 | 2024 | 401 | 401 | 0 | 2.39 | 0381a46a |
+| 2 | 2127 | 2105 | 2105 | 0 | 0.18 | 5b776d34 |
+| 3 | 2011 | 289 | 286 | 3 | 2.35 | 67a2089b |
+| 4 | 2293 | 2271 | 2271 | 0 | 0.15 | fc1bfe2a |
+lost 3 tokens in all, 3 at worst
+== base Tiel-Coder-35B-A3B + DFlash2 (--draft-max 2)
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 577 | 0 | 0 | 0 | 0.75 | 3e027bb3 |
+| 1 | 2259 | 631 | 631 | 0 | 2.09 | 8c9c121d |
+| 2 | 2516 | 2494 | 2494 | 0 | 0.13 | 9ee19bd9 |
+| 3 | 3141 | 3115 | 3115 | 0 | 0.13 | 75b71b7d |
+| 4 | 3768 | 3740 | 3740 | 0 | 0.14 | 2b348789 |
+lost 0 tokens in all, 0 at worst
+== branch Tiel-Coder-35B-A3B + DFlash2 (--draft-max 2)
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 577 | 0 | 0 | 0 | 0.78 | 3e027bb3 |
+| 1 | 2254 | 631 | 631 | 0 | 2.08 | ad8d013d |
+| 2 | 2689 | 2667 | 2667 | 0 | 0.16 | dd353990 |
+| 3 | 2996 | 2974 | 2974 | 0 | 0.16 | a26755f1 |
+| 4 | 3624 | 3595 | 3595 | 0 | 0.17 | db08830b |
+lost 0 tokens in all, 0 at worst
+== base Swift-1.5-Qwen3.8-27B
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 329 | 0 | 0 | 0 | 2.07 | 8834fd20 |
+| 1 | 2017 | 389 | 389 | 0 | 8.97 | 24e67079 |
+| 2 | 2345 | 2316 | 2316 | 0 | 0.48 | 0351d278 |
+| 3 | 2499 | 2477 | 2477 | 0 | 0.48 | 29bd277a |
+lost 0 tokens in all, 0 at worst
+== branch Swift-1.5-Qwen3.8-27B
+   ("IOConsoleLocked" = No)
+| turn | prompt | possible | reused | lost | prefill s | reply |
+|---|---|---|---|---|---|---|
+| 0 | 329 | 0 | 0 | 0 | 2.20 | 8834fd20 |
+| 1 | 2012 | 389 | 389 | 0 | 8.98 | 2269cd09 |
+| 2 | 2339 | 2311 | 2311 | 0 | 0.65 | 6c6968e8 |
+| 3 | 2667 | 2638 | 2638 | 0 | 0.66 | ba0aeecf |
+lost 0 tokens in all, 0 at worst
+## hybrid_bench --pp 512,2048 --tg 128, A-B-B-A x2
+### Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf
+-- base
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 192.36 ± 1.75 |
+| Miroslav 1.0 | pp2048 | 185.85 ± 0.31 |
+| Miroslav 1.0 | tg128 | 6.40 ± 0.51 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 158.59 ± 0.94 |
+| Miroslav 1.0 | pp2048 | 175.09 ± 12.48 |
+| Miroslav 1.0 | tg128 | 6.90 ± 0.51 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 192.36 ± 1.50 |
+| Miroslav 1.0 | pp2048 | 185.59 ± 0.07 |
+| Miroslav 1.0 | tg128 | 7.44 ± 0.00 |
+-- base
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 193.49 ± 1.83 |
+| Miroslav 1.0 | pp2048 | 185.65 ± 0.11 |
+| Miroslav 1.0 | tg128 | 7.46 ± 0.01 |
+-- base
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 194.90 ± 1.66 |
+| Miroslav 1.0 | pp2048 | 185.79 ± 0.32 |
+| Miroslav 1.0 | tg128 | 7.45 ± 0.01 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 193.29 ± 1.90 |
+| Miroslav 1.0 | pp2048 | 185.18 ± 0.42 |
+| Miroslav 1.0 | tg128 | 7.45 ± 0.01 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 194.09 ± 1.76 |
+| Miroslav 1.0 | pp2048 | 185.30 ± 0.08 |
+| Miroslav 1.0 | tg128 | 7.43 ± 0.01 |
+-- base
+   ("IOConsoleLocked" = No)
+| Miroslav 1.0 | pp512 | 191.86 ± 1.28 |
+| Miroslav 1.0 | pp2048 | 185.77 ± 0.15 |
+| Miroslav 1.0 | tg128 | 7.44 ± 0.01 |
+### Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf
+-- base
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 969.65 ± 0.39 |
+| Ornith-1.5-35B | pp2048 | 934.63 ± 3.78 |
+| Ornith-1.5-35B | tg128 | 44.07 ± 0.04 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 966.42 ± 3.55 |
+| Ornith-1.5-35B | pp2048 | 927.84 ± 4.48 |
+| Ornith-1.5-35B | tg128 | 44.00 ± 0.04 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 960.96 ± 2.08 |
+| Ornith-1.5-35B | pp2048 | 922.47 ± 4.96 |
+| Ornith-1.5-35B | tg128 | 43.81 ± 0.01 |
+-- base
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 960.70 ± 2.00 |
+| Ornith-1.5-35B | pp2048 | 919.75 ± 4.98 |
+| Ornith-1.5-35B | tg128 | 43.70 ± 0.07 |
+-- base
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 959.24 ± 1.57 |
+| Ornith-1.5-35B | pp2048 | 915.67 ± 4.43 |
+| Ornith-1.5-35B | tg128 | 43.67 ± 0.10 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 958.72 ± 2.65 |
+| Ornith-1.5-35B | pp2048 | 915.15 ± 7.05 |
+| Ornith-1.5-35B | tg128 | 43.71 ± 0.06 |
+-- branch
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 958.15 ± 2.49 |
+| Ornith-1.5-35B | pp2048 | 915.82 ± 5.51 |
+| Ornith-1.5-35B | tg128 | 43.71 ± 0.09 |
+-- base
+   ("IOConsoleLocked" = No)
+| Ornith-1.5-35B | pp512 | 960.13 ± 2.38 |
+| Ornith-1.5-35B | pp2048 | 917.88 ± 4.79 |
+| Ornith-1.5-35B | tg128 | 43.70 ± 0.04 |
+### LFM3-VL-2B-Q4_K_M.gguf
+-- base
+   ("IOConsoleLocked" = No)
+| LFM3 VL 2B | pp512 | 3044.15 ± 26.18 |
+| LFM3 VL 2B | pp2048 | 2913.55 ± 3.09 |
+| LFM3 VL 2B | tg128 | 101.98 ± 0.19 |
+-- branch
+   ("IOConsoleLocked" = No)
+| LFM3 VL 2B | pp512 | 3041.70 ± 29.37 |
+| LFM3 VL 2B | pp2048 | 2910.43 ± 7.85 |
+| LFM3 VL 2B | tg128 | 101.91 ± 0.15 |
+-- branch
+   ("IOConsoleLocked" = No)
+| LFM3 VL 2B | pp512 | 3037.19 ± 36.45 |
+| LFM3 VL 2B | pp2048 | 2914.45 ± 3.27 |
+| LFM3 VL 2B | tg128 | 101.96 ± 0.24 |
+-- base
+   ("IOConsoleLocked" = No)
+| LFM3 VL 2B | pp512 | 3043.24 ± 37.09 |
+| LFM3 VL 2B | pp2048 | 2917.79 ± 7.00 |
+| LFM3 VL 2B | tg128 | 101.80 ± 0.08 |
+-- base
+   ("IOConsoleLocked" = No)
+| LFM3 VL 2B | pp512 | 3037.96 ± 11.75 |
+| LFM3 VL 2B | pp2048 | 2914.59 ± 2.48 |
+| LFM3 VL 2B | tg128 | 101.72 ± 0.33 |
+-- branch
+   ("IOConsoleLocked" = No)
+| LFM3 VL 2B | pp512 | 3043.11 ± 13.54 |
+| LFM3 VL 2B | pp2048 | 2914.78 ± 2.66 |
+| LFM3 VL 2B | tg128 | 101.71 ± 0.24 |
+-- branch
+   ("IOConsoleLocked" = No)
+| LFM3 VL 2B | pp512 | 3043.24 ± 12.58 |
+| LFM3 VL 2B | pp2048 | 2920.27 ± 6.24 |
+| LFM3 VL 2B | tg128 | 101.54 ± 0.62 |
+-- base
+   ("IOConsoleLocked" = No)
+| LFM3 VL 2B | pp512 | 3048.88 ± 33.29 |
+| LFM3 VL 2B | pp2048 | 2922.40 ± 6.87 |
+| LFM3 VL 2B | tg128 | 101.92 ± 0.26 |
+# end 2026-10-29 19:01:56 UTC

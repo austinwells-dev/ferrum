@@ -155,11 +155,16 @@ impl ChatTemplate {
                 Ok(Value::from_safe_string(out))
             },
         );
-        env.add_template_owned("chat", source.to_owned())
+        // Hugging Face marks the assistant span with `{% generation %}` …
+        // `{% endgeneration %}`. Those tags carry no text. Rewrite them to
+        // `{% if true %}` / `{% endif %}`, keeping each tag's whitespace
+        // dashes, so the template is ordinary Jinja.
+        let source = rewrite_generation_tags(source);
+        env.add_template_owned("chat", source.clone())
             .map_err(|e| Error::Tokenizer(format!("chat template: {e:#}")))?;
         Ok(Self {
             env,
-            source: source.to_owned(),
+            source,
             bos_token: bos_token.to_owned(),
             eos_token: eos_token.to_owned(),
             opens_thinking: false,
@@ -217,6 +222,48 @@ impl ChatTemplate {
             .render(Value::from_serialize(&context))
             .map_err(|e| Error::Tokenizer(format!("chat template: {e:#}")))
     }
+}
+
+/// Turn Hugging Face `{% generation %}` / `{% endgeneration %}` into
+/// `{% if true %}` / `{% endif %}`. A dash on either side stays, so
+/// `{%- generation -%}` keeps the whitespace control a deleted tag would drop.
+fn rewrite_generation_tags(source: &str) -> String {
+    let mut rest = source;
+    let mut out = String::with_capacity(source.len());
+    while let Some(start) = rest.find("{%") {
+        out.push_str(&rest[..start]);
+        let Some(end) = rest[start..].find("%}") else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let inner = rest[start + 2..start + end].trim();
+        let left = inner.starts_with('-');
+        let right = inner.ends_with('-');
+        let body = inner.trim_matches('-').trim();
+        let replacement = match body {
+            "generation" => Some("if true"),
+            "endgeneration" => Some("endif"),
+            _ => None,
+        };
+        if let Some(keyword) = replacement {
+            out.push_str("{%");
+            if left {
+                out.push('-');
+            }
+            out.push(' ');
+            out.push_str(keyword);
+            out.push(' ');
+            if right {
+                out.push('-');
+            }
+            out.push_str("%}");
+        } else {
+            out.push_str(&rest[start..start + end + 2]);
+        }
+        rest = &rest[start + end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Python `json.dumps(ensure_ascii=True)` escaping of every non-ASCII character.
@@ -423,6 +470,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn generation_tags_keep_their_whitespace_dashes() {
+        assert_eq!(
+            rewrite_generation_tags("A{%- generation -%}B{% endgeneration %}C{% generation %}"),
+            "A{%- if true -%}B{% endif %}C{% if true %}"
+        );
+        assert_eq!(
+            rewrite_generation_tags("{% if generation %}keep{% endif %}"),
+            "{% if generation %}keep{% endif %}"
+        );
+    }
+
+    #[test]
     fn tojson_matches_python_json_dumps() {
         let value: Json = serde_json::from_str(r#"{"b": 1, "a": [1.0, "x<y"], "c": {}}"#).unwrap();
         let mut out = String::new();
@@ -492,6 +551,37 @@ mod tests {
     }
 
     #[test]
+    fn types_the_image_tools_arguments() {
+        let tools: Vec<Json> = vec![
+            serde_json::json!({"type": "function", "function": {
+                "name": "view_image",
+                "parameters": {"properties": {"path": {"type": "string"}}}}}),
+            serde_json::json!({"type": "function", "function": {
+                "name": "generate_image",
+                "parameters": {"properties": {
+                    "prompt": {"type": "string"},
+                    "inject": {"type": "boolean"},
+                    "seed": {"type": "integer"}}}}}),
+        ];
+        let text = "<tool_call>\n<function=view_image>\n<parameter=path>\nimages/fox.png\n\
+                    </parameter>\n</function>\n</tool_call>\n\
+                    <tool_call>\n<function=generate_image>\n<parameter=prompt>\na fox\n\
+                    </parameter>\n<parameter=inject>\nfalse\n</parameter>\n\
+                    <parameter=seed>\n7\n</parameter>\n</function>\n</tool_call>";
+        let parsed = parse_output(text, false, &tools);
+        assert_eq!(parsed.tool_calls.len(), 2);
+        assert_eq!(parsed.tool_calls[0].name, "view_image");
+        assert_eq!(
+            parsed.tool_calls[0].arguments["path"],
+            Json::String("images/fox.png".into())
+        );
+        assert_eq!(parsed.tool_calls[1].name, "generate_image");
+        // A boolean from the schema is a JSON boolean, not the text "false".
+        assert_eq!(parsed.tool_calls[1].arguments["inject"], Json::Bool(false));
+        assert_eq!(parsed.tool_calls[1].arguments["seed"], Json::from(7));
+    }
+
+    #[test]
     fn flint_calls_without_arguments_and_malformed_blocks() {
         let tools = vec![serde_json::json!({"name": "now"})];
         let parsed = parse_output("<tool_call>now</tool_call>", false, &tools);
@@ -549,6 +639,24 @@ mod tests {
         renders_like_jinja2(
             &template,
             include_str!("../../tests/fixtures/flint/render_cases.json"),
+        );
+    }
+
+    /// LFM3's template writes `bos_token`, switches on `enable_thinking`, and
+    /// wraps tool calls in `<function=` / `<parameter=`. The GGUF marks the
+    /// assistant span with `{%- generation -%}`, which `ChatTemplate` rewrites
+    /// to `{%- if true -%}`.
+    #[test]
+    fn renders_lfm3_template_like_jinja2() {
+        let template = ChatTemplate::with_special_tokens(
+            include_str!("../../tests/fixtures/lfm3/chat_template.jinja"),
+            "<|startoftext|>",
+            "<|im_end|>",
+        )
+        .unwrap();
+        renders_like_jinja2(
+            &template,
+            include_str!("../../tests/fixtures/lfm3/render_cases.json"),
         );
     }
 

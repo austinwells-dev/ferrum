@@ -52,6 +52,7 @@ fn row(cand: usize, label: &str, depth: Option<usize>, tps: f64, same: Option<Ma
             String::new()
         },
         depth,
+        tree: None,
         tps,
         accept: depth.map(|_| 2.4),
         per_prompt: vec![tps; 3],
@@ -73,6 +74,25 @@ fn every_screen_draws_at_every_size() {
     }
     app.go_tab(Tab::Models);
     sweep(&app, "models", true);
+    app.go_tab(Tab::Image);
+    for state in 0..4 {
+        app.image.demo(state);
+        sweep(&app, "image", true);
+    }
+    app.image.demo(0);
+    app.buffer = app.image.prompt.repeat(6);
+    app.editing = Editing::ImagePrompt;
+    sweep(&app, "image prompt", false);
+    app.editing = Editing::No;
+    app.go_tab(Tab::Audio);
+    for state in 0..4 {
+        app.audio.demo(state);
+        sweep(&app, "audio", true);
+    }
+    app.buffer = "~/Music/Ferrum/ferrum-1761850000.wav".into();
+    app.editing = Editing::AudioClip;
+    sweep(&app, "audio clip", false);
+    app.editing = Editing::No;
     for mode in [Mode::Chat, Mode::Agent, Mode::Serve] {
         app.open_pick(mode);
         sweep(&app, "setups", true);
@@ -230,7 +250,31 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
         kind: "dflash2",
         max_depth: 7,
     };
+    // A dense model: drafters try trees on it.
+    app.models.push(crate::catalog::Model {
+        path: "/m/dense.gguf".into(),
+        name: "dense".into(),
+        origin: String::new(),
+        size: 1,
+        info: Some(crate::catalog::Info {
+            arch: "qwen35".into(),
+            name: None,
+            layers: None,
+            experts: None,
+            train_ctx: None,
+            sampling: String::new(),
+        }),
+        hybrid: None,
+        mtp: false,
+        mtp_why: String::new(),
+        vision: None,
+        audio: false,
+        problem: None,
+        tokenizer: Default::default(),
+    });
+    let dense = app.models.len() - 1;
     let b = app.bench.as_mut().unwrap();
+    b.model = dense;
     b.measure = Measure::Speed;
     b.cands = vec![
         Candidate {
@@ -264,7 +308,14 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
             "{phase:?}: an unticked drafter shows only in the setup list"
         );
     }
-    // Progress lands on the ticked drafter: 1 of its depths measured.
+    // The setup's plan lists the trees each drafter tries, and counts them:
+    // the baseline, 3 depths and 2 trees of the one ticked drafter.
+    app.bench.as_mut().unwrap().phase = BenchPhase::Setup;
+    let text = screen_text(&app, 240, 60);
+    assert!(text.contains("T15, auto"), "the plan lists no trees");
+    assert!(text.contains("6 runs"), "the plan does not count the trees");
+    // Progress lands on the ticked drafter: 1 of its 3 depths and 2 trees
+    // measured.
     app.bench.as_mut().unwrap().phase = BenchPhase::Running;
     let text = screen_text(&app, 240, 60);
     let queue: Vec<&str> = text
@@ -272,7 +323,15 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
         .filter(|l| l.contains("Ticked-Drafter"))
         .collect();
     assert!(
-        queue.iter().any(|l| l.contains(" 1/3")),
-        "no 1/3 progress on the ticked drafter: {queue:?}"
+        queue.iter().any(|l| l.contains(" 1/5")),
+        "no 1/5 progress on the ticked drafter: {queue:?}"
     );
+    // On an MoE model the plan has no trees: 3 depths, no tree runs.
+    if let Some(info) = app.models[dense].info.as_mut() {
+        info.arch = "qwen35moe".into();
+    }
+    app.bench.as_mut().unwrap().phase = BenchPhase::Setup;
+    let text = screen_text(&app, 240, 60);
+    assert!(!text.contains("T15, auto"), "trees planned on an MoE model");
+    assert!(text.contains("4 runs"), "an MoE plan still counts trees");
 }

@@ -15,7 +15,11 @@ using namespace metal;
 
 // ---------------------------------------------------------------- blocks
 
+struct block_q2_0 { half d; uchar qs[16]; };
 struct block_q4_0 { half d; uchar qs[16]; };
+struct block_q5_0 { half d; uchar qh[4]; uchar qs[16]; };
+struct block_iq4_nl { half d; uchar qs[16]; };
+struct block_q3_K { uchar hmask[32]; uchar qs[64]; uchar scales[12]; half d; };
 struct block_q8_0 { half d; char qs[32]; };
 struct block_q4_K { half d; half dmin; uchar scales[12]; uchar qs[128]; };
 struct block_q5_K { half d; half dmin; uchar scales[12]; uchar qh[32]; uchar qs[128]; };
@@ -429,6 +433,65 @@ void dequantize_q4_0(device const block_q4_0 * xb, short il, thread type4x4 & re
     for (int i = 0; i < 8; i++) {
         reg_f[i/2][2*(i%2) + 0] = d1 * (qs[i] & mask0) + md;
         reg_f[i/2][2*(i%2) + 1] = d2 * (qs[i] & mask1) + md;
+    }
+    reg = (type4x4) reg_f;
+}
+
+// Q2_0 (ggml type 42, 64 values): four 2-bit codes per byte, low bits
+// first; a value is d * (code - 1).
+template <typename type4x4>
+void dequantize_q2_0(device const block_q2_0 * xb, short il, thread type4x4 & reg) {
+    device const uchar * qs = xb->qs + 4*il;
+    const float d = xb->d;
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) reg_f[i/4][i%4] = d * (float((qs[i/4] >> (2*(i%4))) & 3) - 1.f);
+    reg = (type4x4) reg_f;
+}
+
+// Q5_0: value j is (low nibble of qs[j] | bit j of qh << 4) - 16, value
+// j + 16 the high nibble with bit j + 16.
+template <typename type4x4>
+void dequantize_q5_0(device const block_q5_0 * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+    const uint qh = uint(xb->qh[0]) | uint(xb->qh[1]) << 8 | uint(xb->qh[2]) << 16 | uint(xb->qh[3]) << 24;
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        const uint q = il ? (xb->qs[i] >> 4) : (xb->qs[i] & 15);
+        const uint h = (qh >> (i + 16*il)) & 1;
+        reg_f[i/4][i%4] = d * (float(q | (h << 4)) - 16.f);
+    }
+    reg = (type4x4) reg_f;
+}
+
+// IQ4_NL: byte j holds values j (low nibble) and j + 16 (high), codebook
+// lookups times d.
+template <typename type4x4>
+void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 & reg) {
+    const float d = xb->d;
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        reg_f[i/4][i%4] = d * kvalues_iq4nl_f[il ? (xb->qs[i] >> 4) : (xb->qs[i] & 15)];
+    }
+    reg = (type4x4) reg_f;
+}
+
+// Q3_K: 16-value chunk il is half il % 2 of 2-bit plane (il / 2) % 4 of the
+// block's 128-value half il / 8, minus 4 where its hmask bit is clear, with
+// 6-bit scale il (low 4 bits from scales[il % 8], high 2 from scales[8 + il % 4]).
+template <typename type4x4>
+void dequantize_q3_K(device const block_q3_K * xb, short il, thread type4x4 & reg) {
+    const short n = il / 8, plane = (il / 2) % 4, half_ = il % 2;
+    device const uchar * q = xb->qs + 32*n + 16*half_;
+    device const uchar * hm = xb->hmask + 16*half_;
+    const uchar m = uchar(1 << (4*n + plane));
+    device const uchar * sc = xb->scales;
+    const int lo = il < 8 ? (sc[il % 8] & 15) : (sc[il % 8] >> 4);
+    const int hi = (sc[8 + il % 4] >> (2 * (il / 4))) & 3;
+    const float dl = float(xb->d) * float((lo | (hi << 4)) - 32);
+    float4x4 reg_f;
+    for (int i = 0; i < 16; i++) {
+        const int v = int((q[i] >> (2*plane)) & 3) - ((hm[i] & m) ? 0 : 4);
+        reg_f[i/4][i%4] = dl * float(v);
     }
     reg = (type4x4) reg_f;
 }
@@ -1196,6 +1259,38 @@ MV_KERNEL(h_mv_q4_0, mv_q4_0, 4, 2)
 MV_KERNEL(h_mv_f32, mv_f32, 4, 2)
 MV_KERNEL(h_mv_bf16, mv_bf16, 4, 2)
 
+// BF16 with 16-byte loads (eight values per lane) and NR0 rows per SIMD
+// group: the hyper-connection matrices are 320 rows of 10240 or 10240 of
+// 320, too few rows or too short for the 4-row, 8-byte-load kernel above to
+// keep the GPU busy. K must be a multiple of 8.
+template<short NR0, short NSG>
+void mv_bf16_wide(constant ProjArgs & a, device const char * w, device const float * x, device float * y,
+                  uint3 tgpig, ushort tiisg, ushort sgitg) {
+    const int first_row = (tgpig.x * NSG + sgitg) * NR0;
+    const int nrows = min(int(NR0), int(a.n) - first_row);
+    if (nrows <= 0) return;
+    device const float4 * xv = (device const float4 *)(x + (ulong)tgpig.y * a.x_stride);
+    float sumf[NR0] = {0.f};
+    for (uint i = tiisg; i < a.k / 8; i += 32) {
+        const float4 x0 = xv[2 * i], x1 = xv[2 * i + 1];
+        FOR_UNROLL (short row = 0; row < NR0; row++) {
+            if (row >= nrows) break;
+            const uint4 b = ((device const uint4 *)(w + (ulong)(first_row + row) * a.row_bytes))[i];
+            const float4 w0 = float4(as_type<float>(b.x << 16), as_type<float>(b.x & 0xffff0000u),
+                                     as_type<float>(b.y << 16), as_type<float>(b.y & 0xffff0000u));
+            const float4 w1 = float4(as_type<float>(b.z << 16), as_type<float>(b.z & 0xffff0000u),
+                                     as_type<float>(b.w << 16), as_type<float>(b.w & 0xffff0000u));
+            sumf[row] += dot(x0, w0) + dot(x1, w1);
+        }
+    }
+    device float * out = y + (ulong)tgpig.y * a.y_stride;
+    for (int row = 0; row < nrows; ++row) {
+        const float t = simd_sum(sumf[row]);
+        if (tiisg == 0) out[first_row + row] = t;
+    }
+}
+MV_KERNEL(h_mv_bf16_wide, mv_bf16_wide, 1, 4)
+
 kernel void h_mv_q8_0(constant ProjArgs & a [[buffer(3)]], device const char * w [[buffer(0)]],
                       device const float * x [[buffer(1)]], device float * y [[buffer(2)]],
                       threadgroup float * shmem [[threadgroup(0)]],
@@ -1293,6 +1388,25 @@ MVB_FORMAT(iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MVB_FORMAT(iq2_s, block_iq2_s, 16, dequantize_iq2_s)
 MVB_FORMAT(f32, float4x4, 1, dequantize_f32)
 MVB_FORMAT(bf16, block_bf16, 1, dequantize_bf16)
+MVB_FORMAT(q2_0, block_q2_0, 4, dequantize_q2_0)
+MVB_FORMAT(q5_0, block_q5_0, 2, dequantize_q5_0)
+MVB_FORMAT(iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MVB_FORMAT(q3_k, block_q3_K, 16, dequantize_q3_K)
+
+// Generic M=1 GEMV for formats without a hand-tuned kernel: the small-batch
+// loop with one activation row. NR0 rows per SIMD group; grid (ceil(n /
+// (NR0*NSG)), m) as for the other M=1 kernels.
+#define MV_DEQ(FMT, BLOCK, NL, DEQ) \
+template<short NR0, short NSG> \
+void mv_##FMT(constant ProjArgs & a, device const char * w, device const float * x, device float * y, \
+              uint3 tgpig, ushort tiisg, ushort sgitg) { \
+    mvb_impl<BLOCK, NL, DEQ<float4x4>, NR0, 1>(a, w, x, y, tgpig, tiisg, sgitg, NSG); \
+} \
+MV_KERNEL(h_mv_##FMT, mv_##FMT, 4, 2)
+MV_DEQ(q2_0, block_q2_0, 4, dequantize_q2_0)
+MV_DEQ(q5_0, block_q5_0, 2, dequantize_q5_0)
+MV_DEQ(iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MV_DEQ(q3_k, block_q3_K, 16, dequantize_q3_K)
 
 // TensorOps GEMM after llama.cpp's kernel_mul_mm (tensor path): a 64-row
 // weight tile is dequantized to F16 in threadgroup memory; 128 activation
@@ -1375,6 +1489,10 @@ MMS_FORMAT(iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MMS_FORMAT(iq2_s, block_iq2_s, 16, dequantize_iq2_s)
 MMS_FORMAT(f32, float4x4, 1, dequantize_f32)
 MMS_FORMAT(bf16, block_bf16, 1, dequantize_bf16)
+MMS_FORMAT(q2_0, block_q2_0, 4, dequantize_q2_0)
+MMS_FORMAT(q5_0, block_q5_0, 2, dequantize_q5_0)
+MMS_FORMAT(iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MMS_FORMAT(q3_k, block_q3_K, 16, dequantize_q3_K)
 MM_KERNEL(h_mm_q4_k, block_q4_K, 16, dequantize_q4_K)
 MM_KERNEL(h_mm_q5_k, block_q5_K, 16, dequantize_q5_K)
 MM_KERNEL(h_mm_q6_k, block_q6_K, 16, dequantize_q6_K)
@@ -1386,6 +1504,10 @@ MM_KERNEL(h_mm_iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MM_KERNEL(h_mm_iq2_s, block_iq2_s, 16, dequantize_iq2_s)
 MM_KERNEL(h_mm_f32, float4x4, 1, dequantize_f32)
 MM_KERNEL(h_mm_bf16, block_bf16, 1, dequantize_bf16)
+MM_KERNEL(h_mm_q2_0, block_q2_0, 4, dequantize_q2_0)
+MM_KERNEL(h_mm_q5_0, block_q5_0, 2, dequantize_q5_0)
+MM_KERNEL(h_mm_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MM_KERNEL(h_mm_q3_k, block_q3_K, 16, dequantize_q3_K)
 
 // ---------------------------------------------------------------- embedding
 
@@ -1418,6 +1540,10 @@ GET_ROWS_KERNEL(h_get_rows_q8_0, block_q8_0, 2, dequantize_q8_0)
 GET_ROWS_KERNEL(h_get_rows_q4_0, block_q4_0, 2, dequantize_q4_0)
 GET_ROWS_KERNEL(h_get_rows_iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
 GET_ROWS_KERNEL(h_get_rows_bf16, block_bf16, 1, dequantize_bf16)
+GET_ROWS_KERNEL(h_get_rows_q2_0, block_q2_0, 4, dequantize_q2_0)
+GET_ROWS_KERNEL(h_get_rows_q5_0, block_q5_0, 2, dequantize_q5_0)
+GET_ROWS_KERNEL(h_get_rows_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+GET_ROWS_KERNEL(h_get_rows_q3_k, block_q3_K, 16, dequantize_q3_K)
 
 // ---------------------------------------------------------------- norms and elementwise
 
@@ -1567,6 +1693,51 @@ kernel void h_gdn_conv(constant ConvArgs & p [[buffer(4)]],
     state[2 * p.channels + c] = s2;
 }
 
+// Parent of draft-tree node t (see KeyMask; the verify's rows are the whole
+// tree, so row t is node t): its latest ancestor, or -1 for the root.
+inline int tree_parent(device const uint * tree, uint t) {
+    const uint ancestors = tree[2 + 2 * t] & ~(1u << t);
+    return ancestors == 0 ? -1 : int(31 - clz(ancestors));
+}
+
+// h_gdn_conv over the nodes of a draft tree (speculative verify; the state is
+// only read): node t convolves its own row with its three latest ancestors'
+// rows, continuing into the state above the root, in the same arithmetic as
+// a chain of the same rows.
+kernel void h_gdn_conv_tree(constant ConvArgs & p [[buffer(5)]],
+                            device const float * x [[buffer(0)]],        // [tokens][channels]
+                            device const float * w [[buffer(1)]],        // [channels][4]
+                            device const float * state [[buffer(2)]],    // [3][channels]
+                            device const uint * tree [[buffer(3)]],
+                            device float * y [[buffer(4)]],              // [tokens][channels]
+                            uint group [[threadgroup_position_in_grid]],
+                            ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    const uint c = group * p.head_dim + tid;
+    const bool normalize = c < 2 * p.key_dim;
+    float4 wc = ((device const float4 *)w)[c];
+    for (uint t = 0; t < p.tokens; t++) {
+        // prev[0] is the parent's row, prev[2] the oldest; past the root, the
+        // state's rows from its newest.
+        float prev[3];
+        int a = tree_parent(tree, t);
+        uint k = 0;
+        for (; k < 3 && a >= 0; k++) {
+            prev[k] = x[(ulong)a * p.channels + c];
+            a = tree_parent(tree, uint(a));
+        }
+        for (uint r = 0; k < 3; k++, r++) prev[k] = state[(2 - r) * p.channels + c];
+        const float xt = x[(ulong)t * p.channels + c];
+        float v = wc[0] * prev[2] + wc[1] * prev[1] + wc[2] * prev[0] + wc[3] * xt;
+        v = v / (1.f + exp(-v));
+        if (normalize) {
+            float ss = block_sum(v * v, scratch, tid, p.head_dim);
+            v = v * rsqrt(max(ss, p.eps * p.eps));
+        }
+        y[(ulong)t * p.channels + c] = v;
+    }
+}
+
 struct DeltaArgs {
     uint tokens;
     uint v_heads;      // 48
@@ -1575,7 +1746,12 @@ struct DeltaArgs {
     uint key_dim;      // offset of K within a row (Q at 0, V at 2*key_dim)
     float scale;       // 1/sqrt(head_dim)
     uint write_state;  // 0 during a speculative verify: the state is only read
+    uint grouped;      // V head h reads K head h / (v_heads / k_heads) (Hugging Face order); else h % k_heads (GGUF)
 };
+
+inline uint delta_key_head(constant DeltaArgs & p, uint h) {
+    return p.grouped != 0 ? h / (p.v_heads / p.k_heads) : h % p.k_heads;
+}
 
 // Sequential gated delta rule after llama.cpp's kernel_gated_delta_net_impl.
 // State per V head is stored transposed: M[i][j] = S[j][i], row i contiguous.
@@ -1590,7 +1766,7 @@ void gdn_recurrent_impl(constant DeltaArgs & p, device const float * qkv, device
     const uint ty = tpitg.y;
     const uint h = tgpig.y;
     const uint i = tgpig.x * NSG + ty;
-    const uint kh = h % p.k_heads;
+    const uint kh = delta_key_head(p, h);
     device float * s_ptr = state + ((ulong)h * S + i) * S;
     float ls[NSG];
     FOR_UNROLL (short j = 0; j < NSG; j++) ls[j] = s_ptr[tx * NSG + j];
@@ -1628,9 +1804,63 @@ kernel void h_gdn_recurrent(constant DeltaArgs & p [[buffer(5)]],
     gdn_recurrent_impl<4>(p, qkv, g, b, out, state, tgpig, tpitg);
 }
 
-struct GatedNormArgs { uint heads; uint head_dim; float eps; };
+// h_gdn_recurrent over the nodes of a draft tree (speculative verify; the
+// state is only read): node t starts from its parent's state, kept per node,
+// or from the live state at the root, then runs the same update as a chain.
+template<short NSG>
+void gdn_recurrent_tree_impl(constant DeltaArgs & p, device const float * qkv, device const float * g,
+                             device const float * b, device const float * state, device const uint * tree,
+                             device float * out, uint3 tgpig, uint3 tpitg) {
+    constexpr uint S = 128;
+    const uint tx = tpitg.x;
+    const uint ty = tpitg.y;
+    const uint h = tgpig.y;
+    const uint i = tgpig.x * NSG + ty;
+    const uint kh = delta_key_head(p, h);
+    device const float * s_ptr = state + ((ulong)h * S + i) * S;
+    float root[NSG];
+    float saved[32][NSG];
+    FOR_UNROLL (short j = 0; j < NSG; j++) root[j] = s_ptr[tx * NSG + j];
+    for (uint t = 0; t < p.tokens; t++) {
+        const int parent = tree_parent(tree, t);
+        float ls[NSG];
+        FOR_UNROLL (short j = 0; j < NSG; j++) ls[j] = parent < 0 ? root[j] : saved[parent][j];
+        device const float * row = qkv + (ulong)t * p.channels;
+        device const float * q = row + kh * S;
+        device const float * k = row + p.key_dim + kh * S;
+        const float v = row[2 * p.key_dim + h * S + i];
+        const float ge = exp(g[t * p.v_heads + h]);
+        const float beta = b[t * p.v_heads + h];
+        float s_k = 0.f;
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            ls[j] *= ge;
+            s_k += ls[j] * k[tx * NSG + j];
+        }
+        s_k = simd_sum(s_k);
+        const float d = (v - s_k) * beta;
+        float yv = 0.f;
+        FOR_UNROLL (short j = 0; j < NSG; j++) {
+            ls[j] += k[tx * NSG + j] * d;
+            yv += ls[j] * q[tx * NSG + j];
+        }
+        yv = simd_sum(yv);
+        if (tx == 0) out[((ulong)t * p.v_heads + h) * S + i] = yv * p.scale;
+        FOR_UNROLL (short j = 0; j < NSG; j++) saved[t][j] = ls[j];
+    }
+}
 
-// y = rmsnorm(o) * w * silu(z) per (token, head); one threadgroup of head_dim threads.
+kernel void h_gdn_recurrent_tree(constant DeltaArgs & p [[buffer(6)]],
+                                 device const float * qkv [[buffer(0)]], device const float * g [[buffer(1)]],
+                                 device const float * b [[buffer(2)]], device const float * state [[buffer(3)]],
+                                 device const uint * tree [[buffer(4)]], device float * out [[buffer(5)]],
+                                 uint3 tgpig [[threadgroup_position_in_grid]], uint3 tpitg [[thread_position_in_threadgroup]]) {
+    gdn_recurrent_tree_impl<4>(p, qkv, g, b, state, tree, out, tgpig, tpitg);
+}
+
+struct GatedNormArgs { uint heads; uint head_dim; float eps; uint sigmoid; };
+
+// y = rmsnorm(o) * w * silu(z) per (token, head), or * sigmoid(z) (qwen4exp);
+// one threadgroup of head_dim threads.
 kernel void h_gated_rmsnorm(constant GatedNormArgs & p [[buffer(4)]],
                             device const float * o [[buffer(0)]], device const float * z [[buffer(1)]],
                             device const float * w [[buffer(2)]], device float * y [[buffer(3)]],
@@ -1641,7 +1871,8 @@ kernel void h_gated_rmsnorm(constant GatedNormArgs & p [[buffer(4)]],
     const float ss = block_sum(v * v, scratch, tid, p.head_dim);
     const float scale = rsqrt(ss / float(p.head_dim) + p.eps);
     const float zv = z[idx];
-    y[idx] = v * scale * w[tid] * (zv / (1.f + exp(-zv)));
+    const float gate = 1.f / (1.f + exp(-zv));
+    y[idx] = v * scale * w[tid] * (p.sigmoid ? gate : zv * gate);
 }
 
 // ---------------------------------------------------------------- gated attention
@@ -1665,6 +1896,7 @@ struct AttnPrepArgs {
     uint gated;        // qg rows hold [q | gate] (2 * head_dim per head) instead of q alone
     uint ring;         // 0: position p lives in row p; else in row p % ring (see kv_row)
     uint qk_norm;      // 0: q and k skip the per-head RMS norm (Spark)
+    uint use_factors;  // 1: angle /= factors[pair] (LFM3 full attention). 0 leaves the formula unchanged.
 };
 
 // Cache row of key position `key`. Sliding-window layers keep a ring of `ring`
@@ -1681,6 +1913,61 @@ inline device half * kv_scales(device half * cache, uint kv_rows, uint stride) {
 }
 inline device const half * kv_scales(device const half * cache, uint kv_rows, uint stride) {
     return (device const half *)((device const char *)cache + (ulong)kv_rows * stride);
+}
+
+// Which keys a query row sees. Without a tree, row t sits at position + t and
+// sees every key up to its own. With a draft tree (the `_tree` kernels), the
+// rows are nodes `offset..` of a tree listed parents first, whose node s has
+// its K/V at cache position base + s (base = position - offset), so earlier
+// nodes may come from previous forwards. tree[0] is `offset`; tree[2 + 2s]
+// has bit r set iff node r is s or one of its ancestors, and tree[3 + 2s] is
+// s's depth. A node's position (for the window, as for RoPE) is base + depth.
+struct KeyMask {
+    uint base;  // cache position of tree node 0 (or of row 0 without a tree)
+    uint window;
+    uint qpos;  // position of the query row
+    uint bits;  // tree nodes it sees, already limited to its window
+};
+
+inline uint tree_offset(device const uint * tree) { return tree[0]; }
+inline uint tree_mask(device const uint * tree, uint node) { return tree[2 + 2 * node]; }
+inline uint tree_depth(device const uint * tree, uint node) { return tree[3 + 2 * node]; }
+
+template <bool TREE>
+inline KeyMask key_mask(device const uint * tree, uint position, uint window, uint t) {
+    KeyMask k = {position, window, position + t, 0};
+    if (TREE) {
+        const uint node = tree_offset(tree) + t;
+        k.base = position - tree_offset(tree);
+        k.qpos = k.base + tree_depth(tree, node);
+        // Resolve the window on tree keys here, so testing a key reads no memory.
+        for (uint seen = tree_mask(tree, node); seen != 0; seen &= seen - 1) {
+            const uint s = ctz(seen);
+            if (window == 0 || k.base + tree_depth(tree, s) + window > k.qpos) k.bits |= 1u << s;
+        }
+    }
+    return k;
+}
+
+template <bool TREE>
+inline bool key_visible(thread const KeyMask & k, uint key) {
+    if (TREE && key >= k.base) {
+        const uint s = key - k.base;
+        return s < 32 && ((k.bits >> s) & 1u) != 0;
+    }
+    return key <= k.qpos && (k.window == 0 || key + k.window > k.qpos);
+}
+
+// Lowest query position of rows t_begin..=t_end, which bounds the window
+// start of a tile holding them. Tree rows are not in position order; a node's
+// ancestors still come before it, so the last row bounds the keys.
+template <bool TREE>
+inline uint lowest_query_position(device const uint * tree, uint position, uint t_begin, uint t_end) {
+    if (!TREE) return position + t_begin;
+    const uint offset = tree_offset(tree);
+    uint depth = 0xffffffffu;
+    for (uint t = t_begin; t <= t_end; t++) depth = min(depth, tree_depth(tree, offset + t));
+    return position - offset + depth;
 }
 
 // Store one element per thread; with Q8 the 32 lanes of a SIMD group hold one
@@ -1724,8 +2011,8 @@ inline float kv_scale(device const half * scales, ulong e) {
 template <bool Q8>
 void attn_prep_impl(constant AttnPrepArgs & p, device const float * qg, device const float * k,
                     device const float * q_norm, device const float * k_norm, device const int * pos3,
-                    device half * q_out, device half * kv, uint2 group, ushort tid,
-                    threadgroup float * scratch, threadgroup float * normed) {
+                    device const float * factors, device half * q_out, device half * kv, uint2 group,
+                    ushort tid, threadgroup float * scratch, threadgroup float * normed) {
     const uint head = group.x;
     const uint t = group.y;
     const bool is_q = head < p.heads;
@@ -1751,7 +2038,8 @@ void attn_prep_impl(constant AttnPrepArgs & p, device const float * qg, device c
             pos = float(pos3[t * 3 + axis]);
         }
         const float freq = pow(p.theta, -2.f * float(pair) / float(p.rope_dims));
-        const float angle = pos * freq;
+        float angle = pos * freq;
+        if (p.use_factors != 0) angle /= factors[pair];
         const float c = cos(angle), s = sin(angle);
         if (tid < half_rot) outv = nv * c - normed[tid + half_rot] * s;
         else outv = normed[tid - half_rot] * s + nv * c;
@@ -1765,19 +2053,85 @@ void attn_prep_impl(constant AttnPrepArgs & p, device const float * qg, device c
 }
 
 #define ATTN_PREP(name, q8)                                                                          \
-kernel void name(constant AttnPrepArgs & p [[buffer(8)]],                                           \
+kernel void name(constant AttnPrepArgs & p [[buffer(9)]],                                           \
                  device const float * qg [[buffer(0)]], device const float * k [[buffer(1)]],       \
                  device const float * v [[buffer(2)]], device const float * q_norm [[buffer(3)]],   \
                  device const float * k_norm [[buffer(4)]], device const int * pos3 [[buffer(5)]],  \
-                 device half * q_out [[buffer(6)]], device half * kv [[buffer(7)]],                 \
+                 device const float * factors [[buffer(6)]],                                        \
+                 device half * q_out [[buffer(7)]], device half * kv [[buffer(8)]],                 \
                  uint2 group [[threadgroup_position_in_grid]],                                      \
                  ushort tid [[thread_index_in_threadgroup]]) {                                      \
     threadgroup float scratch[8];                                                                   \
     threadgroup float normed[256];                                                                  \
-    attn_prep_impl<q8>(p, qg, k, q_norm, k_norm, pos3, q_out, kv, group, tid, scratch, normed);     \
+    attn_prep_impl<q8>(p, qg, k, q_norm, k_norm, pos3, factors, q_out, kv, group, tid, scratch, normed); \
 }
 ATTN_PREP(h_attn_prep, false)
 ATTN_PREP(h_attn_prep_q8, true)
+
+// LFM3 short conv. packed is [tokens, 3H] = B | C | X. weight is w[c*K+k]
+// with K = state_len + 1 and tap 0 the oldest. state is [state_len, H],
+// oldest row first: the previous B*x values, not the conv output.
+// y[t, c] = C * sum_k window[k] * w[c*K+k], window = state || new B*x.
+struct ShortConvArgs {
+    uint tokens;
+    uint hidden;
+    uint state_len; // 1..=8
+    uint write_state;
+    uint write_bx;
+};
+
+kernel void h_short_conv(device const float * packed [[buffer(0)]],
+                         device const float * weight [[buffer(1)]],
+                         device float * y [[buffer(2)]],
+                         device float * state [[buffer(3)]],
+                         device float * bx_out [[buffer(4)]],
+                         constant ShortConvArgs & p [[buffer(5)]],
+                         uint c [[thread_position_in_grid]]) {
+    if (c >= p.hidden || p.state_len == 0 || p.state_len > 8) return;
+    const uint H = p.hidden;
+    const uint S = p.state_len;
+    const uint K = S + 1;
+    float hist[8];
+    for (uint k = 0; k < S; k++) hist[k] = state[(ulong)k * H + c];
+    for (uint t = 0; t < p.tokens; t++) {
+        const ulong base = ((ulong)t * 3) * H + c;
+        const float bx = packed[base] * packed[base + 2 * H];
+        if (p.write_bx != 0) bx_out[(ulong)t * H + c] = bx;
+        float acc = bx * weight[(ulong)c * K + S];
+        for (uint k = 0; k < S; k++) acc += hist[k] * weight[(ulong)c * K + k];
+        y[(ulong)t * H + c] = acc * packed[base + H];
+        for (uint k = 0; k + 1 < S; k++) hist[k] = hist[k + 1];
+        hist[S - 1] = bx;
+    }
+    if (p.write_state != 0) {
+        for (uint k = 0; k < S; k++) state[(ulong)k * H + c] = hist[k];
+    }
+}
+
+// Shift `tokens` of recorded B*x into the short-conv state. Weight-free, so a
+// speculative commit can replay an accepted prefix without the projection.
+struct BxStateArgs {
+    uint tokens;
+    uint hidden;
+    uint state_len;
+};
+
+kernel void h_bx_state(device const float * bx [[buffer(0)]],
+                       device float * state [[buffer(1)]],
+                       constant BxStateArgs & p [[buffer(2)]],
+                       uint c [[thread_position_in_grid]]) {
+    if (c >= p.hidden || p.state_len == 0 || p.state_len > 8) return;
+    const uint H = p.hidden;
+    const uint S = p.state_len;
+    float hist[8];
+    for (uint k = 0; k < S; k++) hist[k] = state[(ulong)k * H + c];
+    for (uint t = 0; t < p.tokens; t++) {
+        const float v = bx[(ulong)t * H + c];
+        for (uint k = 0; k + 1 < S; k++) hist[k] = hist[k + 1];
+        hist[S - 1] = v;
+    }
+    for (uint k = 0; k < S; k++) state[(ulong)k * H + c] = hist[k];
+}
 
 // V is stored in its own cache buffer with the same geometry. Threadgroups of
 // 256 keep every 32-element Q8 block inside one SIMD group.
@@ -1809,28 +2163,34 @@ struct AttnArgs {
     uint gated;
     uint sinks;
     uint ring;         // see kv_row
+    uint tree;         // rows are draft-tree nodes (see KeyMask)
 };
 
 // Reference-grade attention: one threadgroup (head_dim threads) per (query, head),
 // online softmax over keys. Sinks seed the running max with unit mass; the
-// window, output gate and sinks follow the FaArgs semantics.
-kernel void h_attention(constant AttnArgs & p [[buffer(6)]],
+// window, output gate, sinks and tree follow the FaArgs semantics.
+kernel void h_attention(constant AttnArgs & p [[buffer(7)]],
                         device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],
                         device const half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],
-                        device const float * sinks [[buffer(4)]], device float * out [[buffer(5)]],
+                        device const float * sinks [[buffer(4)]], device const uint * tree [[buffer(5)]],
+                        device float * out [[buffer(6)]],
                         uint2 group [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
     threadgroup float scratch[8];
     const uint h = group.x, t = group.y;
     const uint kvh = h / (p.heads / p.kv_heads);
     const float qv = float(q[((ulong)t * p.heads + h) * p.head_dim + tid]);
+    const KeyMask mask = p.tree != 0 ? key_mask<true>(tree, p.position, p.window, t)
+                                     : key_mask<false>(tree, p.position, p.window, t);
+    // A node's ancestors come before it, so no row sees past its own key.
     const uint keys = p.position + t + 1;
-    const uint lo = p.window != 0 && keys > p.window ? keys - p.window : 0;
+    const uint lo = p.window != 0 && mask.qpos + 1 > p.window ? mask.qpos + 1 - p.window : 0;
     float m = -INFINITY, l = 0.f, acc = 0.f;
     if (p.sinks != 0) {
         m = sinks[h];
         l = 1.f;
     }
     for (uint j = lo; j < keys; j++) {
+        if (!(p.tree != 0 ? key_visible<true>(mask, j) : key_visible<false>(mask, j))) continue;
         const ulong base = (ulong)kv_row(j, p.ring) * p.cache_stride + kvh * p.head_dim + tid;
         const float s = block_sum(qv * float(kc[base]), scratch, tid, p.head_dim);
         const float m_new = max(m, s);
@@ -2062,6 +2422,10 @@ MV_ID_KERNEL_SHMEM(h_mv_id_iq4_xs, mv_iq4_xs, 2, 2, float)
 MV_ID_KERNEL_SHMEM(h_mv_id_iq3_s, mv_iq3_s, 4, 2, uint)
 MV_ID_KERNEL_SHMEM(h_mv_id_iq3_xxs, mv_iq3_xxs, 4, 2, uint)
 MV_ID_KERNEL(h_mv_id_iq2_s, mv_iq2_s, 4, 2)
+MV_ID_KERNEL(h_mv_id_q2_0, mv_q2_0, 4, 2)
+MV_ID_KERNEL(h_mv_id_q5_0, mv_q5_0, 4, 2)
+MV_ID_KERNEL(h_mv_id_iq4_nl, mv_iq4_nl, 4, 2)
+MV_ID_KERNEL(h_mv_id_q3_k, mv_q3_k, 4, 2)
 
 // Expert GEMM over expert-sorted rows: z = expert; rows offsets[z]..offsets[z+1]
 // of x (gathered) and y. grid (ceil(max_rows/128), ceil(expert_rows/64), experts).
@@ -2072,7 +2436,7 @@ constant constexpr int MM_ID_NRB = 32;
 template<typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread half4x4 &)>
 void mm_id_impl(constant MoeMmArgs & a, device const char * w, device const float * x,
                 device const uint * offsets, device float * y,
-                threadgroup half * sa, uint3 tgpig, ushort tiitg) {
+                threadgroup half * sa, uint3 tgpig, ushort tiitg, uint stored) {
     const uint e = tgpig.z;
     const uint first = offsets[e];
     const int count = int(offsets[e + 1] - first);
@@ -2081,7 +2445,7 @@ void mm_id_impl(constant MoeMmArgs & a, device const char * w, device const floa
     const int M = a.expert_rows;
     const int ra = tgpig.y * MM_NRA;
     const int rb = tgpig.x * MM_ID_NRB;
-    device const char * we = w + (ulong)e * a.expert_rows * a.p.row_bytes;
+    device const char * we = w + (ulong)stored * a.expert_rows * a.p.row_bytes;
     auto tA = tensor(sa, dextents<int32_t, 2>(MM_NK, MM_NRA));
     auto tB = tensor((device float *)(x + (ulong)first * a.p.x_stride), dextents<int32_t, 2>(K, count),
                      array<int, 2>({1, int(a.p.x_stride)}));
@@ -2120,7 +2484,16 @@ kernel void NAME(constant MoeMmArgs & a [[buffer(4)]], device const char * w [[b
                  device const float * x [[buffer(1)]], device const uint * offsets [[buffer(2)]], \
                  device float * y [[buffer(3)]], threadgroup half * sa [[threadgroup(0)]], \
                  uint3 tgpig [[threadgroup_position_in_grid]], ushort tiitg [[thread_index_in_threadgroup]]) { \
-    mm_id_impl<BLOCK, NL, DEQ<half4x4>>(a, w, x, offsets, y, sa, tgpig, tiitg); \
+    mm_id_impl<BLOCK, NL, DEQ<half4x4>>(a, w, x, offsets, y, sa, tgpig, tiitg, tgpig.z); \
+}
+// The same over streamed experts: group z's expert is stored at arena slot slots[z].
+#define MM_ID_SLOT_KERNEL(NAME, BLOCK, NL, DEQ) \
+kernel void NAME(constant MoeMmArgs & a [[buffer(5)]], device const char * w [[buffer(0)]], \
+                 device const float * x [[buffer(1)]], device const uint * offsets [[buffer(2)]], \
+                 device const uint * slots [[buffer(3)]], \
+                 device float * y [[buffer(4)]], threadgroup half * sa [[threadgroup(0)]], \
+                 uint3 tgpig [[threadgroup_position_in_grid]], ushort tiitg [[thread_index_in_threadgroup]]) { \
+    mm_id_impl<BLOCK, NL, DEQ<half4x4>>(a, w, x, offsets, y, sa, tgpig, tiitg, slots[tgpig.z]); \
 }
 MM_ID_KERNEL(h_mm_id_q4_k, block_q4_K, 16, dequantize_q4_K)
 MM_ID_KERNEL(h_mm_id_q5_k, block_q5_K, 16, dequantize_q5_K)
@@ -2131,6 +2504,23 @@ MM_ID_KERNEL(h_mm_id_iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
 MM_ID_KERNEL(h_mm_id_iq3_s, block_iq3_s, 16, dequantize_iq3_s)
 MM_ID_KERNEL(h_mm_id_iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
 MM_ID_KERNEL(h_mm_id_iq2_s, block_iq2_s, 16, dequantize_iq2_s)
+MM_ID_KERNEL(h_mm_id_q2_0, block_q2_0, 4, dequantize_q2_0)
+MM_ID_KERNEL(h_mm_id_q5_0, block_q5_0, 2, dequantize_q5_0)
+MM_ID_KERNEL(h_mm_id_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MM_ID_KERNEL(h_mm_id_q3_k, block_q3_K, 16, dequantize_q3_K)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q4_k, block_q4_K, 16, dequantize_q4_K)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q5_k, block_q5_K, 16, dequantize_q5_K)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q6_k, block_q6_K, 16, dequantize_q6_K)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q8_0, block_q8_0, 2, dequantize_q8_0)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q4_0, block_q4_0, 2, dequantize_q4_0)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq4_xs, block_iq4_xs, 16, dequantize_iq4_xs)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq3_s, block_iq3_s, 16, dequantize_iq3_s)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq3_xxs, block_iq3_xxs, 16, dequantize_iq3_xxs)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq2_s, block_iq2_s, 16, dequantize_iq2_s)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q2_0, block_q2_0, 4, dequantize_q2_0)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q5_0, block_q5_0, 2, dequantize_q5_0)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_q3_k, block_q3_K, 16, dequantize_q3_K)
 
 // ---------------------------------------------------------------- flash attention
 
@@ -2515,12 +2905,12 @@ inline void stage_kv_half(threadgroup half * Hs, device const half * cache, devi
 // Q8) into threadgroup memory 128 dims at a time (S = Q Kᵀ accumulates over the
 // halves of D; O is one 64x128 cooperative tensor per half). The staging buffer
 // aliases the score tile, which is only live between the K and V phases. Keys
-// start at the first one the tile's first row sees (sliding windows).
+// start at the first one the tile's lowest-positioned row sees (sliding windows).
 // grid (ceil(tokens/64), heads); threads 128; 64*64*4 + 64*64*2 + 3*64*4 bytes.
-template <bool Q8, int D>
+template <bool Q8, int D, bool TREE>
 void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device half * kc,
                                 device half * vc, device const float * qg, device const float * sinks,
-                                device float * out, threadgroup char * shared, threadgroup uint & rescale,
+                                device const uint * tree, device float * out, threadgroup char * shared, threadgroup uint & rescale,
                                 uint2 tgpig, ushort tid) {
     constexpr int W = D < 128 ? D : 128, NH = D / W, BR = 64, BC = 64;
     threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
@@ -2535,7 +2925,7 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
     const int rows = min(BR, int(p.tokens) - t0);
     const uint total_keys = p.position + p.tokens;
     const uint last_key = p.position + uint(t0 + rows - 1);
-    const uint first_row_key = p.position + uint(t0);
+    const uint first_row_key = lowest_query_position<TREE>(tree, p.position, uint(t0), uint(t0 + rows - 1));
     const uint lo = (p.window == 0 || first_row_key + 1 <= p.window) ? 0 : first_row_key + 1 - p.window;
     const int q_stride = int(p.heads) * D;
     const ulong head_off = (ulong)kvh * D;
@@ -2569,7 +2959,8 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
 
     const int my_row = tid / 2;
     const int c0 = (tid % 2) * 32;
-    const uint row_last_key = p.position + uint(t0 + my_row);
+    // Threads past the last row only feed masked scores; give them a valid row.
+    const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, min(uint(t0 + my_row), p.tokens - 1));
     for (uint j0 = lo / BC * BC; j0 < total_keys && j0 <= last_key; j0 += BC) {
         for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
         stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, total_keys, p.cache_stride, head_off, 0, tid, p.ring);
@@ -2588,8 +2979,7 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
         float mx = -INFINITY;
         for (int c = 0; c < 32; c++) {
             const uint key = j0 + uint(c0 + c);
-            const bool ok = my_row < rows && key < total_keys && key <= row_last_key &&
-                            (p.window == 0 || key + p.window > row_last_key);
+            const bool ok = my_row < rows && key < total_keys && key_visible<TREE>(mask, key);
             s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
             mx = max(mx, s[c]);
         }
@@ -2662,12 +3052,31 @@ kernel void name(constant FaArgs & p [[buffer(6)]],                             
                  uint2 tgpig [[threadgroup_position_in_grid]],                                  \
                  ushort tid [[thread_index_in_threadgroup]]) {                                  \
     threadgroup uint rescale;                                                                   \
-    flash_attn_mpp_staged_impl<q8, D>(p, q, kc, vc, qg, sinks, out, shared, rescale, tgpig, tid); \
+    flash_attn_mpp_staged_impl<q8, D, false>(p, q, kc, vc, qg, sinks, nullptr, out, shared,     \
+                                             rescale, tgpig, tid);                              \
+}
+// Draft-tree verify: the tree (see KeyMask) rides after the sinks.
+#define FLASH_MPP_STAGED_TREE(name, q8, D)                                                      \
+kernel void name(constant FaArgs & p [[buffer(7)]],                                             \
+                 device half * q [[buffer(0)]], device half * kc [[buffer(1)]],                 \
+                 device half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],         \
+                 device const float * sinks [[buffer(4)]], device const uint * tree [[buffer(5)]], \
+                 device float * out [[buffer(6)]],                                              \
+                 threadgroup char * shared [[threadgroup(0)]],                                  \
+                 uint2 tgpig [[threadgroup_position_in_grid]],                                  \
+                 ushort tid [[thread_index_in_threadgroup]]) {                                  \
+    threadgroup uint rescale;                                                                   \
+    flash_attn_mpp_staged_impl<q8, D, true>(p, q, kc, vc, qg, sinks, tree, out, shared,         \
+                                            rescale, tgpig, tid);                               \
 }
 FLASH_MPP_STAGED(h_flash_attn_mpp_staged, false, 256)
 FLASH_MPP_STAGED(h_flash_attn_mpp_q8, true, 256)
 FLASH_MPP_STAGED(h_flash_attn_mpp_staged_d128, false, 128)
 FLASH_MPP_STAGED(h_flash_attn_mpp_q8_d128, true, 128)
+FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_staged_tree, false, 256)
+FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_q8_tree, true, 256)
+FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_staged_d128_tree, false, 128)
+FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_q8_d128_tree, true, 128)
 
 // Copy F16 queries [tokens][heads][head_dim] to KV-head-major rows
 // [kv_heads][tokens * group][head_dim] (row t*group + g), so each KV head's query
@@ -2683,13 +3092,12 @@ kernel void h_q_by_kv_head(constant FaArgs & p [[buffer(2)]], device const half 
 
 // Online-softmax step shared by the TensorOps verify kernels: thread tid owns
 // row tid / TPR and CPT columns of the [BR][BC] score tile; scores of keys
-// outside [.., key_end), past the row's causal limit or before its window start
-// are masked. Writes P (F16) and updates the running max / sum / correction rows.
-template <int BR, int BC>
+// outside [.., key_end) or that the row does not see (`mask`) are masked. Writes P (F16) and updates the running max / sum / correction rows.
+template <int BR, int BC, bool TREE>
 inline void verify_softmax(threadgroup const float * Ss, threadgroup half * Ps,
                            threadgroup float * corr, threadgroup float * mrow,
                            threadgroup float * lrow, threadgroup uint & rescale,
-                           int rows, uint j0, uint key_end, uint row_last_key, uint window, ushort tid) {
+                           int rows, uint j0, uint key_end, thread const KeyMask & mask, ushort tid) {
     constexpr int TPR = 128 / BR, CPT = BC / TPR;
     const int my_row = tid / TPR;
     const int c0 = (tid % TPR) * CPT;
@@ -2697,8 +3105,7 @@ inline void verify_softmax(threadgroup const float * Ss, threadgroup half * Ps,
     float mx = -INFINITY;
     for (int c = 0; c < CPT; c++) {
         const uint key = j0 + uint(c0 + c);
-        const bool ok = my_row < rows && key < key_end && key <= row_last_key &&
-                        (window == 0 || key + window > row_last_key);
+        const bool ok = my_row < rows && key < key_end && key_visible<TREE>(mask, key);
         s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
         mx = max(mx, s[c]);
     }
@@ -2764,11 +3171,11 @@ inline void verify_seed(constant FaArgs & p, device const float * sinks, uint kv
 // one key split; S = Q Kᵀ and O += P V run as matmul2d on 64-key blocks read
 // straight from the F16 cache, with the online softmax in threadgroup memory.
 // grid (row_blocks, kv_heads, splits); threads 128; BR*64*4 + BR*64*2 + 3*BR*4 bytes.
-template <int BR, int D>
+template <int BR, int D, bool TREE>
 void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * kc,
                           device half * vc, device const float * qg, device const float * sinks,
-                          device float * out, device float * po, device float * pml, threadgroup char * shared,
-                          threadgroup uint & rescale, uint3 tgpig, ushort tid) {
+                          device const uint * tree, device float * out, device float * po, device float * pml,
+                          threadgroup char * shared, threadgroup uint & rescale, uint3 tgpig, ushort tid) {
     constexpr int BC = 64;
     threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
     threadgroup half  * Ps = (threadgroup half *)(Ss + BR * BC);          // [BR][BC]
@@ -2786,7 +3193,8 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
     // Blocks before the tile's first row's window start are never visited.
     uint j_begin = key_begin;
     if (p.window != 0) {
-        const uint first_pos = p.position + uint(r0) / p.group;
+        const uint first_pos = lowest_query_position<TREE>(tree, p.position, uint(r0) / p.group,
+                                                           uint(r0 + rows - 1) / p.group);
         const uint lo = first_pos + 1 > p.window ? first_pos + 1 - p.window : 0;
         j_begin = max(j_begin, lo / BC * BC);
     }
@@ -2813,13 +3221,15 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
     if (tid < BR) verify_seed(p, sinks, kvh, uint(r0) + tid, int(tid) < rows, mrow, lrow, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint row_last_key = p.position + uint(r0 + int(tid / (128 / BR))) / p.group;
+    // Threads past the last row only feed masked scores; give them a valid row.
+    const uint my_t = min(uint(r0 + int(tid / (128 / BR))) / p.group, p.tokens - 1);
+    const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, my_t);
     for (uint j0 = j_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
         auto mK = tK.slice(0, int(kv_row(j0, p.ring)));
         mm_s.run(tQ, mK, cS);
         cS.store(tS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        verify_softmax<BR, BC>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, row_last_key, p.window, tid);
+        verify_softmax<BR, BC, TREE>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, mask, tid);
         if (rescale) {
             for (uint i = 0; i < cO.get_capacity(); i++) {
                 if (cO.is_valid_element(i)) {
@@ -2848,10 +3258,11 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
 // into threadgroup memory 128 dims at a time (as h_flash_attn_mpp_staged);
 // the staging buffer aliases S.
 // shared bytes max(64*128*2, BR*64*4) + BR*64*2 + 3*BR*4.
-template <int BR, bool Q8, int D>
+template <int BR, bool Q8, int D, bool TREE>
 void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device half * kc,
                              device half * vc, device const float * qg, device const float * sinks,
-                             device float * out, device float * po, device float * pml, threadgroup char * shared,
+                             device const uint * tree, device float * out, device float * po, device float * pml,
+                             threadgroup char * shared,
                              threadgroup uint & rescale, uint3 tgpig, ushort tid) {
     constexpr int W = D < 128 ? D : 128, NH = D / W, BC = 64;
     constexpr int SBYTES = (BC * W * 2 > BR * BC * 4) ? BC * W * 2 : BR * BC * 4;
@@ -2871,7 +3282,8 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
     const uint last_key = p.position + uint(r0 + rows - 1) / p.group;
     uint j_begin = key_begin;
     if (p.window != 0) {
-        const uint first_pos = p.position + uint(r0) / p.group;
+        const uint first_pos = lowest_query_position<TREE>(tree, p.position, uint(r0) / p.group,
+                                                           uint(r0 + rows - 1) / p.group);
         const uint lo = first_pos + 1 > p.window ? first_pos + 1 - p.window : 0;
         j_begin = max(j_begin, lo / BC * BC);
     }
@@ -2900,7 +3312,9 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
     if (tid < BR) verify_seed(p, sinks, kvh, uint(r0) + tid, int(tid) < rows, mrow, lrow, tid);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const uint row_last_key = p.position + uint(r0 + int(tid / (128 / BR))) / p.group;
+    // Threads past the last row only feed masked scores; give them a valid row.
+    const uint my_t = min(uint(r0 + int(tid / (128 / BR))) / p.group, p.tokens - 1);
+    const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, my_t);
     for (uint j0 = j_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
         for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
         stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, key_end, p.cache_stride, head_off, 0, tid, p.ring);
@@ -2915,7 +3329,7 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
         }
         cS.store(tS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        verify_softmax<BR, BC>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, row_last_key, p.window, tid);
+        verify_softmax<BR, BC, TREE>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, mask, tid);
         if (rescale) {
             for (uint i = 0; i < cO0.get_capacity(); i++) {
                 if (cO0.is_valid_element(i)) {
@@ -2960,12 +3374,30 @@ kernel void name(constant FaArgs & p [[buffer(8)]],                             
                  uint3 tgpig [[threadgroup_position_in_grid]],                                  \
                  ushort tid [[thread_index_in_threadgroup]]) {                                  \
     threadgroup uint rescale;                                                                   \
-    call(p, qk, kc, vc, qg, sinks, out, po, pml, shared, rescale, tgpig, tid);                  \
+    call(p, qk, kc, vc, qg, sinks, nullptr, out, po, pml, shared, rescale, tgpig, tid);         \
 }
-ATTN_VERIFY_MPP(h_attn_verify_mpp_32, (attn_verify_mpp_impl<32, 256>))
-ATTN_VERIFY_MPP(h_attn_verify_mpp_32_q8, (attn_verify_mpp_staged_impl<32, true, 256>))
-ATTN_VERIFY_MPP(h_attn_verify_mpp_32_d128, (attn_verify_mpp_impl<32, 128>))
-ATTN_VERIFY_MPP(h_attn_verify_mpp_32_q8_d128, (attn_verify_mpp_staged_impl<32, true, 128>))
+// Draft-tree verify: the tree (see KeyMask) rides after the sinks.
+#define ATTN_VERIFY_MPP_TREE(name, call)                                                         \
+kernel void name(constant FaArgs & p [[buffer(9)]],                                             \
+                 device half * qk [[buffer(0)]], device half * kc [[buffer(1)]],                \
+                 device half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],         \
+                 device const float * sinks [[buffer(4)]], device const uint * tree [[buffer(5)]], \
+                 device float * out [[buffer(6)]],                                              \
+                 device float * po [[buffer(7)]], device float * pml [[buffer(8)]],             \
+                 threadgroup char * shared [[threadgroup(0)]],                                  \
+                 uint3 tgpig [[threadgroup_position_in_grid]],                                  \
+                 ushort tid [[thread_index_in_threadgroup]]) {                                  \
+    threadgroup uint rescale;                                                                   \
+    call(p, qk, kc, vc, qg, sinks, tree, out, po, pml, shared, rescale, tgpig, tid);            \
+}
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32, (attn_verify_mpp_impl<32, 256, false>))
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32_q8, (attn_verify_mpp_staged_impl<32, true, 256, false>))
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32_d128, (attn_verify_mpp_impl<32, 128, false>))
+ATTN_VERIFY_MPP(h_attn_verify_mpp_32_q8_d128, (attn_verify_mpp_staged_impl<32, true, 128, false>))
+ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_tree, (attn_verify_mpp_impl<32, 256, true>))
+ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_q8_tree, (attn_verify_mpp_staged_impl<32, true, 256, true>))
+ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_d128_tree, (attn_verify_mpp_impl<32, 128, true>))
+ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_q8_d128_tree, (attn_verify_mpp_staged_impl<32, true, 128, true>))
 
 // Gathers `N` consecutive cached values (N = 8 or 4) from element e, unscaled.
 template <bool Q8, int N>
@@ -3237,6 +3669,58 @@ kernel void h_copy_rows(constant CopyRowsArgs & a [[buffer(2)]], device const fl
     dst[(ulong)r * a.dst_stride + a.dst_offset + c] = src[(ulong)r * a.src_stride + c];
 }
 
+struct GatherRowsArgs { uint rows; uint width; uint src_stride; };
+
+// dst[r*width + c] = src[idx[r]*src_stride + c]; one thread per value.
+kernel void h_gather_rows(constant GatherRowsArgs & a [[buffer(3)]], device const float * src [[buffer(0)]],
+                          device const uint * idx [[buffer(1)]], device float * dst [[buffer(2)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i >= a.rows * a.width) return;
+    const uint r = i / a.width, c = i % a.width;
+    dst[(ulong)r * a.width + c] = src[(ulong)idx[r] * a.src_stride + c];
+}
+
+struct KvRowsArgs {
+    uint rows;      // K/V rows moved
+    uint stride;    // elements per cache row (kv_heads * head_dim)
+    uint kv_rows;   // rows the cache buffer holds (locates Q8 scales)
+    uint q8;
+    uint ring;      // see kv_row
+    uint position;  // cache position of slot 0
+};
+
+// 16-bit unit u of the cache row at position `key`: F16 rows are `stride`
+// units; Q8 rows are stride / 2 units of values, then stride / 32 scales.
+inline ulong kv_unit(constant KvRowsArgs & a, uint key, uint u) {
+    const ulong row = kv_row(key, a.ring);
+    if (a.q8 == 0) return row * a.stride + u;
+    const uint values = a.stride / 2;
+    return u < values ? row * values + u : (ulong)a.kv_rows * values + row * (a.stride / 32) + (u - values);
+}
+inline uint kv_units(constant KvRowsArgs & a) {
+    return a.q8 == 0 ? a.stride : a.stride / 2 + a.stride / 32;
+}
+
+// tmp[r] = cache row at position + slot[r] (16-bit units, any K/V format).
+kernel void h_kv_gather(constant KvRowsArgs & a [[buffer(3)]], device const ushort * cache [[buffer(0)]],
+                        device const uint * slot [[buffer(1)]], device ushort * tmp [[buffer(2)]],
+                        uint i [[thread_position_in_grid]]) {
+    const uint n = kv_units(a);
+    if (i >= a.rows * n) return;
+    const uint r = i / n, u = i % n;
+    tmp[(ulong)r * n + u] = cache[kv_unit(a, a.position + slot[r], u)];
+}
+
+// Cache row at position + slot[r] = tmp[r].
+kernel void h_kv_scatter(constant KvRowsArgs & a [[buffer(3)]], device const ushort * tmp [[buffer(0)]],
+                         device const uint * slot [[buffer(1)]], device ushort * cache [[buffer(2)]],
+                         uint i [[thread_position_in_grid]]) {
+    const uint n = kv_units(a);
+    if (i >= a.rows * n) return;
+    const uint r = i / n, u = i % n;
+    cache[kv_unit(a, a.position + slot[r], u)] = tmp[(ulong)r * n + u];
+}
+
 // ---------------------------------------------------------------- block-diffusion drafters
 
 struct DraftPrepArgs {
@@ -3485,6 +3969,7 @@ inline void v_gemm_impl(constant VGemmArgs & p, device const float * A, device c
         if (p.has_bias != 0) v += bias[gn];
         if (p.epilogue == 1) v = v_gelu_tanh(v);
         else if (p.epilogue == 2) v = v_gelu_erf(v);
+        else if (p.epilogue == 3) v = v / (1.f + precise::exp(-v));
         C[c_base + (ulong)gm * p.ldc + gn] = v;
     }
 }
@@ -3590,4 +4075,340 @@ kernel void v_softmax(constant VRowsArgs & p [[buffer(1)]], device float * s [[b
 kernel void v_add(constant VRowsArgs & p [[buffer(2)]], device const float * y [[buffer(0)]],
                   device float * acc [[buffer(1)]], uint i [[thread_position_in_grid]]) {
     if (i < p.rows * p.cols) acc[i] += y[i];
+}
+
+// RMSNorm (no mean, no bias). One 256-thread threadgroup per row; the same
+// weight is applied to every row, so a [tokens * heads, head_dim] view is a
+// per-head norm.
+kernel void v_rmsnorm(constant VNormArgs & p [[buffer(3)]], device const float * x [[buffer(0)]],
+                      device const float * w [[buffer(1)]], device float * out [[buffer(2)]],
+                      uint row [[threadgroup_position_in_grid]], uint tid [[thread_index_in_threadgroup]]) {
+    threadgroup float part[8];
+    device const float * xr = x + (ulong)row * p.width;
+    float ss = 0.f;
+    for (uint i = tid; i < p.width; i += 256) ss += xr[i] * xr[i];
+    ss = simd_sum(ss);
+    if (tid % 32 == 0) part[tid / 32] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float sum = 0.f;
+    for (uint i = 0; i < 8; i++) sum += part[i];
+    const float inv = rsqrt(sum / float(p.width) + p.eps);
+    for (uint i = tid; i < p.width; i += 256)
+        out[(ulong)row * p.width + i] = xr[i] * inv * w[i];
+}
+
+struct VMulArgs { uint rows; uint cols; uint a_stride; uint a_off; uint b_stride; uint b_off; };
+
+// out[r, c] = a[r * a_stride + a_off + c] * b[r * b_stride + b_off + c].
+// The conv block's B, C and X thirds share one row, so the strides pick them apart.
+kernel void v_mul(constant VMulArgs & p [[buffer(3)]], device const float * a [[buffer(0)]],
+                  device const float * b [[buffer(1)]], device float * out [[buffer(2)]],
+                  uint i [[thread_position_in_grid]]) {
+    if (i >= p.rows * p.cols) return;
+    const uint r = i / p.cols, c = i % p.cols;
+    out[i] = a[(ulong)r * p.a_stride + p.a_off + c] * b[(ulong)r * p.b_stride + p.b_off + c];
+}
+
+struct VDwArgs { uint gw; uint gh; uint hidden; };
+
+// Depthwise 3x3, padding 1, in-bounds only. Input is raster (x fastest),
+// [gh * gw, hidden]. The kernel is [hidden, 9] with tap ky*3+kx.
+kernel void v_dwconv3(constant VDwArgs & p [[buffer(3)]], device const float * in [[buffer(0)]],
+                      device const float * kern [[buffer(1)]], device float * out [[buffer(2)]],
+                      uint i [[thread_position_in_grid]]) {
+    const uint n = p.gw * p.gh * p.hidden;
+    if (i >= n) return;
+    const uint c = i % p.hidden;
+    const uint t = i / p.hidden;
+    const uint x = t % p.gw;
+    const uint y = t / p.gw;
+    float acc = 0.f;
+    for (uint ky = 0; ky < 3; ky++) {
+        const int sy = int(y) + int(ky) - 1;
+        if (sy < 0 || sy >= int(p.gh)) continue;
+        for (uint kx = 0; kx < 3; kx++) {
+            const int sx = int(x) + int(kx) - 1;
+            if (sx < 0 || sx >= int(p.gw)) continue;
+            acc += in[(ulong)(uint(sy) * p.gw + uint(sx)) * p.hidden + c]
+                 * kern[c * 9 + ky * 3 + kx];
+        }
+    }
+    out[i] = acc;
+}
+
+struct VIntArgs { uint gw; uint gh; uint hidden; };
+
+// 2x2 merge in raster order. Output token (x2, yb) is the concatenation
+// top-left, top-right, bottom-left, bottom-right, each `hidden` floats.
+kernel void v_interleave(constant VIntArgs & p [[buffer(2)]], device const float * in [[buffer(0)]],
+                         device float * out [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    const uint mw = p.gw / 2, mh = p.gh / 2;
+    const uint width = p.hidden * 4;
+    if (i >= mw * mh * width) return;
+    const uint tok = i / width, col = i % width;
+    const uint x2 = tok % mw, yb = tok / mw;
+    const uint which = col / p.hidden, c = col % p.hidden;
+    const uint x = x2 * 2 + (which & 1);
+    const uint y = yb * 2 + (which >> 1);
+    out[i] = in[(ulong)(y * p.gw + x) * p.hidden + c];
+}
+
+struct VRope1Args { uint tokens; uint heads; uint head_dim; uint stride; };
+
+// In-place rotary of one projection [tokens, stride], `heads` of `head_dim`.
+// Pair i rotates (i, i + head_dim/2). cos/sin are [tokens, head_dim/2].
+kernel void v_rope1(constant VRope1Args & p [[buffer(3)]], device const float * cs [[buffer(0)]],
+                    device const float * sn [[buffer(1)]], device float * q [[buffer(2)]],
+                    uint i [[thread_position_in_grid]]) {
+    const uint half_dim = p.head_dim / 2;
+    const uint total = p.tokens * p.heads * half_dim;
+    if (i >= total) return;
+    const uint pair = i % half_dim;
+    const uint head = (i / half_dim) % p.heads;
+    const uint tok = i / (half_dim * p.heads);
+    device float * r = q + (ulong)tok * p.stride + (ulong)head * p.head_dim;
+    const float c = cs[(ulong)tok * half_dim + pair], s = sn[(ulong)tok * half_dim + pair];
+    const float x0 = r[pair], x1 = r[pair + half_dim];
+    r[pair] = x0 * c - x1 * s;
+    r[pair + half_dim] = x1 * c + x0 * s;
+}
+
+// LFM3-Audio downsampler. Activations are [time, freq, channels], channels
+// fastest. Each stage is a 3x3 conv with stride 2 on both axes and one zero
+// row/column of padding on every side, so output (t, f) reads inputs
+// 2t-1..2t+1 and 2f-1..2f+1. Kernels keep ggml's layout, [channel][kf][kt].
+struct AStemArgs { uint t_in; uint f_in; uint t_mid; uint f_mid; uint t_out; uint f_out; uint ch; };
+
+// SiLU(conv0(mel) + b0) at (t, f, c), zero outside the stage-1 grid: the
+// padding of the second conv applies to its input, after the activation.
+inline float a_stem0(constant AStemArgs & p, device const float * mel, device const float * w0,
+                     device const float * b0, int t, int f, uint c) {
+    if (t < 0 || f < 0 || t >= int(p.t_mid) || f >= int(p.f_mid)) return 0.f;
+    float acc = b0[c];
+    for (int kf = 0; kf < 3; kf++) {
+        const int sf = 2 * f + kf - 1;
+        if (sf < 0 || sf >= int(p.f_in)) continue;
+        for (int kt = 0; kt < 3; kt++) {
+            const int st = 2 * t + kt - 1;
+            if (st < 0 || st >= int(p.t_in)) continue;
+            acc += mel[(ulong)st * p.f_in + uint(sf)] * w0[c * 9 + uint(kf * 3 + kt)];
+        }
+    }
+    return acc / (1.f + precise::exp(-acc));
+}
+
+// The first two stages fused: a full conv from the one mel channel to `ch`,
+// SiLU, then a depthwise conv. The stage-1 activation, the largest tensor of
+// the encoder, is recomputed per tap instead of stored.
+kernel void a_conv_stem(constant AStemArgs & p [[buffer(6)]], device const float * mel [[buffer(0)]],
+                        device const float * w0 [[buffer(1)]], device const float * b0 [[buffer(2)]],
+                        device const float * w1 [[buffer(3)]], device const float * b1 [[buffer(4)]],
+                        device float * out [[buffer(5)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.t_out * p.f_out * p.ch) return;
+    const uint c = i % p.ch;
+    const uint f = (i / p.ch) % p.f_out;
+    const uint t = i / (p.ch * p.f_out);
+    float acc = b1[c];
+    for (int kf = 0; kf < 3; kf++) {
+        for (int kt = 0; kt < 3; kt++) {
+            const float s = a_stem0(p, mel, w0, b0, int(2 * t) + kt - 1, int(2 * f) + kf - 1, c);
+            acc += s * w1[c * 9 + uint(kf * 3 + kt)];
+        }
+    }
+    out[i] = acc;
+}
+
+struct ADwArgs { uint t_in; uint f_in; uint t_out; uint f_out; uint ch; };
+
+// Depthwise stride-2 3x3 conv plus bias.
+kernel void a_dwconv_s2(constant ADwArgs & p [[buffer(4)]], device const float * in [[buffer(0)]],
+                        device const float * w [[buffer(1)]], device const float * b [[buffer(2)]],
+                        device float * out [[buffer(3)]], uint i [[thread_position_in_grid]]) {
+    if (i >= p.t_out * p.f_out * p.ch) return;
+    const uint c = i % p.ch;
+    const uint f = (i / p.ch) % p.f_out;
+    const uint t = i / (p.ch * p.f_out);
+    float acc = b[c];
+    for (int kf = 0; kf < 3; kf++) {
+        const int sf = int(2 * f) + kf - 1;
+        if (sf < 0 || sf >= int(p.f_in)) continue;
+        for (int kt = 0; kt < 3; kt++) {
+            const int st = int(2 * t) + kt - 1;
+            if (st < 0 || st >= int(p.t_in)) continue;
+            acc += in[((ulong)st * p.f_in + uint(sf)) * p.ch + c] * w[c * 9 + uint(kf * 3 + kt)];
+        }
+    }
+    out[i] = acc;
+}
+
+// ---------------------------------------------------------------- qwen4exp hyper-connections
+
+struct GroupNormArgs { uint n; float eps; uint rows; uint groups; };
+
+// y = rmsnorm(x) * w per row of n; row r takes gamma row r % groups (the
+// residual stream it belongs to). One threadgroup (256 threads) per row.
+kernel void h_group_rmsnorm(constant GroupNormArgs & a [[buffer(3)]], device const float * x [[buffer(0)]],
+                            device const float * w [[buffer(1)]], device float * y [[buffer(2)]],
+                            uint row [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    device const float * xr = x + (ulong)row * a.n;
+    device const float * wr = w + (ulong)(row % a.groups) * a.n;
+    float ss = 0.f;
+    for (uint i = tid; i < a.n; i += 256) ss += xr[i] * xr[i];
+    ss = block_sum(ss, scratch, tid, 256);
+    const float scale = rsqrt(ss / float(a.n) + a.eps);
+    device float * yr = y + (ulong)row * a.n;
+    for (uint i = tid; i < a.n; i += 256) yr[i] = xr[i] * scale * wr[i];
+}
+
+struct ScaleArgs { uint n; float scale; };
+
+// x = silu(x * scale), in place.
+kernel void h_scaled_silu(constant ScaleArgs & a [[buffer(1)]], device float * x [[buffer(0)]],
+                          uint i [[thread_position_in_grid]]) {
+    if (i >= a.n) return;
+    const float v = x[i] * a.scale;
+    x[i] = v / (1.f + exp(-v));
+}
+
+struct HcArgs { uint n; uint streams; uint rows; };
+
+// y[t] = mean over streams s of xn[t][s] * sigmoid(gate[t][s]).
+kernel void h_hc_mix(constant HcArgs & a [[buffer(3)]], device const float * xn [[buffer(0)]],
+                     device const float * gate [[buffer(1)]], device float * y [[buffer(2)]],
+                     uint i [[thread_position_in_grid]]) {
+    if (i >= a.n * a.rows) return;
+    const uint t = i / a.n, c = i % a.n;
+    float sum = 0.f;
+    for (uint s = 0; s < a.streams; s++) {
+        const ulong at = ((ulong)t * a.streams + s) * a.n + c;
+        sum += xn[at] / (1.f + exp(-gate[at]));
+    }
+    y[i] = sum / float(a.streams);
+}
+
+// y[t] = the mean of the streams res[t][s]: what drafters read of a layer.
+kernel void h_hc_mean(constant HcArgs & a [[buffer(2)]], device const float * res [[buffer(0)]],
+                      device float * y [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i >= a.n * a.rows) return;
+    const uint t = i / a.n, c = i % a.n;
+    float sum = 0.f;
+    for (uint s = 0; s < a.streams; s++) sum += res[((ulong)t * a.streams + s) * a.n + c];
+    y[i] = sum / float(a.streams);
+}
+
+// res[t][s] += out[t] * 2 sigmoid(inject[t][s] / streams), in place.
+kernel void h_hc_write(constant HcArgs & a [[buffer(3)]], device const float * out [[buffer(0)]],
+                       device const float * inject [[buffer(1)]], device float * res [[buffer(2)]],
+                       uint i [[thread_position_in_grid]]) {
+    if (i >= a.n * a.rows) return;
+    const uint t = i / a.n, c = i % a.n;
+    const float o = out[i];
+    for (uint s = 0; s < a.streams; s++) {
+        const float w = 2.f / (1.f + exp(-inject[t * a.streams + s] / float(a.streams)));
+        res[((ulong)t * a.streams + s) * a.n + c] += o * w;
+    }
+}
+
+// res[t][s] = x[t]: the residual starts as copies of the embedding.
+kernel void h_hc_expand(constant HcArgs & a [[buffer(2)]], device const float * x [[buffer(0)]],
+                        device float * res [[buffer(1)]], uint i [[thread_position_in_grid]]) {
+    if (i >= a.n * a.rows) return;
+    const uint t = i / a.n, c = i % a.n;
+    for (uint s = 0; s < a.streams; s++) res[((ulong)t * a.streams + s) * a.n + c] = x[i];
+}
+
+// ---------------------------------------------------------------- qwen4exp n-gram embedding
+
+struct PleGateArgs { uint n; uint streams; uint rows; float eps; };
+
+// Per (token t, stream s), one threadgroup of 256: the gate of the stream is
+// sigmoid(signed sqrt(rmsnorm(key)·nk · rmsnorm(res)·nq / sqrt(n))); the
+// value broadcast to it, scaled by the gate, is `gated`, and its rmsnorm
+// times nc is `normed` (the conv input).
+kernel void h_ple_gate(constant PleGateArgs & a [[buffer(8)]], device const float * key [[buffer(0)]],
+                       device const float * res [[buffer(1)]], device const float * value [[buffer(2)]],
+                       device const float * nk [[buffer(3)]], device const float * nq [[buffer(4)]],
+                       device const float * nc [[buffer(5)]],
+                       device float * gated [[buffer(6)]], device float * normed [[buffer(7)]],
+                       uint row [[threadgroup_position_in_grid]], ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup float scratch[8];
+    const uint t = row / a.streams, s = row % a.streams;
+    device const float * kr = key + (ulong)row * a.n;
+    device const float * qr = res + (ulong)row * a.n;
+    device const float * vr = value + (ulong)t * a.n;
+    device const float * nkr = nk + (ulong)s * a.n;
+    device const float * nqr = nq + (ulong)s * a.n;
+    device const float * ncr = nc + (ulong)s * a.n;
+    float kk = 0.f, qq = 0.f, kq = 0.f, vv = 0.f;
+    for (uint i = tid; i < a.n; i += 256) {
+        const float k = kr[i], q = qr[i], v = vr[i];
+        kk += k * k; qq += q * q; kq += k * nkr[i] * q * nqr[i]; vv += v * v;
+    }
+    kk = block_sum(kk, scratch, tid, 256);
+    qq = block_sum(qq, scratch, tid, 256);
+    kq = block_sum(kq, scratch, tid, 256);
+    vv = block_sum(vv, scratch, tid, 256);
+    const float n = float(a.n);
+    const float score = kq * rsqrt(kk / n + a.eps) * rsqrt(qq / n + a.eps) / sqrt(n);
+    const float mag = sqrt(max(abs(score), 1e-6f));
+    const float gate = 1.f / (1.f + exp(-(score > 0.f ? mag : score < 0.f ? -mag : 0.f)));
+    // rmsnorm(value * gate) = value * gate / sqrt(gate^2 mean(value^2) + eps)
+    const float scale = gate * rsqrt(gate * gate * vv / n + a.eps);
+    device float * gr = gated + (ulong)row * a.n;
+    device float * nr = normed + (ulong)row * a.n;
+    for (uint i = tid; i < a.n; i += 256) {
+        gr[i] = vr[i] * gate;
+        nr[i] = vr[i] * scale * ncr[i];
+    }
+}
+
+struct PleConvArgs { uint channels; uint rows; uint kernel_size; uint dilation; uint keep; };
+
+// Depthwise causal conv dilated by the n-gram size over the history
+// (`hist`, (kernel_size - 1) * dilation rows, oldest first) followed by the
+// rows of `normed`; res[t] += gated[t] + silu(conv[t]). One thread per
+// channel walks the tokens; the history keeps the newest rows.
+kernel void h_ple_conv(constant PleConvArgs & a [[buffer(5)]], device const float * normed [[buffer(0)]],
+                       device const float * gated [[buffer(1)]], device const float * w [[buffer(2)]],
+                       device float * hist [[buffer(3)]], device float * res [[buffer(4)]],
+                       uint c [[thread_position_in_grid]]) {
+    if (c >= a.channels) return;
+    const uint h = (a.kernel_size - 1) * a.dilation;
+    // P[j] for j < h is history row j, else normed row j - h.
+    for (uint t = 0; t < a.rows; t++) {
+        float acc = 0.f;
+        for (uint k = 0; k < a.kernel_size; k++) {
+            const uint j = t + k * a.dilation;
+            const float x = j < h ? hist[(ulong)j * a.channels + c] : normed[(ulong)(j - h) * a.channels + c];
+            acc += w[(ulong)c * a.kernel_size + k] * x;
+        }
+        const ulong at = (ulong)t * a.channels + c;
+        res[at] += gated[at] + acc / (1.f + exp(-acc));
+    }
+    // The newest h rows of P become the history (a verify leaves it to
+    // `h_ple_push` at commit).
+    if (a.keep) return;
+    if (a.rows >= h) {
+        for (uint j = 0; j < h; j++) hist[(ulong)j * a.channels + c] = normed[(ulong)(a.rows - h + j) * a.channels + c];
+    } else {
+        for (uint j = 0; j < h - a.rows; j++) hist[(ulong)j * a.channels + c] = hist[(ulong)(j + a.rows) * a.channels + c];
+        for (uint j = 0; j < a.rows; j++) hist[(ulong)(h - a.rows + j) * a.channels + c] = normed[(ulong)j * a.channels + c];
+    }
+}
+
+struct PlePushArgs { uint channels; uint rows; uint history; };
+
+// Commit: the first `rows` rows of a verify's conv inputs join the history,
+// which keeps its newest `history` rows.
+kernel void h_ple_push(constant PlePushArgs & a [[buffer(2)]], device const float * rows [[buffer(0)]],
+                       device float * hist [[buffer(1)]], uint c [[thread_position_in_grid]]) {
+    if (c >= a.channels) return;
+    const uint h = a.history;
+    if (a.rows >= h) {
+        for (uint j = 0; j < h; j++) hist[(ulong)j * a.channels + c] = rows[(ulong)(a.rows - h + j) * a.channels + c];
+    } else {
+        for (uint j = 0; j < h - a.rows; j++) hist[(ulong)j * a.channels + c] = hist[(ulong)(j + a.rows) * a.channels + c];
+        for (uint j = 0; j < a.rows; j++) hist[(ulong)(h - a.rows + j) * a.channels + c] = rows[(ulong)j * a.channels + c];
+    }
 }

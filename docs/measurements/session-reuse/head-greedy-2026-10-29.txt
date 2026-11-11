@@ -1,0 +1,7 @@
+# Greedy output and memory line with all three commits after aa2b402 applied (built from the disk-cache commit), 29 October 2026, same machine.
+# target/release/ferrum hybrid --model MODEL --raw --prompt 'The capital of France is' --max-new-tokens 48
+# The md5 of stdout matches regression-2026-10-29.txt on experimental ab8f57e and on aa2b402 for every model.
+Tiel-Coder-35B-A3B-MTP-UD-IQ4_XS.gguf md5 b7587183510804ec010b930f941ed75f | measured: weights+scratch 17114 MiB (predicted 17116), state 5183 MiB (predicted 5184)
+Swift-1.5-Qwen3.8-27B-Q4_K_M.gguf md5 83d343513ccf45f2d3d9e48af6c1fe10 | measured: weights+scratch 16679 MiB (predicted 16682), state 6470 MiB (predicted 6471)
+LFM3-VL-2B-Q4_K_M.gguf md5 d4aa1b4312f8b323ce38b3f81edc18d8 | measured: weights+scratch 1344 MiB (predicted 1345), state 1509 MiB (predicted 1510)
+Spark-X2.6-4B-Q4_K_M.gguf md5 c7397fd44e4549e8896067519e9f9458 | measured: weights+scratch 3496 MiB (predicted 3496), state 19726 MiB (predicted 19727)

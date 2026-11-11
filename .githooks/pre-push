@@ -1,0 +1,12 @@
+#!/bin/sh
+# Refuse direct pushes to main and experimental: they change only through
+# pull requests (AGENTS.md). Enable with: git config core.hooksPath .githooks
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$remote_ref" in
+    refs/heads/main | refs/heads/experimental)
+        echo "pre-push: refusing to push to ${remote_ref#refs/heads/}; push a topic branch and open a PR (see AGENTS.md)." >&2
+        exit 1
+        ;;
+    esac
+done
+exit 0

@@ -97,15 +97,27 @@ fn synthetic(d: &MetalDevice, config: VisionConfig, seed: u64) -> VisionModel {
         })
         .collect();
     let merged = h * 4;
+    let merger = |rng: &mut ChaCha8Rng, post_shuffle: bool| {
+        let norm = if post_shuffle { merged } else { h };
+        Merger {
+            norm: (vec(rng, norm, 1.), vec(rng, norm, 0.)),
+            fc1: (mat(rng, merged, merged), vec(rng, merged, 0.)),
+            fc2: (
+                mat(rng, config.out_dim, merged),
+                vec(rng, config.out_dim, 0.),
+            ),
+            post_shuffle,
+        }
+    };
+    let output = merger(&mut rng, false);
+    let deepstack = (0..config.layers)
+        .map(|l| (l, merger(&mut rng, true)))
+        .collect();
     VisionModel {
         patch: (mat(&mut rng, h, config.patch_len()), vec(&mut rng, h, 0.)),
         position: rand_vec(&mut rng, config.table * config.table * h, 0.5),
-        post: (vec(&mut rng, h, 1.), vec(&mut rng, h, 0.)),
-        merge1: (mat(&mut rng, merged, merged), vec(&mut rng, merged, 0.)),
-        merge2: (
-            mat(&mut rng, config.out_dim, merged),
-            vec(&mut rng, config.out_dim, 0.),
-        ),
+        merger: output,
+        deepstack,
         zero: Tensor::zeros(d, [1], DType::F32).unwrap(),
         layers,
         config,
@@ -113,10 +125,37 @@ fn synthetic(d: &MetalDevice, config: VisionConfig, seed: u64) -> VisionModel {
         min_tokens: DEFAULT_MIN_TOKENS,
         weight_bytes: 0,
         score_bytes: SCORE_BYTES,
+        lfm3: None,
+        marker: "<|image_pad|>",
+        filter: image::imageops::FilterType::CatmullRom,
     }
 }
 
-fn reference(m: &VisionModel, image: &Prepared) -> Vec<f32> {
+/// A merger on CPU over `x` (`n` patch rows of `h`, block order).
+fn merge_reference(
+    m: &Merger,
+    x: &[f32],
+    n: usize,
+    h: usize,
+    eps: f32,
+    out_dim: usize,
+) -> Vec<f32> {
+    let w = |t: &(Tensor, Tensor)| (t.0.to_f32(), t.1.to_f32());
+    let (g, b) = w(&m.norm);
+    // Per-patch and post-shuffle norms differ only in the width normalised.
+    let xn = layernorm(x, &g, &b, if m.post_shuffle { 4 * h } else { h }, eps);
+    let rows = n / 4;
+    let (w1, b1) = w(&m.fc1);
+    let mid: Vec<f32> = linear(&xn, &w1, &b1, rows, 4 * h, 4 * h)
+        .into_iter()
+        .map(gelu_erf)
+        .collect();
+    let (w2, b2) = w(&m.fc2);
+    linear(&mid, &w2, &b2, rows, out_dim, 4 * h)
+}
+
+/// The output rows and the DeepStack features.
+fn reference(m: &VisionModel, image: &Prepared) -> (Vec<f32>, Vec<Vec<f32>>) {
     let c = &m.config;
     let (gh, gw) = (image.height / c.patch, image.width / c.patch);
     let (n, h, hd) = (gh * gw, c.hidden, c.head_dim());
@@ -127,7 +166,8 @@ fn reference(m: &VisionModel, image: &Prepared) -> Vec<f32> {
         *a += b;
     }
     let (cos, sin) = rope_tables(gh, gw, c.merge, hd);
-    for layer in &m.layers {
+    let mut deepstack = Vec::new();
+    for (index, layer) in m.layers.iter().enumerate() {
         let (g1, b1) = w(&layer.ln1);
         let xn = layernorm(&x, &g1, &b1, h, c.eps);
         let (qw, qb) = w(&layer.qkv);
@@ -189,17 +229,14 @@ fn reference(m: &VisionModel, image: &Prepared) -> Vec<f32> {
         for (a, b) in x.iter_mut().zip(linear(&hid, &dw, &db, n, h, c.ffn)) {
             *a += b;
         }
+        for (_, merger) in m.deepstack.iter().filter(|(l, _)| *l == index) {
+            deepstack.push(merge_reference(merger, &x, n, h, c.eps, c.out_dim));
+        }
     }
-    let (pg, pbias) = w(&m.post);
-    let xn = layernorm(&x, &pg, &pbias, h, c.eps);
-    let rows = n / 4;
-    let (w1, b1) = w(&m.merge1);
-    let mid: Vec<f32> = linear(&xn, &w1, &b1, rows, 4 * h, 4 * h)
-        .into_iter()
-        .map(gelu_erf)
-        .collect();
-    let (w2, b2) = w(&m.merge2);
-    linear(&mid, &w2, &b2, rows, c.out_dim, 4 * h)
+    (
+        merge_reference(&m.merger, &x, n, h, c.eps, c.out_dim),
+        deepstack,
+    )
 }
 
 fn test_image(width: usize, height: usize, seed: u64) -> Prepared {
@@ -232,7 +269,7 @@ fn encoder_matches_cpu_reference() {
     let mut model = synthetic(&d, tiny_config(), 7);
     for (width, height) in [(16, 16), (32, 24), (24, 40)] {
         let image = test_image(width, height, (width * height) as u64);
-        let want = reference(&model, &image);
+        let (want, want_deepstack) = reference(&model, &image);
         for score_bytes in [SCORE_BYTES, 1] {
             model.score_bytes = score_bytes;
             let got = model.encode_prepared(&d, &image).unwrap();
@@ -242,6 +279,10 @@ fn encoder_matches_cpu_reference() {
                 &got.rows.to_f32(),
                 &want,
             );
+            assert_eq!(got.deepstack.len(), want_deepstack.len());
+            for (i, (g, w)) in got.deepstack.iter().zip(&want_deepstack).enumerate() {
+                compare(&format!("{width}x{height} deepstack {i}"), &g.to_f32(), w);
+            }
         }
     }
 }
@@ -306,4 +347,170 @@ fn prepare_decodes_resizes_and_normalises() {
     assert_ne!(model.prepare(&other).map(|p| p.hash).unwrap_or(0), p.hash);
     assert!(p.pixels.iter().all(|v| (-1.0001..=1.0001).contains(v)));
     assert!(model.prepare(b"not an image").is_err());
+}
+
+#[test]
+fn request_budgets_stay_within_the_projector_cap() {
+    let d = MetalDevice::new().unwrap();
+    let mut model = synthetic(&d, tiny_config(), 1);
+    model.max_tokens = 64;
+    model.min_tokens = 16;
+    let budget = |min, max| ImageBudget {
+        min_tokens: min,
+        max_tokens: max,
+    };
+    assert_eq!(model.limits(ImageBudget::default()), (16, 64));
+    // A request may lower the cap, and the floor follows it down.
+    assert_eq!(model.limits(budget(None, Some(8))), (8, 8));
+    assert_eq!(model.limits(budget(Some(4), Some(32))), (4, 32));
+    // It may not raise the cap the memory plan was made for.
+    assert_eq!(model.limits(budget(Some(100), Some(1 << 20))), (64, 64));
+    // A large image shrinks to the request's cap (factor 8: one token per 8x8).
+    let (w, h) = model.target_size_with(640, 640, budget(None, Some(9)));
+    assert!((w / 8) * (h / 8) <= 9, "{w}x{h}");
+    let (w, h) = model.target_size(640, 640);
+    assert!((w / 8) * (h / 8) <= 64 && (w / 8) * (h / 8) > 9, "{w}x{h}");
+    let fill = ImageBudget {
+        min_tokens: Some(1),
+        ..Default::default()
+    };
+    assert_eq!(fill.or(budget(Some(2), Some(3))), budget(Some(1), Some(3)));
+}
+
+#[test]
+fn safetensors_names_follow_transformers() {
+    for (gguf, hf) in [
+        ("v.patch_embd.bias", "patch_embed.proj.bias"),
+        ("v.position_embd.weight", "pos_embed.weight"),
+        ("v.blk.3.ln1.weight", "blocks.3.norm1.weight"),
+        ("v.blk.3.ln2.bias", "blocks.3.norm2.bias"),
+        ("v.blk.26.attn_qkv.weight", "blocks.26.attn.qkv.weight"),
+        ("v.blk.0.attn_out.bias", "blocks.0.attn.proj.bias"),
+        ("v.blk.1.ffn_up.weight", "blocks.1.mlp.linear_fc1.weight"),
+        ("v.blk.1.ffn_down.weight", "blocks.1.mlp.linear_fc2.weight"),
+        ("v.post_ln.weight", "merger.norm.weight"),
+        ("mm.0.weight", "merger.linear_fc1.weight"),
+        ("mm.2.bias", "merger.linear_fc2.bias"),
+        (
+            "v.deepstack.2.norm.weight",
+            "deepstack_merger_list.2.norm.weight",
+        ),
+        (
+            "v.deepstack.0.fc1.bias",
+            "deepstack_merger_list.0.linear_fc1.bias",
+        ),
+        (
+            "v.deepstack.1.fc2.weight",
+            "deepstack_merger_list.1.linear_fc2.weight",
+        ),
+    ] {
+        assert_eq!(
+            transformers_name("model.visual.", gguf),
+            format!("model.visual.{hf}"),
+            "{gguf}"
+        );
+    }
+}
+
+#[test]
+fn projectors_match_their_model_by_name() {
+    let vl = "lfm3-vl-2b-q4_k_m";
+    let audio = "lfm3-audio-2b-q4_k_m";
+    assert!(named_after("mmproj-lfm3-vl-2b-q8_0.gguf", vl));
+    assert!(!named_after("mmproj-lfm3-audio-2b-q8_0.gguf", vl));
+    assert!(named_after("mmproj-lfm3-audio-2b-bf16.gguf", audio));
+    assert!(!named_after("mmproj-lfm3-vl-2b-f16.gguf", audio));
+    assert!(named_after(
+        "qwen3.8-27b-mmproj.gguf",
+        "qwen3.8-27b-ud-q4_k_xl"
+    ));
+    assert!(named_after(
+        "mmproj-swift-1.5-qwen3.8-27b-q4_k_m.gguf",
+        "swift-1.5-qwen3.8-27b-q4_k_m"
+    ));
+    assert!(!named_after(
+        "mmproj-bf16.gguf",
+        "swift-1.5-qwen3.8-27b-q4_k_m"
+    ));
+    assert!(!named_after("mmproj.gguf", "anything"));
+}
+
+/// A header-and-zeros GGUF: string, u32 and f32 metadata, F32 tensors.
+fn write_gguf(path: &Path, md: &[(&str, Option<&str>, f64)], tensors: &[(&str, &[usize])]) {
+    let s = |b: &mut Vec<u8>, v: &str| {
+        b.extend_from_slice(&(v.len() as u64).to_le_bytes());
+        b.extend_from_slice(v.as_bytes());
+    };
+    let mut b = b"GGUF".to_vec();
+    b.extend_from_slice(&3u32.to_le_bytes());
+    b.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+    b.extend_from_slice(&(md.len() as u64).to_le_bytes());
+    for &(key, text, number) in md {
+        s(&mut b, key);
+        match text {
+            Some(t) => {
+                b.extend_from_slice(&8u32.to_le_bytes());
+                s(&mut b, t);
+            }
+            None if number.fract() != 0. => {
+                b.extend_from_slice(&6u32.to_le_bytes());
+                b.extend_from_slice(&(number as f32).to_le_bytes());
+            }
+            None => {
+                b.extend_from_slice(&4u32.to_le_bytes());
+                b.extend_from_slice(&(number as u32).to_le_bytes());
+            }
+        }
+    }
+    let mut offset = 0u64;
+    for (name, dims) in tensors {
+        s(&mut b, name);
+        b.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+        for &d in *dims {
+            b.extend_from_slice(&(d as u64).to_le_bytes());
+        }
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&offset.to_le_bytes());
+        offset += (dims.iter().product::<usize>() * 4).next_multiple_of(32) as u64;
+    }
+    b.resize(b.len().next_multiple_of(32), 0);
+    b.resize(b.len() + offset as usize, 0);
+    std::fs::write(path, b).unwrap();
+}
+
+#[test]
+fn audio_projector_budget_counts_weights_encode_and_cache() {
+    let path = std::env::temp_dir().join(format!("ferrum-lfm3a-{}.gguf", std::process::id()));
+    let md: &[(&str, Option<&str>, f64)] = &[
+        ("general.architecture", Some("clip"), 0.),
+        ("clip.audio.projector_type", Some("lfm3a"), 0.),
+        ("clip.audio.num_mel_bins", None, 128.),
+        ("clip.audio.embedding_length", None, 64.),
+        ("clip.audio.attention.head_count", None, 4.),
+        ("clip.audio.attention.head_count_kv", None, 2.),
+        ("clip.audio.feed_forward_length", None, 96.),
+        ("clip.audio.block_count", None, 3.),
+        ("clip.audio.window_size", None, 32.),
+        ("clip.audio.attention.layer_norm_epsilon", None, 1e-5),
+        ("clip.audio.projection_dim", None, 48.),
+    ];
+    let tensors: &[(&str, &[usize])] = &[
+        ("a.conv1d.0.bias", &[16]),
+        ("a.blk.0.ffn_up.weight", &[64, 96]),
+        ("mm.a.mlp.1.bias", &[40]),
+        ("mm.a.mlp.3.weight", &[40, 48]),
+        // The speech generator is not loaded, so not planned.
+        ("a.gen.code.proj_in.weight", &[4096, 4096]),
+    ];
+    write_gguf(&path, md, tensors);
+    assert!(is_audio_projector(&path));
+    let config = audio_config(GgufFile::open(&path).unwrap().metadata()).unwrap();
+    let frames = audio::MelBank::frames(MAX_AUDIO_SECONDS * audio::SAMPLE_RATE);
+    let page = crate::hybrid::engine::page;
+    let weights = page(16 * 2) + page(64 * 96 * 2) + page(40 * 2) + page(40 * 48 * 2);
+    let want = weights
+        + lfm3a::activation_bytes(&config, 16, 40, frames)
+        + (AUDIO_CACHE_CLIPS - 1) * lfm3a::output_bytes(&config, frames);
+    assert_eq!(projector_bytes(&path), want);
+    let _ = std::fs::remove_file(&path);
 }

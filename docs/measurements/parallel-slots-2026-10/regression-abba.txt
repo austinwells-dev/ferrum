@@ -1,0 +1,113 @@
+== TIEL 1 base ("IOConsoleLocked" = No) 08:38:58
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 | 834.94 ± 5.26 |
+| Ornith-1.5-35B | pp2048 | 851.76 ± 7.76 |
+| Ornith-1.5-35B | tg128 | 39.12 ± 0.14 |
+decode step: wall 25.74 ms; 864 dispatches in 2 command buffers; encode 0.33 ms; wait 25.17 ms; GPU 25.48 ms
+== TIEL 2 branch ("IOConsoleLocked" = No) 08:39:29
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 | 892.25 ± 58.03 |
+| Ornith-1.5-35B | pp2048 | 820.45 ± 5.53 |
+| Ornith-1.5-35B | tg128 | 38.66 ± 0.13 |
+decode step: wall 22.96 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 22.39 ms; GPU 22.67 ms
+== TIEL 3 branch ("IOConsoleLocked" = No) 08:40:01
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 | 844.64 ± 70.80 |
+| Ornith-1.5-35B | pp2048 | 800.30 ± 13.46 |
+| Ornith-1.5-35B | tg128 | 37.78 ± 0.11 |
+decode step: wall 27.94 ms; 864 dispatches in 2 command buffers; encode 0.35 ms; wait 27.38 ms; GPU 27.71 ms
+== TIEL 4 base ("IOConsoleLocked" = No) 08:40:32
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 | 864.79 ± 48.59 |
+| Ornith-1.5-35B | pp2048 | 805.09 ± 7.94 |
+| Ornith-1.5-35B | tg128 | 38.19 ± 0.03 |
+decode step: wall 25.98 ms; 864 dispatches in 2 command buffers; encode 0.35 ms; wait 22.95 ms; GPU 23.22 ms
+== TIEL 5 base ("IOConsoleLocked" = No) 08:41:04
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 | 824.16 ± 24.93 |
+| Ornith-1.5-35B | pp2048 | 812.08 ± 10.53 |
+| Ornith-1.5-35B | tg128 | 38.19 ± 0.03 |
+decode step: wall 26.15 ms; 864 dispatches in 2 command buffers; encode 0.34 ms; wait 25.57 ms; GPU 25.85 ms
+== TIEL 6 branch ("IOConsoleLocked" = No) 08:41:35
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 | 871.69 ± 49.02 |
+| Ornith-1.5-35B | pp2048 | 812.22 ± 7.48 |
+| Ornith-1.5-35B | tg128 | 38.61 ± 0.19 |
+decode step: wall 25.77 ms; 864 dispatches in 2 command buffers; encode 0.33 ms; wait 22.75 ms; GPU 23.01 ms
+== TIEL 7 branch ("IOConsoleLocked" = No) 08:42:07
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 | 842.55 ± 53.38 |
+| Ornith-1.5-35B | pp2048 | 811.22 ± 15.94 |
+| Ornith-1.5-35B | tg128 | 38.64 ± 0.27 |
+decode step: wall 27.54 ms; 864 dispatches in 2 command buffers; encode 0.33 ms; wait 26.98 ms; GPU 27.26 ms
+== TIEL 8 base ("IOConsoleLocked" = No) 08:42:38
+| model | test | t/s |
+|---|---|---|
+| Ornith-1.5-35B | pp512 | 864.41 ± 57.81 |
+| Ornith-1.5-35B | pp2048 | 814.22 ± 5.80 |
+| Ornith-1.5-35B | tg128 | 38.51 ± 0.12 |
+decode step: wall 25.48 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 22.48 ms; GPU 22.69 ms
+== QWEN27 1 base ("IOConsoleLocked" = No) 08:43:10
+| model | test | t/s |
+|---|---|---|
+| Qwen3.8-27B | pp512 | 160.93 ± 0.44 |
+| Qwen3.8-27B | pp2048 | 155.81 ± 0.88 |
+| Qwen3.8-27B | tg128 | 6.28 ± 0.10 |
+decode step: wall 162.93 ms; 932 dispatches in 2 command buffers; encode 0.50 ms; wait 162.11 ms; GPU 162.62 ms
+== QWEN27 2 branch ("IOConsoleLocked" = No) 08:45:42
+| model | test | t/s |
+|---|---|---|
+| Qwen3.8-27B | pp512 | 149.29 ± 1.41 |
+| Qwen3.8-27B | pp2048 | 158.87 ± 0.91 |
+| Qwen3.8-27B | tg128 | 6.49 ± 0.05 |
+decode step: wall 164.18 ms; 932 dispatches in 2 command buffers; encode 0.44 ms; wait 160.98 ms; GPU 161.37 ms
+== QWEN27 3 branch ("IOConsoleLocked" = No) 08:48:14
+| model | test | t/s |
+|---|---|---|
+| Qwen3.8-27B | pp512 | 169.66 ± 0.96 |
+| Qwen3.8-27B | pp2048 | 162.27 ± 0.34 |
+| Qwen3.8-27B | tg128 | 6.47 ± 0.03 |
+decode step: wall 163.95 ms; 932 dispatches in 2 command buffers; encode 0.44 ms; wait 163.23 ms; GPU 163.60 ms
+== QWEN27 4 base ("IOConsoleLocked" = No) 08:50:41
+| model | test | t/s |
+|---|---|---|
+| Qwen3.8-27B | pp512 | 157.56 ± 1.79 |
+| Qwen3.8-27B | pp2048 | 157.99 ± 1.51 |
+| Qwen3.8-27B | tg128 | 7.19 ± 0.11 |
+decode step: wall 139.64 ms; 932 dispatches in 2 command buffers; encode 0.40 ms; wait 138.79 ms; GPU 139.15 ms
+== QWEN27 5 base ("IOConsoleLocked" = No) 08:53:03
+| model | test | t/s |
+|---|---|---|
+| Qwen3.8-27B | pp512 | 186.33 ± 1.52 |
+| Qwen3.8-27B | pp2048 | 182.61 ± 0.66 |
+| Qwen3.8-27B | tg128 | 7.30 ± 0.02 |
+decode step: wall 136.61 ms; 932 dispatches in 2 command buffers; encode 0.43 ms; wait 135.91 ms; GPU 136.30 ms
+== QWEN27 6 branch ("IOConsoleLocked" = No) 08:55:14
+| model | test | t/s |
+|---|---|---|
+| Qwen3.8-27B | pp512 | 188.56 ± 1.50 |
+| Qwen3.8-27B | pp2048 | 179.26 ± 1.65 |
+| Qwen3.8-27B | tg128 | 7.22 ± 0.08 |
+decode step: wall 140.38 ms; 932 dispatches in 2 command buffers; encode 0.37 ms; wait 137.31 ms; GPU 137.65 ms
+== QWEN27 7 branch ("IOConsoleLocked" = No) 08:57:27
+| model | test | t/s |
+|---|---|---|
+| Qwen3.8-27B | pp512 | 190.41 ± 1.52 |
+| Qwen3.8-27B | pp2048 | 183.85 ± 0.14 |
+| Qwen3.8-27B | tg128 | 7.31 ± 0.02 |
+decode step: wall 141.20 ms; 932 dispatches in 2 command buffers; encode 0.41 ms; wait 140.52 ms; GPU 140.89 ms
+== QWEN27 8 base ("IOConsoleLocked" = No) 08:59:37
+| model | test | t/s |
+|---|---|---|
+| Qwen3.8-27B | pp512 | 168.53 ± 10.45 |
+| Qwen3.8-27B | pp2048 | 178.32 ± 1.62 |
+| Qwen3.8-27B | tg128 | 7.19 ± 0.07 |
+decode step: wall 142.21 ms; 932 dispatches in 2 command buffers; encode 0.41 ms; wait 139.05 ms; GPU 139.44 ms
+DONE

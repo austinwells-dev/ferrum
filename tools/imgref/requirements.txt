@@ -1,0 +1,13 @@
+# Reference environment for tools/imgref (Python 3.13). Versions are the ones
+# the recorded measurements were taken with.
+torch==2.14.1
+torchvision==0.29.1
+transformers==5.20.2
+safetensors
+numpy
+pillow
+accelerate
+huggingface_hub
+# QwenImage21Pipeline is not in a diffusers release yet; 0.42.0.dev0 was
+# installed from main on 2026-10-26.
+diffusers @ git+https://github.com/huggingface/diffusers.git

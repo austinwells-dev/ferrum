@@ -1,0 +1,30 @@
+# Qwen3.8-Flash-Next: context against the expert arena, 2026-11-02
+machine: Apple M5, 32 GB, macOS 27.0.1, iogpu.wired_limit_mb 24576 (budget 23552 MiB = that less the 1 GiB reserve);
+  caffeinate -dims, screen unlocked, one model in memory
+model: Qwen3.8-Flash-Next-GSQ-RCO-Q2_0; branch feat/qwen4exp-formats, the commit that adds this file
+command: FERRUM_KV_CACHE=KV ferrum hybrid --model SHARD1 --raw --prompt-file short.txt --max-new-tokens 128 --context N
+  (short.txt = 'The three laws of thermodynamics are', 7 tokens), interleaved a then b in reverse
+
+## Memory plan and measurement
+### f16-32768-a
+expert arena: 17802 MiB of the 32400 MiB of routed experts, the rest read from the SSD as they are routed
+memory plan: budget 23552 MiB = weights 2871 + experts 17802 + scratch 1675 + recurrent 113 + snapshots 226 + overhead 96 + KV 769 (24.0 KiB/token x 32768); max context 262144 (trained 262144)
+measured: weights+scratch 22346 MiB (predicted 22348), state 881 MiB (predicted 882)
+### q8-262144-a
+expert arena: 15306 MiB of the 32400 MiB of routed experts, the rest read from the SSD as they are routed
+memory plan: budget 23552 MiB = weights 2871 + experts 15306 + scratch 1675 + recurrent 113 + snapshots 226 + overhead 96 + KV 3265 (12.8 KiB/token x 262144); max context 262144 (trained 262144)
+measured: weights+scratch 19850 MiB (predicted 19852), state 3377 MiB (predicted 3378)
+### f16-262144-a
+expert arena: 12426 MiB of the 32400 MiB of routed experts, the rest read from the SSD as they are routed
+memory plan: budget 23552 MiB = weights 2871 + experts 12426 + scratch 1675 + recurrent 113 + snapshots 226 + overhead 96 + KV 6145 (24.0 KiB/token x 262144); max context 262144 (trained 262144)
+measured: weights+scratch 16969 MiB (predicted 16972), state 6257 MiB (predicted 6258)
+
+## Decode (short prompt)
+f16-32768-a: round 0: prefill 7 tok in 1131.1 ms (6.2 tok/s); decode 127 tok in 7641.3 ms (16.62 tok/s, median 56.8 ms, GPU 41.20 ms/tok)
+q8-262144-a: round 0: prefill 7 tok in 1080.2 ms (6.5 tok/s); decode 127 tok in 7644.8 ms (16.61 tok/s, median 57.0 ms, GPU 41.13 ms/tok)
+f16-262144-a: round 0: prefill 7 tok in 1213.5 ms (5.8 tok/s); decode 127 tok in 7862.0 ms (16.15 tok/s, median 58.9 ms, GPU 41.78 ms/tok)
+f16-262144-b: round 0: prefill 7 tok in 1030.1 ms (6.8 tok/s); decode 127 tok in 7799.9 ms (16.28 tok/s, median 58.8 ms, GPU 41.08 ms/tok)
+q8-262144-b: round 0: prefill 7 tok in 1188.3 ms (5.9 tok/s); decode 127 tok in 7633.4 ms (16.64 tok/s, median 57.0 ms, GPU 40.93 ms/tok)
+f16-32768-b: round 0: prefill 7 tok in 1119.7 ms (6.3 tok/s); decode 127 tok in 7626.4 ms (16.65 tok/s, median 56.5 ms, GPU 41.00 ms/tok)
+
+Only the decode after a short prompt is measured: generation deep into a long context also pays attention over the cache, and past 2,048 positions attention is not exact (the QSA indexer is not loaded).

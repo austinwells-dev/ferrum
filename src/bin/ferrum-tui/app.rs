@@ -36,6 +36,7 @@ impl App {
             })
             .unwrap_or(0);
         let drafters = scan_drafters(&extra);
+        let image = imagetab::ImageTab::load(&extra);
         let favs = saved["favorites"]
             .as_array()
             .map(|a| {
@@ -89,6 +90,8 @@ impl App {
             chat: None,
             serve: None,
             bench: None,
+            image,
+            audio: audiotab::AudioTab::load(),
             closing: Vec::new(),
             gfx: Default::default(),
             prefs: Prefs::load(&saved["layout"]),
@@ -241,10 +244,16 @@ impl App {
                 "alias" => "--alias",
                 "reserve" => "--reserve-mib",
                 "snapshots" => "--snapshots",
+                "parallel" => "--parallel",
+                "image_tokens" => "--image-tokens",
+                "image_min_tokens" => "--image-min-tokens",
                 "chunk" => "--chunk",
                 "draft" if drafting => "--draft",
                 "draft_max" if drafting => "--draft-max",
                 "draft_quant" if drafting => "--draft-quant",
+                "draft_tree" if drafting => "--draft-tree",
+                "draft_block" if drafting => "--draft-block",
+                "draft_vocab" if drafting => "--draft-vocab",
                 "think" => {
                     args.push("--no-think".into());
                     continue;
@@ -343,10 +352,7 @@ impl App {
         }
         self.mode = fav.mode;
         let name = fav.name.clone();
-        let found = self
-            .models
-            .iter()
-            .position(|m| m.path.display().to_string() == fav.model);
+        let found = self.fav_model_index(fav);
         self.sel = 0;
         match found {
             Some(at) if self.models[at].problem.is_some() => {

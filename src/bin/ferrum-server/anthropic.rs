@@ -67,7 +67,14 @@ fn convert(body: &Json, id: u64) -> Result<(Vec<Json>, Vec<Json>), String> {
                 for b in &blocks {
                     match b.get("type").and_then(Json::as_str) {
                         Some("image") => {
-                            parts.push(json!({"type": "image", "source": b.get("source").cloned().unwrap_or(Json::Null)}));
+                            let mut part = json!({"type": "image", "source": b.get("source").cloned().unwrap_or(Json::Null)});
+                            // Ferrum's per-image size (vision::media::part_budget).
+                            for key in ["detail", "min_tokens", "max_tokens"] {
+                                if let Some(v) = b.get(key) {
+                                    part[key] = v.clone();
+                                }
+                            }
+                            parts.push(part);
                         }
                         Some("tool_result") => {
                             let mut result = text_of(b.get("content").unwrap_or(&Json::Null));
@@ -169,6 +176,7 @@ fn request(body: &Json, server: &Server, id: u64) -> Result<ChatRequest, String>
         stop: openai::stop_strings(body, "stop_sequences"),
         reasoning_budget: t.budget,
         raw_reasoning: false,
+        image_budget: openai::image_budget(body)?,
     })
 }
 
@@ -213,8 +221,9 @@ pub fn count_tokens(
     let result = convert(body, id).and_then(|(messages, tools)| {
         // Count the prompt `messages` would feed the model, thinking switch included.
         let mut vars = openai::thinking(body, server).vars;
-        normalize_thinking(server.template.source(), &mut vars);
+        normalize_thinking(server.llm().template.source(), &mut vars);
         server
+            .llm()
             .template
             .render(
                 &messages,
@@ -223,8 +232,8 @@ pub fn count_tokens(
                 &vars,
             )
             .and_then(|mut text| {
-                text.push_str(generation_prefix(&server.template, &vars));
-                server.tokenizer.encode(&text)
+                text.push_str(generation_prefix(&server.llm().template, &vars));
+                server.llm().tokenizer.encode(&text)
             })
             .map_err(|e| e.to_string())
     });
@@ -241,7 +250,19 @@ pub fn messages(
     id: u64,
     keep_alive: bool,
 ) -> std::io::Result<()> {
-    let req = match request(body, server, id) {
+    let parsed = request(body, server, id).and_then(|r| {
+        let mut route = openai::route(body)?;
+        // Claude Code's user_id names the session, so it keeps one slot.
+        if route.key.is_none() {
+            route.key = body
+                .pointer("/metadata/user_id")
+                .and_then(Json::as_str)
+                .filter(|k| !k.is_empty())
+                .map(|k| crate::worker::truncate(k, 200));
+        }
+        Ok((r, route))
+    });
+    let (req, route) = match parsed {
         Ok(r) => r,
         Err(e) => {
             warn!(Some(id), "bad request: {e}");
@@ -264,7 +285,7 @@ pub fn messages(
         req.reasoning_budget
             .map_or(String::new(), |b| format!(", budget {b}"))
     );
-    let (rx, cancel) = server.submit(id, Work::Chat(Box::new(req)), stream);
+    let (rx, cancel) = server.submit(id, Work::Chat(Box::new(req)), route, stream);
     let model = server.model_name();
     if !streaming {
         return openai::wait_json(stream, &rx, &cancel, id, keep_alive, |event| match event {

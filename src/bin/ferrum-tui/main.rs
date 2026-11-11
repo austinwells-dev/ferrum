@@ -8,6 +8,7 @@ mod agentcompare;
 mod agentui;
 mod app;
 mod attach;
+mod audiotab;
 mod bench;
 mod benchui;
 mod benchview;
@@ -23,6 +24,8 @@ mod evalui;
 mod fields;
 mod highlight;
 mod home;
+mod imagetab;
+mod imagetool;
 mod layout;
 mod models;
 mod pick;
@@ -110,6 +113,8 @@ pub enum Screen {
     Serve,
     Bench,
     Models,
+    Image,
+    Audio,
 }
 
 /// Why the editor is open: decides what launching does.
@@ -165,6 +170,11 @@ pub enum Editing {
     RenameFav(usize),
     SearchUrl,
     SearchKey,
+    ImagePrompt,
+    /// The Audio tab's clip path.
+    AudioClip,
+    /// The Audio tab's question about the clip.
+    AudioQuestion,
 }
 
 pub struct App {
@@ -201,10 +211,12 @@ pub struct App {
     pub chat: Option<Chat>,
     pub serve: Option<Serve>,
     pub bench: Option<BenchState>,
+    pub image: imagetab::ImageTab,
+    pub audio: audiotab::AudioTab,
     /// Chat workers that were told to stop and may still be unloading.
     pub closing: Vec<std::thread::JoinHandle<()>>,
-    /// The kitty-protocol image currently on screen.
-    pub gfx: preview::Kitty,
+    /// The pictures the terminal shows (kitty or iTerm2 protocol).
+    pub gfx: preview::Gfx,
     /// Split sizes and widths (Settings › Layout).
     pub prefs: Prefs,
     /// Saved measurements per model, refreshed every few seconds.
@@ -249,11 +261,15 @@ impl App {
         if self.bench.is_some() {
             self.bench_tick();
         }
+        self.image.pump();
+        self.audio.pump();
     }
 
     pub fn poll_interval(&self) -> Duration {
         let busy = self.chat.is_some()
             || self.serve.is_some()
+            || self.image.running()
+            || self.audio.running()
             || self
                 .bench
                 .as_ref()
@@ -280,6 +296,8 @@ impl App {
             Screen::Serve => self.draw_serve(f, body, footer),
             Screen::Bench => self.draw_bench(f, body, footer),
             Screen::Models => self.draw_models_tab(f, body, footer),
+            Screen::Image => self.draw_image(f, body, footer),
+            Screen::Audio => self.draw_audio(f, body, footer),
         }
         self.draw_overlay(f);
         if self.picker.is_some() {
@@ -299,6 +317,16 @@ impl App {
                 &self.buffer,
             ),
             Editing::RenameFav(_) => input_popup(f, "Rename favorite", "new name", &self.buffer),
+            Editing::ImagePrompt => imagetab::prompt_popup(f, &self.buffer),
+            Editing::AudioClip => input_popup(
+                f,
+                "Clip",
+                "a .wav file: type its path or drop it here",
+                &self.buffer,
+            ),
+            Editing::AudioQuestion => {
+                input_popup(f, "Question", "what to ask about the clip", &self.buffer)
+            }
             Editing::SearchUrl => input_popup(
                 f,
                 "Search URL",
@@ -349,6 +377,8 @@ impl App {
             Screen::Serve => self.serve_key(key),
             Screen::Bench => self.bench_key(key),
             Screen::Models => self.models_key(key),
+            Screen::Image => self.image_key(key),
+            Screen::Audio => self.audio_key(key),
         }
     }
 
@@ -368,6 +398,8 @@ impl App {
             } else {
                 c.insert_str(&clean);
             }
+        } else if self.screen == Screen::Audio {
+            self.audio_paste(&clean);
         }
     }
 
@@ -414,15 +446,24 @@ impl App {
     }
 }
 
+/// The picture placements the last draw asked for.
+fn wants(app: &App) -> Vec<preview::Want> {
+    match (app.screen, app.chat.as_ref()) {
+        (Screen::Chat, Some(c)) => c.wants.take(),
+        (Screen::Image, _) => app.image.wants.take(),
+        _ => Vec::new(),
+    }
+}
+
 fn run(terminal: &mut DefaultTerminal, app: &mut App) -> std::io::Result<()> {
     while !app.quit {
         app.tick();
         terminal.draw(|f| app.draw(f))?;
-        let wants = match (app.screen, app.chat.as_ref()) {
-            (Screen::Chat, Some(c)) => c.wants.take(),
-            _ => Vec::new(),
-        };
-        app.gfx.sync(terminal.backend_mut(), &wants)?;
+        if app.gfx.sync(terminal.backend_mut(), &wants(app))? {
+            terminal.clear()?;
+            terminal.draw(|f| app.draw(f))?;
+            app.gfx.sync(terminal.backend_mut(), &wants(app))?;
+        }
         if event::poll(app.poll_interval())? {
             loop {
                 match event::read()? {
@@ -471,6 +512,10 @@ fn main() {
     if let Some(s) = app.serve.as_mut() {
         s.stop();
     }
+    // Exiting skips destructors, so end a recording here: ffmpeg would
+    // otherwise keep listening after Ferrum is gone. A run's thread, like
+    // the chat model's, is freed with the process.
+    let _ = app.audio.stop();
     if let Err(e) = result {
         eprintln!("error: {e}");
         std::process::exit(1);

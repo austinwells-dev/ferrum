@@ -3,11 +3,14 @@
 use super::{
     config::{AttnSpec, HybridConfig, KvCache, Variant},
     weights::{
-        AttentionWeights, DeltaWeights, DenseFfn, Ffn, Format, Matrix, Mixer, MoeFfn, Weights,
+        AttentionWeights, DeltaWeights, DenseFfn, Ffn, Format, Matrix, Mixer, MoeFfn,
+        ShortConvWeights, Weights,
     },
 };
 use crate::{DType, Error, MetalDevice, Result, Tensor, metal::MetalBuffer};
 use std::cell::RefCell;
+
+mod qwen4exp;
 
 type Binding<'a> = (&'a MetalBuffer, usize, usize);
 
@@ -45,8 +48,14 @@ pub struct ImageSpan {
     pub grid: (usize, usize),
     /// `[grid.0 * grid.1, hidden]` F32 embeddings in raster order.
     pub embedding: std::rc::Rc<Tensor>,
+    /// DeepStack features (Qwen3-VL): entry `i`, shaped like `embedding`, is
+    /// added to the image's rows after decoder layer `i`. Usually empty.
+    pub deepstack: Vec<std::rc::Rc<Tensor>>,
     /// Identity of the image content, for prefix reuse.
     pub hash: u64,
+    /// One language-model position per token. Qwen's grid is false: those
+    /// tokens share `max(rows, cols)` rotary positions.
+    pub linear: bool,
 }
 
 impl ImageSpan {
@@ -60,9 +69,14 @@ impl ImageSpan {
         self.start + self.len()
     }
     /// How many positions the image advances the rotary position less than it
-    /// advances the cache: its tokens share a 2-D grid of positions.
+    /// advances the cache. A 2-D grid shares `max(rows, cols)` positions.
+    /// A linear span (LFM3) takes one position per token.
     fn rope_saving(&self) -> usize {
-        self.len() - self.grid.0.max(self.grid.1)
+        if self.linear {
+            0
+        } else {
+            self.len() - self.grid.0.max(self.grid.1)
+        }
     }
 }
 
@@ -78,13 +92,119 @@ pub fn rope_position(media: &[ImageSpan], index: usize) -> usize {
             .sum::<usize>()
 }
 
-/// How rotary positions differ from cache positions for one forward chunk.
+/// How rotary positions differ from cache positions for one forward chunk,
+/// and, in a draft-tree verify, which rows each row sees.
 #[derive(Default)]
 pub(crate) struct RopePlan {
     /// Added to the cache position (non-positive: images compress positions).
     pub delta: i32,
-    /// Per-row (time, height, width) positions when the chunk holds image tokens.
+    /// Per-row (time, height, width) positions when the chunk holds image
+    /// tokens or draft-tree nodes.
     pub table: Option<Tensor>,
+    /// Draft tree: the nodes each row sees and their depths (see
+    /// `tree_plan_rows`).
+    pub tree: Option<Tensor>,
+    /// Cache position of the tree's root, the lowest position any row sits at.
+    pub tree_root: usize,
+}
+
+/// Most rows a draft-tree verify takes: a row's ancestors are one `u32` mask.
+pub(crate) const TREE_MAX_ROWS: usize = 32;
+
+/// Plan of a draft-tree verify whose root sits at rotary position `base`:
+/// node i is stored at the i-th new cache position but sits at `base +
+/// depth(i)`, through the position table with all three axes equal.
+pub(crate) fn tree_plan(
+    d: &MetalDevice,
+    pos: usize,
+    base: i32,
+    parents: &[Option<usize>],
+) -> Result<RopePlan> {
+    tree_plan_rows(d, pos, base, parents, 0..parents.len())
+}
+
+/// Plan of a forward over nodes `rows` of the draft tree with `parents`,
+/// whose root sits at cache position `root` and rotary position `base`
+/// (the forward starts at `root + rows.start`): earlier nodes were stored by
+/// earlier forwards. The tree buffer
+/// holds `rows.start`, then every node's mask and depth (`KeyMask` in
+/// `hybrid.metal`). A forward of the root alone needs no tree.
+pub(crate) fn tree_plan_rows(
+    d: &MetalDevice,
+    root: usize,
+    base: i32,
+    parents: &[Option<usize>],
+    rows: std::ops::Range<usize>,
+) -> Result<RopePlan> {
+    let nodes = tree_rows(parents)?;
+    if rows.is_empty() || rows.end > nodes.len() {
+        return Err(Error::Parameter(format!(
+            "tree rows {rows:?} of a {}-node tree",
+            nodes.len()
+        )));
+    }
+    let mut table = Vec::with_capacity(rows.len() * 3 * 4);
+    for &(_, depth) in &nodes[rows.clone()] {
+        let p = base + depth as i32;
+        for v in [p, p, p] {
+            table.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+    let table = Tensor::from_le_bytes(d, [rows.len() * 3], DType::F32, &table)?;
+    if rows == (0..1) {
+        return Ok(RopePlan {
+            delta: 0,
+            table: Some(table),
+            tree: None,
+            tree_root: root,
+        });
+    }
+    let mut tree = Vec::with_capacity((rows.end + 1) * 2 * 4);
+    for v in [rows.start as u32, 0] {
+        tree.extend_from_slice(&v.to_le_bytes());
+    }
+    for &(mask, depth) in &nodes[..rows.end] {
+        tree.extend_from_slice(&mask.to_le_bytes());
+        tree.extend_from_slice(&depth.to_le_bytes());
+    }
+    Ok(RopePlan {
+        delta: 0,
+        table: Some(table),
+        tree: Some(Tensor::from_le_bytes(
+            d,
+            [(rows.end + 1) * 2],
+            DType::F32,
+            &tree,
+        )?),
+        tree_root: root,
+    })
+}
+
+/// Rows of a draft-tree verify, from each node's parent (`None` for the
+/// root, row 0; parents come before their children). Returns per row the
+/// mask of rows it sees (itself and its ancestors) and its depth, the layout
+/// of `KeyMask` in `hybrid.metal`.
+pub(crate) fn tree_rows(parents: &[Option<usize>]) -> Result<Vec<(u32, u32)>> {
+    if parents.is_empty() || parents.len() > TREE_MAX_ROWS {
+        return Err(Error::Parameter(format!(
+            "a draft tree has 1..={TREE_MAX_ROWS} rows, got {}",
+            parents.len()
+        )));
+    }
+    let mut rows: Vec<(u32, u32)> = Vec::with_capacity(parents.len());
+    for (i, parent) in parents.iter().enumerate() {
+        let row = match (i, *parent) {
+            (0, None) => (1, 0),
+            (_, Some(p)) if i > 0 && p < i => (rows[p].0 | 1 << i, rows[p].1 + 1),
+            _ => {
+                return Err(Error::Parameter(format!(
+                    "draft tree row {i}: only row 0 is the root and parents precede children"
+                )));
+            }
+        };
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 /// Conversation state: K/V (F16 or Q8) for attention layers and F32 recurrent state
@@ -95,6 +215,8 @@ pub struct HybridState {
     valid: bool,
     /// Rows written by a speculative verify and not yet committed.
     verified: usize,
+    /// Parents of those rows when the verify was a draft tree (else empty).
+    verified_tree: Vec<Option<usize>>,
     /// Images in the cached or incoming prompt, ordered by position.
     media: Vec<ImageSpan>,
     k: Vec<Option<Tensor>>,
@@ -110,6 +232,17 @@ pub struct HybridState {
     /// One past the highest position whose K/V was ever written: ring rows of
     /// positions below `written - ring` have been overwritten.
     written: usize,
+    /// Format of the K/V caches (`kv_planes`).
+    kv_cache: KvCache,
+    /// qwen4exp: the n-gram embedding's conv history (its last
+    /// `(conv_kernel - 1) * ngram` input rows) and the tokens before `len`
+    /// its hash reads (at most `ngram - 1`).
+    ple: Option<Tensor>,
+    ple_tokens: Vec<u32>,
+    /// The tokens of the latest verify, until `commit` takes the accepted ones.
+    ple_pending: Vec<u32>,
+    /// The n-gram length (0 without the embedding).
+    ple_ngram: usize,
 }
 
 /// Rows of the K/V ring of sliding-window `layer` when a forward adds at most
@@ -156,6 +289,7 @@ impl HybridState {
             len: 0,
             valid: true,
             verified: 0,
+            verified_tree: Vec::new(),
             media: Vec::new(),
             k: Vec::new(),
             v: Vec::new(),
@@ -165,6 +299,18 @@ impl HybridState {
             window: Vec::new(),
             max_rows,
             written: 0,
+            kv_cache: c.kv_cache,
+            ple: match &c.qwen4exp {
+                Some(q) if !q.ple.layers.is_empty() => Some(Tensor::zeros_resident(
+                    d,
+                    [(q.ple.conv_kernel - 1) * q.ple.ngram * q.hc_streams * c.hidden],
+                    DType::F32,
+                )?),
+                _ => None,
+            },
+            ple_tokens: Vec::new(),
+            ple_pending: Vec::new(),
+            ple_ngram: c.qwen4exp.as_ref().map_or(0, |q| q.ple.ngram),
         };
         for layer in 0..c.layers {
             let ring = if c.is_attention(layer) {
@@ -179,6 +325,17 @@ impl HybridState {
                 state.k.push(Some(c.kv_cache.alloc(d, rows, kv_row)?));
                 state.v.push(Some(c.kv_cache.alloc(d, rows, kv_row)?));
                 state.conv.push(None);
+                state.ssm.push(None);
+            } else if c.variant == Variant::Lfm3 {
+                // Previous B*x rows only. No delta-rule matrix: `page(0)` would
+                // still reserve 16 KiB, and the snapshot skips a missing SSM.
+                state.k.push(None);
+                state.v.push(None);
+                state.conv.push(Some(Tensor::zeros_resident(
+                    d,
+                    [(c.conv_kernel - 1) * c.hidden],
+                    DType::F32,
+                )?));
                 state.ssm.push(None);
             } else {
                 state.k.push(None);
@@ -210,6 +367,7 @@ impl HybridState {
         [&self.k, &self.v, &self.conv, &self.ssm]
             .iter()
             .flat_map(|v| v.iter().flatten())
+            .chain(&self.ple)
             .map(|t| page(t.byte_size()))
             .sum()
     }
@@ -218,16 +376,23 @@ impl HybridState {
         self.len = 0;
         self.valid = true;
         self.verified = 0;
+        self.verified_tree.clear();
         self.written = 0;
         self.media.clear();
+        self.ple_tokens.clear();
+        self.ple_pending.clear();
     }
     /// Whether every K/V row a forward at `position` reads is still intact:
     /// a ring layer must not have overwritten the start of that window.
     pub(crate) fn can_resume(&self, position: usize) -> bool {
+        self.can_resume_from(position, self.written)
+    }
+    /// `can_resume` for rings as they were when `written` positions had been
+    /// written (a snapshot's own copy of them).
+    pub(crate) fn can_resume_from(&self, position: usize, written: usize) -> bool {
         self.ring.iter().zip(&self.window).all(|(&ring, &window)| {
             ring == 0
-                || (position + 1).saturating_sub(window) / 64 * 64
-                    >= self.written.saturating_sub(ring)
+                || (position + 1).saturating_sub(window) / 64 * 64 >= written.saturating_sub(ring)
         })
     }
     /// The images of the sequence being processed. Spans past `len` are the
@@ -248,7 +413,10 @@ impl HybridState {
             .iter()
             .any(|s| s.start < pos + m && s.end() > pos)
         {
-            return Ok(RopePlan { delta, table: None });
+            return Ok(RopePlan {
+                delta,
+                ..Default::default()
+            });
         }
         let mut table = Vec::with_capacity(m * 3 * 4);
         for index in pos..pos + m {
@@ -260,11 +428,16 @@ impl HybridState {
                 Some(span) => {
                     let base = rope_position(&self.media, span.start) as i32;
                     let offset = index - span.start;
-                    (
-                        base,
-                        base + (offset / span.grid.1) as i32,
-                        base + (offset % span.grid.1) as i32,
-                    )
+                    if span.linear {
+                        let p = base + offset as i32;
+                        (p, p, p)
+                    } else {
+                        (
+                            base,
+                            base + (offset / span.grid.1) as i32,
+                            base + (offset % span.grid.1) as i32,
+                        )
+                    }
                 }
                 None => {
                     let p = rope_position(&self.media, index) as i32;
@@ -278,52 +451,170 @@ impl HybridState {
         Ok(RopePlan {
             delta: 0,
             table: Some(Tensor::from_le_bytes(d, [m * 3], DType::F32, &table)?),
+            tree: None,
+            tree_root: 0,
         })
+    }
+    /// Rotary positions and visibility for a draft-tree verify of the nodes
+    /// with `parents` (see `tree_rows`) at cache positions `pos..`.
+    fn tree_plan(
+        &self,
+        d: &MetalDevice,
+        pos: usize,
+        parents: &[Option<usize>],
+    ) -> Result<RopePlan> {
+        if self
+            .media
+            .iter()
+            .any(|s| s.start < pos + parents.len() && s.end() > pos)
+        {
+            return Err(Error::Parameter(
+                "a draft tree cannot hold image tokens".into(),
+            ));
+        }
+        let base = i32::try_from(rope_position(&self.media, pos))
+            .map_err(|_| Error::Cache("rotary position exceeds i32".into()))?;
+        tree_plan(d, pos, base, parents)
     }
     /// Recurrent tensors (conv windows then delta-rule matrices) in a fixed order.
     pub(crate) fn recurrent(&self) -> impl Iterator<Item = &Tensor> {
-        self.conv.iter().flatten().chain(self.ssm.iter().flatten())
+        self.conv
+            .iter()
+            .flatten()
+            .chain(self.ssm.iter().flatten())
+            .chain(self.ple.iter())
+    }
+    /// After a restore to the end of `before`: the tokens an n-gram embedding
+    /// hashes the next token with (its conv history is restored with the
+    /// recurrent state).
+    /// Append `tokens` to the n-gram context, which keeps the newest
+    /// `ngram - 1`.
+    pub(crate) fn push_ple_tokens(&mut self, tokens: &[u32]) {
+        let keep = self.ple_ngram.saturating_sub(1);
+        self.ple_tokens.extend_from_slice(tokens);
+        let drop = self.ple_tokens.len().saturating_sub(keep);
+        self.ple_tokens.drain(..drop);
+    }
+    pub(crate) fn set_ple_context(&mut self, before: &[u32]) {
+        let keep = self.ple_ngram.saturating_sub(1);
+        self.ple_tokens = before[before.len().saturating_sub(keep)..].to_vec();
     }
     /// Whether the model has recurrent state (only attention-only models, such
     /// as Flint, have none: their append-only K/V cache can resume anywhere).
     pub(crate) fn has_recurrent(&self) -> bool {
         self.recurrent().next().is_some()
     }
-    /// Copy the recurrent state into `dst` (same order and shapes).
-    pub(crate) fn save_recurrent(&self, d: &MetalDevice, dst: &[Tensor]) -> Result<()> {
-        let e = d.execution_with_shared_encoder(true)?;
-        for (src, dst) in self.recurrent().zip(dst) {
-            copy(d, src, dst)?;
-        }
-        e.finish()
+    /// What a snapshot copies: the recurrent tensors, then the K/V rings of
+    /// sliding-window layers. A ring overwrites its oldest rows, so without
+    /// its own copy a snapshot stops being resumable once the conversation
+    /// has moved a window and a chunk past it.
+    pub(crate) fn snapshot_tensors(&self) -> impl Iterator<Item = &Tensor> {
+        let rings = self
+            .ring
+            .iter()
+            .zip(self.k.iter().zip(&self.v))
+            .filter(|(ring, _)| **ring > 0)
+            .flat_map(|(_, (k, v))| k.iter().chain(v));
+        self.recurrent().chain(rings)
     }
-    /// Restore recurrent state saved at `position`. K/V rows up to
-    /// `position` are unchanged because the cache is append-only.
-    pub(crate) fn restore_recurrent(
+    /// K/V caches of full-attention layers (one row per position), K then V
+    /// per layer: what a session saved to disk stores row by row.
+    pub(crate) fn kv_linear(&self) -> impl Iterator<Item = &Tensor> {
+        self.ring
+            .iter()
+            .zip(self.k.iter().zip(&self.v))
+            .filter(|(ring, _)| **ring == 0)
+            .flat_map(|(_, (k, v))| k.iter().chain(v))
+    }
+    pub(crate) fn written(&self) -> usize {
+        self.written
+    }
+    /// The byte planes of a `kv_linear` cache as (offset, bytes per row):
+    /// the whole row for F16; for Q8 every row's values, then every row's
+    /// scales (`KvCache::Q8`).
+    pub(crate) fn kv_planes(&self, t: &Tensor) -> Vec<(usize, usize)> {
+        let rows = t.shape().dimensions()[0];
+        let row = t.byte_size() / rows;
+        debug_assert_eq!(t.byte_size(), rows * row);
+        match self.kv_cache {
+            KvCache::F16 => vec![(0, row)],
+            KvCache::Q8 => {
+                // `row` = width + width / 16 (one F16 scale per 32 values).
+                debug_assert_eq!(row % 17, 0);
+                let width = row / 17 * 16;
+                // `upload` copies whole 4-byte words of scales.
+                debug_assert_eq!(width % 64, 0);
+                vec![(0, width), (rows * width, row - width)]
+            }
+        }
+    }
+    /// Take `len` positions whose K/V rows were written from disk, with
+    /// `written` for the rings a snapshot restore then copies in.
+    pub(crate) fn adopt(&mut self, len: usize, written: usize, media: Vec<ImageSpan>) {
+        self.len = len;
+        self.written = written;
+        self.media = media;
+        self.valid = true;
+        self.verified = 0;
+        self.verified_tree.clear();
+    }
+    /// Buffers for one `save_snapshot`.
+    pub(crate) fn alloc_snapshot(&self, d: &MetalDevice) -> Result<Vec<Tensor>> {
+        self.snapshot_tensors()
+            .map(|t| Tensor::zeros_resident(d, [t.byte_size() / 4], DType::F32))
+            .collect()
+    }
+    /// Copy `snapshot_tensors` into `dst` (same order, same byte sizes).
+    /// Returns the `written` mark the copied rings go with.
+    pub(crate) fn save_snapshot(&self, d: &MetalDevice, dst: &[Tensor]) -> Result<usize> {
+        let e = d.execution_with_shared_encoder(true)?;
+        for (src, dst) in self.snapshot_tensors().zip(dst) {
+            copy_bytes(d, src, dst)?;
+        }
+        e.finish()?;
+        Ok(self.written)
+    }
+    /// Restore a snapshot saved at `position` with `written` (`save_snapshot`),
+    /// or with `src` empty, only rewind to `position`: K/V rows of full
+    /// attention up to `position` are unchanged because that cache is
+    /// append-only.
+    pub(crate) fn restore_snapshot(
         &mut self,
         d: &MetalDevice,
         src: &[Tensor],
         position: usize,
+        written: usize,
     ) -> Result<()> {
         if position > self.len && self.valid {
             return Err(Error::Cache(
                 "snapshot lies beyond the cached sequence".into(),
             ));
         }
-        if !self.can_resume(position) {
+        let rings = !src.is_empty() && src.len() > self.recurrent().count();
+        let resumable = if rings {
+            self.can_resume_from(position, written)
+        } else {
+            self.can_resume(position)
+        };
+        if !resumable {
             return Err(Error::Cache(
                 "the sliding-window K/V ring no longer holds that position's window".into(),
             ));
         }
         self.valid = false;
         let e = d.execution_with_shared_encoder(true)?;
-        for (dst, src) in self.recurrent().zip(src) {
-            copy(d, src, dst)?;
+        let dst: Vec<&Tensor> = self.snapshot_tensors().collect();
+        for (dst, src) in dst.into_iter().zip(src) {
+            copy_bytes(d, src, dst)?;
         }
         e.finish()?;
+        if rings {
+            self.written = written;
+        }
         self.len = position;
         self.valid = true;
         self.verified = 0;
+        self.verified_tree.clear();
         Ok(())
     }
     pub(crate) fn is_valid(&self) -> bool {
@@ -364,6 +655,7 @@ pub(crate) struct Scratch {
     pub(crate) token: Tensor,
     pub(crate) candidates: Tensor,
     moe: Option<MoeScratch>,
+    hc: Option<qwen4exp::HcScratch>,
 }
 
 /// Routing and expert buffers for `chunk * experts_used` routes.
@@ -419,11 +711,15 @@ pub(crate) struct Spec {
     tape_qkv: Vec<Tensor>,
     tape_g: Vec<Tensor>,
     tape_b: Vec<Tensor>,
+    /// `[rows, streams * hidden]`: the n-gram conv inputs of the verify rows.
+    tape_ple: Option<Tensor>,
     /// Recurrent-layer index of each layer (None for attention layers).
     recurrent_index: Vec<Option<usize>>,
     logits: Tensor,
     candidates: Tensor,
     tokens: Tensor,
+    /// `[rows, gather_width]`: staging for `commit_path`.
+    gather: Tensor,
 }
 
 impl Spec {
@@ -434,7 +730,8 @@ impl Spec {
             .chain(&self.tape_qkv)
             .chain(&self.tape_g)
             .chain(&self.tape_b)
-            .chain([&self.logits, &self.candidates, &self.tokens])
+            .chain(&self.tape_ple)
+            .chain([&self.logits, &self.candidates, &self.tokens, &self.gather])
             .map(|t| page(t.byte_size()))
             .sum()
     }
@@ -462,9 +759,125 @@ pub fn spec_bytes(c: &HybridConfig, chunk: usize, g: &SpecGeometry) -> usize {
     if g.final_hidden {
         total += f32s(capture * c.hidden);
     }
-    total += c.recurrent_layer_count()
-        * (f32s(g.rows * c.conv_channels()) + 2 * f32s(g.rows * c.ssm_v_heads));
-    total + f32s(g.rows * c.vocab) + f32s(g.rows * c.vocab.div_ceil(1024) * 64) + f32s(g.rows)
+    total += if c.variant == Variant::Lfm3 {
+        // One B*x tape per short-conv layer. No g/beta tapes.
+        c.recurrent_layer_count() * f32s(g.rows * c.hidden)
+    } else {
+        c.recurrent_layer_count()
+            * (f32s(g.rows * c.conv_channels()) + 2 * f32s(g.rows * c.ssm_v_heads))
+    };
+    total
+        + qwen4exp::ple_tape_bytes(c, g.rows)
+        + f32s(g.rows * c.vocab)
+        + f32s(g.rows * c.vocab.div_ceil(1024) * 64)
+        + f32s(g.rows)
+        + f32s(g.rows * gather_width(c, g))
+}
+
+/// Widest row `commit_path` stages: captured features, the hidden state, or
+/// a K/V row (at most two bytes per element, so this overcounts).
+fn gather_width(c: &HybridConfig, g: &SpecGeometry) -> usize {
+    (g.aux_layers.len() * c.hidden)
+        .max(c.hidden)
+        .max(c.kv_heads * c.head_dim)
+}
+
+/// Gated depthwise conv of one LFM3 short-conv layer. `tape`, when set, receives
+/// the B*x rows and the live state is left unchanged (speculative verify).
+#[allow(clippy::too_many_arguments)]
+fn run_short_conv(
+    d: &MetalDevice,
+    c: &HybridConfig,
+    s: &Scratch,
+    w: &ShortConvWeights,
+    state: &HybridState,
+    layer: usize,
+    xn: &Tensor,
+    out: &Tensor,
+    m: usize,
+    tape: Option<&Tensor>,
+) -> Result<()> {
+    let h = c.hidden;
+    let packed = rows(&s.qkv, 0, m, 3 * h)?;
+    HybridModel::project(d, &w.in_proj, xn, m, &packed)?;
+    let y = rows(&s.conv, 0, m, h)?;
+    let conv_state = state.conv[layer]
+        .as_ref()
+        .expect("short-conv layer has a conv window");
+    // Unread unless the verify tapes B*x. A zero-width view is enough.
+    let bx = match tape {
+        Some(t) => rows(t, 0, m, h)?,
+        None => s.z.view(0, [0])?,
+    };
+    d.dispatch_hybrid(
+        "h_short_conv",
+        &[packed.binding(), w.conv.binding()],
+        &[y.binding(), conv_state.binding(), bx.binding()],
+        &Params::default()
+            .u(m)?
+            .u(h)?
+            .u(c.conv_kernel - 1)?
+            .u(usize::from(tape.is_none()))?
+            .u(usize::from(tape.is_some()))?
+            .0,
+        [h.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )?;
+    HybridModel::project(d, &w.out_proj, &y, m, out)
+}
+
+/// Shift `n` recorded B*x rows into a short-conv window.
+fn bx_state(
+    d: &MetalDevice,
+    c: &HybridConfig,
+    bx: &Tensor,
+    state: &HybridState,
+    layer: usize,
+    n: usize,
+) -> Result<()> {
+    let conv_state = state.conv[layer]
+        .as_ref()
+        .expect("short-conv layer has a conv window");
+    d.dispatch_hybrid(
+        "h_bx_state",
+        &[bx.binding()],
+        &[conv_state.binding()],
+        &Params::default().u(n)?.u(c.hidden)?.u(c.conv_kernel - 1)?.0,
+        [c.hidden.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
+}
+
+/// Write `data` into `dst` at byte `offset` through a staging buffer.
+pub(crate) fn upload(d: &MetalDevice, dst: &Tensor, offset: usize, data: &[u8]) -> Result<()> {
+    let size = dst.dtype().size_bytes();
+    if !offset.is_multiple_of(size) || !data.len().is_multiple_of(4) || data.is_empty() {
+        return Err(Error::Shape("unaligned upload".into()));
+    }
+    let staged = Tensor::staged(d, [data.len() / 4], DType::F32, data)?;
+    let view = dst.view(offset / size, [data.len() / size])?;
+    copy_bytes(d, &staged, &view)
+}
+
+/// `copy` of the raw bytes of two same-sized tensors of any type (a
+/// multiple of 4 bytes, as K/V rows and F32 state are).
+fn copy_bytes(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
+    let bytes = src.byte_size();
+    if dst.byte_size() != bytes || !bytes.is_multiple_of(4) {
+        return Err(Error::Shape("copy between different sizes".into()));
+    }
+    let n = bytes / 4;
+    d.dispatch_hybrid(
+        "h_copy",
+        &[src.binding()],
+        &[dst.binding()],
+        &Params::default().u(n)?.0,
+        [n.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
 }
 
 fn copy(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
@@ -485,6 +898,27 @@ fn copy(d: &MetalDevice, src: &Tensor, dst: &Tensor) -> Result<()> {
 
 /// Attention options of `layer`. Layers past the trunk (the MTP block) use the
 /// Qwen3.5 layout: full window, RoPE, gated, no sinks.
+/// `dst[r] = src[idx[r]]` for `n` rows of `width` (`src` rows `src_stride` apart).
+pub(crate) fn gather_rows(
+    d: &MetalDevice,
+    src: &Tensor,
+    idx: &Tensor,
+    dst: &Tensor,
+    n: usize,
+    width: usize,
+    src_stride: usize,
+) -> Result<()> {
+    d.dispatch_hybrid(
+        "h_gather_rows",
+        &[src.binding(), idx.binding()],
+        &[dst.binding()],
+        &Params::default().u(n)?.u(width)?.u(src_stride)?.0,
+        [(n * width).div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
+}
+
 pub(crate) fn attn_spec(c: &HybridConfig, layer: usize) -> AttnSpec {
     c.attn.get(layer).copied().unwrap_or(AttnSpec {
         window: None,
@@ -528,20 +962,20 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
         chunk * c.kv_heads * c.head_dim,
         chunk * c.kv_heads * c.head_dim,
         chunk * c.heads * c.head_dim,
-        if c.variant == Variant::Spark {
+        if matches!(c.variant, Variant::Spark | Variant::Lfm3) {
             chunk * c.heads
         } else {
             1
         },
         MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim,
         MAX_SPLITS * MAX_SPLIT_ROWS * 2,
-        chunk * c.conv_channels(),
+        qkv_width(c) * chunk,
         chunk * c.ssm_value_dim(),
         chunk * c.ssm_v_heads,
         chunk * c.ssm_v_heads,
         chunk * c.ssm_v_heads,
         chunk * c.ssm_v_heads,
-        chunk * c.conv_channels(),
+        conv_out_width(c) * chunk,
         chunk * c.ssm_value_dim(),
         chunk * c.ssm_value_dim(),
         chunk * ffn,
@@ -575,7 +1009,11 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
             total += f32s(n);
         }
     }
-    total
+    let ahead = match super::streams_experts(c) {
+        true => super::stream::ahead_bytes(c, chunk),
+        false => 0,
+    };
+    total + qwen4exp::scratch_bytes(c, chunk) + ahead
 }
 
 /// Bytes of a `HybridState` for `capacity` positions, page-rounded.
@@ -609,10 +1047,33 @@ pub fn kv_ring_bytes(c: &HybridConfig, max_rows: usize) -> usize {
 }
 
 /// Convolution windows and delta-rule matrices of every recurrent layer.
+/// LFM3 counts only the short-conv window (`(l_cache - 1) * hidden`).
 pub fn recurrent_bytes(c: &HybridConfig) -> usize {
+    if c.variant == Variant::Lfm3 {
+        let conv = page((c.conv_kernel - 1) * c.hidden * 4);
+        return c.recurrent_layer_count() * conv;
+    }
     let conv = page((c.conv_kernel - 1) * c.conv_channels() * 4);
     let ssm = page(c.ssm_v_heads * c.ssm_head_dim * c.ssm_head_dim * 4);
-    c.recurrent_layer_count() * (conv + ssm)
+    c.recurrent_layer_count() * (conv + ssm) + qwen4exp::ple_state_bytes(c)
+}
+
+/// Width of the packed QKV / short-conv in-projection scratch.
+fn qkv_width(c: &HybridConfig) -> usize {
+    if c.variant == Variant::Lfm3 {
+        3 * c.hidden
+    } else {
+        c.conv_channels()
+    }
+}
+
+/// Width of the conv-output scratch (delta channels, or the LFM3 gated conv).
+fn conv_out_width(c: &HybridConfig) -> usize {
+    if c.variant == Variant::Lfm3 {
+        c.hidden
+    } else {
+        c.conv_channels()
+    }
 }
 
 /// Metal rounds each allocation up to whole 16 KiB pages.
@@ -639,21 +1100,21 @@ impl Scratch {
                 DType::F16,
             )?,
             att: f(&[chunk, c.heads * c.head_dim])?,
-            // Only Spark has a per-head output gate.
-            head_gate: f(&if c.variant == Variant::Spark {
+            // Spark and LFM3 multiply a per-head sigmoid gate onto attention.
+            head_gate: f(&if matches!(c.variant, Variant::Spark | Variant::Lfm3) {
                 [chunk, c.heads]
             } else {
                 [1, 1]
             })?,
             attn_partial: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * c.head_dim])?,
             attn_ml: f(&[MAX_SPLITS * MAX_SPLIT_ROWS * 2])?,
-            qkv: f(&[chunk, c.conv_channels()])?,
+            qkv: f(&[chunk, qkv_width(c)])?,
             z: f(&[chunk, c.ssm_value_dim()])?,
             alpha: f(&[chunk, c.ssm_v_heads])?,
             beta: f(&[chunk, c.ssm_v_heads])?,
             g: f(&[chunk, c.ssm_v_heads])?,
             b: f(&[chunk, c.ssm_v_heads])?,
-            conv: f(&[chunk, c.conv_channels()])?,
+            conv: f(&[chunk, conv_out_width(c)])?,
             delta: f(&[chunk, c.ssm_value_dim()])?,
             gated: f(&[chunk, c.ssm_value_dim()])?,
             ffn_gate: f(&[chunk, ffn])?,
@@ -662,6 +1123,7 @@ impl Scratch {
             logits: f(&[logit_rows, c.vocab])?,
             token: f(&[1])?,
             candidates: f(&[c.vocab.div_ceil(1024) * 64])?,
+            hc: qwen4exp::HcScratch::new(d, c, chunk)?,
             moe: match c.moe {
                 None => None,
                 Some(moe) => {
@@ -723,6 +1185,7 @@ impl Scratch {
                 .moe
                 .as_ref()
                 .map_or(0, |m| m.tensors().iter().map(|t| page(t.byte_size())).sum())
+            + self.hc.as_ref().map_or(0, qwen4exp::HcScratch::byte_size)
     }
 }
 
@@ -838,9 +1301,13 @@ impl HybridModel {
                 recurrent_index.push(None);
             } else {
                 recurrent_index.push(Some(tape_qkv.len()));
-                tape_qkv.push(f(&[g.rows, c.conv_channels()])?);
-                tape_g.push(f(&[g.rows, c.ssm_v_heads])?);
-                tape_b.push(f(&[g.rows, c.ssm_v_heads])?);
+                if c.variant == Variant::Lfm3 {
+                    tape_qkv.push(f(&[g.rows, c.hidden])?);
+                } else {
+                    tape_qkv.push(f(&[g.rows, c.conv_channels()])?);
+                    tape_g.push(f(&[g.rows, c.ssm_v_heads])?);
+                    tape_b.push(f(&[g.rows, c.ssm_v_heads])?);
+                }
             }
         }
         *self.spec.borrow_mut() = Some(Spec {
@@ -859,10 +1326,15 @@ impl HybridModel {
             tape_qkv,
             tape_g,
             tape_b,
+            tape_ple: match qwen4exp::ple_tape_bytes(c, g.rows) {
+                0 => None,
+                _ => Some(f(&[g.rows, qwen4exp::ple_width(c)])?),
+            },
             recurrent_index,
             logits: f(&[g.rows, c.vocab])?,
             candidates: f(&[g.rows, c.vocab.div_ceil(1024) * 64])?,
             tokens: f(&[g.rows])?,
+            gather: f(&[g.rows, gather_width(c, g)])?,
         });
         Ok(())
     }
@@ -876,6 +1348,16 @@ impl HybridModel {
     }
     pub fn weight_bytes(&self) -> usize {
         self.weights.byte_size()
+    }
+    /// Expert streaming counters since the last reset (None when the
+    /// experts are resident).
+    pub fn stream_stats(&self) -> Option<super::stream::StreamStats> {
+        self.weights.stream.as_ref().map(|s| s.stats())
+    }
+    pub fn reset_stream_stats(&self) {
+        if let Some(s) = &self.weights.stream {
+            s.reset_stats();
+        }
     }
     pub fn scratch_bytes(&self) -> usize {
         self.scratch.borrow().byte_size()
@@ -925,11 +1407,12 @@ impl HybridModel {
         let pieces = tokens.chunks(chunk).count();
         // An uncommitted verify only wrote K/V rows past `len`; drop it.
         state.verified = 0;
+        state.verified_tree.clear();
         for (index, piece) in tokens.chunks(chunk).enumerate() {
             let last = index + 1 == pieces;
             let out = if last { &output } else { &Output::None };
             state.valid = false;
-            produced = self.forward_chunk(d, state, piece, out, None, false)?;
+            produced = self.forward_chunk(d, state, piece, out, None, false, None)?;
             state.len += piece.len();
             state.valid = true;
         }
@@ -955,8 +1438,9 @@ impl HybridModel {
         }
         state.valid = false;
         state.verified = 0;
+        state.verified_tree.clear();
         let mut all = Vec::new();
-        self.forward_chunk(d, state, tokens, &Output::None, Some(&mut all), false)?;
+        self.forward_chunk(d, state, tokens, &Output::None, Some(&mut all), false, None)?;
         state.len += tokens.len();
         state.valid = true;
         Ok(all)
@@ -972,6 +1456,40 @@ impl HybridModel {
         d: &MetalDevice,
         state: &mut HybridState,
         tokens: &[u32],
+        output: RowOutput,
+    ) -> Result<RowsProduced> {
+        self.verify_rows(d, state, tokens, None, output)
+    }
+
+    /// Speculative verify of a draft tree: row i holds node `tokens[i]`, a
+    /// child of row `parents[i]` (`None` for the anchor, row 0; parents come
+    /// before their children). Each row sees the cached sequence and its own
+    /// ancestors, at position `len + depth`, and recurrent layers start each
+    /// node from its parent's state. `commit_path` keeps one root-to-node path.
+    pub fn verify_tree(
+        &self,
+        d: &MetalDevice,
+        state: &mut HybridState,
+        tokens: &[u32],
+        parents: &[Option<usize>],
+        output: RowOutput,
+    ) -> Result<RowsProduced> {
+        if parents.len() != tokens.len() {
+            return Err(Error::Parameter(format!(
+                "{} parents for {} tree rows",
+                parents.len(),
+                tokens.len()
+            )));
+        }
+        self.verify_rows(d, state, tokens, Some(parents), output)
+    }
+
+    fn verify_rows(
+        &self,
+        d: &MetalDevice,
+        state: &mut HybridState,
+        tokens: &[u32],
+        parents: Option<&[Option<usize>]>,
         output: RowOutput,
     ) -> Result<RowsProduced> {
         let rows = self
@@ -1005,14 +1523,23 @@ impl HybridModel {
         {
             return Err(Error::Parameter("one penalty set per verify row".into()));
         }
+        if parents.is_some() && self.config.variant == Variant::Lfm3 {
+            return Err(Error::Parameter(
+                "draft trees are not supported for this model".into(),
+            ));
+        }
         state.verified = 0;
+        state.verified_tree.clear();
         // The recurrent state is never written, so a failure leaves it valid.
-        let produced = self.forward_chunk(d, state, tokens, &Output::None, None, true);
+        let produced = self.forward_chunk(d, state, tokens, &Output::None, None, true, parents);
         let produced = match produced {
             Ok(_) => self.verify_outputs(d, tokens.len(), &output)?,
             Err(e) => return Err(e),
         };
         state.verified = tokens.len();
+        if let Some(p) = parents {
+            state.verified_tree = p.to_vec();
+        }
         Ok(produced)
     }
 
@@ -1025,39 +1552,201 @@ impl HybridModel {
                 state.verified
             )));
         }
+        if !state.verified_tree.is_empty()
+            && !(0..n).all(|i| i == 0 || state.verified_tree[i] == Some(i - 1))
+        {
+            return Err(Error::Cache(
+                "the first rows of the last tree verify are not a path; use commit_path".into(),
+            ));
+        }
+        let spec = self.spec.borrow();
+        let spec = spec.as_ref().expect("verify implies speculation");
+        let s = self.scratch.borrow();
+        state.valid = false;
+        let e = d.execution_with_shared_encoder(true)?;
+        self.replay(d, &s, spec, state, n, None)?;
+        self.commit_ple(d, spec, state, n)?;
+        e.finish()?;
+        state.len += n;
+        state.verified = 0;
+        state.verified_tree.clear();
+        state.valid = true;
+        Ok(())
+    }
+
+    /// Keep the root-to-node `path` (verify rows, starting at the anchor's 0)
+    /// of the last tree verify: its K/V rows, recurrent replay and captured
+    /// features move to the next `path.len()` positions, and the sequence
+    /// advances by that much.
+    pub fn commit_path(
+        &self,
+        d: &MetalDevice,
+        state: &mut HybridState,
+        path: &[usize],
+    ) -> Result<()> {
+        let n = path.len();
+        if path.first() != Some(&0) || n > state.verified {
+            return Err(Error::Cache(format!(
+                "commit of path {path:?} after a verify of {} rows",
+                state.verified
+            )));
+        }
+        if path.iter().enumerate().all(|(i, &row)| i == row) {
+            return self.commit(d, state, n);
+        }
+        let tree = &state.verified_tree;
+        if tree.is_empty()
+            || path
+                .windows(2)
+                .any(|w| tree.get(w[1]).copied().flatten() != Some(w[0]))
+        {
+            return Err(Error::Cache(format!(
+                "path {path:?} does not follow the last verify's tree"
+            )));
+        }
         let c = &self.config;
         let spec = self.spec.borrow();
         let spec = spec.as_ref().expect("verify implies speculation");
         let s = self.scratch.borrow();
-        let channels = c.conv_channels();
-        let heads = c.ssm_v_heads;
+        let index = |v: &[usize]| {
+            Tensor::from_le_bytes(
+                d,
+                [v.len()],
+                DType::F32,
+                &v.iter()
+                    .flat_map(|&i| (i as u32).to_le_bytes())
+                    .collect::<Vec<_>>(),
+            )
+        };
+        // Rows already in place (the path's chain prefix) stay where they are.
+        let first = path
+            .iter()
+            .enumerate()
+            .take_while(|&(i, &row)| i == row)
+            .count();
+        let from = index(&path[first..])?;
+        let to = index(&(first..n).collect::<Vec<_>>())?;
+        let path_t = index(path)?;
         state.valid = false;
         let e = d.execution_with_shared_encoder(true)?;
-        for (layer, index) in spec.recurrent_index.iter().enumerate() {
-            let Some(r) = *index else { continue };
-            let Mixer::Delta(w) = &self.weights.layers[layer].mixer else {
-                unreachable!("recurrent index on an attention layer")
+        self.replay(d, &s, spec, state, n, Some(&path_t))?;
+        let moved = n - first;
+        for layer in 0..c.layers {
+            let (Some(kc), Some(vc)) = (&state.k[layer], &state.v[layer]) else {
+                continue;
             };
-            let qkv = rows(&spec.tape_qkv[r], 0, n, channels)?;
-            let conv = rows(&s.conv, 0, n, channels)?;
-            let delta = rows(&s.delta, 0, n, c.ssm_value_dim())?;
-            self.gdn_conv(d, &qkv, w, &conv, state, layer, n, true)?;
-            self.gdn_recurrent(
-                d,
-                &conv,
-                &rows(&spec.tape_g[r], 0, n, heads)?,
-                &rows(&spec.tape_b[r], 0, n, heads)?,
-                &delta,
-                state,
-                layer,
-                n,
-                true,
+            for cache in [kc, vc] {
+                let args = Params::default()
+                    .u(moved)?
+                    .u(c.kv_heads * c.head_dim)?
+                    .u(cache.shape().dimensions()[0])?
+                    .u(usize::from(c.kv_cache == KvCache::Q8))?
+                    .u(state.ring[layer])?
+                    .u(state.len)?;
+                let units = moved * c.kv_heads * c.head_dim;
+                d.dispatch_hybrid(
+                    "h_kv_gather",
+                    &[cache.binding(), from.binding()],
+                    &[spec.gather.binding()],
+                    &args.0,
+                    [units.div_ceil(256), 1, 1],
+                    [256, 1, 1],
+                    0,
+                )?;
+                d.dispatch_hybrid(
+                    "h_kv_scatter",
+                    &[spec.gather.binding(), to.binding()],
+                    &[cache.binding()],
+                    &args.0,
+                    [units.div_ceil(256), 1, 1],
+                    [256, 1, 1],
+                    0,
+                )?;
+            }
+        }
+        // Captured rows the drafter ingests next: rows 0..n become the path's.
+        for captured in spec.features.iter().chain(&spec.hidden) {
+            let width = captured.numel() / captured.shape().dimensions()[0];
+            gather_rows(d, captured, &path_t, &spec.gather, n, width, width)?;
+            d.dispatch_hybrid(
+                "h_copy_rows",
+                &[spec.gather.binding()],
+                &[captured.binding()],
+                &Params::default()
+                    .u(n)?
+                    .u(width)?
+                    .u(width)?
+                    .u(width)?
+                    .u(0)?
+                    .0,
+                [(n * width).div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
             )?;
         }
         e.finish()?;
         state.len += n;
         state.verified = 0;
+        state.verified_tree.clear();
         state.valid = true;
+        Ok(())
+    }
+
+    /// Replay `n` verify rows into the recurrent state: tape rows `0..n`, or
+    /// the tape rows `path` lists, gathered into the chunk scratch.
+    fn replay(
+        &self,
+        d: &MetalDevice,
+        s: &Scratch,
+        spec: &Spec,
+        state: &HybridState,
+        n: usize,
+        path: Option<&Tensor>,
+    ) -> Result<()> {
+        let c = &self.config;
+        let channels = c.conv_channels();
+        let heads = c.ssm_v_heads;
+        for (layer, index) in spec.recurrent_index.iter().enumerate() {
+            let Some(r) = *index else { continue };
+            if matches!(&self.weights.layers[layer].mixer, Mixer::ShortConv(_)) {
+                let hidden = c.hidden;
+                let bx = match path {
+                    None => rows(&spec.tape_qkv[r], 0, n, hidden)?,
+                    Some(path) => {
+                        let bx = rows(&s.conv, 0, n, hidden)?;
+                        gather_rows(d, &spec.tape_qkv[r], path, &bx, n, hidden, hidden)?;
+                        bx
+                    }
+                };
+                bx_state(d, c, &bx, state, layer, n)?;
+                continue;
+            }
+            let Mixer::Delta(w) = &self.weights.layers[layer].mixer else {
+                unreachable!("recurrent index on an attention layer")
+            };
+            let (qkv, g, b) = match path {
+                None => (
+                    rows(&spec.tape_qkv[r], 0, n, channels)?,
+                    rows(&spec.tape_g[r], 0, n, heads)?,
+                    rows(&spec.tape_b[r], 0, n, heads)?,
+                ),
+                Some(path) => {
+                    let (qkv, g, b) = (
+                        rows(&s.qkv, 0, n, channels)?,
+                        rows(&s.g, 0, n, heads)?,
+                        rows(&s.b, 0, n, heads)?,
+                    );
+                    gather_rows(d, &spec.tape_qkv[r], path, &qkv, n, channels, channels)?;
+                    gather_rows(d, &spec.tape_g[r], path, &g, n, heads, heads)?;
+                    gather_rows(d, &spec.tape_b[r], path, &b, n, heads, heads)?;
+                    (qkv, g, b)
+                }
+            };
+            let conv = rows(&s.conv, 0, n, channels)?;
+            let delta = rows(&s.delta, 0, n, c.ssm_value_dim())?;
+            self.gdn_conv(d, &qkv, w, &conv, state, layer, n, true, None)?;
+            self.gdn_recurrent(d, &conv, &g, &b, &delta, state, layer, n, true, None)?;
+        }
         Ok(())
     }
 
@@ -1198,6 +1887,7 @@ impl HybridModel {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn forward_chunk(
         &self,
         d: &MetalDevice,
@@ -1206,6 +1896,7 @@ impl HybridModel {
         output: &Output,
         all_logits: Option<&mut Vec<f32>>,
         verify: bool,
+        tree: Option<&[Option<usize>]>,
     ) -> Result<Produced> {
         let c = &self.config;
         let s = self.scratch.borrow();
@@ -1221,9 +1912,17 @@ impl HybridModel {
         state.written = state.written.max(pos + m);
         let execution = d.execution_with_shared_encoder(true)?;
         if pos == 0 {
-            for t in state.conv.iter().chain(&state.ssm).flatten() {
+            for t in state
+                .conv
+                .iter()
+                .chain(&state.ssm)
+                .flatten()
+                .chain(&state.ple)
+            {
                 self.fill_zero(d, t)?;
             }
+            state.ple_tokens.clear();
+            state.ple_pending.clear();
         }
         let ids = Tensor::from_le_bytes(
             d,
@@ -1265,54 +1964,97 @@ impl HybridModel {
                 0,
             )?;
         }
-        let rope = state.rope_plan(d, pos, m)?;
-        self.rmsnorm(d, &x0, &self.weights.layers[0].attn_norm, &xn, m)?;
+        let rope = match tree {
+            Some(parents) => state.tree_plan(d, pos, parents)?,
+            None => state.rope_plan(d, pos, m)?,
+        };
         let spec = self.spec.borrow();
         let spec = spec.as_ref();
-        let (mut cur, mut next) = (&x0, &x1);
-        for (i, layer) in self.weights.layers.iter().enumerate() {
-            match &layer.mixer {
-                Mixer::Attention(a) => {
-                    self.attention(d, &s, a, state, i, &xn, &mix, m, pos, &rope)?
+        if self.weights.hc_head.is_some() {
+            if tree.is_some() {
+                return Err(Error::Parameter(
+                    "draft trees are not available for hyper-connection models".into(),
+                ));
+            }
+            self.hc_layers(
+                d, &s, state, tokens, &x0, &xn, &mix, m, pos, &rope, verify, spec,
+            )?;
+        } else {
+            self.rmsnorm(d, &x0, &self.weights.layers[0].attn_norm, &xn, m)?;
+            let (mut cur, mut next) = (&x0, &x1);
+            for (i, layer) in self.weights.layers.iter().enumerate() {
+                match &layer.mixer {
+                    Mixer::Attention(a) => {
+                        self.attention(d, &s, a, state, i, &xn, &mix, m, pos, &rope)?
+                    }
+                    Mixer::ShortConv(w) => {
+                        let tape = match (verify, spec) {
+                            (true, Some(sp)) => {
+                                let r = sp.recurrent_index[i].expect("short conv is recurrent");
+                                Some(&sp.tape_qkv[r])
+                            }
+                            _ => None,
+                        };
+                        run_short_conv(d, c, &s, w, state, i, &xn, &mix, m, tape)?;
+                    }
+                    Mixer::Delta(w) => {
+                        let tape = match (verify, spec) {
+                            (true, Some(sp)) => {
+                                let r = sp.recurrent_index[i].expect("delta layer is recurrent");
+                                Some((&sp.tape_qkv[r], &sp.tape_g[r], &sp.tape_b[r]))
+                            }
+                            _ => None,
+                        };
+                        self.delta(d, &s, w, state, i, &xn, &mix, m, tape, rope.tree.as_ref())?
+                    }
                 }
-                Mixer::Delta(w) => {
-                    let tape = match (verify, spec) {
-                        (true, Some(sp)) => {
-                            let r = sp.recurrent_index[i].expect("delta layer is recurrent");
-                            Some((&sp.tape_qkv[r], &sp.tape_g[r], &sp.tape_b[r]))
-                        }
-                        _ => None,
-                    };
-                    self.delta(d, &s, w, state, i, &xn, &mix, m, tape)?
+                // LFM3 sandwich: norm the branch, then the fused residual + next
+                // pre-norm. The dispatcher rejects an input that aliases an
+                // output, so the fused norm lands in `mix` and is copied back to
+                // `xn`, which is where the rest of the loop reads it.
+                if let Some(post) = &layer.post_attn {
+                    self.rmsnorm(d, &mix, post, &xn, m)?;
+                    self.add_rmsnorm(d, cur, &xn, &layer.post_norm, next, &mix, m)?;
+                    copy(d, &mix, &xn)?;
+                } else {
+                    self.add_rmsnorm(d, cur, &mix, &layer.post_norm, next, &xn, m)?;
+                }
+                std::mem::swap(&mut cur, &mut next);
+                match &layer.ffn {
+                    Ffn::Dense(f) => self.dense_ffn(d, &s, f, &xn, &mix, m)?,
+                    Ffn::Moe(f) => {
+                        self.dump(d, "attn_post_norm", i, &xn)?;
+                        self.moe_ffn(d, &s, f, Some(i), &xn, &mix, m)?;
+                        self.dump(d, "ffn_out", i, &mix)?;
+                    }
+                }
+                let norm = self
+                    .weights
+                    .layers
+                    .get(i + 1)
+                    .map_or(&self.weights.output_norm, |l| &l.attn_norm);
+                if let Some(post) = &layer.post_ffw {
+                    self.rmsnorm(d, &mix, post, &xn, m)?;
+                    self.add_rmsnorm(d, cur, &xn, norm, next, &mix, m)?;
+                    copy(d, &mix, &xn)?;
+                } else {
+                    self.add_rmsnorm(d, cur, &mix, norm, next, &xn, m)?;
+                }
+                std::mem::swap(&mut cur, &mut next);
+                if self.add_deepstack(d, state, i, cur, pos, m)? {
+                    self.rmsnorm(d, cur, norm, &xn, m)?;
+                }
+                self.dump(d, "l_out", i, cur)?;
+                if let Some(sp) = spec
+                    && let Some(features) = &sp.features
+                    && let Some(column) = sp.aux.iter().position(|&l| l == i)
+                {
+                    self.capture(d, cur, features, column, m)?;
                 }
             }
-            self.add_rmsnorm(d, cur, &mix, &layer.post_norm, next, &xn, m)?;
-            std::mem::swap(&mut cur, &mut next);
-            match &layer.ffn {
-                Ffn::Dense(f) => self.dense_ffn(d, &s, f, &xn, &mix, m)?,
-                Ffn::Moe(f) => {
-                    self.dump(d, "attn_post_norm", i, &xn)?;
-                    self.moe_ffn(d, &s, f, &xn, &mix, m)?;
-                    self.dump(d, "ffn_out", i, &mix)?;
-                }
+            if let Some(hidden) = spec.and_then(|sp| sp.hidden.as_ref()) {
+                self.capture(d, &xn, hidden, 0, m)?;
             }
-            let norm = self
-                .weights
-                .layers
-                .get(i + 1)
-                .map_or(&self.weights.output_norm, |l| &l.attn_norm);
-            self.add_rmsnorm(d, cur, &mix, norm, next, &xn, m)?;
-            std::mem::swap(&mut cur, &mut next);
-            self.dump(d, "l_out", i, cur)?;
-            if let Some(sp) = spec
-                && let Some(features) = &sp.features
-                && let Some(column) = sp.aux.iter().position(|&l| l == i)
-            {
-                self.capture(d, cur, features, column, m)?;
-            }
-        }
-        if let Some(hidden) = spec.and_then(|sp| sp.hidden.as_ref()) {
-            self.capture(d, &xn, hidden, 0, m)?;
         }
         // xn now holds output_norm(final hidden) for every position.
         let produced = if let Some(all) = all_logits {
@@ -1413,6 +2155,50 @@ impl HybridModel {
         Ok(produced)
     }
 
+    /// Add layer `layer`'s DeepStack features of the images in this chunk to
+    /// their rows of `x`. Whether any were added.
+    fn add_deepstack(
+        &self,
+        d: &MetalDevice,
+        state: &HybridState,
+        layer: usize,
+        x: &Tensor,
+        pos: usize,
+        m: usize,
+    ) -> Result<bool> {
+        let h = self.config.hidden;
+        let mut added = false;
+        for span in state
+            .media
+            .iter()
+            .filter(|sp| sp.start < pos + m && sp.end() > pos)
+        {
+            let Some(features) = span.deepstack.get(layer) else {
+                continue;
+            };
+            if features.numel() != span.len() * h || features.dtype() != DType::F32 {
+                return Err(Error::Shape(format!(
+                    "DeepStack features of {} values for an image of {} x {h}",
+                    features.numel(),
+                    span.len()
+                )));
+            }
+            let (from, to) = (span.start.max(pos), span.end().min(pos + m));
+            let n = (to - from) * h;
+            d.dispatch_hybrid(
+                "h_accumulate",
+                &[rows(features, from - span.start, to - from, h)?.binding()],
+                &[rows(x, from - pos, to - from, h)?.binding()],
+                &Params::default().u(n)?.0,
+                [n.div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )?;
+            added = true;
+        }
+        Ok(added)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn attention(
         &self,
@@ -1498,7 +2284,14 @@ impl HybridModel {
             .u(kc.shape().dimensions()[0])?
             .u(usize::from(spec.gated))?
             .u(ring)?
-            .u(usize::from(a.q_norm.is_some()))?;
+            .u(usize::from(a.q_norm.is_some()))?
+            // Full-attention LFM3 layers divide the angle by rope_freqs.
+            // Sliding layers, and every other variant, leave the formula as it is.
+            .u(usize::from(
+                c.variant == Variant::Lfm3
+                    && spec.window.is_none()
+                    && self.weights.rope_freqs.is_some(),
+            ))?;
         let q8 = c.kv_cache == KvCache::Q8;
         d.dispatch_hybrid(
             if q8 { "h_attn_prep_q8" } else { "h_attn_prep" },
@@ -1511,6 +2304,8 @@ impl HybridModel {
                 a.k_norm.as_ref().unwrap_or(&qg).binding(),
                 // Unread unless the plan carries a position table.
                 rope.table.as_ref().unwrap_or(&qg).binding(),
+                // Unread unless use_factors is set.
+                self.weights.rope_freqs.as_ref().unwrap_or(&qg).binding(),
             ],
             &[q.binding(), kc.binding()],
             &prep.0,
@@ -1544,6 +2339,7 @@ impl HybridModel {
             spec,
             a.sinks.as_ref(),
             ring,
+            rope.tree.as_ref().map(|t| (t, rope.tree_root)),
         )?;
         if let Some(gate) = &a.head_gate {
             let logits = rows(&s.head_gate, 0, m, c.heads)?;
@@ -1566,7 +2362,10 @@ impl HybridModel {
     /// Causal attention of `m` new queries against the cache (format `kv`),
     /// written to `att`. With `spec.gated` the output is multiplied by
     /// sigmoid(gate) from `qg`; `spec.window` masks keys out of range, and
-    /// `sinks` (per-head logits) join the softmax denominator.
+    /// `sinks` (per-head logits) join the softmax denominator. With `tree`
+    /// (`RopePlan::tree`) the rows are draft-tree nodes that see only their
+    /// ancestors among the tree's rows, stored from cache position `root`
+    /// (the second member) on.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn flash_attention(
         &self,
@@ -1583,14 +2382,19 @@ impl HybridModel {
         spec: AttnSpec,
         sinks: Option<&Tensor>,
         ring: usize,
+        tree: Option<(&Tensor, usize)>,
     ) -> Result<()> {
         let c = &self.config;
         let group = c.heads / c.kv_heads;
+        let (tree, tree_root) = (tree.map(|t| t.0), tree.map_or(pos, |t| t.1));
         let rows = m * group;
         let window = spec.window.unwrap_or(0);
-        // No query reads keys before the window of the first query. A ring
-        // starts at a multiple of 64 so tensor-op tiles never wrap.
-        let first_key = spec.window.map_or(0, |w| (pos + 1).saturating_sub(w));
+        // No query reads keys before the window of the first query (of the
+        // tree's root, which sits lowest). A ring starts at a multiple of 64
+        // so tensor-op tiles never wrap.
+        let first_key = spec
+            .window
+            .map_or(0, |w| (pos.min(tree_root) + 1).saturating_sub(w));
         let first_key = if ring > 0 {
             first_key / 64 * 64
         } else {
@@ -1612,9 +2416,19 @@ impl HybridModel {
                     .into(),
             ));
         }
+        // A one-row forward with a tree is a node whose ancestors earlier
+        // forwards stored; it runs on the verify kernels, not decode.
+        if tree.is_some() && (legacy || m > TREE_MAX_ROWS) {
+            return Err(Error::Config(format!(
+                "a draft-tree verify takes at most {TREE_MAX_ROWS} rows on the TensorOps \
+                 or reference attention kernels"
+            )));
+        }
         let sinks_on = usize::from(sinks.is_some());
-        // Bound (and ignored) when the layer has no sinks.
+        let tree_on = usize::from(tree.is_some());
+        // Bound (and ignored) when the layer has no sinks or the rows no tree.
         let sinks_t = sinks.unwrap_or(qg);
+        let tree_t = tree.unwrap_or(qg);
         if flags().reference_attention {
             let args = Params::default()
                 .u(m)?
@@ -1627,7 +2441,8 @@ impl HybridModel {
                 .u(window)?
                 .u(usize::from(spec.gated))?
                 .u(sinks_on)?
-                .u(ring)?;
+                .u(ring)?
+                .u(tree_on)?;
             return d.dispatch_hybrid(
                 "h_attention",
                 &[
@@ -1636,6 +2451,7 @@ impl HybridModel {
                     vc.binding(),
                     qg.binding(),
                     sinks_t.binding(),
+                    tree_t.binding(),
                 ],
                 &[att.binding()],
                 &args.0,
@@ -1663,23 +2479,42 @@ impl HybridModel {
                 .u(ring)?
                 .0)
         };
-        // Sinks ride as the fifth input; the legacy kernels predate them.
+        // Sinks ride as the fifth input; the legacy kernels predate them. The
+        // `_tree` variants take the tree as the sixth.
         let base = [q.binding(), kc.binding(), vc.binding(), qg.binding()];
         let sink_inputs = [base[0], base[1], base[2], base[3], sinks_t.binding()];
+        let tree_inputs = [
+            base[0],
+            base[1],
+            base[2],
+            base[3],
+            sinks_t.binding(),
+            tree_t.binding(),
+        ];
         if m >= MPP_ATTENTION_MIN_TOKENS && !flags().simd_attention {
             let args = fa(0, 1)?;
-            let name = match (q8, legacy, wide) {
-                (true, _, true) => "h_flash_attn_mpp_q8",
-                (true, _, false) => "h_flash_attn_mpp_q8_d128",
-                (false, false, true) => "h_flash_attn_mpp_staged",
-                (false, false, false) => "h_flash_attn_mpp_staged_d128",
-                (false, true, _) => "h_flash_attn_mpp",
+            let name = match (q8, legacy, wide, tree.is_some()) {
+                (true, _, true, false) => "h_flash_attn_mpp_q8",
+                (true, _, false, false) => "h_flash_attn_mpp_q8_d128",
+                (false, false, true, false) => "h_flash_attn_mpp_staged",
+                (false, false, false, false) => "h_flash_attn_mpp_staged_d128",
+                (false, true, _, _) => "h_flash_attn_mpp",
+                (true, _, true, true) => "h_flash_attn_mpp_q8_tree",
+                (true, _, false, true) => "h_flash_attn_mpp_q8_d128_tree",
+                (false, false, true, true) => "h_flash_attn_mpp_staged_tree",
+                (false, false, false, true) => "h_flash_attn_mpp_staged_d128_tree",
             };
             // K/V staged through threadgroup memory measured 15-20% faster
             // than reading the cache as a device tensor.
             return d.dispatch_hybrid(
                 name,
-                if legacy { &base } else { &sink_inputs },
+                if legacy {
+                    &base
+                } else if tree.is_some() {
+                    &tree_inputs
+                } else {
+                    &sink_inputs
+                },
                 &[att.binding()],
                 &args,
                 [m.div_ceil(64), c.heads, 1],
@@ -1707,7 +2542,7 @@ impl HybridModel {
                 0,
             )
         };
-        if m == 1 && group <= 8 && !flags().simd_attention {
+        if m == 1 && group <= 8 && !flags().simd_attention && tree.is_none() {
             let target = DECODE_SPLIT_TARGET;
             let min_keys = DECODE_SPLIT_MIN_KEYS;
             let splits = (target / c.kv_heads)
@@ -1768,23 +2603,29 @@ impl HybridModel {
             } else {
                 br * 64 * 4 + br * 64 * 2 + 3 * br * 4
             };
-            let name = match (q8, wide) {
-                (false, true) => "h_attn_verify_mpp_32",
-                (true, true) => "h_attn_verify_mpp_32_q8",
-                (false, false) => "h_attn_verify_mpp_32_d128",
-                (true, false) => "h_attn_verify_mpp_32_q8_d128",
+            let name = match (q8, wide, tree.is_some()) {
+                (false, true, false) => "h_attn_verify_mpp_32",
+                (true, true, false) => "h_attn_verify_mpp_32_q8",
+                (false, false, false) => "h_attn_verify_mpp_32_d128",
+                (true, false, false) => "h_attn_verify_mpp_32_q8_d128",
+                (false, true, true) => "h_attn_verify_mpp_32_tree",
+                (true, true, true) => "h_attn_verify_mpp_32_q8_tree",
+                (false, false, true) => "h_attn_verify_mpp_32_d128_tree",
+                (true, false, true) => "h_attn_verify_mpp_32_q8_d128_tree",
             };
+            let qk_inputs = [
+                qk.binding(),
+                kc.binding(),
+                vc.binding(),
+                qg.binding(),
+                sinks_t.binding(),
+                tree_t.binding(),
+            ];
             d.dispatch_hybrid(
                 // F16 reads K/V directly: staging only pays off for prompt
                 // chunks. Q8 must stage to dequantize.
                 name,
-                &[
-                    qk.binding(),
-                    kc.binding(),
-                    vc.binding(),
-                    qg.binding(),
-                    sinks_t.binding(),
-                ],
+                &qk_inputs[..if tree.is_some() { 6 } else { 5 }],
                 &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
                 &args,
                 [row_blocks, c.kv_heads, splits],
@@ -1844,6 +2685,7 @@ impl HybridModel {
         out: &Tensor,
         m: usize,
         tape: Option<(&Tensor, &Tensor, &Tensor)>,
+        tree: Option<&Tensor>,
     ) -> Result<()> {
         let c = &self.config;
         let channels = c.conv_channels();
@@ -1891,14 +2733,21 @@ impl HybridModel {
             [64, 1, 1],
             0,
         )?;
-        self.gdn_conv(d, &qkv, w, &conv, state, layer, m, write_state)?;
-        self.gdn_recurrent(d, &conv, &g, &b, &delta, state, layer, m, write_state)?;
+        // Tree rows only arise in a verify, which never writes the state.
+        let tree = tree.filter(|_| tape.is_some());
+        self.gdn_conv(d, &qkv, w, &conv, state, layer, m, write_state, tree)?;
+        self.gdn_recurrent(d, &conv, &g, &b, &delta, state, layer, m, write_state, tree)?;
         self.dump(d, "attn_output", layer, &delta)?;
         d.dispatch_hybrid(
             "h_gated_rmsnorm",
             &[delta.binding(), z.binding(), w.norm.binding()],
             &[gated.binding()],
-            &Params::default().u(heads)?.u(c.ssm_head_dim)?.f(c.eps).0,
+            &Params::default()
+                .u(heads)?
+                .u(c.ssm_head_dim)?
+                .f(c.eps)
+                .u(usize::from(c.variant == Variant::Qwen4Exp))?
+                .0,
             [m * heads, 1, 1],
             [c.ssm_head_dim, 1, 1],
             0,
@@ -1920,28 +2769,49 @@ impl HybridModel {
         layer: usize,
         m: usize,
         write_state: bool,
+        tree: Option<&Tensor>,
     ) -> Result<()> {
         let c = &self.config;
         let channels = c.conv_channels();
         let conv_state = state.conv[layer]
             .as_ref()
             .expect("delta layer has conv state");
-        d.dispatch_hybrid(
-            "h_gdn_conv",
-            &[qkv.binding(), w.conv.binding()],
-            &[conv.binding(), conv_state.binding()],
-            &Params::default()
-                .u(channels)?
-                .u(m)?
-                .u(c.ssm_key_dim())?
-                .u(c.ssm_head_dim)?
-                .f(c.eps)
-                .u(usize::from(write_state))?
-                .0,
-            [channels / c.ssm_head_dim, 1, 1],
-            [c.ssm_head_dim, 1, 1],
-            0,
-        )
+        let params = Params::default()
+            .u(channels)?
+            .u(m)?
+            .u(c.ssm_key_dim())?
+            .u(c.ssm_head_dim)?
+            .f(c.eps)
+            .u(usize::from(write_state))?
+            .0;
+        let groups = [channels / c.ssm_head_dim, 1, 1];
+        let threads = [c.ssm_head_dim, 1, 1];
+        match tree {
+            // Draft-tree rows read their ancestors' rows; the state is only read.
+            Some(tree) => d.dispatch_hybrid(
+                "h_gdn_conv_tree",
+                &[
+                    qkv.binding(),
+                    w.conv.binding(),
+                    conv_state.binding(),
+                    tree.binding(),
+                ],
+                &[conv.binding()],
+                &params,
+                groups,
+                threads,
+                0,
+            ),
+            None => d.dispatch_hybrid(
+                "h_gdn_conv",
+                &[qkv.binding(), w.conv.binding()],
+                &[conv.binding(), conv_state.binding()],
+                &params,
+                groups,
+                threads,
+                0,
+            ),
+        }
     }
 
     /// Sequential gated delta rule over `m` conv rows into `delta`.
@@ -1957,37 +2827,63 @@ impl HybridModel {
         layer: usize,
         m: usize,
         write_state: bool,
+        tree: Option<&Tensor>,
     ) -> Result<()> {
         let c = &self.config;
         let ssm = state.ssm[layer]
             .as_ref()
             .expect("delta layer has recurrent state");
         const NSG: usize = 4;
-        d.dispatch_hybrid(
-            "h_gdn_recurrent",
-            &[conv.binding(), g.binding(), b.binding()],
-            &[delta.binding(), ssm.binding()],
-            &Params::default()
-                .u(m)?
-                .u(c.ssm_v_heads)?
-                .u(c.ssm_k_heads)?
-                .u(c.conv_channels())?
-                .u(c.ssm_key_dim())?
-                .f(1. / (c.ssm_head_dim as f32).sqrt())
-                .u(usize::from(write_state))?
-                .0,
-            [c.ssm_head_dim / NSG, c.ssm_v_heads, 1],
-            [32, NSG, 1],
-            0,
-        )
+        let params = Params::default()
+            .u(m)?
+            .u(c.ssm_v_heads)?
+            .u(c.ssm_k_heads)?
+            .u(c.conv_channels())?
+            .u(c.ssm_key_dim())?
+            .f(1. / (c.ssm_head_dim as f32).sqrt())
+            .u(usize::from(write_state))?
+            .u(usize::from(c.ssm_grouped_heads))?
+            .0;
+        let groups = [c.ssm_head_dim / NSG, c.ssm_v_heads, 1];
+        match tree {
+            // Draft-tree rows start from their parent's state; the state is only read.
+            Some(tree) => d.dispatch_hybrid(
+                "h_gdn_recurrent_tree",
+                &[
+                    conv.binding(),
+                    g.binding(),
+                    b.binding(),
+                    ssm.binding(),
+                    tree.binding(),
+                ],
+                &[delta.binding()],
+                &params,
+                groups,
+                [32, NSG, 1],
+                0,
+            ),
+            None => d.dispatch_hybrid(
+                "h_gdn_recurrent",
+                &[conv.binding(), g.binding(), b.binding()],
+                &[delta.binding(), ssm.binding()],
+                &params,
+                groups,
+                [32, NSG, 1],
+                0,
+            ),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn moe_ffn(
+    /// The routed and shared experts of trunk layer `layer` (`None`: a block
+    /// outside the trunk, whose experts are always resident).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn moe_ffn(
         &self,
         d: &MetalDevice,
         s: &Scratch,
         f: &MoeFfn,
+        layer: Option<usize>,
         xn: &Tensor,
         out: &Tensor,
         m: usize,
@@ -2040,13 +2936,106 @@ impl HybridModel {
         self.dump(d, "ffn_moe_weights", 0, &weights)?;
         self.dump(d, "ffn_shexp", 0, &shared)?;
         self.dump(d, "shared_expert_gate_sigmoid", 0, &shared_gate)?;
+        // Streamed experts: read the routes back, make their experts resident
+        // and route through their arena slots instead. Expert-sorted prompt
+        // rows number the layer's experts 0..k and look their slots up.
         let identity = routes <= MV_ID_MAX_ROUTES || exact_math();
+        let u32s = |d: &MetalDevice, v: &[u32]| {
+            Tensor::from_le_bytes(
+                d,
+                [v.len()],
+                DType::F32,
+                &v.iter().flat_map(|s| s.to_le_bytes()).collect::<Vec<_>>(),
+            )
+        };
+        let streamed = match (&self.weights.stream, layer) {
+            (Some(stream), Some(layer)) => {
+                // Guess the next layer's experts from this layer's input, to
+                // read them while this layer and the next mixer run.
+                let next = self
+                    .weights
+                    .layers
+                    .get(layer + 1)
+                    .and_then(|l| match &l.ffn {
+                        Ffn::Moe(f) => Some(f),
+                        Ffn::Dense(_) => None,
+                    })
+                    .zip(stream.ahead_scratch.as_ref())
+                    .filter(|(_, a)| m <= a.rows);
+                let k = |a: &super::stream::AheadScratch| match m <= super::stream::AHEAD_ROWS {
+                    true => a.k,
+                    false => used,
+                };
+                if let Some((nf, a)) = next {
+                    let k = k(a);
+                    let logits = rows(&a.logits, 0, m, experts)?;
+                    Self::project(d, &nf.router, xn, m, &logits)?;
+                    d.dispatch_hybrid(
+                        "h_moe_route",
+                        &[
+                            logits.binding(),
+                            xn.binding(),
+                            nf.shared_gate_inp.as_ref().unwrap_or(xn).binding(),
+                        ],
+                        &[
+                            a.ids.view(0, [m * k])?.binding(),
+                            a.weights.view(0, [m * k])?.binding(),
+                            a.shared_gate.view(0, [m])?.binding(),
+                        ],
+                        &Params::default()
+                            .u(experts)?
+                            .u(k)?
+                            .u(hidden)?
+                            .u(m)?
+                            .u(usize::from(moe.sigmoid))?
+                            .u(usize::from(moe.norm_weights))?
+                            .u(0)?
+                            .0,
+                        [m, 1, 1],
+                        [experts, 1, 1],
+                        0,
+                    )?;
+                }
+                d.synchronize()?;
+                let picked: Vec<u32> = ids.to_f32().iter().map(|v| v.to_bits()).collect();
+                // Verify rows are decode: their wrong guesses are often the next
+                // tokens' experts.
+                let slots = stream.place(d, layer, &picked, m > MMS_MAX_ROWS)?;
+                if let Some((_, a)) = next {
+                    let guess: Vec<u32> = a
+                        .ids
+                        .view(0, [m * k(a)])?
+                        .to_f32()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect();
+                    stream.read_ahead(d, layer + 1, &guess)?;
+                }
+                if identity {
+                    Some((u32s(d, &slots)?, None))
+                } else {
+                    let mut table = slots.clone();
+                    table.sort_unstable();
+                    table.dedup();
+                    let local: Vec<u32> = slots
+                        .iter()
+                        .map(|s| table.binary_search(s).expect("listed") as u32)
+                        .collect();
+                    let k = table.len();
+                    Some((u32s(d, &local)?, Some((u32s(d, &table)?, k))))
+                }
+            }
+            _ => None,
+        };
+        let ids = streamed.as_ref().map_or(&ids, |(t, _)| t);
+        let table = streamed.as_ref().and_then(|(_, t)| t.as_ref());
         if identity {
-            Self::project_id(d, &f.gate_exps, xn, &ids, routes, used, &gate)?;
-            Self::project_id(d, &f.up_exps, xn, &ids, routes, used, &up)?;
+            Self::project_id(d, &f.gate_exps, xn, ids, routes, used, &gate)?;
+            Self::project_id(d, &f.up_exps, xn, ids, routes, used, &up)?;
             self.glu(d, &gate, &up, &act)?;
-            Self::project_id(d, &f.down_exps, &act, &ids, routes, 1, &down)?;
+            Self::project_id(d, &f.down_exps, &act, ids, routes, 1, &down)?;
         } else {
+            let experts = table.map_or(experts, |&(_, k)| k);
             let offsets = ms.offsets.view(0, [experts + 1])?;
             let sorted = ms.sorted.view(0, [routes])?;
             let position = ms.position.view(0, [routes])?;
@@ -2069,10 +3058,11 @@ impl HybridModel {
                 [256, 1, 1],
                 0,
             )?;
-            self.project_mm_id(d, &f.gate_exps, &xg, &offsets, m, &gate)?;
-            self.project_mm_id(d, &f.up_exps, &xg, &offsets, m, &up)?;
+            let slots = table.map(|(t, k)| (t, *k));
+            Self::project_mm_id_in(d, &f.gate_exps, &xg, &offsets, slots, m, &gate)?;
+            Self::project_mm_id_in(d, &f.up_exps, &xg, &offsets, slots, m, &up)?;
             self.glu(d, &gate, &up, &act)?;
-            self.project_mm_id(d, &f.down_exps, &act, &offsets, m, &down)?;
+            Self::project_mm_id_in(d, &f.down_exps, &act, &offsets, slots, m, &down)?;
         }
         let position = ms.position.view(0, [routes])?;
         d.dispatch_hybrid(
@@ -2157,12 +3147,26 @@ impl HybridModel {
     }
 
     /// Expert GEMM over expert-sorted rows delimited by `offsets`.
-    fn project_mm_id(
-        &self,
+    #[cfg(test)]
+    pub(crate) fn project_mm_id(
         d: &MetalDevice,
         w: &Matrix,
         x: &Tensor,
         offsets: &Tensor,
+        max_rows: usize,
+        y: &Tensor,
+    ) -> Result<()> {
+        Self::project_mm_id_in(d, w, x, offsets, None, max_rows, y)
+    }
+
+    /// `project_mm_id`, or with `slots` (table, k) over k groups whose experts
+    /// are stored at `table[z]` (streamed experts' arena slots).
+    pub(crate) fn project_mm_id_in(
+        d: &MetalDevice,
+        w: &Matrix,
+        x: &Tensor,
+        offsets: &Tensor,
+        slots: Option<(&Tensor, usize)>,
         max_rows: usize,
         y: &Tensor,
     ) -> Result<()> {
@@ -2176,32 +3180,47 @@ impl HybridModel {
             .u(rows_e)?
             .u(rows_e)?
             .0;
-        let name = match w.format {
-            Format::Q4K => "h_mm_id_q4_k",
-            Format::Q5K => "h_mm_id_q5_k",
-            Format::Q6K => "h_mm_id_q6_k",
-            Format::Q8_0 => "h_mm_id_q8_0",
-            Format::Q4_0 => "h_mm_id_q4_0",
-            Format::Iq4Xs => "h_mm_id_iq4_xs",
-            Format::Iq3S => "h_mm_id_iq3_s",
-            Format::Iq3Xxs => "h_mm_id_iq3_xxs",
-            Format::Iq2S => "h_mm_id_iq2_s",
-            Format::F32 | Format::Bf16 => {
+        let (plain, slotted) = match w.format {
+            Format::Q4K => ("h_mm_id_q4_k", "h_mm_id_slot_q4_k"),
+            Format::Q5K => ("h_mm_id_q5_k", "h_mm_id_slot_q5_k"),
+            Format::Q6K => ("h_mm_id_q6_k", "h_mm_id_slot_q6_k"),
+            Format::Q8_0 => ("h_mm_id_q8_0", "h_mm_id_slot_q8_0"),
+            Format::Q4_0 => ("h_mm_id_q4_0", "h_mm_id_slot_q4_0"),
+            Format::Iq4Xs => ("h_mm_id_iq4_xs", "h_mm_id_slot_iq4_xs"),
+            Format::Iq3S => ("h_mm_id_iq3_s", "h_mm_id_slot_iq3_s"),
+            Format::Iq3Xxs => ("h_mm_id_iq3_xxs", "h_mm_id_slot_iq3_xxs"),
+            Format::Iq2S => ("h_mm_id_iq2_s", "h_mm_id_slot_iq2_s"),
+            Format::Q2_0 => ("h_mm_id_q2_0", "h_mm_id_slot_q2_0"),
+            Format::Q5_0 => ("h_mm_id_q5_0", "h_mm_id_slot_q5_0"),
+            Format::Q3K => ("h_mm_id_q3_k", "h_mm_id_slot_q3_k"),
+            Format::Iq4Nl => ("h_mm_id_iq4_nl", "h_mm_id_slot_iq4_nl"),
+            Format::F32 | Format::Bf16 | Format::Mlx4 => {
                 return Err(Error::Gguf(format!(
                     "{} experts are unsupported",
                     w.format.name()
                 )));
             }
         };
-        d.dispatch_hybrid(
-            name,
-            &[w.binding(), x.binding(), offsets.binding()],
-            &[y.binding()],
-            &args,
-            [max_rows.div_ceil(32), rows_e.div_ceil(64), w.experts],
-            [128, 1, 1],
-            64 * 32 * 2,
-        )
+        match slots {
+            None => d.dispatch_hybrid(
+                plain,
+                &[w.binding(), x.binding(), offsets.binding()],
+                &[y.binding()],
+                &args,
+                [max_rows.div_ceil(32), rows_e.div_ceil(64), w.experts],
+                [128, 1, 1],
+                64 * 32 * 2,
+            ),
+            Some((table, k)) => d.dispatch_hybrid(
+                slotted,
+                &[w.binding(), x.binding(), offsets.binding(), table.binding()],
+                &[y.binding()],
+                &args,
+                [max_rows.div_ceil(32), rows_e.div_ceil(64), k],
+                [128, 1, 1],
+                64 * 32 * 2,
+            ),
+        }
     }
 
     pub(crate) fn dense_ffn(
@@ -2261,7 +3280,12 @@ impl HybridModel {
             Format::Q8_0 => "h_get_rows_q8_0",
             Format::Q4_0 => "h_get_rows_q4_0",
             Format::Iq4Xs => "h_get_rows_iq4_xs",
+            Format::Q2_0 => "h_get_rows_q2_0",
+            Format::Q5_0 => "h_get_rows_q5_0",
+            Format::Q3K => "h_get_rows_q3_k",
+            Format::Iq4Nl => "h_get_rows_iq4_nl",
             Format::Bf16 => "h_get_rows_bf16",
+            Format::Mlx4 => "h_get_rows_mlx4",
             f => return Err(Error::Gguf(format!("no embedding lookup for {}", f.name()))),
         };
         d.dispatch_hybrid(
@@ -2319,6 +3343,67 @@ impl HybridModel {
     }
 
     /// y[m][rows] = x[m][cols] · Wᵀ.
+    /// An MLX 4-bit projection of 2..=32 rows on the matrix units: the rows
+    /// as a T table (`h_mlx_ttable`), then Kapitsa's integer-code GEMM in
+    /// 8-row tiles, or tile pairs past 8 rows (`h_mlx_qmm8t*`).
+    fn project_mlx_tiles(
+        d: &MetalDevice,
+        w: &Matrix,
+        x: &Tensor,
+        m: usize,
+        y: &Tensor,
+    ) -> Result<()> {
+        let k = w.cols;
+        let groups = k / 64;
+        let pair = m > 8;
+        let trows = if pair { 16 } else { 8 };
+        let tiles = m.div_ceil(trows);
+        let rows = tiles * trows;
+        let (table, sums) = mlx_tables(d, rows * k, rows / 8 * groups * 8)?;
+        d.dispatch_hybrid(
+            "h_mlx_ttable",
+            &[x.binding()],
+            &[table.binding(), sums.binding()],
+            &Params::default().u(k)?.u(m)?.u(k)?.u(rows)?.0,
+            [groups, rows, 1],
+            [64, 1, 1],
+            0,
+        )?;
+        // Kapitsa's tiling (qwen35_v8.cpp v8t_plan): 32 weight rows per SIMD
+        // group for LM-head-sized grids, else 16; 4 k-slices for 33..=64
+        // groups, else 8.
+        let nt = if w.rows.div_ceil(16) > 8192 { 32 } else { 16 };
+        let mut ks = if groups > 32 && groups <= 64 { 4 } else { 8 };
+        while ks > 1 && groups < ks {
+            ks /= 2;
+        }
+        let per = w.rows.div_ceil(nt);
+        let name = match (pair, nt) {
+            (false, 16) => "h_mlx_qmm8t_nt16",
+            (false, _) => "h_mlx_qmm8t_nt32",
+            (true, 16) => "h_mlx_qmm8t2_nt16",
+            (true, _) => "h_mlx_qmm8t2_nt32",
+        };
+        d.dispatch_hybrid(
+            name,
+            &[w.binding(), table.binding(), sums.binding()],
+            &[y.binding()],
+            &Params::default()
+                .u(k)?
+                .u(m)?
+                .u(ks)?
+                .u(w.rows)?
+                .u(w.rows)?
+                .u(w.row_bytes)?
+                .u(per)?
+                .u(0)?
+                .0,
+            [per * tiles, 1, 1],
+            [32 * ks, 1, 1],
+            0,
+        )
+    }
+
     pub(crate) fn project(
         d: &MetalDevice,
         w: &Matrix,
@@ -2345,6 +3430,11 @@ impl HybridModel {
             .0;
         let inputs: [Binding; 2] = [w.binding(), x.binding()];
         let outputs: [Binding; 1] = [y.binding()];
+        // MLX from 3 rows: the integer-code tiles (2 rows: the batched GEMV,
+        // 133 against 148 ms per 27B forward; 3 rows: 185 against 148).
+        if w.format == Format::Mlx4 && (3..=MMS_MAX_ROWS).contains(&m) && !exact_math() {
+            return Self::project_mlx_tiles(d, w, x, m, y);
+        }
         if (2..=MVB_MAX_ROWS).contains(&m) && !exact_math() {
             const SIMDS: usize = 4;
             return d.dispatch_hybrid(
@@ -2381,6 +3471,11 @@ impl HybridModel {
                 Format::Iq3S => "h_mm_iq3_s",
                 Format::Iq3Xxs => "h_mm_iq3_xxs",
                 Format::Iq2S => "h_mm_iq2_s",
+                Format::Q2_0 => "h_mm_q2_0",
+                Format::Q5_0 => "h_mm_q5_0",
+                Format::Q3K => "h_mm_q3_k",
+                Format::Iq4Nl => "h_mm_iq4_nl",
+                Format::Mlx4 => "h_mm_mlx4",
             };
             return d.dispatch_hybrid(
                 name,
@@ -2403,6 +3498,35 @@ impl HybridModel {
             shared,
         )
     }
+}
+
+thread_local! {
+    /// T table and group sums of the MLX verify-width GEMMs
+    /// (`HybridModel::project_mlx_tiles`), grown to the widest use and reused:
+    /// at most 32 rows of the widest projection input (about 1.1 MB on the
+    /// 27B). Consecutive projections are ordered by the encoder's hazards.
+    static MLX_TABLES: RefCell<Option<(Tensor, Tensor)>> = const { RefCell::new(None) };
+}
+
+fn mlx_tables(d: &MetalDevice, halves: usize, sums: usize) -> Result<(Tensor, Tensor)> {
+    MLX_TABLES.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let fits = cell.as_ref().is_some_and(|(t, s)| {
+            d.owns(t.binding().0) && t.numel() >= halves && s.numel() >= sums
+        });
+        if !fits {
+            let (h, n) = match cell.as_ref().filter(|(t, _)| d.owns(t.binding().0)) {
+                Some((t, s)) => (halves.max(t.numel()), sums.max(s.numel())),
+                None => (halves, sums),
+            };
+            *cell = Some((
+                Tensor::zeros_resident(d, [h], DType::F16)?,
+                Tensor::zeros_resident(d, [n], DType::F32)?,
+            ));
+        }
+        let (t, s) = cell.as_ref().expect("allocated above");
+        Ok((t.clone(), s.clone()))
+    })
 }
 
 /// Diagnostic switches, read once from the environment:
@@ -2474,6 +3598,11 @@ fn mvb_kernel(format: Format) -> &'static str {
         Format::Iq3S => "h_mvb_iq3_s",
         Format::Iq3Xxs => "h_mvb_iq3_xxs",
         Format::Iq2S => "h_mvb_iq2_s",
+        Format::Q2_0 => "h_mvb_q2_0",
+        Format::Q5_0 => "h_mvb_q5_0",
+        Format::Q3K => "h_mvb_q3_k",
+        Format::Iq4Nl => "h_mvb_iq4_nl",
+        Format::Mlx4 => "h_mvb_mlx4",
         Format::F32 => "h_mvb_f32",
         Format::Bf16 => "h_mvb_bf16",
     }
@@ -2491,6 +3620,11 @@ fn mms_kernel(format: Format) -> &'static str {
         Format::Iq3S => "h_mms_iq3_s",
         Format::Iq3Xxs => "h_mms_iq3_xxs",
         Format::Iq2S => "h_mms_iq2_s",
+        Format::Q2_0 => "h_mms_q2_0",
+        Format::Q5_0 => "h_mms_q5_0",
+        Format::Q3K => "h_mms_q3_k",
+        Format::Iq4Nl => "h_mms_iq4_nl",
+        Format::Mlx4 => "h_mms_mlx4",
         Format::F32 => "h_mms_f32",
         Format::Bf16 => "h_mms_bf16",
     }
@@ -2505,12 +3639,21 @@ fn mv_kernel(format: Format, expert: bool) -> (&'static str, usize, usize, usize
         Format::Q6K => (pick("h_mv_q6_k", "h_mv_id_q6_k"), 4, 2, 0),
         Format::Q4_0 => (pick("h_mv_q4_0", "h_mv_id_q4_0"), 8, 2, 0),
         Format::F32 => ("h_mv_f32", 8, 2, 0),
-        Format::Bf16 => ("h_mv_bf16", 8, 2, 0),
+        Format::Bf16 => ("h_mv_bf16_wide", 4, 4, 0),
         Format::Q8_0 => (pick("h_mv_q8_0", "h_mv_id_q8_0"), 2, 4, 32 * 2 * 4),
         Format::Iq4Xs => (pick("h_mv_iq4_xs", "h_mv_id_iq4_xs"), 4, 2, 32 * 4),
         Format::Iq3S => (pick("h_mv_iq3_s", "h_mv_id_iq3_s"), 8, 2, 512 * 4),
         Format::Iq3Xxs => (pick("h_mv_iq3_xxs", "h_mv_id_iq3_xxs"), 8, 2, 256 * 4 + 128),
         Format::Iq2S => (pick("h_mv_iq2_s", "h_mv_id_iq2_s"), 8, 2, 0),
+        // Generic dequantizing GEMVs (`MV_DEQ`), 4 rows per SIMD group.
+        Format::Q2_0 => (pick("h_mv_q2_0", "h_mv_id_q2_0"), 8, 2, 0),
+        Format::Q5_0 => (pick("h_mv_q5_0", "h_mv_id_q5_0"), 8, 2, 0),
+        Format::Q3K => (pick("h_mv_q3_k", "h_mv_id_q3_k"), 8, 2, 0),
+        Format::Iq4Nl => (pick("h_mv_iq4_nl", "h_mv_id_iq4_nl"), 8, 2, 0),
+        // Expert matrices are never MLX (`moe_ffn` refuses them first). One row
+        // per SIMD group with 16-byte loads beat Kapitsa's 2 x 8 (its M4 Pro
+        // tuning) on every 27B shape on the M5.
+        Format::Mlx4 => ("h_mv_mlx4", 4, 4, 0),
     }
 }
 
@@ -2539,7 +3682,9 @@ mod tests {
             embedding: std::rc::Rc::new(
                 Tensor::zeros(&d, [grid.0 * grid.1, 4], DType::F32).unwrap(),
             ),
+            deepstack: Vec::new(),
             hash: 0,
+            linear: false,
         };
         // A 3x4 image at cache positions 5..17 advances rotary positions by 4.
         let media = [span(5, (3, 4)), span(30, (2, 2))];
@@ -2555,6 +3700,7 @@ mod tests {
             len: 0,
             valid: true,
             verified: 0,
+            verified_tree: Vec::new(),
             media: media.to_vec(),
             k: Vec::new(),
             v: Vec::new(),
@@ -2564,6 +3710,11 @@ mod tests {
             window: Vec::new(),
             max_rows: 1,
             written: 0,
+            kv_cache: KvCache::F16,
+            ple: None,
+            ple_tokens: Vec::new(),
+            ple_pending: Vec::new(),
+            ple_ngram: 0,
         };
         // Text only: a plain offset.
         let plan = state.rope_plan(&d, 17, 4).unwrap();
@@ -2583,6 +3734,22 @@ mod tests {
         assert_eq!(&ints[39..42], &[9, 9, 9]);
         state.media.clear();
         assert_eq!(state.rope_plan(&d, 17, 4).unwrap().delta, 0);
+        // LFM3: one position per image token, so the text after it is not pulled back.
+        let linear = ImageSpan {
+            linear: true,
+            ..span(5, (3, 4))
+        };
+        assert_eq!(rope_position(std::slice::from_ref(&linear), 17), 17);
+        state.media = vec![linear];
+        let plan = state.rope_plan(&d, 5, 3).unwrap();
+        let ints: Vec<i32> = plan
+            .table
+            .expect("linear image")
+            .to_f32()
+            .iter()
+            .map(|v| v.to_bits() as i32)
+            .collect();
+        assert_eq!(&ints[..9], &[5, 5, 5, 6, 6, 6, 7, 7, 7]);
     }
 
     /// The attention-prep kernel rotates image rows by their (t, h, w) table and
@@ -2651,7 +3818,9 @@ mod tests {
                 .u(0)
                 .unwrap() // ring
                 .u(1)
-                .unwrap(); // qk_norm
+                .unwrap() // qk_norm
+                .u(0)
+                .unwrap(); // use_factors
             let e = d.execution_with_shared_encoder(true).unwrap();
             d.dispatch_hybrid(
                 "h_attn_prep",
@@ -2662,6 +3831,7 @@ mod tests {
                     qn.binding(),
                     kn.binding(),
                     pos3.binding(),
+                    qg_t.binding(),
                 ],
                 &[q_out.binding(), cache.binding()],
                 &params.0,
@@ -2798,7 +3968,9 @@ mod tests {
                 .u(0)
                 .unwrap()
                 .u(0)
-                .unwrap(); // ring
+                .unwrap()
+                .u(0)
+                .unwrap(); // ring, tree
             {
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
@@ -2807,6 +3979,7 @@ mod tests {
                         q.binding(),
                         kc.binding(),
                         vc.binding(),
+                        qg.binding(),
                         qg.binding(),
                         qg.binding(),
                     ],
@@ -3132,6 +4305,7 @@ mod tests {
             len: written,
             valid: true,
             verified: 0,
+            verified_tree: Vec::new(),
             media: Vec::new(),
             k: Vec::new(),
             v: Vec::new(),
@@ -3141,6 +4315,11 @@ mod tests {
             window: vec![0, 513],
             max_rows: 512,
             written,
+            kv_cache: KvCache::F16,
+            ple: None,
+            ple_tokens: Vec::new(),
+            ple_pending: Vec::new(),
+            ple_ngram: 0,
         };
         // Nothing overwritten yet: any position resumes.
         assert!(state(1000).can_resume(10));
@@ -3201,7 +4380,9 @@ mod tests {
             .u(0)
             .unwrap() // ring
             .u(1)
-            .unwrap(); // qk_norm
+            .unwrap() // qk_norm
+            .u(0)
+            .unwrap(); // use_factors
         let (qg_t, k_t, zeros) = (t(&qg, qg.len()), t(&kk, kk.len()), t(&[0.], 1));
         let (qn, kn) = (t(&norm, head_dim), t(&norm, head_dim));
         let e = d.execution_with_shared_encoder(true).unwrap();
@@ -3213,6 +4394,7 @@ mod tests {
                 k_t.binding(),
                 qn.binding(),
                 kn.binding(),
+                zeros.binding(),
                 zeros.binding(),
             ],
             &[q_out.binding(), cache.binding()],
@@ -3238,6 +4420,199 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// A factor of 1 matches plain RoPE. A factor of 1e30 is identity on that pair.
+    #[test]
+    fn rope_factors_divide_the_angle() {
+        let d = MetalDevice::new().unwrap();
+        let (heads, kv_heads, head_dim, rope_dims, rows) =
+            (2usize, 1usize, 128usize, 128usize, 2usize);
+        let (theta, eps, scale) = (1.0e6f32, 1e-5f32, 1. / (head_dim as f32).sqrt());
+        let qg = random(rows * heads * head_dim, 7);
+        let kk = random(rows * kv_heads * head_dim, 8);
+        let norm = vec![1f32; head_dim];
+        let mut factors = vec![1f32; rope_dims / 2];
+        for f in &mut factors[rope_dims / 4..] {
+            *f = 1e30;
+        }
+        let run = |use_factors: usize| -> Vec<f32> {
+            let t = |data: &[f32]| Tensor::from_f32(&d, [data.len()], DType::F32, data).unwrap();
+            let q_out = Tensor::zeros(&d, [rows * heads * head_dim], DType::F16).unwrap();
+            let cache = Tensor::zeros(&d, [8 * kv_heads * head_dim], DType::F16).unwrap();
+            let mut p = Params::default();
+            for v in [rows, heads, kv_heads, head_dim, rope_dims, 3usize] {
+                p = p.u(v).unwrap();
+            }
+            p = p
+                .f(theta)
+                .f(eps)
+                .u(kv_heads * head_dim)
+                .unwrap()
+                .f(scale)
+                .i(0);
+            for v in [0usize, 0, 0, 8, 0, 0, 1, use_factors] {
+                p = p.u(v).unwrap();
+            }
+            let (qg_t, k_t, n_t, f_t) = (t(&qg), t(&kk), t(&norm), t(&factors));
+            let e = d.execution_with_shared_encoder(true).unwrap();
+            d.dispatch_hybrid(
+                "h_attn_prep",
+                &[
+                    qg_t.binding(),
+                    k_t.binding(),
+                    k_t.binding(),
+                    n_t.binding(),
+                    n_t.binding(),
+                    qg_t.binding(),
+                    f_t.binding(),
+                ],
+                &[q_out.binding(), cache.binding()],
+                &p.0,
+                [heads + kv_heads, rows, 1],
+                [head_dim, 1, 1],
+                0,
+            )
+            .unwrap();
+            e.finish().unwrap();
+            q_out.to_f32()
+        };
+        let plain = run(0);
+        let factored = run(1);
+        let half = rope_dims / 2;
+        for r in 0..rows {
+            for h in 0..heads {
+                let base = (r * heads + h) * head_dim;
+                let row = &qg[base..base + head_dim];
+                let ss = row.iter().map(|x| x * x).sum::<f32>() / head_dim as f32;
+                let inv = 1. / (ss + eps).sqrt();
+                let n: Vec<f32> = row.iter().map(|v| v * inv).collect();
+                for pair in 0..half {
+                    let pos = (3 + r) as f32;
+                    let freq = theta.powf(-2. * pair as f32 / rope_dims as f32);
+                    let angle = pos * freq;
+                    let (c, s) = (angle.cos(), angle.sin());
+                    let rotated = n[pair] * c - n[pair + half] * s;
+                    let plain_v = plain[base + pair];
+                    let fact_v = factored[base + pair];
+                    let tol = 2e-3 * rotated.abs().max(1e-2);
+                    assert!(
+                        (plain_v - rotated * scale).abs() <= tol,
+                        "plain pair {pair}"
+                    );
+                    if pair < half / 2 {
+                        assert!((fact_v - plain_v).abs() <= tol, "factor 1 pair {pair}");
+                    } else {
+                        let ident = n[pair] * scale;
+                        assert!(
+                            (fact_v - ident).abs() <= 2e-3 * ident.abs().max(1e-2),
+                            "factor 1e30 pair {pair}: {fact_v} vs {ident}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Short conv matches prepend-state + ggml_ssm_conv, including a non-zero
+    /// window and a single token.
+    #[test]
+    fn short_conv_matches_prepend_state() {
+        let d = MetalDevice::new().unwrap();
+        let (hidden, state_len) = (32usize, 6usize);
+        let kernel = state_len + 1;
+        let reference = |packed: &[f32], weight: &[f32], state0: &[f32], tokens: usize| {
+            let mut hist = state0.to_vec();
+            let mut y = vec![0f32; tokens * hidden];
+            for t in 0..tokens {
+                for c in 0..hidden {
+                    let b = packed[t * 3 * hidden + c];
+                    let gate = packed[t * 3 * hidden + hidden + c];
+                    let x = packed[t * 3 * hidden + 2 * hidden + c];
+                    let bx = b * x;
+                    let mut acc = bx * weight[c * kernel + state_len];
+                    for k in 0..state_len {
+                        acc += hist[k * hidden + c] * weight[c * kernel + k];
+                    }
+                    y[t * hidden + c] = acc * gate;
+                }
+                if state_len > 0 {
+                    hist.copy_within(hidden.., 0);
+                    for c in 0..hidden {
+                        let b = packed[t * 3 * hidden + c];
+                        let x = packed[t * 3 * hidden + 2 * hidden + c];
+                        hist[(state_len - 1) * hidden + c] = b * x;
+                    }
+                }
+            }
+            (y, hist)
+        };
+        for (tokens, seed, nonzero) in [(1usize, 1u64, false), (3, 2, true), (8, 3, true)] {
+            let packed = random(tokens * 3 * hidden, seed);
+            let weight = random(hidden * kernel, seed + 10);
+            let mut state0 = vec![0f32; state_len * hidden];
+            if nonzero {
+                state0 = random(state_len * hidden, seed + 20);
+            }
+            let (want_y, want_state) = reference(&packed, &weight, &state0, tokens);
+            let t = |data: &[f32]| Tensor::from_f32(&d, [data.len()], DType::F32, data).unwrap();
+            let (packed_t, weight_t) = (t(&packed), t(&weight));
+            let state_t = t(&state0);
+            let y = Tensor::zeros(&d, [tokens * hidden], DType::F32).unwrap();
+            let bx = Tensor::zeros(&d, [tokens * hidden], DType::F32).unwrap();
+            let replay = t(&state0);
+            let e = d.execution_with_shared_encoder(true).unwrap();
+            d.dispatch_hybrid(
+                "h_short_conv",
+                &[packed_t.binding(), weight_t.binding()],
+                &[y.binding(), state_t.binding(), bx.binding()],
+                &Params::default()
+                    .u(tokens)
+                    .unwrap()
+                    .u(hidden)
+                    .unwrap()
+                    .u(state_len)
+                    .unwrap()
+                    .u(1)
+                    .unwrap()
+                    .u(1)
+                    .unwrap()
+                    .0,
+                [hidden.div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )
+            .unwrap();
+            d.dispatch_hybrid(
+                "h_bx_state",
+                &[bx.binding()],
+                &[replay.binding()],
+                &Params::default()
+                    .u(tokens)
+                    .unwrap()
+                    .u(hidden)
+                    .unwrap()
+                    .u(state_len)
+                    .unwrap()
+                    .0,
+                [hidden.div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )
+            .unwrap();
+            e.finish().unwrap();
+            let close = |got: &[f32], want: &[f32], what: &str| {
+                for (i, (g, w)) in got.iter().zip(want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-5 * w.abs().max(1e-4),
+                        "{what} [{i}] {g} vs {w} tokens {tokens}"
+                    );
+                }
+            };
+            close(&y.to_f32(), &want_y, "y");
+            close(&state_t.to_f32(), &want_state, "state");
+            close(&replay.to_f32(), &want_state, "replay");
         }
     }
 
@@ -3336,7 +4711,9 @@ mod tests {
                     .u(sinks_on)
                     .unwrap()
                     .u(0)
-                    .unwrap(); // ring
+                    .unwrap()
+                    .u(0)
+                    .unwrap(); // ring, tree
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
                     "h_attention",
@@ -3346,6 +4723,7 @@ mod tests {
                         vr.binding(),
                         qg.binding(),
                         sink_arg.binding(),
+                        qg.binding(),
                     ],
                     &[reference.binding()],
                     &args.0,
@@ -3801,7 +5179,9 @@ mod tests {
                     .u(0)
                     .unwrap()
                     .u(0)
-                    .unwrap(); // ring
+                    .unwrap()
+                    .u(0)
+                    .unwrap(); // ring, tree
                 let e = d.execution_with_shared_encoder(true).unwrap();
                 d.dispatch_hybrid(
                     "h_attention",
@@ -3809,6 +5189,7 @@ mod tests {
                         q.binding(),
                         kr.binding(),
                         vr.binding(),
+                        qg.binding(),
                         qg.binding(),
                         qg.binding(),
                     ],

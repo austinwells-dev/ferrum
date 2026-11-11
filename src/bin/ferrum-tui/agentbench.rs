@@ -424,6 +424,7 @@ fn load(plan: &AgentPlan, context: usize) -> Result<Runtime, String> {
         chunks: false,
         context,
         kv_cache: plan.kv_cache,
+        trees: false,
     };
     let plain = Candidate {
         source: Source::Baseline,
@@ -606,7 +607,7 @@ fn attempt(
     }
     let sb = Sandbox::with_state(work.clone(), tmp.join("state"), false)?;
     let shared = coding::new_shared();
-    let tools: Vec<Json> = coding::tool_defs(false, false)
+    let tools: Vec<Json> = coding::tool_defs(false, false, false)
         .into_iter()
         .filter(|d| d["function"]["name"] != "ask_user")
         .collect();
@@ -637,6 +638,7 @@ fn attempt(
             stop: Vec::new(),
             reasoning_budget: plan.thinking,
             raw_reasoning: false,
+            image_budget: Default::default(),
         };
         let r = match rt.chat(
             &request,
@@ -714,11 +716,12 @@ fn attempt(
                 .lock()
                 .map(|mut g| g.is_loop(&call.name, &call.arguments))
                 .unwrap_or(false);
-            let (ok, out) = if looping {
+            let (ok, out, _image) = if looping {
                 (
                     false,
                     "error: you already made this exact call twice. Do something different."
                         .to_string(),
+                    None,
                 )
             } else {
                 coding::execute(&shared, &sb, &call.name, &call.arguments, &cancel)

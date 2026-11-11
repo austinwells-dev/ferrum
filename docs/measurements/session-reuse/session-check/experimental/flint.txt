@@ -1,0 +1,12 @@
+extend        prompt   94 tokens, reused   67: identical (32 tokens, 0 verify steps, acceptance 0.00)
+rewind        prompt   29 tokens, reused   28: identical (32 tokens, 0 verify steps, acceptance 0.00)
+retry         prompt   28 tokens, reused   27: identical (32 tokens, 0 verify steps, acceptance 0.00)
+replace       prompt   25 tokens, reused    6: identical (32 tokens, 0 verify steps, acceptance 0.00)
+extend again  prompt   94 tokens, reused    6: identical (32 tokens, 0 verify steps, acceptance 0.00)
+pin           prompt   94 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+long turn     prompt  961 tokens, reused   94: identical (32 tokens, 0 verify steps, acceptance 0.00)
+later turn    prompt  989 tokens, reused  961: DIFFERENT (32 tokens, 0 verify steps, acceptance 0.00)
+  cached: [26222, 11633, 53567, 91, 316, 8082, 91, 29, 150007, 6562, 332, 269, 17515, 2121, 497, 220, 16, 295, 220, 603, 947, 367, 16, 2490, 2121, 2068, 1177, 16, 13904, 220, 16, 311]
+  fresh:  [26222, 11633, 53567, 91, 316, 8082, 91, 29]
+pinned rewind prompt   98 tokens, reused   94: identical (32 tokens, 0 verify steps, acceptance 0.00)
+FAIL

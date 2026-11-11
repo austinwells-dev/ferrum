@@ -1,7 +1,13 @@
-//! Vision encoder for Qwen3-VL style projectors (`clip` GGUF with
-//! `clip.projector_type = qwen3vl_merger`), the `mmproj` file that ships next
-//! to Qwen3.5/3.6/3.8-family checkpoints. An image becomes a grid of
-//! language-model embeddings that replace `<|image_pad|>` rows in the prompt.
+//! Vision encoders for still images. Qwen3-VL projectors
+//! (`clip.projector_type = qwen3vl_merger`), the `mmproj` file next to
+//! Qwen3.5/3.6/3.8-family checkpoints, are the path in this file: an image
+//! becomes a grid of embeddings that replace `<|image_pad|>` rows.
+//! LFM3-VL (`clip.vision.projector_type = lfm3vl`) is the private `lfm3` module. It repeats
+//! `<|image|>` and gives each of those tokens its own position, not a 2-D grid.
+//! LFM3-Audio's speech encoder (`clip.audio.projector_type = lfm3a`) is
+//! `AudioModel` (the private `lfm3a` and public `audio` modules): its rows
+//! replace repeated `<|audio|>` tokens the same way. Speech output
+//! (`lfm3a_gen`) and video are refused.
 //!
 //! Pipeline: decode, resize to a multiple of `patch * merge`, normalise, cut
 //! into 16x16 patches (ordered so each 2x2 merge block is contiguous), embed
@@ -9,6 +15,12 @@
 //! repeats its frame), add the bilinearly resized learned position table, run
 //! the ViT blocks with 2-D rotary attention, then merge 2x2 patches through the
 //! MLP projector into the language model's hidden width.
+//!
+//! The same tower also loads from a Hugging Face Qwen3-VL checkpoint
+//! (`model.visual.*`, as the image generator's text encoder ships it), where
+//! it has DeepStack mergers: features of a few intermediate blocks, merged
+//! like the output, that the language model adds to the image rows after its
+//! first layers.
 #![forbid(unsafe_code)]
 use crate::{
     DType, Error, MetalDevice, Result, Tensor,
@@ -25,10 +37,12 @@ use std::{
 pub const DEFAULT_MIN_TOKENS: usize = 64;
 /// Default cap on language-model tokens per image.
 pub const DEFAULT_MAX_TOKENS: usize = 1024;
+/// Cap for `detail: "low"` images: a 512x512 picture, as OpenAI's low detail.
+pub const LOW_DETAIL_TOKENS: usize = 256;
 /// Hard cap on one image's longest decoded side before resizing.
 const MAX_SOURCE_SIDE: u32 = 16384;
 /// Attention score scratch (all heads of a group) stays under this many bytes.
-const SCORE_BYTES: usize = 192 << 20;
+pub const SCORE_BYTES: usize = 192 << 20;
 
 #[derive(Debug, Clone)]
 pub struct VisionConfig {
@@ -60,6 +74,24 @@ impl VisionConfig {
     }
 }
 
+/// Token limits one request asks for an image, within the projector's own
+/// (`VisionModel::limits`). `None` keeps the projector's setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct ImageBudget {
+    pub min_tokens: Option<usize>,
+    pub max_tokens: Option<usize>,
+}
+
+impl ImageBudget {
+    /// Each limit this budget leaves unset, taken from `fallback`.
+    pub fn or(self, fallback: Self) -> Self {
+        Self {
+            min_tokens: self.min_tokens.or(fallback.min_tokens),
+            max_tokens: self.max_tokens.or(fallback.max_tokens),
+        }
+    }
+}
+
 /// A decoded, resized and normalised image ready to be cut into patches.
 pub struct Prepared {
     /// Resized width and height in pixels (multiples of `patch * merge`).
@@ -78,12 +110,25 @@ pub struct ImageEmbedding {
     pub grid: (usize, usize),
     /// `[rows * columns, out_dim]` F32, in raster order.
     pub rows: std::rc::Rc<Tensor>,
+    /// DeepStack features, one per merger, each shaped like `rows`: entry
+    /// `i` is added to the image rows after language-model layer `i`.
+    pub deepstack: Vec<std::rc::Rc<Tensor>>,
 }
 
 impl ImageEmbedding {
     pub fn tokens(&self) -> usize {
         self.grid.0 * self.grid.1
     }
+}
+
+/// Norm, linear, GELU, linear from a `merge x merge` block of patches to one
+/// language-model row. The output merger normalises each patch before the
+/// blocks are concatenated; DeepStack mergers normalise the concatenation.
+struct Merger {
+    norm: (Tensor, Tensor),
+    fc1: (Tensor, Tensor),
+    fc2: (Tensor, Tensor),
+    post_shuffle: bool,
 }
 
 struct Layer {
@@ -105,13 +150,20 @@ pub struct VisionModel {
     layers: Vec<Layer>,
     patch: (Tensor, Tensor),
     position: Vec<f32>,
-    post: (Tensor, Tensor),
-    merge1: (Tensor, Tensor),
-    merge2: (Tensor, Tensor),
+    merger: Merger,
+    /// DeepStack mergers and the block whose output each reads.
+    deepstack: Vec<(usize, Merger)>,
     zero: Tensor,
     weight_bytes: usize,
     /// Attention score scratch per head group.
     score_bytes: usize,
+    /// LFM3-VL tower. Absent on the Qwen path.
+    lfm3: Option<lfm3::Tower>,
+    /// Placeholder the chat template emits once per image (`<|image_pad|>` or
+    /// `<|image|>`). Repeated once per language-model token.
+    marker: &'static str,
+    /// Resize filter. Qwen is Catmull-Rom; LFM3 follows the file.
+    filter: image::imageops::FilterType,
 }
 
 fn meta_uint(md: &BTreeMap<String, MetadataValue>, key: &str) -> Result<usize> {
@@ -185,10 +237,41 @@ pub fn find_projectors(model: &Path) -> Vec<std::path::PathBuf> {
     // Prefer a projector named after the model, then the smallest filename.
     found.sort_by_key(|p| {
         let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase());
-        let named = name.is_some_and(|n| n.contains(&stem));
+        let named = name.is_some_and(|n| named_after(&n, &stem));
         (!named, p.clone())
     });
     found
+}
+
+/// Is the projector file `name` named after the model whose lowercase file
+/// stem is `stem`? Either it contains the whole stem, or, with `mmproj` and
+/// its quant taken off (`mmproj-LFM3-VL-2B-Q8_0.gguf` is `lfm3-vl-2b`), it
+/// starts the stem. Two projectors of one width in a folder (LFM3-VL and
+/// LFM3-Audio) are told apart this way.
+fn named_after(name: &str, stem: &str) -> bool {
+    if name.contains(stem) {
+        return true;
+    }
+    let base = name.strip_suffix(".gguf").unwrap_or(name);
+    let base = ["mmproj-", "mmproj_", "mmproj."]
+        .iter()
+        .find_map(|p| base.strip_prefix(p))
+        .or_else(|| {
+            ["-mmproj", "_mmproj", ".mmproj"]
+                .iter()
+                .find_map(|s| base.strip_suffix(s))
+        })
+        .unwrap_or(base);
+    // `q8_0`, `bf16`, `iq4_xs`: letters, then a digit.
+    let is_quant = |q: &str| {
+        let digits = q.trim_start_matches(|c: char| c.is_ascii_alphabetic());
+        digits.len() < q.len() && digits.starts_with(|c: char| c.is_ascii_digit()) && q.len() <= 7
+    };
+    let base = match base.rfind('-') {
+        Some(at) if is_quant(&base[at + 1..]) => &base[..at],
+        _ => base,
+    };
+    base.len() >= 3 && stem.starts_with(base)
 }
 
 /// Does the projector at `projector` produce embeddings of `model`'s width?
@@ -204,7 +287,8 @@ fn fits_model(projector: &Path, model: &Path) -> bool {
         Some(MetadataValue::Uint64(v)) => Some(*v),
         _ => None,
     };
-    let wanted = width(&p, "clip.vision.projection_dim");
+    let wanted =
+        width(&p, "clip.vision.projection_dim").or_else(|| width(&p, "clip.audio.projection_dim"));
     wanted.is_some() && wanted == width(&m, &format!("{arch}.embedding_length"))
 }
 
@@ -230,24 +314,206 @@ pub fn resolve_projector(model: &Path, flag: Option<&str>) -> Result<Option<std:
     }
 }
 
-/// Device bytes `VisionModel::load` will take, for memory planning.
+/// Device bytes `VisionModel::load` or `AudioModel::load` will take, for
+/// memory planning.
 pub fn projector_bytes(path: &Path) -> usize {
+    let audio = is_audio_projector(path);
     GgufFile::open(path).map_or(0, |f| {
         let weights: usize = f
             .tensors()
             .values()
-            .filter(|t| t.name.starts_with("v.blk.") || t.name.starts_with("mm."))
-            .map(|t| t.dimensions.iter().product::<usize>() * 2)
+            .filter(|t| {
+                if audio {
+                    (t.name.starts_with("a.") && !t.name.starts_with("a.gen."))
+                        || t.name.starts_with("mm.a.")
+                } else {
+                    t.name.starts_with("v.blk.") || t.name.starts_with("mm.")
+                }
+            })
+            .map(|t| {
+                let bytes = t.dimensions.iter().product::<usize>() * 2;
+                // Each speech-encoder tensor is its own buffer.
+                if audio {
+                    crate::hybrid::engine::page(bytes)
+                } else {
+                    bytes
+                }
+            })
             .sum();
-        // Weights plus the transient activations of a full-size image.
-        weights + (640 << 20)
+        if !audio {
+            // Weights plus the transient activations of a full-size image.
+            return weights + (640 << 20);
+        }
+        // Weights, every buffer a `MAX_AUDIO_SECONDS` clip's encode
+        // allocates (counted as the encoder makes them), and the rows of the
+        // other clips the runtime keeps cached meanwhile.
+        let width = |name: &str| {
+            f.tensors()
+                .get(name)
+                .map(|t| t.dimensions.iter().product::<usize>())
+        };
+        let frames = audio::MelBank::frames(MAX_AUDIO_SECONDS * audio::SAMPLE_RATE);
+        match (
+            audio_config(f.metadata()),
+            width("a.conv1d.0.bias"),
+            width("mm.a.mlp.1.bias"),
+        ) {
+            (Ok(config), Some(channels), Some(mid)) => {
+                weights
+                    + lfm3a::activation_bytes(&config, channels, mid, frames)
+                    + (AUDIO_CACHE_CLIPS - 1) * lfm3a::output_bytes(&config, frames)
+            }
+            // AudioModel::load refuses this file anyway.
+            _ => weights,
+        }
     })
+}
+
+/// Encoded clips the runtime keeps, so a conversation does not re-encode its
+/// history: as many as one request may carry, since each turn walks them in
+/// order and a smaller LRU would miss on every one.
+pub const AUDIO_CACHE_CLIPS: usize = media::MAX_AUDIO_CLIPS;
+
+/// Longest clip, and so the longest each attached clip may be. The encoder runs a clip in one pass,
+/// so its activations grow with the clip.
+pub const MAX_AUDIO_SECONDS: usize = 120;
+
+/// Length of a WAV clip in seconds, read from its header, or an error when it
+/// is not a readable WAV file or is longer than `MAX_AUDIO_SECONDS`.
+pub fn clip_seconds(bytes: &[u8]) -> Result<f64> {
+    let seconds = audio::wav_seconds(bytes)?;
+    check_seconds(seconds)?;
+    Ok(seconds)
+}
+
+fn check_seconds(seconds: f64) -> Result<()> {
+    if seconds > MAX_AUDIO_SECONDS as f64 {
+        return Err(Error::Parameter(format!(
+            "a {seconds:.1} s clip is longer than the {MAX_AUDIO_SECONDS} s one clip may last; split it"
+        )));
+    }
+    Ok(())
+}
+
+/// Is `path` a speech-input projector with no vision tower (LFM3-Audio's
+/// `mmproj`)? Combined files (LFM3-Omni) load as vision projectors.
+pub fn is_audio_projector(path: &Path) -> bool {
+    GgufFile::open(path).is_ok_and(|f| {
+        let md = f.metadata();
+        matches!(md.get("clip.audio.projector_type"), Some(MetadataValue::String(t)) if t == "lfm3a")
+            && !matches!(md.get("clip.has_vision_encoder"), Some(MetadataValue::Bool(true)))
+    })
+}
+
+/// LFM3-Audio's speech encoder: WAV in, one language-model row per 80 ms.
+pub struct AudioModel {
+    encoder: lfm3a::Encoder,
+    mel: audio::MelBank,
+}
+
+/// The `lfm3a` encoder's shape from `clip.audio.*` metadata.
+fn audio_config(md: &BTreeMap<String, MetadataValue>) -> Result<lfm3a::Config> {
+    let key = |k: &str| meta_uint(md, &format!("clip.audio.{k}"));
+    Ok(lfm3a::Config {
+        n_mel: key("num_mel_bins")?,
+        hidden: key("embedding_length")?,
+        heads: key("attention.head_count")?,
+        kv_heads: key("attention.head_count_kv")?,
+        ffn: key("feed_forward_length")?,
+        layers: key("block_count")?,
+        window: key("window_size")?,
+        eps: meta_float(md, "clip.audio.attention.layer_norm_epsilon")?,
+        out_dim: key("projection_dim")?,
+    })
+}
+
+impl AudioModel {
+    pub fn load(d: &MetalDevice, path: impl AsRef<Path>) -> Result<Self> {
+        let file = GgufFile::open(path.as_ref())?;
+        let md = file.metadata().clone();
+        let unsupported = |what: String| {
+            Err(Error::Config(format!(
+                "unsupported audio projector: {what}"
+            )))
+        };
+        match md.get("general.architecture") {
+            Some(MetadataValue::String(a)) if a == "clip" => {}
+            _ => return unsupported("not a clip/mmproj GGUF".into()),
+        }
+        match md.get("clip.audio.projector_type") {
+            Some(MetadataValue::String(t)) if t == "lfm3a" => {}
+            Some(MetadataValue::String(t)) => {
+                return unsupported(format!("projector type {t} (only lfm3a is implemented)"));
+            }
+            _ => return unsupported("missing clip.audio.projector_type".into()),
+        }
+        let config = audio_config(&md)?;
+        let mut source = GgufSource(file);
+        let encoder = lfm3a::load(d, config, &mut source)?;
+        Ok(Self {
+            mel: audio::MelBank::new(encoder.config.n_mel),
+            encoder,
+        })
+    }
+
+    /// Placeholder the chat template emits once per clip, repeated once per
+    /// language-model row.
+    pub fn marker(&self) -> &'static str {
+        "<|audio|>"
+    }
+
+    /// Embedding width of the language model this projector feeds.
+    pub fn out_dim(&self) -> usize {
+        self.encoder.config.out_dim
+    }
+
+    pub fn weight_bytes(&self) -> usize {
+        self.encoder.weight_bytes
+    }
+
+    /// Most language-model rows one clip can take.
+    pub fn max_tokens(&self) -> usize {
+        lfm3a::tokens_for(audio::MelBank::frames(
+            MAX_AUDIO_SECONDS * audio::SAMPLE_RATE,
+        ))
+    }
+
+    /// Device bytes the latest clip's encoder activations took.
+    pub fn activation_bytes(&self) -> usize {
+        self.encoder.activation_bytes.get()
+    }
+
+    /// Encode a WAV file. Its length is checked from the header first, so a
+    /// clip that is too long is refused before it is decoded and resampled.
+    pub fn encode(&self, d: &MetalDevice, bytes: &[u8]) -> Result<ImageEmbedding> {
+        clip_seconds(bytes)?;
+        let samples = audio::decode_wav(bytes)?;
+        self.encode_samples(d, &samples, content_hash(bytes))
+    }
+
+    /// Encode 16 kHz mono samples.
+    pub fn encode_samples(
+        &self,
+        d: &MetalDevice,
+        samples: &[f32],
+        hash: u64,
+    ) -> Result<ImageEmbedding> {
+        check_seconds(samples.len() as f64 / audio::SAMPLE_RATE as f64)?;
+        self.encoder.encode(d, &self.mel.features(samples), hash)
+    }
+
+    /// Run a short silent clip through the encoder so its kernels are
+    /// compiled before the first request.
+    pub fn warm(&self, d: &MetalDevice) -> Result<()> {
+        self.encode_samples(d, &[0.; audio::SAMPLE_RATE / 4], 0)
+            .map(|_| ())
+    }
 }
 
 impl VisionModel {
     pub fn load(d: &MetalDevice, path: impl AsRef<Path>, max_tokens: usize) -> Result<Self> {
         let path = path.as_ref();
-        let mut file = GgufFile::open(path)?;
+        let file = GgufFile::open(path)?;
         let md = file.metadata().clone();
         let unsupported =
             |what: String| Err(Error::Config(format!("unsupported projector: {what}")));
@@ -255,14 +521,28 @@ impl VisionModel {
             Some(MetadataValue::String(a)) if a == "clip" => {}
             _ => return unsupported("not a clip/mmproj GGUF".into()),
         }
-        match md.get("clip.projector_type") {
-            Some(MetadataValue::String(t)) if t == "qwen3vl_merger" => {}
-            Some(MetadataValue::String(t)) => {
+        // `clip.projector_type` wins when both keys are set, so a combined
+        // audio+vision file that names `lfm3a` there is refused instead of
+        // loading the vision half.
+        let projector = match (
+            md.get("clip.projector_type"),
+            md.get("clip.vision.projector_type"),
+        ) {
+            (Some(MetadataValue::String(t)), _) | (_, Some(MetadataValue::String(t))) => t.as_str(),
+            _ => return unsupported("missing clip.projector_type".into()),
+        };
+        match projector {
+            "qwen3vl_merger" | "lfm3vl" => {}
+            "lfm3a" | "lfm3a_gen" => {
                 return unsupported(format!(
-                    "projector type {t} (only qwen3vl_merger is implemented)"
+                    "projector type {projector} (audio is not implemented; still images only)"
                 ));
             }
-            _ => return unsupported("missing clip.projector_type".into()),
+            other => {
+                return unsupported(format!(
+                    "projector type {other} (only qwen3vl_merger and lfm3vl are implemented)"
+                ));
+            }
         }
         if let Some(MetadataValue::Array { values, .. }) = md.get("clip.vision.is_deepstack_layers")
             && values
@@ -297,17 +577,116 @@ impl VisionModel {
         {
             return unsupported("vision geometry".into());
         }
+        let mut source = GgufSource(file);
+        if projector == "lfm3vl" {
+            return Self::load_lfm3(d, config, &md, &mut source, max_tokens);
+        }
+        Self::build(d, config, &[], &mut source, max_tokens)
+    }
+
+    /// LFM3-VL still-image tower. The Qwen fields stay empty; encoding goes
+    /// through `lfm3` and language positions are linear.
+    fn load_lfm3(
+        d: &MetalDevice,
+        mut config: VisionConfig,
+        md: &BTreeMap<String, MetadataValue>,
+        source: &mut dyn Source,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let unsupported =
+            |what: String| Err(Error::Config(format!("unsupported projector: {what}")));
+        match md.get("clip.use_silu") {
+            Some(MetadataValue::Bool(true)) => {}
+            _ => return unsupported("lfm3vl encoder without clip.use_silu".into()),
+        }
+        let filter = match md.get("clip.vision.image_resize_algo") {
+            Some(MetadataValue::String(s)) if s == "bicubic" => {
+                image::imageops::FilterType::CatmullRom
+            }
+            Some(MetadataValue::String(s)) if s == "bilinear" => {
+                image::imageops::FilterType::Triangle
+            }
+            Some(MetadataValue::String(s)) => {
+                return unsupported(format!("image resize {s} (bicubic or bilinear)"));
+            }
+            _ => return unsupported("missing clip.vision.image_resize_algo".into()),
+        };
+        let kv_heads = meta_uint(md, "clip.vision.attention.head_count_kv")?;
+        let min_pixels = meta_uint(md, "clip.vision.image_min_pixels")?;
+        let max_pixels = meta_uint(md, "clip.vision.image_max_pixels")?;
+        // The position table is a Qwen tensor. LFM3 does not have one.
+        config.table = config.table.max(1);
+        let (tower, limits) = lfm3::load(
+            d, &config, source, max_tokens, kv_heads, min_pixels, max_pixels,
+        )?;
+        let z = || Tensor::zeros(d, [1], DType::F32);
+        let m = || Tensor::zeros(d, [1, 1], DType::F16);
+        Ok(Self {
+            config,
+            max_tokens: limits.max_tokens,
+            min_tokens: limits.min_tokens,
+            layers: Vec::new(),
+            patch: (m()?, z()?),
+            position: Vec::new(),
+            merger: Merger {
+                norm: (z()?, z()?),
+                fc1: (m()?, z()?),
+                fc2: (m()?, z()?),
+                post_shuffle: false,
+            },
+            deepstack: Vec::new(),
+            zero: z()?,
+            weight_bytes: tower.weight_bytes,
+            score_bytes: SCORE_BYTES,
+            lfm3: Some(tower),
+            marker: "<|image|>",
+            filter,
+        })
+    }
+
+    /// Load the tower of a Hugging Face Qwen3-VL checkpoint, whose tensors
+    /// are under `prefix` (`model.visual.`), with DeepStack mergers reading
+    /// the outputs of blocks `deepstack`.
+    pub fn load_safetensors(
+        d: &MetalDevice,
+        ckpt: &crate::diffusion::checkpoint::Checkpoint,
+        prefix: &str,
+        config: VisionConfig,
+        deepstack: &[usize],
+        max_tokens: usize,
+    ) -> Result<Self> {
+        Self::build(
+            d,
+            config,
+            deepstack,
+            &mut SafetensorsSource { ckpt, prefix },
+            max_tokens,
+        )
+    }
+
+    fn build(
+        d: &MetalDevice,
+        config: VisionConfig,
+        deepstack: &[usize],
+        source: &mut dyn Source,
+        max_tokens: usize,
+    ) -> Result<Self> {
+        let unsupported =
+            |what: String| Err(Error::Config(format!("unsupported vision tower: {what}")));
+        if deepstack.iter().any(|&l| l >= config.layers) {
+            return unsupported(format!("DeepStack layers {deepstack:?}"));
+        }
         let h = config.hidden;
         let mut load = Loader {
             d,
-            file: &mut file,
+            source,
             bytes: 0,
         };
         let patch_len = config.patch_len();
         // The two temporal taps see the same frame, so their sum is the kernel.
         let (w0, w1) = (
-            load.f32s("v.patch_embd.weight")?,
-            load.f32s("v.patch_embd.weight.1")?,
+            load.source.values("v.patch_embd.weight")?,
+            load.source.values("v.patch_embd.weight.1")?,
         );
         if w0.len() != h * patch_len || w1.len() != w0.len() {
             return unsupported("patch embedding shape".into());
@@ -318,7 +697,7 @@ impl VisionModel {
             load.vector("v.patch_embd.bias", h)?,
         );
         load.bytes += summed.len() * 2;
-        let position = load.f32s("v.position_embd.weight")?;
+        let position = load.source.values("v.position_embd.weight")?;
         if position.len() != config.table * config.table * h {
             return unsupported("position table shape".into());
         }
@@ -326,45 +705,37 @@ impl VisionModel {
         for i in 0..config.layers {
             let n = |s: &str| format!("v.blk.{i}.{s}");
             layers.push(Layer {
-                ln1: (
-                    load.vector(&n("ln1.weight"), h)?,
-                    load.vector(&n("ln1.bias"), h)?,
-                ),
-                ln2: (
-                    load.vector(&n("ln2.weight"), h)?,
-                    load.vector(&n("ln2.bias"), h)?,
-                ),
-                qkv: (
-                    load.matrix(&n("attn_qkv.weight"), 3 * h, h)?,
-                    load.vector(&n("attn_qkv.bias"), 3 * h)?,
-                ),
-                out: (
-                    load.matrix(&n("attn_out.weight"), h, h)?,
-                    load.vector(&n("attn_out.bias"), h)?,
-                ),
-                up: (
-                    load.matrix(&n("ffn_up.weight"), config.ffn, h)?,
-                    load.vector(&n("ffn_up.bias"), config.ffn)?,
-                ),
-                down: (
-                    load.matrix(&n("ffn_down.weight"), h, config.ffn)?,
-                    load.vector(&n("ffn_down.bias"), h)?,
-                ),
+                ln1: load.affine(&n("ln1"), h, None)?,
+                ln2: load.affine(&n("ln2"), h, None)?,
+                qkv: load.affine(&n("attn_qkv"), 3 * h, Some(h))?,
+                out: load.affine(&n("attn_out"), h, Some(h))?,
+                up: load.affine(&n("ffn_up"), config.ffn, Some(h))?,
+                down: load.affine(&n("ffn_down"), h, Some(config.ffn))?,
             });
         }
         let merged = h * config.merge * config.merge;
-        let post = (
-            load.vector("v.post_ln.weight", h)?,
-            load.vector("v.post_ln.bias", h)?,
-        );
-        let merge1 = (
-            load.matrix("mm.0.weight", merged, merged)?,
-            load.vector("mm.0.bias", merged)?,
-        );
-        let merge2 = (
-            load.matrix("mm.2.weight", config.out_dim, merged)?,
-            load.vector("mm.2.bias", config.out_dim)?,
-        );
+        let merger = Merger {
+            norm: load.affine("v.post_ln", h, None)?,
+            fc1: load.affine("mm.0", merged, Some(merged))?,
+            fc2: load.affine("mm.2", config.out_dim, Some(merged))?,
+            post_shuffle: false,
+        };
+        let deepstack = deepstack
+            .iter()
+            .enumerate()
+            .map(|(i, &layer)| {
+                let n = |s: &str| format!("v.deepstack.{i}.{s}");
+                Ok((
+                    layer,
+                    Merger {
+                        norm: load.affine(&n("norm"), merged, None)?,
+                        fc1: load.affine(&n("fc1"), merged, Some(merged))?,
+                        fc2: load.affine(&n("fc2"), config.out_dim, Some(merged))?,
+                        post_shuffle: true,
+                    },
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let weight_bytes = load.bytes;
         let zero = Tensor::zeros(d, [1], DType::F32)?;
         Ok(Self {
@@ -374,13 +745,25 @@ impl VisionModel {
             layers,
             patch,
             position,
-            post,
-            merge1,
-            merge2,
+            merger,
+            deepstack,
             zero,
             weight_bytes,
             score_bytes: SCORE_BYTES,
+            lfm3: None,
+            marker: "<|image_pad|>",
+            filter: image::imageops::FilterType::CatmullRom,
         })
+    }
+
+    /// Placeholder repeated once per image token.
+    pub fn marker(&self) -> &'static str {
+        self.marker
+    }
+
+    /// Language-model positions are one per token (LFM3), not a 2-D grid.
+    pub fn linear_positions(&self) -> bool {
+        self.lfm3.is_some()
     }
 
     pub fn weight_bytes(&self) -> usize {
@@ -400,53 +783,71 @@ impl VisionModel {
         self.encode_prepared(d, &image).map(drop)
     }
 
+    /// The (fewest, most) tokens an image with `budget` takes. A request may
+    /// lower the cap but never raise it past `max_tokens`, which the memory
+    /// plan budgets the encoder's activations for.
+    pub fn limits(&self, budget: ImageBudget) -> (usize, usize) {
+        let max = budget
+            .max_tokens
+            .unwrap_or(self.max_tokens)
+            .clamp(4, self.max_tokens);
+        (budget.min_tokens.unwrap_or(self.min_tokens).min(max), max)
+    }
+
     /// Pixel size an image of `width` x `height` is resized to.
     pub fn target_size(&self, width: usize, height: usize) -> (usize, usize) {
+        self.target_size_with(width, height, ImageBudget::default())
+    }
+
+    /// `target_size` within a request's `budget`.
+    pub fn target_size_with(
+        &self,
+        width: usize,
+        height: usize,
+        budget: ImageBudget,
+    ) -> (usize, usize) {
         let f = self.config.factor();
-        smart_resize(
-            height,
-            width,
-            f,
-            self.min_tokens.min(self.max_tokens) * f * f,
-            self.max_tokens * f * f,
-        )
+        let (min, max) = self.limits(budget);
+        smart_resize(height, width, f, min * f * f, max * f * f)
     }
 
     /// Decode and resize an encoded image (PNG, JPEG, GIF, WebP, BMP).
     pub fn prepare(&self, bytes: &[u8]) -> Result<Prepared> {
+        self.prepare_with(bytes, ImageBudget::default())
+    }
+
+    /// `prepare` within a request's `budget`.
+    pub fn prepare_with(&self, bytes: &[u8], budget: ImageBudget) -> Result<Prepared> {
         let hash = content_hash(bytes);
-        let decoded = image::load_from_memory(bytes)
-            .map_err(|e| Error::Parameter(format!("cannot decode image: {e}")))?;
-        if decoded.width().max(decoded.height()) > MAX_SOURCE_SIDE
-            || decoded.width() == 0
-            || decoded.height() == 0
-        {
-            return Err(Error::Parameter(format!(
-                "image of {}x{} pixels is unsupported",
-                decoded.width(),
-                decoded.height()
-            )));
-        }
-        // Transparent areas are shown on white, as a viewer would.
-        let rgba = decoded.to_rgba8();
-        let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
-        for (o, p) in rgb.pixels_mut().zip(rgba.pixels()) {
-            let a = u32::from(p[3]);
-            let mix = |c: u8| ((u32::from(c) * a + 255 * (255 - a) + 127) / 255) as u8;
-            *o = image::Rgb([mix(p[0]), mix(p[1]), mix(p[2])]);
-        }
-        let (width, height) = self.target_size(rgb.width() as usize, rgb.height() as usize);
+        let rgb = on_white(&decode(bytes)?);
+        let (width, height) =
+            self.target_size_with(rgb.width() as usize, rgb.height() as usize, budget);
         let rgb = if (rgb.width() as usize, rgb.height() as usize) == (width, height) {
             rgb
         } else {
-            image::imageops::resize(
-                &rgb,
-                width as u32,
-                height as u32,
-                image::imageops::FilterType::CatmullRom,
-            )
+            image::imageops::resize(&rgb, width as u32, height as u32, self.filter)
         };
+        Ok(self.normalise(&rgb, hash))
+    }
+
+    /// An RGBA image already sized to whole merged tokens, as is: the image
+    /// generator sizes condition images itself so both of its encoders see
+    /// the same pixels.
+    pub fn prepare_rgba(&self, rgba: &image::RgbaImage) -> Result<Prepared> {
+        let f = self.config.factor();
+        let (w, h) = (rgba.width() as usize, rgba.height() as usize);
+        if w == 0 || h == 0 || !w.is_multiple_of(f) || !h.is_multiple_of(f) {
+            return Err(Error::Parameter(format!(
+                "a {w} x {h} image is not whole {f}-pixel tokens"
+            )));
+        }
+        Ok(self.normalise(&on_white(rgba), content_hash(rgba.as_raw())))
+    }
+
+    /// Channel-first pixels in the encoder's normalisation.
+    fn normalise(&self, rgb: &image::RgbImage, hash: u64) -> Prepared {
         let c = &self.config;
+        let (width, height) = (rgb.width() as usize, rgb.height() as usize);
         let mut pixels = vec![0f32; 3 * width * height];
         for (i, p) in rgb.pixels().enumerate() {
             for ch in 0..3 {
@@ -454,12 +855,12 @@ impl VisionModel {
                     (f32::from(p[ch]) / 255. - c.mean[ch]) / c.std[ch];
             }
         }
-        Ok(Prepared {
+        Prepared {
             width,
             height,
             pixels,
             hash,
-        })
+        }
     }
 
     /// Language-model tokens an image of this prepared size produces.
@@ -470,11 +871,24 @@ impl VisionModel {
 
     /// Encode one image into language-model embeddings.
     pub fn encode(&self, d: &MetalDevice, bytes: &[u8]) -> Result<ImageEmbedding> {
-        let prepared = self.prepare(bytes)?;
+        self.encode_with(d, bytes, ImageBudget::default())
+    }
+
+    /// `encode` within a request's `budget`.
+    pub fn encode_with(
+        &self,
+        d: &MetalDevice,
+        bytes: &[u8],
+        budget: ImageBudget,
+    ) -> Result<ImageEmbedding> {
+        let prepared = self.prepare_with(bytes, budget)?;
         self.encode_prepared(d, &prepared)
     }
 
     pub fn encode_prepared(&self, d: &MetalDevice, image: &Prepared) -> Result<ImageEmbedding> {
+        if let Some(tower) = &self.lfm3 {
+            return tower.encode(self, d, image);
+        }
         let c = &self.config;
         let (gh, gw) = (image.height / c.patch, image.width / c.patch);
         let n = gh * gw;
@@ -502,8 +916,9 @@ impl VisionModel {
         self.linear(d, &patches, &self.patch, &x, n, h, c.patch_len(), 0)?;
         let pos = tensor(&[n, h], &position)?;
         self.add(d, &pos, &x, n * h)?;
-        for layer in &self.layers {
-            self.norm(d, &x, &layer.ln1, &xn, n)?;
+        let mut deepstack = Vec::with_capacity(self.deepstack.len());
+        for (index, layer) in self.layers.iter().enumerate() {
+            self.norm(d, &x, &layer.ln1, &xn, n, h)?;
             self.linear(d, &xn, &layer.qkv, &qkv, n, 3 * h, h, 0)?;
             d.dispatch_hybrid(
                 "v_rope",
@@ -573,22 +988,46 @@ impl VisionModel {
             }
             self.linear(d, &att, &layer.out, &tmp, n, h, h, 0)?;
             self.add(d, &tmp, &x, n * h)?;
-            self.norm(d, &x, &layer.ln2, &xn, n)?;
+            self.norm(d, &x, &layer.ln2, &xn, n, h)?;
             self.linear(d, &xn, &layer.up, &hid, n, c.ffn, h, 1)?;
             self.linear(d, &hid, &layer.down, &tmp, n, h, c.ffn, 0)?;
             self.add(d, &tmp, &x, n * h)?;
+            for (_, merger) in self.deepstack.iter().filter(|(l, _)| *l == index) {
+                deepstack.push(std::rc::Rc::new(self.merge(d, merger, &x, n)?));
+            }
         }
-        self.norm(d, &x, &self.post, &xn, n)?;
+        let out = self.merge(d, &self.merger, &x, n)?;
+        execution.finish()?;
+        Ok(ImageEmbedding {
+            hash: image.hash,
+            grid: (gh / c.merge, gw / c.merge),
+            rows: std::rc::Rc::new(out),
+            deepstack,
+        })
+    }
+
+    /// Merge `n` patch rows of `x` (block order) through `m`: `[n / merge², out_dim]`.
+    fn merge(&self, d: &MetalDevice, m: &Merger, x: &Tensor, n: usize) -> Result<Tensor> {
+        let c = &self.config;
+        let h = c.hidden;
         // Four consecutive rows are one merge block: a reshape concatenates them.
         let merged_rows = n / (c.merge * c.merge);
         let merged_width = h * c.merge * c.merge;
-        let grouped = xn.reshape([merged_rows, merged_width])?;
+        let normed = Tensor::zeros(d, [n, h], DType::F32)?;
+        if m.post_shuffle {
+            let grouped = x.reshape([merged_rows, merged_width])?;
+            let out = normed.reshape([merged_rows, merged_width])?;
+            self.norm(d, &grouped, &m.norm, &out, merged_rows, merged_width)?;
+        } else {
+            self.norm(d, x, &m.norm, &normed, n, h)?;
+        }
+        let grouped = normed.reshape([merged_rows, merged_width])?;
         let mid = Tensor::zeros(d, [merged_rows, merged_width], DType::F32)?;
         let out = Tensor::zeros(d, [merged_rows, c.out_dim], DType::F32)?;
         self.linear(
             d,
             &grouped,
-            &self.merge1,
+            &m.fc1,
             &mid,
             merged_rows,
             merged_width,
@@ -598,19 +1037,14 @@ impl VisionModel {
         self.linear(
             d,
             &mid,
-            &self.merge2,
+            &m.fc2,
             &out,
             merged_rows,
             c.out_dim,
             merged_width,
             0,
         )?;
-        execution.finish()?;
-        Ok(ImageEmbedding {
-            hash: image.hash,
-            grid: (gh / c.merge, gw / c.merge),
-            rows: std::rc::Rc::new(out),
-        })
+        Ok(out)
     }
 
     /// Patch vectors `[tokens, 3*patch*patch]`, channel-major, with the
@@ -626,6 +1060,27 @@ impl VisionModel {
                     let start =
                         ch * image.width * image.height + (row * p + y) * image.width + col * p;
                     out.extend_from_slice(&image.pixels[start..start + p]);
+                }
+            }
+        }
+        out
+    }
+
+    /// Patch vectors in raster order (row, then column). LFM3 keeps this order
+    /// through the encoder; Qwen regroups into merge blocks ([`patchify`]).
+    fn patchify_raster(&self, image: &Prepared) -> Vec<f32> {
+        let c = &self.config;
+        let (gh, gw) = (image.height / c.patch, image.width / c.patch);
+        let p = c.patch;
+        let mut out = Vec::with_capacity(gh * gw * c.patch_len());
+        for row in 0..gh {
+            for col in 0..gw {
+                for ch in 0..3 {
+                    for y in 0..p {
+                        let start =
+                            ch * image.width * image.height + (row * p + y) * image.width + col * p;
+                        out.extend_from_slice(&image.pixels[start..start + p]);
+                    }
                 }
             }
         }
@@ -715,43 +1170,10 @@ impl VisionModel {
         bias: Option<&Tensor>,
         c: &Tensor,
     ) -> Result<()> {
-        let kernel = match b.dtype() {
-            DType::F16 => "v_gemm_h",
-            DType::F32 => "v_gemm_f",
-            _ => return Err(Error::DType),
-        };
-        let params = Params::default()
-            .u(g.m)?
-            .u(g.n)?
-            .u(g.k)?
-            .u(g.lda)?
-            .u(g.ldb_n)?
-            .u(g.ldb_k)?
-            .u(g.ldc)?
-            .u(g.strides.0)?
-            .u(g.strides.1)?
-            .u(g.strides.2)?
-            .u(g.offsets.0)?
-            .u(g.offsets.1)?
-            .u(g.offsets.2)?
-            .u(g.epilogue as usize)?
-            .u(usize::from(bias.is_some()))?
-            .f(g.alpha);
-        d.dispatch_hybrid(
-            kernel,
-            &[
-                a.binding(),
-                b.binding(),
-                bias.unwrap_or(&self.zero).binding(),
-            ],
-            &[c.binding()],
-            &params.0,
-            [g.n.div_ceil(32), g.m.div_ceil(32), g.batch],
-            [128, 1, 1],
-            0,
-        )
+        run_gemm(d, &self.zero, g, a, b, bias, c)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn norm(
         &self,
         d: &MetalDevice,
@@ -759,16 +1181,13 @@ impl VisionModel {
         w: &(Tensor, Tensor),
         out: &Tensor,
         rows: usize,
+        width: usize,
     ) -> Result<()> {
         d.dispatch_hybrid(
             "v_layernorm",
             &[x.binding(), w.0.binding(), w.1.binding()],
             &[out.binding()],
-            &Params::default()
-                .u(rows)?
-                .u(self.config.hidden)?
-                .f(self.config.eps)
-                .0,
+            &Params::default().u(rows)?.u(width)?.f(self.config.eps).0,
             [rows, 1, 1],
             [256, 1, 1],
             0,
@@ -777,16 +1196,65 @@ impl VisionModel {
 
     /// `acc += y` over `count` values.
     fn add(&self, d: &MetalDevice, y: &Tensor, acc: &Tensor, count: usize) -> Result<()> {
-        d.dispatch_hybrid(
-            "v_add",
-            &[y.binding()],
-            &[acc.binding()],
-            &Params::default().u(count)?.u(1)?.0,
-            [count.div_ceil(256), 1, 1],
-            [256, 1, 1],
-            0,
-        )
+        run_add(d, y, acc, count)
     }
+}
+
+/// `c = epilogue(alpha * a b^T + bias)` through the `v_gemm_*` kernels. `zero`
+/// is bound in place of a missing bias.
+fn run_gemm(
+    d: &MetalDevice,
+    zero: &Tensor,
+    g: &Gemm,
+    a: &Tensor,
+    b: &Tensor,
+    bias: Option<&Tensor>,
+    c: &Tensor,
+) -> Result<()> {
+    let kernel = match b.dtype() {
+        DType::F16 => "v_gemm_h",
+        DType::F32 => "v_gemm_f",
+        _ => return Err(Error::DType),
+    };
+    let params = Params::default()
+        .u(g.m)?
+        .u(g.n)?
+        .u(g.k)?
+        .u(g.lda)?
+        .u(g.ldb_n)?
+        .u(g.ldb_k)?
+        .u(g.ldc)?
+        .u(g.strides.0)?
+        .u(g.strides.1)?
+        .u(g.strides.2)?
+        .u(g.offsets.0)?
+        .u(g.offsets.1)?
+        .u(g.offsets.2)?
+        .u(g.epilogue as usize)?
+        .u(usize::from(bias.is_some()))?
+        .f(g.alpha);
+    d.dispatch_hybrid(
+        kernel,
+        &[a.binding(), b.binding(), bias.unwrap_or(zero).binding()],
+        &[c.binding()],
+        &params.0,
+        [g.n.div_ceil(32), g.m.div_ceil(32), g.batch],
+        [128, 1, 1],
+        0,
+    )
+}
+
+/// `acc += y` over `count` values.
+fn run_add(d: &MetalDevice, y: &Tensor, acc: &Tensor, count: usize) -> Result<()> {
+    d.dispatch_hybrid(
+        "v_add",
+        &[y.binding()],
+        &[acc.binding()],
+        &Params::default().u(count)?.u(1)?.0,
+        [count.div_ceil(256), 1, 1],
+        [256, 1, 1],
+        0,
+    )
 }
 
 /// Strided batched GEMM description for the `v_gemm_*` kernels.
@@ -826,23 +1294,34 @@ impl Default for Gemm {
     }
 }
 
-struct Loader<'a> {
-    d: &'a MetalDevice,
-    file: &'a mut GgufFile,
-    bytes: usize,
+/// Where the tower's tensors come from, by their GGUF names
+/// (`v.blk.0.ln1.weight`).
+trait Source {
+    fn contains(&mut self, name: &str) -> bool;
+    /// Any float tensor's values.
+    fn values(&mut self, name: &str) -> Result<Vec<f32>>;
+    /// A `[rows, cols]` matrix as F16 on the device.
+    fn matrix(&mut self, d: &MetalDevice, name: &str, rows: usize, cols: usize) -> Result<Tensor>;
 }
 
-impl Loader<'_> {
-    fn raw(&mut self, name: &str) -> Result<(u32, Vec<usize>, Vec<u8>)> {
-        let info = self.file.tensor(name)?.clone();
+struct GgufSource(GgufFile);
+
+impl GgufSource {
+    fn raw(&mut self, name: &str) -> Result<(u32, Vec<u8>)> {
+        let info = self.0.tensor(name)?.clone();
         let mut data = vec![0u8; info.byte_len];
-        self.file.read_tensor_into(name, &mut data)?;
-        Ok((info.type_id, info.dimensions, data))
+        self.0.read_tensor_into(name, &mut data)?;
+        Ok((info.type_id, data))
+    }
+}
+
+impl Source for GgufSource {
+    fn contains(&mut self, name: &str) -> bool {
+        self.0.tensors().contains_key(name)
     }
 
-    /// Any float tensor as F32 values.
-    fn f32s(&mut self, name: &str) -> Result<Vec<f32>> {
-        let (ty, _, data) = self.raw(name)?;
+    fn values(&mut self, name: &str) -> Result<Vec<f32>> {
+        let (ty, data) = self.raw(name)?;
         Ok(match ty {
             0 => data
                 .chunks_exact(4)
@@ -852,6 +1331,7 @@ impl Loader<'_> {
                 .chunks_exact(2)
                 .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
                 .collect(),
+            8 => dequant_q8(name, &data)?,
             30 => data
                 .chunks_exact(2)
                 .map(|b| half::bf16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
@@ -864,37 +1344,205 @@ impl Loader<'_> {
         })
     }
 
-    fn vector(&mut self, name: &str, len: usize) -> Result<Tensor> {
-        let v = self.f32s(name)?;
-        if v.len() != len {
-            return Err(Error::Gguf(format!(
-                "projector tensor {name} has {} values, expected {len}",
-                v.len()
-            )));
-        }
-        self.bytes += len * 4;
-        Tensor::from_f32(self.d, [len], DType::F32, &v)
-    }
-
-    /// A `[rows, cols]` weight stored as F16.
-    fn matrix(&mut self, name: &str, rows: usize, cols: usize) -> Result<Tensor> {
-        let info = self.file.tensor(name)?.clone();
+    fn matrix(&mut self, d: &MetalDevice, name: &str, rows: usize, cols: usize) -> Result<Tensor> {
+        let info = self.0.tensor(name)?.clone();
         if info.dimensions != [cols, rows] {
             return Err(Error::Gguf(format!(
                 "projector tensor {name} has shape {:?}, expected [{cols}, {rows}]",
                 info.dimensions
             )));
         }
-        self.bytes += rows * cols * 2;
         if info.type_id == 1 {
-            let file = &mut *self.file;
-            return Tensor::from_reader(self.d, [rows, cols], DType::F16, |dst| {
+            let file = &mut self.0;
+            return Tensor::from_reader(d, [rows, cols], DType::F16, |dst| {
                 file.read_tensor_into(name, dst)
             });
         }
-        let values = self.f32s(name)?;
-        Tensor::from_f32(self.d, [rows, cols], DType::F16, &values)
+        let values = self.values(name)?;
+        if values.len() != rows * cols {
+            return Err(Error::Gguf(format!(
+                "projector tensor {name} has {} values, expected {}",
+                values.len(),
+                rows * cols
+            )));
+        }
+        Tensor::from_f32(d, [rows, cols], DType::F16, &values)
     }
+}
+
+/// ggml Q8_0: 32 int8 values and one F16 scale per 34-byte block.
+fn dequant_q8(name: &str, data: &[u8]) -> Result<Vec<f32>> {
+    if !data.len().is_multiple_of(34) {
+        return Err(Error::Gguf(format!(
+            "projector tensor {name} has {} bytes, not a whole Q8_0 block",
+            data.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(data.len() / 34 * 32);
+    for block in data.chunks_exact(34) {
+        let scale = half::f16::from_le_bytes([block[0], block[1]]).to_f32();
+        for &q in &block[2..] {
+            out.push(f32::from(q as i8) * scale);
+        }
+    }
+    Ok(out)
+}
+
+/// A Hugging Face Qwen3-VL tower under `prefix`.
+struct SafetensorsSource<'a> {
+    ckpt: &'a crate::diffusion::checkpoint::Checkpoint,
+    prefix: &'a str,
+}
+
+impl SafetensorsSource<'_> {
+    fn name(&self, gguf: &str) -> String {
+        transformers_name(self.prefix, gguf)
+    }
+}
+
+/// The transformers checkpoint's name, under `prefix`, for a tower tensor's
+/// GGUF name.
+fn transformers_name(prefix: &str, gguf: &str) -> String {
+    {
+        let (stem, kind) = gguf.rsplit_once('.').unwrap_or((gguf, ""));
+        let tail = match stem.split('.').collect::<Vec<_>>()[..] {
+            ["v", "patch_embd"] => "patch_embed.proj".to_string(),
+            ["v", "position_embd"] => "pos_embed".to_string(),
+            ["v", "post_ln"] => "merger.norm".to_string(),
+            ["mm", "0"] => "merger.linear_fc1".to_string(),
+            ["mm", "2"] => "merger.linear_fc2".to_string(),
+            ["v", "blk", i, part] => format!(
+                "blocks.{i}.{}",
+                match part {
+                    "ln1" => "norm1",
+                    "ln2" => "norm2",
+                    "attn_qkv" => "attn.qkv",
+                    "attn_out" => "attn.proj",
+                    "ffn_up" => "mlp.linear_fc1",
+                    "ffn_down" => "mlp.linear_fc2",
+                    other => other,
+                }
+            ),
+            ["v", "deepstack", i, part] => format!(
+                "deepstack_merger_list.{i}.{}",
+                match part {
+                    "fc1" => "linear_fc1",
+                    "fc2" => "linear_fc2",
+                    other => other,
+                }
+            ),
+            _ => stem.to_string(),
+        };
+        format!("{prefix}{tail}.{kind}")
+    }
+}
+
+impl Source for SafetensorsSource<'_> {
+    fn contains(&mut self, name: &str) -> bool {
+        self.ckpt.entry(&self.name(name)).is_ok()
+    }
+
+    fn values(&mut self, name: &str) -> Result<Vec<f32>> {
+        // The patch kernel is one `[out, 3, 2, p, p]` tensor; GGUF splits
+        // its two temporal taps.
+        let tap = match name {
+            "v.patch_embd.weight" => Some(0),
+            "v.patch_embd.weight.1" => Some(1),
+            _ => None,
+        };
+        let Some(tap) = tap else {
+            return self.ckpt.read_f32(&self.name(name));
+        };
+        let full = self.name("v.patch_embd.weight");
+        let shape = self.ckpt.entry(&full)?.shape.clone();
+        let [out, channels, 2, ph, pw] = shape[..] else {
+            return Err(Error::Weight {
+                name: full,
+                message: format!("expected a [out, 3, 2, p, p] kernel, found {shape:?}"),
+            });
+        };
+        let all = self.ckpt.read_f32(&full)?;
+        let taps = ph * pw;
+        Ok((0..out * channels)
+            .flat_map(|oc| &all[(oc * 2 + tap) * taps..][..taps])
+            .copied()
+            .collect())
+    }
+
+    fn matrix(&mut self, d: &MetalDevice, name: &str, rows: usize, cols: usize) -> Result<Tensor> {
+        let full = self.name(name);
+        let shape = &self.ckpt.entry(&full)?.shape;
+        if shape[..] != [rows, cols] {
+            return Err(Error::Weight {
+                name: full,
+                message: format!("expected [{rows}, {cols}], found {shape:?}"),
+            });
+        }
+        Tensor::from_f32(d, [rows, cols], DType::F16, &self.ckpt.read_f32(&full)?)
+    }
+}
+
+struct Loader<'a> {
+    d: &'a MetalDevice,
+    source: &'a mut dyn Source,
+    bytes: usize,
+}
+
+impl Loader<'_> {
+    fn vector(&mut self, name: &str, len: usize) -> Result<Tensor> {
+        let v = self.source.values(name)?;
+        if v.len() != len {
+            return Err(Error::Weight {
+                name: name.into(),
+                message: format!("{} values, expected {len}", v.len()),
+            });
+        }
+        self.bytes += len * 4;
+        Tensor::from_f32(self.d, [len], DType::F32, &v)
+    }
+
+    /// `{name}.weight` and `{name}.bias`: a `[rows, cols]` matrix, or with
+    /// no `cols` a norm's `rows` scales.
+    fn affine(&mut self, name: &str, rows: usize, cols: Option<usize>) -> Result<(Tensor, Tensor)> {
+        let weight = format!("{name}.weight");
+        let weight = match cols {
+            Some(cols) => {
+                self.bytes += rows * cols * 2;
+                self.source.matrix(self.d, &weight, rows, cols)?
+            }
+            None => self.vector(&weight, rows)?,
+        };
+        Ok((weight, self.vector(&format!("{name}.bias"), rows)?))
+    }
+}
+
+/// Decode an encoded image (PNG, JPEG, GIF, WebP, BMP) of a supported size.
+pub fn decode(bytes: &[u8]) -> Result<image::RgbaImage> {
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|e| Error::Parameter(format!("cannot decode image: {e}")))?;
+    if decoded.width().max(decoded.height()) > MAX_SOURCE_SIDE
+        || decoded.width() == 0
+        || decoded.height() == 0
+    {
+        return Err(Error::Parameter(format!(
+            "image of {}x{} pixels is unsupported",
+            decoded.width(),
+            decoded.height()
+        )));
+    }
+    Ok(decoded.to_rgba8())
+}
+
+/// Transparent areas shown on white, as a viewer would (and as Qwen-Image
+/// was trained to read them).
+fn on_white(rgba: &image::RgbaImage) -> image::RgbImage {
+    let mut rgb = image::RgbImage::new(rgba.width(), rgba.height());
+    for (o, p) in rgb.pixels_mut().zip(rgba.pixels()) {
+        let a = u32::from(p[3]);
+        let mix = |c: u8| ((u32::from(c) * a + 255 * (255 - a) + 127) / 255) as u8;
+        *o = image::Rgb([mix(p[0]), mix(p[1]), mix(p[2])]);
+    }
+    rgb
 }
 
 /// Patch coordinates (row, column) in merge-block order: each `merge x merge`
@@ -959,6 +1607,9 @@ pub fn smart_resize(
     (wb as usize, hb as usize)
 }
 
+pub mod audio;
+mod lfm3;
+mod lfm3a;
 pub mod media;
 
 #[cfg(test)]

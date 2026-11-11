@@ -90,6 +90,7 @@ fn main() -> Result<()> {
             stop: Vec::new(),
             reasoning_budget: None,
             raw_reasoning: false,
+            image_budget: Default::default(),
         };
         rt.session.reset();
         let result = rt.chat(&request, |_| Ok(()))?;

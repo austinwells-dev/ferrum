@@ -10,6 +10,7 @@ use ferrum::hybrid::{
     plan::PlanOptions,
     runtime::{ChatHooks, ChatRequest, Delta, Runtime, SpecOptions},
 };
+use ferrum::vision::ImageBudget;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::rc::Rc;
@@ -20,6 +21,10 @@ use std::sync::{
 };
 use std::thread::JoinHandle;
 
+/// What a tool reports back: its turn, whether it worked, the text for the
+/// model, how long it took, and a picture to add to its reply, if any.
+pub type ToolResult = (usize, bool, String, f32, Option<Vec<u8>>);
+
 pub struct ChatOpts {
     pub model: PathBuf,
     pub context: Option<usize>,
@@ -29,6 +34,8 @@ pub struct ChatOpts {
     pub think: bool,
     pub effort: Option<String>,
     pub show_thinking: bool,
+    /// Keep each chat's session cache on disk (`sessions::cache_dir`).
+    pub session_cache: bool,
     pub budget: Option<usize>,
     pub overrides: Vec<(&'static str, f32)>,
     pub spec: Option<SpecOptions>,
@@ -40,6 +47,12 @@ pub struct ChatOpts {
     pub sandbox_confined: bool,
     pub search: crate::search::Config,
     pub agent: Option<AgentOpts>,
+    /// Most and fewest tokens one image takes (`--image-tokens`,
+    /// `--image-min-tokens`); `/detail` lowers the cap per image.
+    pub image_tokens: usize,
+    pub image_min_tokens: usize,
+    /// The Image tab's model, offered as the `generate_image` tool.
+    pub image: Option<imagetool::ImageModel>,
 }
 
 pub struct AgentOpts {
@@ -134,6 +147,17 @@ impl ChatOpts {
             if !quant.is_empty() {
                 apply("--draft-quant", quant)?;
             }
+            // Cycle fields: their first option is the default, never passed.
+            for (key, flag, default) in [
+                ("draft_tree", "--draft-tree", "off"),
+                ("draft_block", "--draft-block", "trained"),
+                ("draft_vocab", "--draft-vocab", "full"),
+            ] {
+                let v = app.value(key);
+                if !v.is_empty() && v != default {
+                    apply(flag, v)?;
+                }
+            }
             spec
         };
         Ok(Self {
@@ -146,6 +170,7 @@ impl ChatOpts {
             effort: Some(app.value("effort").to_string())
                 .filter(|s| !s.is_empty() && s != "default"),
             show_thinking: app.value("show") != "hide",
+            session_cache: app.value("session_cache") != "off",
             budget: count("budget"),
             overrides,
             spec,
@@ -161,6 +186,10 @@ impl ChatOpts {
             network: app.value("network") != "off",
             sandbox_confined: app.value("sandbox") != "off",
             search: app.search.clone(),
+            image_tokens: count("image_tokens").unwrap_or(ferrum::vision::DEFAULT_MAX_TOKENS),
+            image_min_tokens: count("image_min_tokens")
+                .unwrap_or(ferrum::vision::DEFAULT_MIN_TOKENS),
+            image: app.image.tool_model(),
             agent: if app.mode == Mode::Agent {
                 let project = match app.value("project") {
                     "" => std::env::current_dir().map_err(|e| e.to_string())?,
@@ -189,6 +218,10 @@ enum ToWorker {
         tools: Vec<Json>,
     },
     Reset,
+    /// The chat whose cache folder this is is now open: save the current
+    /// one's cache, then load this one's (`None`: the cache is off).
+    Chat(Option<PathBuf>),
+    Image(Box<imagetool::Work>),
 }
 
 #[derive(Clone)]
@@ -201,6 +234,8 @@ pub struct LoadInfo {
     pub drafter: Option<String>,
     /// File name of the vision projector, when images can be shown to the model.
     pub vision: Option<String>,
+    /// File name of the audio projector, when WAV clips can be played to it.
+    pub audio: Option<String>,
     pub sampling: String,
 }
 
@@ -223,12 +258,20 @@ enum FromWorker {
     Stage(String),
     Ready(Box<LoadInfo>),
     Failed(String),
-    Begin { prompt: usize, reused: usize },
+    Begin {
+        prompt: usize,
+        reused: usize,
+    },
     Prefill(usize, usize),
-    Delta { reasoning: bool, text: String },
+    Delta {
+        reasoning: bool,
+        text: String,
+    },
     Tokens(usize),
     Done(Box<TurnDone>),
     TurnFailed(String),
+    /// What the running `generate_image` call (its turn) is doing.
+    ToolProgress(usize, String),
 }
 
 struct Hooks<'a> {
@@ -260,16 +303,10 @@ impl ChatHooks for Hooks<'_> {
     }
 }
 
-fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel: Arc<AtomicBool>) {
-    let send = |m: FromWorker| {
-        let _ = tx.send(m);
-    };
-    send(FromWorker::Stage("loading weights".into()));
-    // A projector next to the model lets attached images reach it as pixels.
-    let mmproj = ferrum::vision::resolve_projector(&opts.model, None)
-        .ok()
-        .flatten();
-    let mut rt = match Runtime::load_multimodal(
+/// The chat model as configured, warmed up; `stage` hears what it is doing.
+fn load(opts: &ChatOpts, mmproj: Option<&Path>, stage: &dyn Fn(&str)) -> ferrum::Result<Runtime> {
+    stage("loading weights");
+    let mut rt = Runtime::load_multimodal(
         &opts.model,
         PlanOptions {
             context: opts.context,
@@ -277,16 +314,31 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
             ..Default::default()
         },
         opts.spec.as_ref(),
-        mmproj.as_deref(),
-        ferrum::vision::DEFAULT_MAX_TOKENS,
-    ) {
+        mmproj,
+        opts.image_tokens,
+    )?;
+    if let Some(v) = rt.vision.as_mut() {
+        v.model.min_tokens = opts.image_min_tokens;
+    }
+    stage("warming up kernels");
+    rt.warmup()?;
+    Ok(rt)
+}
+
+fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel: Arc<AtomicBool>) {
+    let send = |m: FromWorker| {
+        let _ = tx.send(m);
+    };
+    // A projector next to the model lets attached images reach it as pixels.
+    let mmproj = ferrum::vision::resolve_projector(&opts.model, None)
+        .ok()
+        .flatten();
+    let rt = match load(&opts, mmproj.as_deref(), &|s| {
+        send(FromWorker::Stage(s.into()))
+    }) {
         Ok(rt) => rt,
         Err(e) => return send(FromWorker::Failed(e.to_string())),
     };
-    send(FromWorker::Stage("warming up kernels".into()));
-    if let Err(e) = rt.warmup() {
-        return send(FromWorker::Failed(e.to_string()));
-    }
     let mut sampling = rt.default_sampling.clone();
     for (flag, v) in &opts.overrides {
         match *flag {
@@ -323,20 +375,107 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                 .file_name()
                 .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
         }),
+        audio: rt.audio.as_ref().map(|a| {
+            a.path
+                .file_name()
+                .map_or_else(String::new, |n| n.to_string_lossy().into_owned())
+        }),
         sampling: format!(
             "t {} · p {} · k {} · min-p {}",
             sampling.temperature, sampling.top_p, sampling.top_k, sampling.min_p
         ),
     })));
+    // `None` while a picture has the chat model's memory, or if loading it
+    // again afterwards failed (the next turn tries again).
+    let mut rt = Some(rt);
+    // The open chat's cache folder (`ToWorker::Chat`). Its cache is written
+    // only when it would otherwise be lost: before a reset, a switch to
+    // another chat, a picture that unloads the model, and on exit.
+    let mut cache: Option<PathBuf> = None;
+    let save = |rt: &Option<Runtime>, cache: &Option<PathBuf>| {
+        if let (Some(rt), Some(dir)) = (rt, cache)
+            && !rt.session.is_empty()
+            && rt.save_session(dir).is_ok()
+        {
+            sessions::prune_caches();
+        }
+    };
+    let restore = |rt: &mut Runtime, cache: &Option<PathBuf>| {
+        if let Some(dir) = cache {
+            let _ = rt.load_session(dir);
+        }
+    };
     while let Ok(msg) = rx.recv() {
         match msg {
-            ToWorker::Reset => rt.session.reset(),
+            ToWorker::Reset => {
+                save(&rt, &cache);
+                if let Some(rt) = rt.as_mut() {
+                    rt.session.reset();
+                }
+            }
+            ToWorker::Chat(dir) => {
+                save(&rt, &cache);
+                cache = dir;
+                if let Some(rt) = rt.as_mut() {
+                    rt.session.reset();
+                    restore(rt, &cache);
+                }
+            }
+            ToWorker::Image(work) => {
+                let started = Instant::now();
+                let progress = |text: String| {
+                    let _ = tx.send(FromWorker::ToolProgress(work.idx, text));
+                };
+                let result = match &opts.image {
+                    Some(model) => imagetool::run(
+                        model,
+                        &work,
+                        &mut || {
+                            save(&rt, &cache);
+                            rt = None;
+                        },
+                        &progress,
+                    ),
+                    None => Err("no Qwen-Image model is set up (see the Image tab)".into()),
+                };
+                let secs = started.elapsed().as_secs_f32();
+                if rt.is_none() {
+                    progress("loading the chat model again".into());
+                    match load(&opts, mmproj.as_deref(), &|_| {}) {
+                        Ok(mut loaded) => {
+                            restore(&mut loaded, &cache);
+                            rt = Some(loaded);
+                        }
+                        Err(e) => progress(format!("the chat model did not load again: {e}")),
+                    }
+                }
+                let (ok, text, shown) = match result {
+                    Ok((text, shown)) => (true, text, shown),
+                    Err(e) => (false, format!("error: {e}"), None),
+                };
+                let _ = work.reply.send((work.idx, ok, text, secs, shown));
+            }
             ToWorker::Turn {
                 messages,
                 think,
                 tools,
             } => {
                 cancel.store(false, Ordering::SeqCst);
+                if rt.is_none() {
+                    match load(&opts, mmproj.as_deref(), &|_| {}) {
+                        Ok(mut loaded) => {
+                            restore(&mut loaded, &cache);
+                            rt = Some(loaded);
+                        }
+                        Err(e) => {
+                            send(FromWorker::TurnFailed(format!(
+                                "loading the chat model again: {e}"
+                            )));
+                            continue;
+                        }
+                    }
+                }
+                let rt = rt.as_mut().expect("loaded above");
                 let mut vars = Map::new();
                 vars.insert("enable_thinking".into(), Json::Bool(think));
                 if let Some(effort) = &opts.effort {
@@ -351,6 +490,7 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                     stop: Vec::new(),
                     reasoning_budget: opts.budget,
                     raw_reasoning: false,
+                    image_budget: Default::default(),
                 };
                 let hooks = Hooks {
                     tx: &tx,
@@ -387,6 +527,7 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
             }
         }
     }
+    save(&rt, &cache);
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -479,6 +620,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("/paste", "attach the clipboard (image, files or text)"),
     ("/screenshot", "drag out a screen region to attach"),
     ("/detach", "remove the attachments"),
+    (
+        "/detail ",
+        "image size for the next messages: low, high, auto or N tokens",
+    ),
     ("/preview", "view attached images and videos (ctrl-o)"),
     ("/previews off", "hide images and videos in the transcript"),
     ("/previews on", "show images and videos in the transcript"),
@@ -581,6 +726,10 @@ pub const AGENT_COMMANDS: &[(&str, &str)] = &[
     ("/attach ", "attach a file by path"),
     ("/paste", "attach the clipboard (image, files or text)"),
     ("/screenshot", "drag out a screen region to attach"),
+    (
+        "/detail ",
+        "image size for the next messages: low, high, auto or N tokens",
+    ),
     ("/preview", "view attached images and videos (ctrl-o)"),
     ("/help", "list the commands"),
     ("/exit", "leave the agent"),
@@ -639,12 +788,15 @@ pub struct Chat {
     tool_msgs: Vec<Json>,
     /// A call waiting for the user's yes or no.
     pub approval: Option<(usize, String, String, Map<String, Json>)>,
-    exec_rx: Option<Receiver<(usize, bool, String, f32)>>,
+    exec_rx: Option<Receiver<ToolResult>>,
     tool_cancel: Arc<AtomicBool>,
+    /// An image model is set up, so `generate_image` is offered.
+    image_tool: bool,
     aborted: bool,
     flash: Option<(String, bool, Instant)>,
     pub agent: Option<Agent>,
     pub id: String,
+    session_cache: bool,
     created: u64,
     title: Option<String>,
     pub resume: Option<ResumeList>,
@@ -654,6 +806,8 @@ pub struct Chat {
     pub wants: RefCell<Vec<preview::Want>>,
     /// Show images and videos inline (`/previews on|off`).
     pub inline: bool,
+    /// Token limits for the images of the next messages (`/detail`).
+    pub image_detail: ImageBudget,
     /// Display rows of finished turns, by turn index (see `turn_key`).
     rendered: RefCell<Vec<Option<Rendered>>>,
 }
@@ -775,6 +929,12 @@ impl Chat {
         };
         let flag = cancel.clone();
         let sandbox_confined = opts.sandbox_confined;
+        let image_tool = opts.image.is_some();
+        let session_cache = opts.session_cache;
+        let id = sessions::new_id();
+        if session_cache {
+            let _ = tx.send(ToWorker::Chat(Some(sessions::cache_dir(&id))));
+        }
         let handle = std::thread::Builder::new()
             .name("ferrum-chat".into())
             .spawn(move || worker(opts, wrx, wtx, flag))
@@ -822,10 +982,12 @@ impl Chat {
             approval: None,
             exec_rx: None,
             tool_cancel: Arc::new(AtomicBool::new(false)),
+            image_tool,
             aborted: false,
             flash: None,
             agent,
-            id: sessions::new_id(),
+            id,
+            session_cache,
             created: bench::now(),
             title: None,
             resume: None,
@@ -833,6 +995,7 @@ impl Chat {
             thumbs: Default::default(),
             wants: RefCell::new(Vec::new()),
             inline: true,
+            image_detail: ImageBudget::default(),
         })
     }
 
@@ -985,16 +1148,22 @@ impl Chat {
 
     fn tool_defs(&self) -> Vec<Json> {
         if self.tools == ToolMode::Off {
-            Vec::new()
-        } else if let Some(a) = &self.agent {
-            let mut defs = coding::tool_defs(a.plan, self.network);
-            if !a.skills_text.is_empty() {
-                defs.push(coding::skill_def());
-            }
-            defs
-        } else {
-            agent::tool_defs(self.network)
+            return Vec::new();
         }
+        let mut defs = match &self.agent {
+            Some(a) => {
+                let mut defs = coding::tool_defs(a.plan, self.network, self.sees_images());
+                if !a.skills_text.is_empty() {
+                    defs.push(coding::skill_def());
+                }
+                defs
+            }
+            None => agent::tool_defs(self.network, self.sees_images()),
+        };
+        if self.image_tool {
+            defs.push(imagetool::def_json(self.sees_images()));
+        }
+        defs
     }
 
     /// Send the history to the model and show an empty reply being written.
@@ -1036,8 +1205,8 @@ impl Chat {
                 results.push(r);
             }
         }
-        for (idx, ok, out, secs) in results {
-            self.tool_done(idx, ok, out, secs);
+        for (idx, ok, out, secs, image) in results {
+            self.tool_done(idx, ok, out, secs, image);
         }
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
@@ -1067,6 +1236,11 @@ impl Chat {
                     }
                 }
                 FromWorker::Tokens(n) => self.gen_tokens = n,
+                FromWorker::ToolProgress(idx, text) => {
+                    if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
+                        t.output = text;
+                    }
+                }
                 FromWorker::Done(d) => self.finish(*d),
                 FromWorker::TurnFailed(e) => {
                     if let Some(t) = self.turns.last_mut() {
@@ -1167,18 +1341,21 @@ impl Chat {
         self.end_generation();
     }
 
-    fn tool_message(&mut self, idx: usize, text: &str) {
+    fn tool_message(&mut self, idx: usize, text: &str, image: Option<Vec<u8>>) {
         let (id, name) = self
             .turns
             .get(idx)
             .and_then(|t| t.tool.as_ref())
             .map(|t| (t.id.clone(), t.name.clone()))
             .unwrap_or_default();
+        let held = ferrum::vision::media::count_images(&self.history)
+            + ferrum::vision::media::count_images(&self.tool_msgs);
+        let content = tool_content(text, image, self.sees_images(), held, self.image_detail);
         self.tool_msgs.push(json!({
             "role": "tool",
             "tool_call_id": id,
             "name": name,
-            "content": text,
+            "content": content,
         }));
     }
 
@@ -1194,7 +1371,7 @@ impl Chat {
         if self.aborted {
             while let Some((idx, _, _, _)) = self.queue.pop_front() {
                 self.set_tool(idx, ToolState::Denied, "cancelled");
-                self.tool_message(idx, "cancelled by the user");
+                self.tool_message(idx, "cancelled by the user", None);
             }
             return self.finish_round();
         }
@@ -1219,10 +1396,23 @@ impl Chat {
             Ok(sb) => sb,
             Err(e) => {
                 self.set_tool(idx, ToolState::Failed, &e);
-                self.tool_message(idx, &format!("error: {e}"));
+                self.tool_message(idx, &format!("error: {e}"), None);
                 return self.next_tool();
             }
         };
+        // Pictures are made on the chat model's thread, which can lend them
+        // the model's memory.
+        let image = (name == imagetool::NAME).then(|| match &self.agent {
+            Some(a) if a.plan => {
+                Err("plan mode is on, so nothing can be made. Finish the plan first.".to_string())
+            }
+            _ => imagetool::job(&sb, &args),
+        });
+        if let Some(Err(e)) = &image {
+            self.set_tool(idx, ToolState::Failed, e);
+            self.tool_message(idx, &format!("error: {e}"), None);
+            return self.next_tool();
+        }
         if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
             t.state = ToolState::Running;
             t.started = Some(Instant::now());
@@ -1230,38 +1420,47 @@ impl Chat {
         let (tx, rx) = channel();
         self.exec_rx = Some(rx);
         self.tool_cancel.store(false, Ordering::SeqCst);
+        if let Some(Ok(job)) = image {
+            let _ = self.tx.send(ToWorker::Image(Box::new(imagetool::Work {
+                idx,
+                job,
+                cancel: self.tool_cancel.clone(),
+                reply: tx,
+            })));
+            return;
+        }
         let cancel = self.tool_cancel.clone();
         let coder = self.agent.as_ref().map(|a| (a.shared.clone(), a.plan));
         std::thread::spawn(move || {
             let started = Instant::now();
-            let (ok, out) = match coder {
+            let (ok, out, shown) = match coder {
                 Some((shared, plan)) => {
                     if plan && !coding::read_only(&name) {
-                        (false, "error: plan mode is on, so nothing can be changed. Finish the plan; the user will turn plan mode off to carry it out.".to_string())
+                        (false, "error: plan mode is on, so nothing can be changed. Finish the plan; the user will turn plan mode off to carry it out.".to_string(), None)
                     } else if shared
                         .lock()
                         .map(|mut g| g.is_loop(&name, &args))
                         .unwrap_or(false)
                     {
-                        (false, "error: you already made this exact call twice. Do something different, or ask the user.".to_string())
+                        (false, "error: you already made this exact call twice. Do something different, or ask the user.".to_string(), None)
                     } else {
                         coding::execute(&shared, &sb, &name, &args, &cancel)
                     }
                 }
                 None => sb.execute(&name, &args, &cancel),
             };
-            let _ = tx.send((idx, ok, out, started.elapsed().as_secs_f32()));
+            let _ = tx.send((idx, ok, out, started.elapsed().as_secs_f32(), shown));
         });
     }
 
-    fn tool_done(&mut self, idx: usize, ok: bool, out: String, secs: f32) {
+    fn tool_done(&mut self, idx: usize, ok: bool, out: String, secs: f32, image: Option<Vec<u8>>) {
         self.exec_rx = None;
         if let Some(t) = self.turns.get_mut(idx).and_then(|t| t.tool.as_mut()) {
             t.state = if ok { ToolState::Ok } else { ToolState::Failed };
             t.output = out.clone();
             t.secs = secs;
         }
-        self.tool_message(idx, &out);
+        self.tool_message(idx, &out, image);
         let question = self
             .turns
             .get(idx)
@@ -1294,7 +1493,7 @@ impl Chat {
     pub fn deny(&mut self) {
         if let Some((idx, _, _, _)) = self.approval.take() {
             self.set_tool(idx, ToolState::Denied, "denied");
-            self.tool_message(idx, "The user denied this tool call.");
+            self.tool_message(idx, "The user denied this tool call.", None);
             self.next_tool();
         }
     }
@@ -1356,6 +1555,10 @@ impl Chat {
         self.info.as_ref().is_some_and(|i| i.vision.is_some())
     }
 
+    fn hears_audio(&self) -> bool {
+        self.info.as_ref().is_some_and(|i| i.audio.is_some())
+    }
+
     fn submit(&mut self, text: String) {
         self.submit_with(text.clone(), text);
     }
@@ -1365,18 +1568,28 @@ impl Chat {
         let text = body;
         let attachments = std::mem::take(&mut self.attachments);
         let sees = self.sees_images();
+        let hears = self.hears_audio();
         let mut content = String::new();
         let mut pictures = Vec::new();
         for a in &attachments {
+            if hears && a.kind == attach::Kind::Audio {
+                match std::fs::read(&a.full) {
+                    Ok(bytes) => {
+                        pictures.push(ferrum::vision::media::audio_part_from_bytes(&bytes))
+                    }
+                    Err(e) => self.note(format!("{}: {e}", a.name)),
+                }
+            }
             if sees && a.kind == attach::Kind::Image {
                 match attach::image_bytes(a) {
-                    Ok(bytes) => {
-                        pictures.push(ferrum::vision::media::image_part_from_bytes(&bytes))
-                    }
+                    Ok(bytes) => pictures.push(ferrum::vision::media::image_part_with(
+                        &bytes,
+                        self.image_detail,
+                    )),
                     Err(e) => self.note(e),
                 }
             }
-            content += &a.block(sees);
+            content += &a.block(sees, hears);
             content += "\n\n";
         }
         content += &text;
@@ -1598,7 +1811,12 @@ impl Chat {
         self.ctx = None;
         self.last_stats.clear();
         self.follow = true;
-        let _ = self.tx.send(ToWorker::Reset);
+        let _ = self.tx.send(ToWorker::Chat(self.cache_dir()));
+    }
+
+    /// This chat's session cache folder, unless the cache is off.
+    fn cache_dir(&self) -> Option<PathBuf> {
+        self.session_cache.then(|| sessions::cache_dir(&self.id))
     }
 
     /// Keep this session on disk and start a fresh one in the same loaded model.
@@ -1606,6 +1824,7 @@ impl Chat {
         self.persist();
         self.reset();
         self.id = sessions::new_id();
+        let _ = self.tx.send(ToWorker::Chat(self.cache_dir()));
         self.created = bench::now();
         self.title = None;
         self.note("new session · the previous one is in /resume");
@@ -1808,6 +2027,27 @@ impl Chat {
                 Err(e) => self.note(e),
             },
             "/paste" => self.paste_clipboard(),
+            l if l == "/detail" || l.starts_with("/detail ") => {
+                let arg = l.trim_start_matches("/detail").trim();
+                if arg.is_empty() {
+                    let now = match self.image_detail.max_tokens {
+                        None => "auto".to_owned(),
+                        Some(usize::MAX) => "high".to_owned(),
+                        Some(n) => format!("up to {n} tokens"),
+                    };
+                    self.note(format!(
+                        "images are sent at {now}; /detail low|high|auto|N changes it"
+                    ));
+                } else {
+                    match ferrum::vision::media::parse_detail(arg) {
+                        Ok(budget) => {
+                            self.image_detail = budget;
+                            self.note(format!("images from now on: {arg}"));
+                        }
+                        Err(e) => self.flash(e.to_string(), false),
+                    }
+                }
+            }
             "/previews on" | "/previews off" => {
                 self.inline = line.trim().ends_with("on");
                 self.note(format!(
@@ -2103,9 +2343,17 @@ impl App {
                             chat.persist();
                             chat.restore(&data);
                             let n = chat.history.iter().filter(|m| m["role"] == "user").count();
+                            let cached = chat
+                                .cache_dir()
+                                .is_some_and(|d| d.join("meta.json").exists());
                             chat.note(format!(
-                                "resumed {:?} ({n} messages) · the model re-reads it with your next message",
-                                chat.title.clone().unwrap_or_default()
+                                "resumed {:?} ({n} messages) · {}",
+                                chat.title.clone().unwrap_or_default(),
+                                if cached {
+                                    "its saved cache is used if it was made with this model, so only new text is read"
+                                } else {
+                                    "the model re-reads it with your next message"
+                                }
                             ));
                         }
                         None => chat.flash("that session could not be read", false),
@@ -2897,6 +3145,12 @@ impl App {
                         Style::new().fg(GOLD),
                     ));
                 }
+                if let Some(a) = &i.audio {
+                    lines.push(Line::styled(
+                        format!("🔊 WAV clips are played to the model · {a}"),
+                        Style::new().fg(GOLD),
+                    ));
+                }
                 lines.push(Line::styled(i.sampling.clone(), Style::new().fg(DIM)));
             }
             lines.push(Line::default());
@@ -3282,9 +3536,82 @@ impl App {
     }
 }
 
+/// The content of one tool's reply: its text, with an image part in front
+/// when the tool has a picture to show and the prompt can carry it. `held` is
+/// how many images the messages already sent hold.
+fn tool_content(
+    text: &str,
+    image: Option<Vec<u8>>,
+    vision: bool,
+    held: usize,
+    detail: ImageBudget,
+) -> Json {
+    let Some(bytes) = image else {
+        return Json::String(text.to_owned());
+    };
+    // Only a loaded projector can turn a part back into pixels; a prompt also
+    // carries at most MAX_IMAGES pictures.
+    if !vision {
+        return Json::String(format!(
+            "{text}\n(the picture is not shown: this model has no vision projector)"
+        ));
+    }
+    if held >= ferrum::vision::media::MAX_IMAGES {
+        return Json::String(format!(
+            "{text}\n(the picture is not shown: this request already carries {} images, the most a prompt takes)",
+            ferrum::vision::media::MAX_IMAGES
+        ));
+    }
+    json!([
+        ferrum::vision::media::image_part_with(&bytes, detail),
+        {"type": "text", "text": text},
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tool_reply_shows_its_picture_unless_the_prompt_is_full() {
+        let png = b"\x89PNG\r\n\x1a\nrest";
+        let content = tool_content(
+            "saved a.png",
+            Some(png.to_vec()),
+            true,
+            0,
+            Default::default(),
+        );
+        assert_eq!(content[0]["type"], "image_url");
+        assert!(
+            content[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
+        assert_eq!(content[1]["type"], "text");
+        assert_eq!(content[1]["text"], "saved a.png");
+        // No projector, or no room left: the text says why the picture is absent.
+        let blind = tool_content(
+            "saved a.png",
+            Some(png.to_vec()),
+            false,
+            0,
+            Default::default(),
+        );
+        assert!(blind.is_string());
+        assert!(blind.as_str().unwrap().contains("no vision projector"));
+        let full = tool_content(
+            "saved a.png",
+            Some(png.to_vec()),
+            true,
+            ferrum::vision::media::MAX_IMAGES,
+            Default::default(),
+        );
+        assert!(full.is_string());
+        assert!(full.as_str().unwrap().contains("already carries"));
+        assert!(tool_content("plain", None, true, 0, Default::default()).is_string());
+    }
 
     #[test]
     fn each_session_gets_its_own_folder() {

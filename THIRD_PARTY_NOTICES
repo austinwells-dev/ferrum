@@ -1,0 +1,37 @@
+Third-party notices
+
+Ferrum (Copyright 2026 Austin Wells) is dual-licensed under MIT or Apache-2.0, except for the files listed below,
+which are adapted from other projects and stay under those projects' licenses. Model weights are not part of Ferrum:
+they keep their own licenses.
+
+================================================================================
+Kapitsa (Nace AI), Apache License 2.0
+https://github.com/nace-ai/kapitsa
+Copyright 2026 Nace AI
+
+Files adapted from Kapitsa, Apache-2.0 only (not dual-licensed); each file's header says what it was adapted from and
+what changed:
+
+- src/metal/shaders/hybrid_mlx.metal: the MLX affine 4-bit decode GEMV, adapted from src/kernels/qmv.metal (qmv3_impl)
+  and src/kernels/quant.h (load_x, dot_row): the shift-free dequantization and the per-group epilogue; and the
+  verify-width GEMMs on the matrix units, adapted from src/kernels/tensor/verify8t.metal (qmm8t_impl, qmm8t2_impl):
+  integer codes as exact tensor_ops operands with an fp32 group epilogue, in 8-row tiles and 16-row tile pairs, and the
+  T-table operand layout they read (from src/kernels/verify8.metal, v8t_input_of_slot).
+- src/hybrid/kflash.rs: KFlash's tree budget, adapted from src/model/kflash_budget.{h,cpp} (KfBudget, KfCosts: the
+  per-depth logistic calibration and its fit, the cost table, the E(n) - rate * cost(n) row rule, the cache file) and
+  src/kernels/kflash.h (kf_lcal, and kf_build_impl's E(n) and choice of rows).
+
+Ideas taken from Kapitsa's code and documentation without copying code, credited where they are used:
+
+- src/hybrid/mlx.rs: how MLX conversions of Qwen3.5-family checkpoints store their tensors (src/model/qwen35.cpp).
+- src/hybrid/speculative.rs, lattice_best_first: ranking lattice-tree nodes by calibrated path probability (KFlash's
+  kf_build); src/hybrid/session.rs: the per-cycle budget loop and its calibration records (kf_accept).
+- src/hybrid/session.rs, uniform and the speculative step: sampled acceptance with one uniform per position, a row
+  kept when it equals its own draw (kf_accept's T > 0 rule).
+- src/hybrid/draft.rs, DraftOptions::block and ::kflash: drafting DFlash2 with a 16-row block over a reduced head of
+  98,304 ids (src/model/dflash2.cpp, NI_DFLASH_BLOCK and NI_DFLASH_HEAD).
+- src/hybrid/engine.rs, HybridModel::project_mlx_tiles: the verify GEMMs' tiling rule (src/model/qwen35_v8.cpp,
+  v8t_plan).
+
+Review reference: be57c8f (the Kapitsa commit the adaptations were read from).
+The Apache License 2.0 text is in LICENSE-APACHE.

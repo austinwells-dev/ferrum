@@ -2,7 +2,8 @@
 //! linear attention interleaved with gated full attention, on a dedicated
 //! kernel library with preallocated state. The same engine runs the
 //! attention-only `flint` and `spark2_5` architectures (experimental), whose
-//! sliding-window layers keep K/V rings.
+//! sliding-window layers keep K/V rings. `lfm3` (experimental) mixes short
+//! convolutions with sliding and full attention on the same path.
 #![forbid(unsafe_code)]
 pub mod bench;
 pub mod chat;
@@ -10,13 +11,23 @@ pub mod config;
 pub mod draft;
 pub mod engine;
 #[cfg(test)]
+mod hc_tests;
+#[cfg(test)]
 mod iq_tests;
+pub mod kflash;
 pub mod lookup;
+pub mod mlx;
+#[cfg(test)]
+mod mlx_tests;
 pub mod mtp;
 pub mod plan;
+pub mod ple;
 pub mod runtime;
 pub mod session;
 pub mod speculative;
+pub mod stream;
+#[cfg(test)]
+mod tree_tests;
 pub mod weights;
 
 pub use config::{AttnSpec, HybridConfig, KvCache, Variant};
@@ -42,6 +53,10 @@ const FLINT_PATTERNS: [&str; 3] = [
     r"[一-龥぀-ゟ゠-ヿ]+",
     r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+",
 ];
+
+/// LFM3 pre-tokenizer (llama.cpp `LLAMA_VOCAB_PRE_TYPE_LLAMA3`, selected by
+/// `tokenizer.ggml.pre = lfm2`): one regex, no NFC, and `ignore_merges`.
+const LFM2_PATTERN: &str = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// Spark pre-tokenizer (llama.cpp `LLAMA_VOCAB_PRE_TYPE_SPARK2_5`): digit runs
 /// of up to three, CJK runs, words, punctuation and whitespace, then single
@@ -97,15 +112,22 @@ pub fn load_with(
     options: plan::PlanOptions,
 ) -> Result<LoadedHybrid> {
     let start = std::time::Instant::now();
-    let mut file = GgufFile::open(path)?;
+    if mlx::is_mlx_dir(path.as_ref()) {
+        return load_mlx(device, path.as_ref(), options, start);
+    }
+    let mut file = GgufFile::open(path.as_ref())?;
     let mut config = HybridConfig::from_gguf(&file)?;
     config.kv_cache = options.kv_cache;
-    let plan = plan::plan(
+    let mut options = options;
+    options.chunk = plan::model_chunk(&config, options.chunk);
+    let mut plan = plan::plan(
         &file,
         &config,
         device.recommended_max_working_set() as usize,
         options,
     )?;
+    // The arena is one buffer: no larger than the device allocates at once.
+    plan.arena = plan.arena.min(device.max_buffer_length());
     let (tokenizer, eos_ids) = tokenizer(&file, config.vocab)?;
     let chat_template = match file.metadata_value("tokenizer.chat_template") {
         Some(MetadataValue::String(t)) => Some(t.clone()),
@@ -113,7 +135,25 @@ pub fn load_with(
     };
     let chat_special_tokens = special_tokens(file.metadata());
     let before = device.allocated_bytes();
-    let weights = weights::load(device, &mut file, &config)?;
+    let weights = if streams_experts(&config) {
+        let slot = plan.streamed / (config.layers * config.moe.map_or(1, |m| m.experts));
+        let experts = stream::StreamedExperts::open(
+            device,
+            path.as_ref(),
+            &file,
+            &config,
+            plan.arena / slot.max(1),
+            stream_threads(),
+            options.chunk,
+        )?;
+        let table = match &config.qwen4exp {
+            Some(_) => Some(ple::PleTable::open(path.as_ref(), &config)?),
+            None => None,
+        };
+        weights::load_streamed(device, &mut file, &config, experts, table)?
+    } else {
+        weights::load(device, &mut file, &config)?
+    };
     let model = HybridModel::new(device, config, weights, options.chunk, options.logit_rows)?;
     Ok(LoadedHybrid {
         model,
@@ -127,8 +167,65 @@ pub fn load_with(
     })
 }
 
+/// Whether `c`'s routed experts stay in the file and stream into an arena:
+/// always for qwen4exp (larger than any Mac it targets), and for any MoE
+/// model under `FERRUM_STREAM_EXPERTS=1` (to compare against it resident).
+pub fn streams_experts(c: &HybridConfig) -> bool {
+    c.variant == config::Variant::Qwen4Exp
+        || (c.moe.is_some() && std::env::var("FERRUM_STREAM_EXPERTS").is_ok_and(|v| v == "1"))
+}
+
+/// I/O threads reading experts (`FERRUM_STREAM_THREADS`, default 6).
+fn stream_threads() -> usize {
+    std::env::var("FERRUM_STREAM_THREADS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6)
+}
+
+/// `load_with` for an MLX checkpoint directory (`mlx`).
+fn load_mlx(
+    device: &MetalDevice,
+    dir: &Path,
+    options: plan::PlanOptions,
+    start: std::time::Instant,
+) -> Result<LoadedHybrid> {
+    let mut config = mlx::config(dir)?;
+    config.kv_cache = options.kv_cache;
+    let mut options = options;
+    options.chunk = plan::model_chunk(&config, options.chunk);
+    let plan = plan::plan_for_weights(
+        mlx::weight_bytes(dir, &config)?,
+        &config,
+        device.recommended_max_working_set() as usize,
+        options,
+    )?;
+    let chat = mlx::chat_files(dir)?;
+    let before = device.allocated_bytes();
+    let weights = mlx::load_weights(device, dir, &config)?;
+    let model = HybridModel::new(device, config, weights, options.chunk, options.logit_rows)?;
+    Ok(LoadedHybrid {
+        model,
+        tokenizer: chat.tokenizer,
+        eos_ids: chat.eos_ids,
+        chat_template: chat.template,
+        chat_special_tokens: chat.special,
+        load_time: start.elapsed(),
+        plan,
+        loaded_bytes: device.allocated_bytes().saturating_sub(before),
+    })
+}
+
 /// The chat template embedded in a GGUF (no weights are read).
 pub fn load_chat_template(path: impl AsRef<Path>) -> Result<Option<chat::ChatTemplate>> {
+    if mlx::is_mlx_dir(path.as_ref()) {
+        let chat = mlx::chat_files(path.as_ref())?;
+        let (bos, eos) = &chat.special;
+        return chat
+            .template
+            .map(|t| chat::ChatTemplate::with_special_tokens(&t, bos, eos))
+            .transpose();
+    }
     let file = GgufFile::open(path)?;
     let (bos, eos) = special_tokens(file.metadata());
     let flint = matches!(
@@ -170,6 +267,9 @@ fn special_tokens(md: &std::collections::BTreeMap<String, MetadataValue>) -> (St
 
 /// Build only the tokenizer of a hybrid GGUF (no weights are read).
 pub fn load_tokenizer(path: impl AsRef<Path>) -> Result<Tokenizer> {
+    if mlx::is_mlx_dir(path.as_ref()) {
+        return Ok(mlx::chat_files(path.as_ref())?.tokenizer);
+    }
     let file = GgufFile::open(path)?;
     let config = HybridConfig::from_gguf(&file)?;
     Ok(tokenizer(&file, config.vocab)?.0)
@@ -188,13 +288,15 @@ fn tokenizer(file: &GgufFile, vocab: usize) -> Result<(Tokenizer, Vec<u32>)> {
     }
     // Qwen3.5 text is NFC-normalized before splitting; llama.cpp's Flint
     // tokenizer is not, so combining marks stay separate tokens.
-    let (patterns, nfc): (&[&str], bool) = match text("tokenizer.ggml.pre")? {
-        "qwen35" => (&[QWEN35_PATTERN], true),
-        "flint" => (&FLINT_PATTERNS, false),
-        "spark2_5" => (&SPARK_PATTERNS, false),
+    let pre = text("tokenizer.ggml.pre")?;
+    let (patterns, nfc, ignore_merges): (&[&str], bool, bool) = match pre {
+        "qwen35" => (&[QWEN35_PATTERN], true, false),
+        "flint" => (&FLINT_PATTERNS, false, false),
+        "spark2_5" => (&SPARK_PATTERNS, false, false),
+        "lfm2" => (&[LFM2_PATTERN], false, true),
         other => {
             return Err(Error::Tokenizer(format!(
-                "hybrid GGUF pre-tokenizer {other:?} is not supported (qwen35, flint, spark2_5)"
+                "hybrid GGUF pre-tokenizer {other:?} is not supported (qwen35, flint, spark2_5, lfm2)"
             )));
         }
     };
@@ -230,8 +332,14 @@ fn tokenizer(file: &GgufFile, vocab: usize) -> Result<(Tokenizer, Vec<u32>)> {
             "tokenizer vocabulary exceeds embedding rows".into(),
         ));
     }
-    let tokenizer =
-        Tokenizer::from_gguf_bpe_with_patterns(&tokens, &merges, &types, patterns, nfc)?;
+    let tokenizer = Tokenizer::from_gguf_bpe_with_patterns(
+        &tokens,
+        &merges,
+        &types,
+        patterns,
+        nfc,
+        ignore_merges,
+    )?;
     let eos = config::uint(md, "tokenizer.ggml.eos_token_id")? as u32;
     let mut eos_ids = vec![eos];
     // Architectures that list their end-of-generation tokens use that list.

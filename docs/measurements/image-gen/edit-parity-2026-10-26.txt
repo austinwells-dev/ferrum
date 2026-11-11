@@ -1,0 +1,180 @@
+# Qwen-Image-2.1-Turbo against diffusers and the memory planner, after the audit fixes and editing
+machine: Apple M5, 32 GB, macOS 27.0.1
+model:   Qwen/Qwen-Image-2.1-Turbo @ fc13ba1986fcb905854dc8de2f52eee395f49b5b, BF16 weights (Q8_0, Q4_0 or GGUF where stated)
+text GGUF: unsloth/Qwen3-VL-8B-Instruct-GGUF, Qwen3-VL-8B-Instruct-UD-Q4_K_XL.gguf
+commit:  30e6d67 + the working tree of this change
+dumps:   tools/imgref/dump_reference.py; fox-512 (bf16) and fox-512-f16 (fp16): 'A red fox sitting in fresh snow, golden hour light.', seed 42;
+         fox-edit-512 (bf16): --image fox.png (a 512x512 Ferrum render of that prompt) --prompt 'Make the fox wear a red knitted scarf.' --resolution 512, seed 42
+memory:  'predicted' is Pipeline::stage_bytes, 'measured peak' Metal's currentAllocatedSize high-water mark per stage window; the test fails above predicted + 4 MiB
+timings here are incidental (no measurement hygiene); see retime records for timings
+
+## text to image, dump fox-512-f16
+command: FERRUM_IMGREF=~/models/imgref/fox-512-f16 FERRUM_TEXT_GGUF=<UD-Q4_K_XL> cargo test --release --lib -- --ignored --nocapture --test-threads 1 dit_blocks dit_sampling vae_decodes reference_tests::text_encoder template_tokenizes
+test diffusion::reference_tests::dit_blocks_match_diffusers ... loaded 14.2 GB in 2.8s
+          text block 0: rms   58.214  rel rms error 0.00066  max error / rms 0.0544
+          text block 1: rms   60.292  rel rms error 0.00068  max error / rms 0.0465
+         text block 15: rms  152.422  rel rms error 0.00288  max error / rms 0.1760
+         text block 31: rms  153.123  rel rms error 0.00313  max error / rms 0.2201
+ image block 0, step 0: rms    6.380  rel rms error 0.00045  max error / rms 0.0493
+ image block 1, step 0: rms    7.014  rel rms error 0.00049  max error / rms 0.0425
+image block 15, step 0: rms    5.734  rel rms error 0.00341  max error / rms 0.6196
+image block 31, step 0: rms   23.248  rel rms error 0.00145  max error / rms 0.1188
+    prediction, step 0: rms    1.479  rel rms error 0.00115  max error / rms 0.0074
+ image block 0, step 1: rms    6.315  rel rms error 0.00047  max error / rms 0.0437
+ image block 1, step 1: rms    6.820  rel rms error 0.00053  max error / rms 0.0459
+image block 15, step 1: rms    5.678  rel rms error 0.00436  max error / rms 1.0483
+image block 31, step 1: rms   23.721  rel rms error 0.00707  max error / rms 2.0191
+    prediction, step 1: rms    1.442  rel rms error 0.00328  max error / rms 0.0891
+ok
+test diffusion::reference_tests::dit_sampling_matches_diffusers_latents ... loaded 14.2 GB in 2.6s
+  latents after step 0: rms    0.985  rel rms error 0.00029  max error / rms 0.0031
+  latents after step 1: rms    0.962  rel rms error 0.00039  max error / rms 0.0039
+  latents after step 2: rms    0.937  rel rms error 0.00048  max error / rms 0.0043
+  latents after step 3: rms    0.909  rel rms error 0.00059  max error / rms 0.0054
+  latents after step 4: rms    0.870  rel rms error 0.00079  max error / rms 0.0070
+  latents after step 5: rms    0.784  rel rms error 0.00135  max error / rms 0.0115
+  latents after step 6: rms    0.771  rel rms error 0.00335  max error / rms 0.0661
+  latents after step 7: rms    1.095  rel rms error 0.00869  max error / rms 0.3381
+8 steps in 11.6s
+         final latents: rms    1.095  rel rms error 0.00869  max error / rms 0.3381
+ok
+test diffusion::reference_tests::template_tokenizes_like_diffusers ... ok
+test diffusion::reference_tests::text_encoder_gguf_error_is_bounded ... None: loaded 4.6 GB in 0.9s
+encoded 34 tokens in 0.19s
+    prompt embeds None: rms   12.275  rel rms error 0.26462  max error / rms 20.9220
+GGUF prompt embedding error 0.26462054
+ok
+test diffusion::reference_tests::text_encoder_matches_diffusers ... None: loaded 15.1 GB in 3.0s
+encoded 34 tokens in 0.75s
+    prompt embeds None: rms   12.275  rel rms error 0.01027  max error / rms 1.8499
+ok
+test diffusion::reference_tests::text_encoder_q4_0_error_is_bounded ... Some(Q4_0): loaded 5.2 GB in 3.2s
+encoded 34 tokens in 0.18s
+prompt embeds Some(Q4_0): rms   12.275  rel rms error 0.33439  max error / rms 9.7656
+Q4_0 prompt embedding error 0.3343879
+ok
+test diffusion::reference_tests::text_encoder_q8_stays_close_to_diffusers ... Some(Q8_0): loaded 8.6 GB in 2.4s
+encoded 34 tokens in 0.21s
+prompt embeds Some(Q8_0): rms   12.275  rel rms error 0.02739  max error / rms 1.5696
+ok
+test diffusion::reference_tests::vae_decodes_like_diffusers ... loaded 0.51 GB in 0.4s
+decoded in 0.75s
+         decoded image: rms    0.708  rel rms error 0.00065  max error / rms 0.0526
+PSNR 72.8 dB (on [0, 1])
+ok
+
+## text to image, dump fox-512
+command: FERRUM_IMGREF=~/models/imgref/fox-512 FERRUM_TEXT_GGUF=<UD-Q4_K_XL> cargo test --release --lib -- --ignored --nocapture --test-threads 1 dit_blocks dit_sampling vae_decodes reference_tests::text_encoder template_tokenizes
+test diffusion::reference_tests::dit_blocks_match_diffusers ... loaded 14.2 GB in 2.8s
+          text block 0: rms   58.145  rel rms error 0.00375  max error / rms 0.3474
+          text block 1: rms   60.162  rel rms error 0.00491  max error / rms 0.4483
+         text block 15: rms  152.778  rel rms error 0.02001  max error / rms 1.2475
+         text block 31: rms  153.323  rel rms error 0.02248  max error / rms 1.6165
+ image block 0, step 0: rms    6.355  rel rms error 0.00502  max error / rms 0.3572
+ image block 1, step 0: rms    6.997  rel rms error 0.00450  max error / rms 0.3716
+image block 15, step 0: rms    5.721  rel rms error 0.02790  max error / rms 5.1377
+image block 31, step 0: rms   23.268  rel rms error 0.01335  max error / rms 2.4982
+    prediction, step 0: rms    1.483  rel rms error 0.00738  max error / rms 0.0891
+ image block 0, step 1: rms    6.311  rel rms error 0.00406  max error / rms 0.2432
+ image block 1, step 1: rms    6.817  rel rms error 0.00492  max error / rms 0.3044
+image block 15, step 1: rms    5.689  rel rms error 0.06155  max error / rms 16.0639
+image block 31, step 1: rms   23.762  rel rms error 0.03237  max error / rms 2.6647
+    prediction, step 1: rms    1.444  rel rms error 0.02415  max error / rms 0.1541
+ok
+test diffusion::reference_tests::dit_sampling_matches_diffusers_latents ... loaded 14.2 GB in 2.6s
+  latents after step 0: rms    0.985  rel rms error 0.00238  max error / rms 0.0170
+  latents after step 1: rms    0.962  rel rms error 0.00309  max error / rms 0.0230
+  latents after step 2: rms    0.937  rel rms error 0.00392  max error / rms 0.0297
+  latents after step 3: rms    0.910  rel rms error 0.00504  max error / rms 0.0342
+  latents after step 4: rms    0.870  rel rms error 0.00708  max error / rms 0.0636
+  latents after step 5: rms    0.784  rel rms error 0.01735  max error / rms 0.3739
+  latents after step 6: rms    0.772  rel rms error 0.04681  max error / rms 1.4667
+  latents after step 7: rms    1.095  rel rms error 0.06427  max error / rms 1.9970
+8 steps in 11.8s
+         final latents: rms    1.095  rel rms error 0.06427  max error / rms 1.9970
+ok
+test diffusion::reference_tests::template_tokenizes_like_diffusers ... ok
+test diffusion::reference_tests::text_encoder_gguf_error_is_bounded ... None: loaded 4.6 GB in 0.9s
+encoded 34 tokens in 0.19s
+    prompt embeds None: rms   12.312  rel rms error 0.26704  max error / rms 17.3813
+GGUF prompt embedding error 0.2670434
+ok
+test diffusion::reference_tests::text_encoder_matches_diffusers ... None: loaded 15.1 GB in 3.0s
+encoded 34 tokens in 0.73s
+    prompt embeds None: rms   12.312  rel rms error 0.05670  max error / rms 10.8393
+ok
+test diffusion::reference_tests::text_encoder_q4_0_error_is_bounded ... Some(Q4_0): loaded 5.2 GB in 3.2s
+encoded 34 tokens in 0.18s
+prompt embeds Some(Q4_0): rms   12.312  rel rms error 0.33638  max error / rms 12.2157
+Q4_0 prompt embedding error 0.3363817
+ok
+test diffusion::reference_tests::text_encoder_q8_stays_close_to_diffusers ... Some(Q8_0): loaded 8.6 GB in 2.4s
+encoded 34 tokens in 0.21s
+prompt embeds Some(Q8_0): rms   12.312  rel rms error 0.05399  max error / rms 9.3168
+ok
+test diffusion::reference_tests::vae_decodes_like_diffusers ... loaded 0.51 GB in 0.4s
+decoded in 0.74s
+         decoded image: rms    0.707  rel rms error 0.00065  max error / rms 0.0362
+PSNR 72.8 dB (on [0, 1])
+ok
+
+## editing, dump fox-edit-512 (bf16; one 512x512 condition image)
+command: FERRUM_IMGREF_EDIT=~/models/imgref/fox-edit-512 cargo test --release --lib -- --ignored --nocapture --test-threads 1 edit::
+test diffusion::reference_tests::edit::dit_with_a_condition_image_matches_diffusers ...         prefix block 0: rms   13.285  rel rms error 0.00326  max error / rms 1.0150
+       prefix block 15: rms   21.452  rel rms error 0.02167  max error / rms 10.6897
+       prefix block 31: rms   27.848  rel rms error 0.02024  max error / rms 8.0049
+    prediction, step 0: rms    1.536  rel rms error 0.00793  max error / rms 0.1235
+    prediction, step 1: rms    1.413  rel rms error 0.02151  max error / rms 0.3102
+         final latents: rms    1.169  rel rms error 0.02180  max error / rms 0.6809
+ok
+test diffusion::reference_tests::edit::edit_prompt_tokenizes_like_transformers ... ok
+test diffusion::reference_tests::edit::pipeline_edits_an_image ... 
+total 25.6s, Timings { load: 6.455512834s, encode: 2.874100125s, denoise: 15.374774334s, decode: 766.65525ms }
+    vision + image encoder: predicted   1402.0 MiB, measured peak   1267.4 MiB
+                   encoder: predicted  14594.6 MiB, measured peak  14590.5 MiB
+               transformer: predicted  14343.8 MiB, measured peak  14343.1 MiB
+                   decoder: predicted    844.0 MiB, measured peak    843.9 MiB
+ok
+test diffusion::reference_tests::edit::text_encoder_with_an_image_matches_diffusers ...    with Ferrum's tower: rms   11.962  rel rms error 0.08833  max error / rms 19.1822
+with Ferrum's tower, after it: rms   11.853  rel rms error 0.02648  max error / rms 1.4464
+ with the dump's tower: rms   11.962  rel rms error 0.08750  max error / rms 19.1822
+with the dump's tower, after it: rms   11.853  rel rms error 0.02186  max error / rms 1.1200
+ok
+test diffusion::reference_tests::edit::vae_encoder_matches_diffusers ...            vs fp32 VAE: rms    1.086  rel rms error 0.00359  max error / rms 0.1474
+     vs pipeline's VAE: rms    1.086  rel rms error 0.00888  max error / rms 0.1841
+ok
+test diffusion::reference_tests::edit::vision_tower_matches_transformers ...       vs BF16 pipeline: rms    0.316  rel rms error 0.05398  max error / rms 1.8843
+        vision vs fp32: rms    0.316  rel rms error 0.01992  max error / rms 1.1293
+   deepstack 0 vs fp32: rms    0.227  rel rms error 0.00251  max error / rms 0.0465
+   deepstack 1 vs fp32: rms    0.283  rel rms error 0.00524  max error / rms 0.0930
+   deepstack 2 vs fp32: rms    0.199  rel rms error 0.01132  max error / rms 0.3621
+ok
+
+## memory, text to image 512x512
+command:  cargo test --release --lib -- --ignored --nocapture --test-threads 1 pipeline_generates
+test diffusion::reference_tests::pipeline_generates_an_image ... 
+total 20.7s, Timings { load: 6.278042125s, encode: 649.337833ms, denoise: 12.920540709s, decode: 765.013833ms }
+                   encoder: predicted  14465.4 MiB, measured peak  14465.4 MiB
+               transformer: predicted  13823.4 MiB, measured peak  13822.8 MiB
+                   decoder: predicted    844.0 MiB, measured peak    843.9 MiB
+ok
+
+## memory, text to image 1024x1024
+command: FERRUM_SIDE=1024 cargo test --release --lib -- --ignored --nocapture --test-threads 1 pipeline_generates
+test diffusion::reference_tests::pipeline_generates_an_image ... 
+total 71.1s, Timings { load: 6.522246041s, encode: 644.171333ms, denoise: 60.835432875s, decode: 3.03476575s }
+                   encoder: predicted  14465.4 MiB, measured peak  14465.4 MiB
+               transformer: predicted  14546.4 MiB, measured peak  14545.8 MiB
+                   decoder: predicted   1924.0 MiB, measured peak   1925.1 MiB
+ok
+
+## memory, edit to 1024x1024 from the 512x512 condition image
+command: FERRUM_IMGREF_EDIT=~/models/imgref/fox-edit-512 FERRUM_RESOLUTION=1024 cargo test --release --lib -- --ignored --nocapture --test-threads 1 edit::pipeline_edits
+test diffusion::reference_tests::edit::pipeline_edits_an_image ... 
+total 98.9s, Timings { load: 6.432267208s, encode: 8.865207625s, denoise: 80.536572958s, decode: 2.981088958s }
+    vision + image encoder: predicted   1726.2 MiB, measured peak   1719.7 MiB
+                   encoder: predicted  14978.6 MiB, measured peak  14962.5 MiB
+               transformer: predicted  16605.1 MiB, measured peak  16603.5 MiB
+                   decoder: predicted   1924.0 MiB, measured peak   1925.1 MiB
+ok
+

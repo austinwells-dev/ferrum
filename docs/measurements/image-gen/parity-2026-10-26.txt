@@ -1,0 +1,109 @@
+# Qwen-Image-2.1-Turbo parity against diffusers, 512x512
+machine: Apple M5, 32 GB, macOS 27.0.1
+model:   Qwen/Qwen-Image-2.1-Turbo @ fc13ba1986fcb905854dc8de2f52eee395f49b5b, BF16 weights (Q8_0 where stated)
+commit:  c9d3275
+prompt:  'A red fox sitting in fresh snow, golden hour light.', seed 42, 8 Turbo steps
+dumps:   tools/imgref/dump_reference.py, diffusers 0.42.0.dev0, torch 2.14.1 MPS; fox-512 = bf16, fox-512-f16 = fp16
+command: FERRUM_QWEN_IMAGE=<snapshot> FERRUM_IMGREF=~/models/imgref/<dump> cargo test --release --lib -- --ignored --nocapture --test-threads=1 diffusion::
+
+## reference dump: fox-512
+
+test diffusion::reference_tests::dit_blocks_match_diffusers ... loaded 14.2 GB in 2.7s
+          text block 0: rms   58.145  rel rms error 0.00358  max error / rms 0.3488
+          text block 1: rms   60.162  rel rms error 0.00468  max error / rms 0.4503
+         text block 15: rms  152.778  rel rms error 0.01722  max error / rms 1.0871
+         text block 31: rms  153.323  rel rms error 0.01986  max error / rms 1.4573
+ image block 0, step 0: rms    6.355  rel rms error 0.00456  max error / rms 0.3413
+ image block 1, step 0: rms    6.997  rel rms error 0.00419  max error / rms 0.3541
+image block 15, step 0: rms    5.721  rel rms error 0.02777  max error / rms 4.8024
+image block 31, step 0: rms   23.268  rel rms error 0.01328  max error / rms 2.5065
+    prediction, step 0: rms    1.483  rel rms error 0.00745  max error / rms 0.0880
+ image block 0, step 1: rms    6.311  rel rms error 0.00398  max error / rms 0.2557
+ image block 1, step 1: rms    6.817  rel rms error 0.00484  max error / rms 0.3168
+image block 15, step 1: rms    5.689  rel rms error 0.06166  max error / rms 16.7754
+image block 31, step 1: rms   23.762  rel rms error 0.03259  max error / rms 2.6599
+    prediction, step 1: rms    1.444  rel rms error 0.02439  max error / rms 0.1562
+ok
+test diffusion::reference_tests::dit_sampling_matches_diffusers_latents ... loaded 14.2 GB in 2.4s
+  latents after step 0: rms    0.985  rel rms error 0.00238  max error / rms 0.0169
+  latents after step 1: rms    0.962  rel rms error 0.00309  max error / rms 0.0230
+  latents after step 2: rms    0.937  rel rms error 0.00393  max error / rms 0.0296
+  latents after step 3: rms    0.910  rel rms error 0.00506  max error / rms 0.0344
+  latents after step 4: rms    0.870  rel rms error 0.00712  max error / rms 0.0648
+  latents after step 5: rms    0.784  rel rms error 0.01754  max error / rms 0.3798
+  latents after step 6: rms    0.772  rel rms error 0.04734  max error / rms 1.4755
+  latents after step 7: rms    1.095  rel rms error 0.06493  max error / rms 1.9971
+8 steps in 14.4s
+         final latents: rms    1.095  rel rms error 0.06493  max error / rms 1.9971
+ok
+test diffusion::reference_tests::text_encoder_matches_diffusers ... None: loaded 15.1 GB in 2.9s
+encoded 34 tokens in 0.46s
+    prompt embeds None: rms   12.312  rel rms error 0.05670  max error / rms 10.8393
+ok
+test diffusion::reference_tests::text_encoder_q8_stays_close_to_diffusers ... Some(Q8_0): loaded 8.6 GB in 2.8s
+encoded 34 tokens in 0.20s
+prompt embeds Some(Q8_0): rms   12.312  rel rms error 0.05399  max error / rms 9.3168
+ok
+test diffusion::reference_tests::vae_decodes_like_diffusers ... loaded 0.51 GB in 0.4s
+decoded in 0.71s
+         decoded image: rms    0.707  rel rms error 0.00065  max error / rms 0.0362
+PSNR 72.8 dB (on [0, 1])
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 81 filtered out; finished in 32.18s
+
+
+## reference dump: fox-512-f16
+
+test diffusion::reference_tests::dit_blocks_match_diffusers ... loaded 14.2 GB in 2.8s
+          text block 0: rms   58.214  rel rms error 0.00073  max error / rms 0.0555
+          text block 1: rms   60.292  rel rms error 0.00074  max error / rms 0.0481
+         text block 15: rms  152.422  rel rms error 0.00088  max error / rms 0.0573
+         text block 31: rms  153.123  rel rms error 0.00141  max error / rms 0.0786
+ image block 0, step 0: rms    6.380  rel rms error 0.00081  max error / rms 0.0643
+ image block 1, step 0: rms    7.014  rel rms error 0.00074  max error / rms 0.0565
+image block 15, step 0: rms    5.734  rel rms error 0.00341  max error / rms 0.5569
+image block 31, step 0: rms   23.248  rel rms error 0.00164  max error / rms 0.1835
+    prediction, step 0: rms    1.479  rel rms error 0.00108  max error / rms 0.0108
+ image block 0, step 1: rms    6.315  rel rms error 0.00060  max error / rms 0.0524
+ image block 1, step 1: rms    6.820  rel rms error 0.00064  max error / rms 0.0527
+image block 15, step 1: rms    5.678  rel rms error 0.00465  max error / rms 1.1051
+image block 31, step 1: rms   23.721  rel rms error 0.00707  max error / rms 2.0251
+    prediction, step 1: rms    1.442  rel rms error 0.00338  max error / rms 0.0898
+ok
+test diffusion::reference_tests::dit_sampling_matches_diffusers_latents ... loaded 14.2 GB in 2.4s
+  latents after step 0: rms    0.985  rel rms error 0.00029  max error / rms 0.0031
+  latents after step 1: rms    0.962  rel rms error 0.00039  max error / rms 0.0039
+  latents after step 2: rms    0.937  rel rms error 0.00048  max error / rms 0.0044
+  latents after step 3: rms    0.909  rel rms error 0.00059  max error / rms 0.0054
+  latents after step 4: rms    0.870  rel rms error 0.00078  max error / rms 0.0057
+  latents after step 5: rms    0.784  rel rms error 0.00141  max error / rms 0.0124
+  latents after step 6: rms    0.771  rel rms error 0.00354  max error / rms 0.0723
+  latents after step 7: rms    1.095  rel rms error 0.00903  max error / rms 0.3491
+8 steps in 14.6s
+         final latents: rms    1.095  rel rms error 0.00903  max error / rms 0.3491
+ok
+test diffusion::reference_tests::text_encoder_matches_diffusers ... None: loaded 15.1 GB in 3.0s
+encoded 34 tokens in 0.48s
+    prompt embeds None: rms   12.275  rel rms error 0.01027  max error / rms 1.8499
+ok
+test diffusion::reference_tests::text_encoder_q8_stays_close_to_diffusers ... Some(Q8_0): loaded 8.6 GB in 2.8s
+encoded 34 tokens in 0.21s
+prompt embeds Some(Q8_0): rms   12.275  rel rms error 0.02739  max error / rms 1.5696
+ok
+test diffusion::reference_tests::vae_decodes_like_diffusers ... loaded 0.51 GB in 0.4s
+decoded in 0.71s
+         decoded image: rms    0.708  rel rms error 0.00065  max error / rms 0.0526
+PSNR 72.8 dB (on [0, 1])
+ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 81 filtered out; finished in 32.77s
+
+
+## noise floor of the references themselves (bf16 dump vs fp16 dump)
+ prompt_embeds: rel rms 0.04830  max error / rms 8.9951
+        pred.0: rel rms 0.00744  max error / rms 0.0876
+     latents.3: rel rms 0.00483  max error / rms 0.0365
+     latents.7: rel rms 0.06228  max error / rms 1.9816
+        vae_in: rel rms 0.05797  max error / rms 1.8010
+         image: rel rms 0.08314  max error / rms 2.3453

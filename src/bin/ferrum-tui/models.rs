@@ -342,6 +342,7 @@ impl App {
                         DIM,
                     ),
                     "vision" => match m.vision {
+                        Some(_) if m.audio => ("audio".into(), TEAL),
                         Some(_) => ("yes".into(), TEAL),
                         None => ("–".into(), FAINT),
                     },
@@ -441,7 +442,8 @@ impl App {
             "vision",
             match &m.vision {
                 Some(p) => format!(
-                    "yes · {}",
+                    "{} · {}",
+                    if m.audio { "audio" } else { "yes" },
                     p.file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default()

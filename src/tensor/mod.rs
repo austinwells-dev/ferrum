@@ -124,6 +124,7 @@ impl Tensor {
             dtype,
         })
     }
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn output(device: &MetalDevice, dims: &[usize], dtype: DType) -> Result<Self> {
         let shape = Shape::new(dims)?;
         let layout = Layout::contiguous(&shape)?;
@@ -205,6 +206,33 @@ impl Tensor {
             layout,
             dtype,
         })
+    }
+    /// Fresh, non-resident storage holding `data`: a staging copy that a GPU
+    /// copy moves into long-lived state.
+    pub(crate) fn staged(
+        device: &MetalDevice,
+        dims: impl AsRef<[usize]>,
+        dtype: DType,
+        data: &[u8],
+    ) -> Result<Self> {
+        let shape = Shape::new(dims)?;
+        let layout = Layout::contiguous(&shape)?;
+        if shape.byte_size(dtype)? != data.len() {
+            return Err(Error::Shape("byte length differs from shape/dtype".into()));
+        }
+        let mut storage = device.allocate(data.len())?;
+        storage.with_bytes_mut(|dst| dst.copy_from_slice(data));
+        Ok(Self {
+            storage: Rc::new(storage),
+            offset: 0,
+            shape,
+            layout,
+            dtype,
+        })
+    }
+    /// The tensor's bytes, once the GPU work that wrote them has completed.
+    pub(crate) fn read_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
+        self.storage.with_bytes(self.offset, self.byte_size(), f)
     }
     pub fn to_f32(&self) -> Vec<f32> {
         self.storage
@@ -299,6 +327,7 @@ impl Tensor {
     pub(crate) fn binding(&self) -> (&MetalBuffer, usize, usize) {
         (&self.storage, self.offset, self.byte_size())
     }
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn buffer(&self) -> &MetalBuffer {
         &self.storage
     }
@@ -309,6 +338,7 @@ impl Tensor {
 #[derive(Clone)]
 pub(crate) struct PackedStorage {
     storage: Rc<MetalBuffer>,
+    offset: usize,
     byte_len: usize,
 }
 impl PackedStorage {
@@ -324,12 +354,24 @@ impl PackedStorage {
         storage.with_bytes_mut(fill)?;
         Ok(Self {
             storage: Rc::new(storage),
+            offset: 0,
             byte_len,
         })
     }
-    pub(crate) fn binding(&self) -> (&MetalBuffer, usize, usize) {
-        (&self.storage, 0, self.byte_len)
+    /// `byte_len` bytes at `offset` of `storage`, which is never mapped (an
+    /// expert arena region the host fills outside the tensor rules).
+    pub(crate) fn region(storage: Rc<MetalBuffer>, offset: usize, byte_len: usize) -> Self {
+        assert!(offset + byte_len <= storage.len_bytes());
+        Self {
+            storage,
+            offset,
+            byte_len,
+        }
     }
+    pub(crate) fn binding(&self) -> (&MetalBuffer, usize, usize) {
+        (&self.storage, self.offset, self.byte_len)
+    }
+    #[cfg(feature = "legacy-engine")]
     pub(crate) fn buffer(&self) -> &MetalBuffer {
         &self.storage
     }
@@ -338,6 +380,6 @@ impl PackedStorage {
     }
     #[cfg(test)]
     pub(crate) fn with_bytes<T>(&self, f: impl FnOnce(&[u8]) -> T) -> T {
-        self.storage.with_bytes(0, self.byte_len, f)
+        self.storage.with_bytes(self.offset, self.byte_len, f)
     }
 }

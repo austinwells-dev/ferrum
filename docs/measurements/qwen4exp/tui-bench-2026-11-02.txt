@@ -1,0 +1,21 @@
+# ferrum-tui Speed benchmark on Qwen3.8-Flash-Next, 2026-11-02 21:24
+machine: Apple M5, 32 GB, macOS 27.0.1; one model in memory
+model: Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf (ISTA-DASLab), ~/models/Qwen3.8-Flash-Next-GGUF
+build: feat/qwen4exp-formats working tree, committed unchanged in its bench and engine paths as 15a3418
+command: ferrum-tui, Benchmark tab, Speed; depth sweep quick, 192 tokens per prompt, 3 prompts (code, prose,
+  structured data), greedy, q4_0 drafters only, prefill chunk not tuned; trees skipped (MoE)
+drafters: ~/models/qwen38-drafters/dflash2 (incoai DFlash2), ~/models/qwen38-drafters/dspark (shadowpa0327)
+saved result (~/.config/ferrum/bench.json): best "dflash2 (dflash) · depth 2 · q4_0", speedup 1.4195
+
+Rows, as the TUI shows them (tok/s is the best of the three prompts' means; same = answer check):
+  config            depth  quant  tok/s  ×base  accept  same
+  ★ dflash2         2      q4_0   26.5   1.42×  2.48    ≈✓
+    dflash2         3      q4_0   25.8   1.38×  3.05    ≠
+    dspark          2      q4_0   25.5   1.37×  2.45    ≈?
+    dspark          3      q4_0   24.6   1.32×  3.00    ≠
+    dflash2         7      q4_0   21.9   1.17×  4.09    ≈?
+    dspark          7      q4_0   20.7   1.11×  3.97    ≈?
+    no drafter      –      –      18.6   1.00×  –
+
+These chat prompts are not interleaved with Strata; drafters-abba-2026-11-02.txt is the interleaved comparison
+on raw prompts (DFlash2 23.2 vs 17.1 tok/s on the short one).

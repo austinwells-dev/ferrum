@@ -1,0 +1,18 @@
+# vision.py on Tiel IQ4_XS + mmproj-BF16, --image-tokens 1024 (default)
+## base 12a6e09
+default                        {'prompt_tokens': 1171, 'content': 'A large red circle centered over a blue-and-white checkerboard background pattern.'}
+## branch
+default                        {'prompt_tokens': 1171, 'content': 'A large red circle centered over a blue-and-white checkerboard background pattern.'}
+detail low                     {'prompt_tokens': 433, 'content': 'A large solid red circle centered on a blue-and-white checkerboard background.'}
+detail high                    {'prompt_tokens': 1171, 'content': 'A large red circle centered over a blue-and-white checkerboard background pattern.'}
+max_tokens 300                 {'prompt_tokens': 499, 'content': 'A large red circle centered on a blue-and-white checkerboard background.'}
+request image_detail low       {'prompt_tokens': 433, 'content': 'A large solid red circle centered on a blue-and-white checkerboard background.'}
+request image_max_tokens 400   {'prompt_tokens': 590, 'content': 'A large solid red circle centered over a blue-and-white checkerboard background.'}
+part wins over request         {'prompt_tokens': 1171, 'content': 'A large red circle centered over a blue-and-white checkerboard background pattern.'}
+above cap clamps               {'prompt_tokens': 1171, 'content': 'A large red circle centered over a blue-and-white checkerboard background pattern.'}
+invalid detail                 {'status': 400, 'error': '{"error":{"message":"invalid operation parameter: image detail must be low, high, auto or a token count, not \\"huge\\"","type":"invalid_request_error","code":400}}'}
+zero max_tokens                {'status': 400, 'error': '{"error":{"message":"invalid operation parameter: image max_tokens must be a positive integer","type":"invalid_request_error","code":400}}'}
+08:28:01.392 INF [req 1] encoded images in 4.59 s
+08:28:04.297 INF [req 2] encoded images in 0.74 s
+08:28:08.776 INF [req 4] encoded images in 0.92 s
+08:28:13.557 INF [req 6] encoded images in 1.97 s

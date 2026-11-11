@@ -1,0 +1,11 @@
+extend        prompt   73 tokens, reused   58: identical (32 tokens, 0 verify steps, acceptance 0.00)
+rewind        prompt   20 tokens, reused   18: identical (32 tokens, 0 verify steps, acceptance 0.00)
+retry         prompt   19 tokens, reused   18: identical (32 tokens, 0 verify steps, acceptance 0.00)
+replace       prompt   16 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+extend again  prompt   73 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+pin           prompt   73 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+long turn     prompt  988 tokens, reused   72: identical (32 tokens, 0 verify steps, acceptance 0.00)
+later turn    prompt 1004 tokens, reused  987: identical (32 tokens, 0 verify steps, acceptance 0.00)
+pinned rewind prompt   77 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+  expected to resume at the pinned checkpoint, position 70
+FAIL

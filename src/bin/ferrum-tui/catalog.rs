@@ -21,8 +21,11 @@ pub struct Model {
     pub mtp: bool,
     /// Why `--draft mtp` is unavailable.
     pub mtp_why: String,
-    /// A vision projector sits next to the file, so images can be attached.
+    /// A projector sits next to the file, so images (or, when `audio`, WAV
+    /// clips) can be attached.
     pub vision: Option<PathBuf>,
+    /// The projector is a speech encoder (LFM3-Audio), not a vision tower.
+    pub audio: bool,
     /// Why ferrum cannot run this file; None means it can.
     pub problem: Option<String>,
     /// The header's scalar `tokenizer.*` keys, to check GGUF drafters against.
@@ -38,8 +41,12 @@ pub fn make_model(path: PathBuf, name: String, size: u64) -> Model {
     } else {
         None
     };
+    let audio = vision
+        .as_deref()
+        .is_some_and(ferrum::vision::is_audio_projector);
     Model {
         vision,
+        audio,
         origin: origin_of(&path),
         path,
         name,
@@ -138,6 +145,7 @@ pub fn is_drafter(lower: &str) -> bool {
         || lower.contains("dflash")
         || lower.contains("speculator")
         || lower.starts_with("mtp-")
+        || lower.contains("-mtp-drafter")
 }
 
 pub struct Drafter {
@@ -501,16 +509,17 @@ pub fn type_name(id: u32) -> String {
         23 => "IQ4_XS",
         29 => "IQ1_M",
         30 => "BF16",
+        42 => "Q2_0",
         n => return format!("type {n}"),
     }
     .to_string()
 }
 
 /// Weight types the hybrid engine has kernels for (see `hybrid::weights`).
-pub const SUPPORTED: [u32; 10] = [0, 2, 8, 12, 13, 14, 18, 21, 22, 23];
+pub const SUPPORTED: [u32; 14] = [0, 2, 6, 8, 11, 12, 13, 14, 18, 20, 21, 22, 23, 42];
 
 /// Types the token-embedding lookup reads (`HybridModel::get_rows`).
-const EMBEDDING: [u32; 7] = [2, 8, 12, 13, 14, 23, 30];
+const EMBEDDING: [u32; 11] = [2, 6, 8, 11, 12, 13, 14, 20, 23, 30, 42];
 
 /// Mirrors what `Runtime::load` requires, without reading any weights.
 pub fn check(path: &Path) -> Checked {
@@ -569,13 +578,19 @@ pub fn check(path: &Path) -> Checked {
             .unwrap_or(20),
         float("general.sampling.min_p").unwrap_or(0.),
     );
+    // Same gate as `recommended_sampling`: only lfm3 adopts penalty_repeat.
+    let penalty = if arch == "lfm3" {
+        float("general.sampling.penalty_repeat").filter(|p| *p != 1.0)
+    } else {
+        None
+    };
     let info = Info {
         name: text("general.name"),
         layers: get("block_count"),
         experts: get("expert_count").filter(|n| *n > 0),
         train_ctx: get("context_length"),
         sampling: format!(
-            "t {} · p {} · k {}{}",
+            "t {} · p {} · k {}{}{}",
             s.0,
             s.1,
             s.2,
@@ -583,7 +598,8 @@ pub fn check(path: &Path) -> Checked {
                 format!(" · min-p {}", s.3)
             } else {
                 String::new()
-            }
+            },
+            penalty.map(|p| format!(" · rep {p}")).unwrap_or_default()
         ),
         arch: arch.clone(),
     };
@@ -606,15 +622,24 @@ pub fn check(path: &Path) -> Checked {
         result.problem = Some("a DFlash drafter, not a chat model".into());
         return result;
     }
-    if !matches!(arch.as_str(), "qwen35" | "qwen35moe" | "flint" | "spark2_5") {
+    // A separate MTP head, such as Qwen3.8-Flash-Next's `qwen4exp-mtp`.
+    if arch.ends_with("-mtp") {
+        result.problem = Some("an MTP draft head, not a chat model".into());
+        return result;
+    }
+    if !matches!(
+        arch.as_str(),
+        "qwen35" | "qwen35moe" | "qwen4exp" | "flint" | "spark2_5" | "lfm3"
+    ) {
         result.problem = Some(format!(
-            "architecture {arch}: needs qwen35, qwen35moe, flint or spark2_5"
+            "architecture {arch}: needs qwen35, qwen35moe, qwen4exp, flint, spark2_5 or lfm3"
         ));
         return result;
     }
     let pre = text("tokenizer.ggml.pre");
     let pre_ok = match arch.as_str() {
         "flint" | "spark2_5" => pre.as_deref() == Some(arch.as_str()),
+        "lfm3" => pre.as_deref() == Some("lfm2"),
         _ => pre.as_deref() == Some("qwen35"),
     };
     if text("tokenizer.ggml.model").as_deref() != Some("gpt2") || !pre_ok {
@@ -632,7 +657,7 @@ pub fn check(path: &Path) -> Checked {
         && !EMBEDDING.contains(&t.type_id)
     {
         result.problem = Some(format!(
-            "embedding quant {} has no lookup kernel (needs Q4_0 Q8_0 Q4_K Q5_K Q6_K IQ4_XS BF16)",
+            "embedding quant {} has no lookup kernel (needs Q2_0 Q4_0 Q5_0 Q8_0 Q3_K Q4_K Q5_K Q6_K IQ4_NL IQ4_XS BF16)",
             type_name(t.type_id)
         ));
         return result;
@@ -649,10 +674,14 @@ pub fn check(path: &Path) -> Checked {
                 || (arch == "spark2_5"
                     && (t.name.ends_with("attn_gate.weight")
                         || t.name.ends_with("attn_qkv.weight"))));
+        // qwen4exp keeps its hyper-connection, router, indexer, gate and
+        // n-gram weights in BF16 (some 1-D) and its n-gram conv in F16; its
+        // loader reads every one of them.
+        let qwen4exp_ok = arch == "qwen4exp" && matches!(t.type_id, 1 | 30);
         let supported = if t.dimensions.len() <= 1 {
-            t.type_id == 0
+            t.type_id == 0 || qwen4exp_ok
         } else {
-            SUPPORTED.contains(&t.type_id) || bf16_ok
+            SUPPORTED.contains(&t.type_id) || bf16_ok || qwen4exp_ok
         };
         if supported {
             continue;
@@ -727,5 +756,17 @@ mod tests {
         assert_eq!(checked.problem, None);
         assert!(checked.hybrid.is_some());
         assert!(!checked.mtp);
+    }
+
+    /// Qwen3.8-Flash-Next's first shard: its BF16 hyper-connection weights and
+    /// F16 n-gram conv must not make it "unsupported".
+    /// `FERRUM_QWEN38_GGUF=...-00001-of-00002.gguf cargo test --bin ferrum-tui -- --ignored qwen38_gguf`
+    #[test]
+    #[ignore = "needs the Qwen3.8-Flash-Next GGUF on disk"]
+    fn qwen38_gguf_passes_the_quant_check() {
+        let path = PathBuf::from(std::env::var("FERRUM_QWEN38_GGUF").expect("FERRUM_QWEN38_GGUF"));
+        let checked = check(&path);
+        assert_eq!(checked.problem, None);
+        assert!(checked.hybrid.is_some());
     }
 }

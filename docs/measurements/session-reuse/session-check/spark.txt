@@ -1,0 +1,10 @@
+extend        prompt  108 tokens, reused   73: identical (32 tokens, 0 verify steps, acceptance 0.00)
+rewind        prompt   35 tokens, reused   34: identical (32 tokens, 0 verify steps, acceptance 0.00)
+retry         prompt   34 tokens, reused   33: identical (32 tokens, 0 verify steps, acceptance 0.00)
+replace       prompt   32 tokens, reused    8: identical (25 tokens, 0 verify steps, acceptance 0.00)
+extend again  prompt  108 tokens, reused    8: identical (32 tokens, 0 verify steps, acceptance 0.00)
+pin           prompt  108 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+long turn     prompt 1043 tokens, reused  108: identical (32 tokens, 0 verify steps, acceptance 0.00)
+later turn    prompt 1079 tokens, reused 1043: identical (32 tokens, 0 verify steps, acceptance 0.00)
+pinned rewind prompt  113 tokens, reused  108: identical (32 tokens, 0 verify steps, acceptance 0.00)
+PASS

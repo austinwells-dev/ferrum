@@ -1,0 +1,43 @@
+== session tiel
+extend        prompt   73 tokens, reused   58: identical (32 tokens, 0 verify steps, acceptance 0.00)
+rewind        prompt   20 tokens, reused   18: identical (32 tokens, 0 verify steps, acceptance 0.00)
+retry         prompt   19 tokens, reused   18: identical (32 tokens, 0 verify steps, acceptance 0.00)
+replace       prompt   16 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+extend again  prompt   73 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+PASS
+exit 0
+== session tiel dflash
+drafter dflash (942d20fee84d04c9ecbf18e9c6fc4144914a1d5d)
+drafter dflash (942d20fee84d04c9ecbf18e9c6fc4144914a1d5d)
+extend        prompt   73 tokens, reused   58: identical (32 tokens, 15 verify steps, acceptance 2.07)
+rewind        prompt   20 tokens, reused   18: identical (32 tokens, 14 verify steps, acceptance 2.21)
+retry         prompt   19 tokens, reused   18: identical (32 tokens, 13 verify steps, acceptance 2.38)
+replace       prompt   16 tokens, reused    0: identical (32 tokens, 14 verify steps, acceptance 2.21)
+extend again  prompt   73 tokens, reused    0: identical (32 tokens, 18 verify steps, acceptance 1.72)
+PASS
+exit 0
+== session q27
+extend        prompt   73 tokens, reused   58: identical (32 tokens, 0 verify steps, acceptance 0.00)
+rewind        prompt   20 tokens, reused   18: identical (0 tokens, 0 verify steps, acceptance 0.00)
+retry         prompt   19 tokens, reused   18: identical (32 tokens, 0 verify steps, acceptance 0.00)
+replace       prompt   16 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+extend again  prompt   73 tokens, reused    0: identical (32 tokens, 0 verify steps, acceptance 0.00)
+PASS
+exit 0
+== spec tiel
+44 verify steps, 2.18 tokens/step, 14 corrupted blocks
+first divergence at token 59: reference margin 0.0012 (near-tie if small)
+verify rows vs single-row decode over 9 positions: max |dlogit| 0.0101, max KL 1.55e-6
+replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 21.1), argmax 2336 vs 2336
+exit 0
+== spec q27
+13 verify steps, 7.38 tokens/step, 4 corrupted blocks
+speculative output == greedy reference (96 tokens)
+verify rows vs single-row decode over 9 positions: max |dlogit| 0.0093, max KL 5.59e-7
+replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 24.3), argmax 5759 vs 5759
+exit 0
+== spec tiel (base 12a6e09)
+44 verify steps, 2.18 tokens/step, 14 corrupted blocks
+first divergence at token 59: reference margin 0.0012 (near-tie if small)
+verify rows vs single-row decode over 9 positions: max |dlogit| 0.0101, max KL 1.55e-6
+replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 21.1), argmax 2336 vs 2336
