@@ -40,7 +40,7 @@ pub struct Thinking {
 }
 
 pub fn thinking(body: &Json, server: &Server) -> Thinking {
-    let d = &server.llm().defaults;
+    let d = &server.model(body).defaults;
     let mut vars = d.template_vars.clone();
     if let Some(kwargs) = body.get("chat_template_kwargs").and_then(Json::as_object) {
         for (k, v) in kwargs {
@@ -117,7 +117,7 @@ pub fn thinking(body: &Json, server: &Server) -> Thinking {
 /// Sampling from the request over the server defaults; llama-server field
 /// names (`n_predict`, `repeat_penalty`, ...) are accepted too.
 pub fn sampling(body: &Json, server: &Server) -> Result<SamplingParams, String> {
-    let d = &server.llm().defaults.sampling;
+    let d = &server.model(body).defaults.sampling;
     let f = |keys: &[&str], default: f32| {
         keys.iter()
             .find_map(|k| body.get(*k).and_then(Json::as_f64))
@@ -212,7 +212,7 @@ pub fn stop_strings(body: &Json, key: &str) -> Vec<String> {
 /// The slot a request asks for: `id_slot` (llama-server; -1 is any), and a
 /// cache key (`prompt_cache_key`, OpenAI's; `session_id`) to return to the
 /// slot that served it last.
-pub fn route(body: &Json) -> Result<Route, String> {
+pub fn route(body: &Json, server: &Server) -> Result<Route, String> {
     let slot = match body.get("id_slot") {
         None | Some(Json::Null) => None,
         Some(v) => match v.as_i64() {
@@ -226,7 +226,11 @@ pub fn route(body: &Json) -> Result<Route, String> {
         .find_map(|k| body.get(*k).and_then(Json::as_str))
         .filter(|k| !k.is_empty())
         .map(|k| crate::worker::truncate(k, 200));
-    Ok(Route { slot, key })
+    Ok(Route {
+        slot,
+        key,
+        model: server.model_path(body),
+    })
 }
 
 /// Token limits for every image of a request: `image_detail` (low, high,
@@ -258,19 +262,16 @@ pub fn max_tokens(body: &Json, keys: &[&str], server: &Server) -> usize {
     keys.iter()
         .find_map(|k| body.get(*k).and_then(Json::as_i64))
         .filter(|&v| v > 0)
-        .map_or(server.llm().defaults.max_tokens, |v| v as usize)
+        .map_or(server.model(body).defaults.max_tokens, |v| v as usize)
 }
 
-fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, bool), String> {
+pub fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, bool), String> {
     let messages = body
         .get("messages")
         .and_then(Json::as_array)
         .filter(|m| !m.is_empty())
         .ok_or("messages must be a non-empty array")?
         .clone();
-    if body.get("n").and_then(Json::as_u64).is_some_and(|n| n > 1) {
-        return Err("n > 1 is not supported".into());
-    }
     let mut tools = body
         .get("tools")
         .and_then(Json::as_array)
@@ -297,7 +298,7 @@ fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, b
     if force_tool.is_some() && tools.is_empty() {
         return Err("tool_choice needs tools".into());
     }
-    for unsupported in ["logprobs", "grammar"] {
+    for unsupported in ["logprobs"] {
         if body
             .get(unsupported)
             .is_some_and(|v| !v.is_null() && v != &json!(false))
@@ -315,6 +316,18 @@ fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, b
         }
         _ => None,
     };
+    // llama-server's `grammar`: GBNF text.
+    match body.get("grammar") {
+        None | Some(Json::Null) => {}
+        Some(Json::String(text)) if text.trim().is_empty() => {}
+        Some(Json::String(_)) if grammar.is_some() => {
+            return Err("grammar cannot be combined with response_format or json_schema".into());
+        }
+        Some(Json::String(text)) => {
+            grammar = Some(Grammar::from_gbnf(text).map_err(|e| e.to_string())?)
+        }
+        Some(_) => return Err("grammar must be a string of GBNF".into()),
+    }
     if let Some(g) = &grammar {
         if !g.ignored.is_empty() {
             warn!(
@@ -327,7 +340,7 @@ fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, b
             // A constrained reply could not call a tool.
             warn!(
                 Some(id),
-                "response_format is not enforced in a request with tools"
+                "the output grammar is not enforced in a request with tools"
             );
             grammar = None;
         }
@@ -354,7 +367,7 @@ fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, b
     Ok((request, t.exclude))
 }
 
-fn describe(request: &ChatRequest, exclude: bool, stream: bool) -> String {
+pub fn describe(request: &ChatRequest, exclude: bool, stream: bool) -> String {
     let s = &request.sampling;
     let mut thinking = match request.template_vars.get("enable_thinking") {
         Some(Json::Bool(false)) => "off".to_owned(),
@@ -467,6 +480,9 @@ fn message(result: &ChatResult, id: u64, exclude: bool) -> Json {
     m
 }
 
+/// Most choices (`n`) one request may ask for.
+const MAX_CHOICES: u64 = 8;
+
 /// Wait for events, calling `idle(elapsed_since_last_event)` roughly every
 /// second while nothing arrives. `idle` returning false aborts the wait.
 pub fn next_event(rx: &Receiver<Event>, mut idle: impl FnMut() -> bool) -> Option<Event> {
@@ -490,21 +506,62 @@ pub fn chat(
     id: u64,
     keep_alive: bool,
 ) -> std::io::Result<()> {
-    let parsed = chat_request(body, server, id).and_then(|r| Ok((r, route(body)?)));
+    let mut refuse = |e: &str| {
+        warn!(Some(id), "bad request: {e}");
+        http::json(
+            stream,
+            400,
+            &error_json(e, "invalid_request_error"),
+            keep_alive,
+        )
+    };
+    let parsed = chat_request(body, server, id).and_then(|r| Ok((r, route(body, server)?)));
     let ((request, exclude), route) = match parsed {
         Ok(r) => r,
-        Err(e) => {
-            warn!(Some(id), "bad request: {e}");
-            return http::json(
-                stream,
-                400,
-                &error_json(&e, "invalid_request_error"),
-                keep_alive,
-            );
-        }
+        Err(e) => return refuse(&e),
     };
     let streaming = body.get("stream").and_then(Json::as_bool).unwrap_or(false);
+    let n = match body.get("n") {
+        None | Some(Json::Null) => 1,
+        Some(n) => match n.as_u64() {
+            Some(n @ 1..=MAX_CHOICES) if n == 1 || !streaming => n,
+            Some(1..=MAX_CHOICES) => return refuse("n above 1 cannot be streamed"),
+            _ => return refuse("n must be a whole number from 1 to 8"),
+        },
+    };
     info!(Some(id), "chat: {}", describe(&request, exclude, streaming));
+    // The choices before the last run one after another, each with the next
+    // seed; all of them reuse the prompt the first one cached.
+    let mut earlier = Vec::new();
+    let mut request = request;
+    for _ in 1..n {
+        let (rx, _cancel) = server.submit(
+            id,
+            Work::Chat(Box::new(request.clone())),
+            route.clone(),
+            stream,
+        );
+        loop {
+            match next_event(&rx, || true) {
+                Some(Event::Chat(result)) => {
+                    earlier.push(result);
+                    break;
+                }
+                Some(Event::Failed { status, message }) => {
+                    let kind = if status == 400 {
+                        "invalid_request_error"
+                    } else {
+                        "server_error"
+                    };
+                    return http::json(stream, status, &error_json(&message, kind), keep_alive);
+                }
+                Some(_) => {}
+                // The request was dropped (the client left).
+                None => return Ok(()),
+            }
+        }
+        request.sampling.seed = request.sampling.seed.wrapping_add(1);
+    }
     let (rx, cancel) = server.submit(id, Work::Chat(Box::new(request)), route, stream);
     let include_usage = body
         .pointer("/stream_options/include_usage")
@@ -516,7 +573,7 @@ pub fn chat(
         .unwrap_or(false);
     if streaming {
         chat_stream(
-            server,
+            server.model_name(body),
             stream,
             &rx,
             &cancel,
@@ -528,15 +585,33 @@ pub fn chat(
         )
     } else {
         wait_json(stream, &rx, &cancel, id, keep_alive, |event| match event {
-            Event::Chat(result) => Some(json!({
-                "id": format!("chatcmpl-{id}"),
-                "object": "chat.completion",
-                "created": now(),
-                "model": server.model_name(),
-                "choices": [{"index": 0, "message": message(&result, id, exclude), "finish_reason": finish_reason(&result)}],
-                "usage": chat_usage(&result),
-                "timings": timings(&result.completion),
-            })),
+            Event::Chat(result) => {
+                let all: Vec<&ChatResult> =
+                    earlier.iter().map(|r| &**r).chain([&*result]).collect();
+                let choices: Vec<Json> = all
+                    .iter()
+                    .enumerate()
+                    .map(|(i, r)| json!({"index": i, "message": message(r, id * 100 + i as u64, exclude), "finish_reason": finish_reason(r)}))
+                    .collect();
+                // The prompt is counted once; the completions add up.
+                let mut usage = chat_usage(all[0]);
+                if all.len() > 1 {
+                    let tokens: usize = all.iter().map(|r| r.completion.tokens.len()).sum();
+                    let reasoning: usize = all.iter().map(|r| r.reasoning_tokens).sum();
+                    usage["completion_tokens"] = json!(tokens);
+                    usage["total_tokens"] = json!(all[0].completion.prompt_tokens + tokens);
+                    usage["completion_tokens_details"] = json!({"reasoning_tokens": reasoning});
+                }
+                Some(json!({
+                    "id": format!("chatcmpl-{id}"),
+                    "object": "chat.completion",
+                    "created": now(),
+                    "model": server.model_name(body),
+                    "choices": choices,
+                    "usage": usage,
+                    "timings": timings(&result.completion),
+                }))
+            }
             _ => None,
         })
     }
@@ -622,7 +697,7 @@ pub fn wait_json(
 
 #[allow(clippy::too_many_arguments)]
 fn chat_stream(
-    server: &Server,
+    model: String,
     stream: &mut TcpStream,
     rx: &Receiver<Event>,
     cancel: &Arc<AtomicBool>,
@@ -632,7 +707,6 @@ fn chat_stream(
     include_usage: bool,
     progress: bool,
 ) -> std::io::Result<()> {
-    let model = server.model_name();
     let chunk = |delta: Json, finish: Option<&str>| {
         json!({
             "id": format!("chatcmpl-{id}"),
@@ -778,7 +852,7 @@ pub fn completion(
             );
         }
     };
-    let parsed = sampling(body, server).and_then(|s| Ok((s, route(body)?)));
+    let parsed = sampling(body, server).and_then(|s| Ok((s, route(body, server)?)));
     let (sampling, route) = match parsed {
         Ok(s) => s,
         Err(e) => {
@@ -810,7 +884,7 @@ pub fn completion(
         route,
         stream,
     );
-    let model = server.model_name();
+    let model = server.model_name(body);
     let body_for = |text: &str, c: &Completion, stopped: bool, obj: &str| {
         let finish = if stopped {
             "stop"

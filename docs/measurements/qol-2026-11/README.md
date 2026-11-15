@@ -67,3 +67,19 @@ The whole-process time includes the K/V allocation, which the reported load time
 [final-regression-2026-11-15.txt](final-regression-2026-11-15.txt): after the load-time, `logit_bias` and `tool_choice` changes, the greedy reply is byte-identical to `716e9b4` on both models, `hybrid_session_check` passes and `hybrid_spec_check` reproduces the plain forward.
 
 Not adopted: thin LTO with one codegen unit. Interleaved against the default build on Spark 4B it moved neither constrained decoding (32.5–36.5 against 32.0–36.4 tok/s) nor `hybrid_bench` beyond their spread; the binary was 19% smaller (9.4 against 11.6 MB).
+
+## GBNF
+
+[gbnf.sh](gbnf.sh) → [gbnf-2026-11-15.txt](gbnf-2026-11-15.txt), Spark 4B: a yes/no grammar, a date, and a three-item list each gave a reply of exactly that form; a sampled reply with thinking on followed its grammar after 700 tokens of reasoning; a left-recursive grammar and a grammar beside `response_format` got 400. Constrained replies ran at 35.6–38.1 tok/s against 37.9 unconstrained.
+
+## n choices
+
+[n-choices-2026-11-15.txt](n-choices-2026-11-15.txt), Spark 4B: `n: 3` at temperature 1 returned three choices, the same three when repeated with the same seed, and the second request reused 30 of 31 prompt tokens; streaming with `n: 2` and `n: 9` got 400.
+
+## Responses API
+
+[responses.sh](responses.sh) → [responses-2026-11-15.txt](responses-2026-11-15.txt), 35B MoE: string input with instructions and thinking, the same request served from the cache, a reply cut at 5 tokens (`incomplete`), `text.format` with a schema, a forced function call, the call's result fed back as `function_call_output`, a refused `previous_response_id`, and both a text reply and a function call streamed (event order printed, sequence numbers consecutive). No OpenAI SDK was run against it.
+
+## Several models
+
+[models-dir.sh](models-dir.sh) → [models-dir-2026-11-15.txt](models-dir-2026-11-15.txt): Spark 4B as the `--model` and the 35B MoE beside it. A request naming the 35B took 5.5 s (the switch) and the next one 0.04 s; an unknown model name went back to Spark in 1.6 s; two requests sent together for the two models were both answered, in order; `/tokenize` gave each model's own ids. A model that fails to load was not tried.

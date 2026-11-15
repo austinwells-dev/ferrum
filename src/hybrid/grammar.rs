@@ -8,6 +8,8 @@
 //! backtracking. `Session` asks it which tokens may follow
 //! (`GenerationHooks::allows`).
 //!
+//! `gbnf` compiles llama.cpp's grammar text to the same rules.
+//!
 //! What a schema may use is listed in docs/server.md ("Structured output").
 //! Objects write their properties in the schema's order, as llama.cpp's
 //! converter does: the model does not choose an order.
@@ -19,7 +21,7 @@ use std::collections::BTreeMap;
 const MAX_ARRAY_BOUND: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
-enum Sym {
+pub(super) enum Sym {
     /// One character in (or, negated, outside) these inclusive ranges.
     Chars(Vec<(char, char)>, bool),
     Rule(usize),
@@ -36,12 +38,12 @@ impl Sym {
     }
 }
 
-type Seq = Vec<Sym>;
+pub(super) type Seq = Vec<Sym>;
 
 /// A compiled grammar; rule 0 is the root.
 #[derive(Debug)]
 pub struct Grammar {
-    rules: Vec<Vec<Seq>>,
+    pub(super) rules: Vec<Vec<Seq>>,
     /// Schema keywords that were accepted but are not enforced.
     pub ignored: Vec<String>,
 }

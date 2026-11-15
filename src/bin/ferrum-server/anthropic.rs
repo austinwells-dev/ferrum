@@ -239,9 +239,9 @@ pub fn count_tokens(
     let result = convert(body, id).and_then(|(messages, tools, _)| {
         // Count the prompt `messages` would feed the model, thinking switch included.
         let mut vars = openai::thinking(body, server).vars;
-        normalize_thinking(server.llm().template.source(), &mut vars);
+        normalize_thinking(server.model(body).template.source(), &mut vars);
         server
-            .llm()
+            .model(body)
             .template
             .render(
                 &messages,
@@ -250,8 +250,8 @@ pub fn count_tokens(
                 &vars,
             )
             .and_then(|mut text| {
-                text.push_str(generation_prefix(&server.llm().template, &vars));
-                server.llm().tokenizer.encode(&text)
+                text.push_str(generation_prefix(&server.model(body).template, &vars));
+                server.model(body).tokenizer.encode(&text)
             })
             .map_err(|e| e.to_string())
     });
@@ -269,7 +269,7 @@ pub fn messages(
     keep_alive: bool,
 ) -> std::io::Result<()> {
     let parsed = request(body, server, id).and_then(|r| {
-        let mut route = openai::route(body)?;
+        let mut route = openai::route(body, server)?;
         // Claude Code's user_id names the session, so it keeps one slot.
         if route.key.is_none() {
             route.key = body
@@ -304,7 +304,7 @@ pub fn messages(
             .map_or(String::new(), |b| format!(", budget {b}"))
     );
     let (rx, cancel) = server.submit(id, Work::Chat(Box::new(req)), route, stream);
-    let model = server.model_name();
+    let model = server.model_name(body);
     if !streaming {
         return openai::wait_json(stream, &rx, &cancel, id, keep_alive, |event| match event {
             Event::Chat(r) => {

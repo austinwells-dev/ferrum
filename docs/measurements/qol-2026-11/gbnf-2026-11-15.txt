@@ -1,0 +1,16 @@
+# gbnf.sh, 2026-11-15, Apple M5 32 GB, Spark-X2.6-4B-Q4_K_M.gguf, working tree after 02db606
+1 yes/no
+   stop 1 tok | 'no'
+2 a date
+   stop 10 tok | '1969-07-20'
+3 a list of three colours
+   stop 10 tok | '- red\n- blue\n- green'
+4 thinking on, sampled (seed 7)
+   stop 700 tok | 'a1'
+5 left recursion
+   ERROR 400 invalid operation parameter: grammar: a rule can begin with itself (left recursion, or a repetition of something that can be empty), which is not supported
+6 with response_format
+   ERROR 400 grammar cannot be combined with response_format or json_schema
+7 no grammar
+   stop 19 tok | 'No, Paris is the capital of France, not Germany; the capital of Germany is Berlin.'
+generated 1 tok in 0.03 s (35.6 tok/s);generated 10 tok in 0.27 s (37.7 tok/s);generated 10 tok in 0.26 s (38.1 tok/s);generated 700 tok in 19.62 s (35.7 tok/s);generated 19 tok in 0.50 s (37.9 tok/s);

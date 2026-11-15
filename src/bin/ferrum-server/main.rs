@@ -12,6 +12,7 @@ mod images;
 mod log;
 mod multipart;
 mod openai;
+mod responses;
 mod worker;
 
 use ferrum::diffusion::pipeline;
@@ -27,7 +28,7 @@ use serde_json::{Map, Value as Json, json};
 use std::{
     io::BufReader,
     net::{TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
@@ -63,6 +64,10 @@ server:
   --slot-save-path DIR      keep every session's cache in DIR across restarts: saved
                             on SIGINT/SIGTERM, loaded at startup when the model
                             file, context and K/V format are the same
+  --models-dir DIR          also offer the other chat GGUFs in DIR (by file name
+                            without .gguf): a request whose model names one makes
+                            the server unload the current model and load that one;
+                            any other model name means the --model
   --idle-unload SECS        free the model after SECS seconds without a request and
                             load it again for the next one, which waits for the
                             load (default 0: keep it loaded). With --slot-save-path
@@ -142,6 +147,16 @@ pub struct Defaults {
 /// The chat model: its thread's queue and what requests are rendered with.
 pub struct Llm {
     jobs: Mutex<Sender<Job>>,
+    /// The `--model`.
+    main: ModelInfo,
+    /// The other models of `--models-dir`, which a request's `model` names.
+    others: Vec<ModelInfo>,
+}
+
+/// What one model's requests are rendered with.
+pub struct ModelInfo {
+    /// What requests call it: the alias or the file's stem.
+    pub name: String,
     pub tokenizer: Tokenizer,
     pub template: ChatTemplate,
     pub defaults: Defaults,
@@ -178,8 +193,29 @@ impl Server {
             .any(|given| same_key(given, key))
     }
 
-    pub fn model_name(&self) -> String {
-        self.name.clone()
+    /// The model a request's `model` field names: one of `--models-dir`,
+    /// otherwise the `--model`.
+    pub fn model(&self, body: &Json) -> &ModelInfo {
+        let llm = self.llm();
+        body.get("model")
+            .and_then(Json::as_str)
+            .and_then(|name| llm.others.iter().find(|m| m.name == name))
+            .unwrap_or(&llm.main)
+    }
+
+    /// The name replies give for the model that served `body`.
+    pub fn model_name(&self, body: &Json) -> String {
+        match &self.llm {
+            Some(_) => self.model(body).name.clone(),
+            None => self.name.clone(),
+        }
+    }
+
+    /// The file the model thread must have loaded for `body`. None with a
+    /// single model, which is always the one loaded.
+    pub fn model_path(&self, body: &Json) -> Option<PathBuf> {
+        self.llm.as_ref().filter(|llm| !llm.others.is_empty())?;
+        Some(self.model(body).model_path.clone())
     }
 
     /// The chat model. Chat routes are refused up front when there is none
@@ -261,6 +297,7 @@ struct Options {
     gpu_share: u32,
     slot_save: Option<PathBuf>,
     idle_unload: Option<std::time::Duration>,
+    models_dir: Option<PathBuf>,
 }
 
 fn parse() -> Result<Options, String> {
@@ -289,6 +326,7 @@ fn parse() -> Result<Options, String> {
         gpu_share: ferrum::hybrid::runtime::gpu_share_from_env(),
         slot_save: None,
         idle_unload: None,
+        models_dir: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(key) = args.next() {
@@ -329,6 +367,7 @@ fn parse() -> Result<Options, String> {
                     ferrum::hybrid::runtime::parse_gpu_share(&value).map_err(|e| e.to_string())?
             }
             "--slot-save-path" => o.slot_save = Some(value.clone().into()),
+            "--models-dir" => o.models_dir = Some(value.clone().into()),
             "--idle-unload" => {
                 let secs = number()? as u64;
                 o.idle_unload = (secs > 0).then(|| std::time::Duration::from_secs(secs));
@@ -495,7 +534,7 @@ fn run(o: Options) -> Result<(), String> {
         queued: AtomicUsize::new(0),
     });
     let llm = if chat {
-        Some(start_llm(&o, &shared)?)
+        Some(start_llm(&o, &shared, &name)?)
     } else {
         None
     };
@@ -523,7 +562,7 @@ fn run(o: Options) -> Result<(), String> {
     });
     info!(
         None,
-        "listening on http://{}:{} (OpenAI: /v1/chat/completions, /v1/images/generations, /v1/images/edits; Anthropic: /v1/messages){}",
+        "listening on http://{}:{} (OpenAI: /v1/chat/completions, /v1/responses, /v1/images/generations, /v1/images/edits; Anthropic: /v1/messages){}",
         o.host,
         o.port,
         if chat { "; model loading…" } else { "" }
@@ -567,9 +606,10 @@ fn run(o: Options) -> Result<(), String> {
     Ok(())
 }
 
-/// Start the model thread for `--model` and gather what requests are rendered with.
-fn start_llm(o: &Options, shared: &Arc<Shared>) -> Result<Llm, String> {
-    let mut sampling = recommended_sampling_for(&o.model).map_err(|e| e.to_string())?;
+/// What `path`'s requests are rendered with: its tokenizer and template, and
+/// its recommended sampling under the command line's overrides.
+fn model_info(o: &Options, path: &Path, name: String) -> Result<ModelInfo, String> {
+    let mut sampling = recommended_sampling_for(path).map_err(|e| e.to_string())?;
     for (key, v) in &o.sampling {
         match key.as_str() {
             "--temp" | "--temperature" => sampling.temperature = *v,
@@ -583,10 +623,79 @@ fn start_llm(o: &Options, shared: &Arc<Shared>) -> Result<Llm, String> {
         }
     }
     sampling.validate().map_err(|e| e.to_string())?;
-    let tokenizer = hybrid::load_tokenizer(&o.model).map_err(|e| e.to_string())?;
-    let template = hybrid::load_chat_template(&o.model)
+    let tokenizer = hybrid::load_tokenizer(path).map_err(|e| e.to_string())?;
+    let template = hybrid::load_chat_template(path)
         .map_err(|e| e.to_string())?
         .ok_or("the GGUF has no chat template")?;
+    Ok(ModelInfo {
+        name,
+        tokenizer,
+        template,
+        defaults: Defaults {
+            sampling,
+            template_vars: o.vars.clone(),
+            reasoning_budget: o.reasoning_budget,
+            raw_reasoning: o.raw_reasoning,
+            max_tokens: o.max_tokens,
+        },
+        model_path: path.to_owned(),
+    })
+}
+
+/// The other chat models of `--models-dir`: every `*.gguf` there that is
+/// not a projector or the `--model` itself, named by its file stem.
+fn other_models(o: &Options, main: &str) -> Result<Vec<ModelInfo>, String> {
+    let Some(dir) = &o.models_dir else {
+        return Ok(Vec::new());
+    };
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("--models-dir {}: {e}", dir.display()))?
+        .filter_map(|entry| Some(entry.ok()?.path()))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        })
+        .collect();
+    files.sort();
+    let same = |a: &Path, b: &Path| match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    };
+    let mut others: Vec<ModelInfo> = Vec::new();
+    for path in files {
+        let name = path
+            .file_stem()
+            .map_or_else(String::new, |s| s.to_string_lossy().into_owned());
+        if name.to_ascii_lowercase().starts_with("mmproj") || same(&path, &o.model) {
+            continue;
+        }
+        if name == main || others.iter().any(|m| m.name == name) {
+            warn!(
+                None,
+                "--models-dir: {name} is already a model's name; skipped"
+            );
+            continue;
+        }
+        match model_info(o, &path, name.clone()) {
+            Ok(info) => others.push(info),
+            Err(e) => warn!(None, "--models-dir: {name} is not offered: {e}"),
+        }
+    }
+    Ok(others)
+}
+
+/// Start the model thread for `--model` and gather what requests are rendered with.
+fn start_llm(o: &Options, shared: &Arc<Shared>, name: &str) -> Result<Llm, String> {
+    let main = model_info(o, &o.model, name.to_owned())?;
+    let others = other_models(o, name)?;
+    if !others.is_empty() {
+        let names: Vec<&str> = others.iter().map(|m| m.name.as_str()).collect();
+        info!(
+            None,
+            "also offered, loaded when a request's model names one: {}",
+            names.join(", ")
+        );
+    }
     let mmproj = ferrum::vision::resolve_projector(&o.model, o.mmproj.as_deref())
         .map_err(|e| e.to_string())?;
     let jobs = worker::spawn(
@@ -618,16 +727,8 @@ fn start_llm(o: &Options, shared: &Arc<Shared>) -> Result<Llm, String> {
     }
     Ok(Llm {
         jobs: Mutex::new(jobs),
-        tokenizer,
-        template,
-        defaults: Defaults {
-            sampling,
-            template_vars: o.vars.clone(),
-            reasoning_budget: o.reasoning_budget,
-            raw_reasoning: o.raw_reasoning,
-            max_tokens: o.max_tokens,
-        },
-        model_path: o.model.clone(),
+        main,
+        others,
     })
 }
 
@@ -832,6 +933,8 @@ fn handle(
             | "/completions"
             | "/completion"
             | "/v1/messages"
+            | "/v1/responses"
+            | "/responses"
     );
     if (needs_model
         || matches!(
@@ -891,6 +994,9 @@ fn handle(
                 openai::completion(server, stream, &json_body, id, ka)
             }
             "/v1/messages" => anthropic::messages(server, stream, &json_body, id, ka),
+            "/v1/responses" | "/responses" => {
+                responses::responses(server, stream, &json_body, id, ka)
+            }
             "/v1/messages/count_tokens" => {
                 anthropic::count_tokens(server, stream, &json_body, id, ka)
             }
@@ -899,7 +1005,7 @@ fn handle(
                     .get("content")
                     .and_then(Json::as_str)
                     .unwrap_or_default();
-                match server.llm().tokenizer.encode(text) {
+                match server.model(&json_body).tokenizer.encode(text) {
                     Ok(tokens) => http::json(stream, 200, &json!({"tokens": tokens}), ka),
                     Err(e) => http::json(
                         stream,
@@ -919,7 +1025,7 @@ fn handle(
                             .collect()
                     })
                     .unwrap_or_default();
-                match server.llm().tokenizer.decode(&ids) {
+                match server.model(&json_body).tokenizer.decode(&ids) {
                     Ok(text) => http::json(stream, 200, &json!({"content": text}), ka),
                     Err(e) => http::json(
                         stream,
@@ -943,8 +1049,9 @@ fn handle(
                     .unwrap_or_default();
                 let t = openai::thinking(&json_body, server);
                 let mut vars = t.vars;
-                hybrid::runtime::normalize_thinking(server.llm().template.source(), &mut vars);
-                match server.llm().template.render(
+                let model = server.model(&json_body);
+                hybrid::runtime::normalize_thinking(model.template.source(), &mut vars);
+                match model.template.render(
                     &messages,
                     (!tools.is_empty()).then_some(&tools[..]),
                     true,
@@ -952,10 +1059,7 @@ fn handle(
                 ) {
                     // The same prompt a chat request feeds the model.
                     Ok(mut prompt) => {
-                        prompt.push_str(hybrid::runtime::generation_prefix(
-                            &server.llm().template,
-                            &vars,
-                        ));
+                        prompt.push_str(hybrid::runtime::generation_prefix(&model.template, &vars));
                         http::json(stream, 200, &json!({"prompt": prompt}), ka)
                     }
                     Err(e) => http::json(
@@ -991,16 +1095,17 @@ fn handle(
             ka,
         ),
         ("GET", "/props") => {
-            let d = &server.llm().defaults;
+            let main = &server.llm().main;
+            let d = &main.defaults;
             http::json(
                 stream,
                 200,
                 &json!({
-                    "model_path": server.llm().model_path.display().to_string(),
+                    "model_path": main.model_path.display().to_string(),
                     "model_alias": server.name,
                     "n_ctx": status.context,
                     "total_slots": status.slots.len().max(1),
-                    "chat_template": server.llm().template.source(),
+                    "chat_template": main.template.source(),
                     "modalities": {"vision": status.vision, "audio": status.audio},
                     "build_info": format!("ferrum {}", env!("CARGO_PKG_VERSION")),
                     "default_generation_settings": {
@@ -1093,12 +1198,14 @@ fn handle(
                 ka,
             )
         }
-        (_, "/v1/chat/completions" | "/v1/completions" | "/v1/messages") => http::json(
-            stream,
-            405,
-            &error_json("use POST", "invalid_request_error"),
-            ka,
-        ),
+        (_, "/v1/chat/completions" | "/v1/completions" | "/v1/messages" | "/v1/responses") => {
+            http::json(
+                stream,
+                405,
+                &error_json("use POST", "invalid_request_error"),
+                ka,
+            )
+        }
         _ => {
             warn!(Some(id), "no route for {} {}", r.method, r.path);
             http::json(stream, 404, &error_json("not found", "not_found_error"), ka)
@@ -1109,11 +1216,20 @@ fn handle(
 /// The `/v1/models` entries: the chat model, then the image model.
 fn models(server: &Server, status: &Status) -> Vec<Json> {
     let mut data = Vec::new();
-    if server.llm.is_some() {
-        data.push(json!({
-            "id": server.name, "object": "model", "created": openai::now(), "owned_by": "ferrum",
-            "meta": {"n_ctx_train": status.context, "n_ctx": status.context, "status": if status.unloaded { "unloaded" } else { status.state }}
-        }));
+    if let Some(llm) = &server.llm {
+        for model in std::iter::once(&llm.main).chain(&llm.others) {
+            // One model is in memory at a time; the context is that one's.
+            let loaded = status.path == model.model_path && !status.unloaded;
+            let mut meta = json!({"status": if loaded { status.state } else { "unloaded" }});
+            if loaded || llm.others.is_empty() {
+                meta["n_ctx_train"] = json!(status.context);
+                meta["n_ctx"] = json!(status.context);
+            }
+            data.push(json!({
+                "id": model.name, "object": "model", "created": openai::now(), "owned_by": "ferrum",
+                "meta": meta
+            }));
+        }
     }
     if let Some(images) = &server.images {
         data.push(json!({

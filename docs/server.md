@@ -22,7 +22,7 @@ ferrum-server --model model.gguf --port 8080      # http://127.0.0.1:8080/v1
 
 | Kind | Paths |
 |---|---|
-| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/models` |
+| OpenAI | `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/models` |
 | Anthropic | `/v1/messages`, `/v1/messages/count_tokens` |
 | Images | `/v1/images/generations` (needs `--image-model`; see [Image generation](#image-generation)) |
 | Utility | `/health`, `/props`, `/slots`, `/metrics` (Prometheus), `/tokenize`, `/detokenize`, `/apply-template` |
@@ -94,7 +94,11 @@ Schemas may use `type` (also a list of types), `properties`, `required`, `additi
 - **Whitespace** between JSON tokens is at most one space, or a newline and up to 20 spaces or tabs.
 - A token that is only part of a multi-byte character is never chosen inside a constrained reply, so text in scripts the tokenizer splits below the character may come out worse than unconstrained.
 
-A constraint steers the model, it does not make it smarter: a small model held to a tight schema (for example `maxItems` it wants to exceed) can run on inside a string until `max_tokens`. `/v1/completions`, `/v1/messages`, `grammar` (GBNF) and `logprobs` are not supported; the last two are ignored with a warning. What was checked: [models.md](models.md#structured-output).
+A constraint steers the model, it does not make it smarter: a small model held to a tight schema (for example `maxItems` it wants to exceed) can run on inside a string until `max_tokens`. Constraints are not available on `/v1/completions` or `/v1/messages`, and `logprobs` is ignored with a warning. What was checked: [models.md](models.md#structured-output).
+
+**GBNF grammars.** `grammar` takes llama.cpp's grammar text and holds the content to its `root` rule, with the same rules as a schema (reasoning is free, tools win, no drafter). It cannot be combined with `response_format`. Supported: quoted literals with escapes, character classes (ranges, `^` negation), `.`, rule names, groups, `|`, and the repetitions `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (counts up to 256). Refused with 400: token references (`<[id]>`), and left recursion, including a repetition of something that can be empty such as `("a"?)*`. Checked on Spark-X2.6-4B: [record](measurements/qol-2026-11/README.md#gbnf).
+
+**`n`.** `/v1/chat/completions` returns up to 8 choices for `n`, run one after another with seeds `seed`, `seed + 1`, ..., each reusing the cached prompt. `usage` counts the prompt once and adds the completions up. `n` above 1 cannot be streamed.
 
 **`tool_choice`.** `"none"` drops the tools. `"required"`, or a named function (`{"type": "function", "function": {"name": N}}`; on `/v1/messages`, `{"type": "any"}` and `{"type": "tool", "name": N}`), makes the reply call a tool: the server writes the opening of the model's tool-call format where the reply's content starts (after the reasoning when thinking is on, including a reasoning budget's forced close), and the model continues from there. A name that is not in `tools` is refused with 400. Things to know:
 
@@ -104,6 +108,34 @@ A constraint steers the model, it does not make it smarter: a small model held t
 - Checked on a 35B MoE: [record](measurements/qol-2026-11/README.md#tool_choice). Flint's opening has not been run.
 
 **`logit_bias`** on `/v1/chat/completions` is OpenAI's map of token id to a value from -100 to 100, added to that token's logit at every step (reasoning included) after the penalties; llama-server's list form `[[id, bias], ...]` is accepted too, where `false` bans the token. Ids outside the vocabulary are ignored. Like a schema, a biased reply reads the full logits, samples from the 1024 likeliest tokens and does not use the drafter.
+
+### Responses API
+
+`/v1/responses` is OpenAI's Responses API, stateless: every request carries its whole conversation in `input`, and `previous_response_id` is refused with 400 (nothing is stored, so `store` is ignored). It runs the same path as `/v1/chat/completions`, so conversation caching, thinking controls, `tool_choice`, `logit_bias`, `grammar` and this server's sampling fields work the same way.
+
+| Request | Meaning |
+|---|---|
+| `input` | A string, or items: messages (`role` with `input_text`, `output_text` and `input_image` parts; `developer` is the system role), `function_call`, `function_call_output`; `reasoning` items are dropped |
+| `instructions` | The system message |
+| `tools`, `tool_choice` | Function tools; other tool types (web search, file search, ...) are ignored with a warning |
+| `text.format` | `json_schema` or `json_object`, as [Structured output](#structured-output) |
+| `reasoning.effort` | As `reasoning_effort`; `none` turns thinking off |
+| `max_output_tokens` | The token limit; a reply cut by it has `status: "incomplete"` |
+
+The reply's `output` holds a `reasoning` item (the thinking, as `reasoning_text` content), a `message` with one `output_text` part, and one `function_call` per tool call. With `stream: true` the events are `response.created`, `response.in_progress`, then for each item `response.output_item.added`, its text as `response.reasoning_text.delta` or `response.output_text.delta`, and `response.output_item.done`, ending with `response.completed` (or `response.incomplete`). Function calls arrive whole after the text, since a call is parsed when the reply ends. Checked on a 35B MoE: [record](measurements/qol-2026-11/README.md#responses-api).
+
+### Several models
+
+With `--models-dir DIR` the server also offers every other chat GGUF in `DIR`, named by its file name without `.gguf` (projector files are skipped, and a file whose tokenizer or chat template cannot be read is left out with a warning). `/v1/models` lists them with `status` `ready` or `unloaded`. One model is in memory at a time:
+
+- A request whose `model` names one of them is for that model. Any other `model` value, or none, means the `--model`.
+- When the oldest waiting request is for a model that is not loaded, nothing new starts, the running requests finish, the server unloads the model and loads the other one. The request waits for the load. Clients that alternate between two models therefore reload on every request.
+- A switched-to model gets the largest context that fits, its own sibling `mmproj` projector, its GGUF's recommended sampling under the same command-line overrides, and no drafter: `--draft`, `--alias` and `--mmproj` apply to the `--model` only.
+- Slot caches do not survive a switch. With `--slot-save-path` they are saved before it, but the directory holds one model's slots at a time: the next model to save replaces them, and a model only loads slots it wrote itself.
+- If the model fails to load, its requests get 503 and the server goes back to the `--model`. This path has not been exercised.
+- `/tokenize`, `/detokenize`, `/apply-template` and `/v1/messages/count_tokens` take `model` too; `/props` describes the `--model`.
+
+Checked with a 4B and a 35B model: [record](measurements/qol-2026-11/README.md#several-models).
 
 ### Streaming
 
@@ -127,6 +159,7 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 | `--alias NAME` | file name | Model name reported to clients |
 | `--gpu-share PCT\|off` | `off` | Keep the GPU busy at most PCT% of the time (5–100). See [Sharing the GPU](#sharing-the-gpu) |
 | `--slot-save-path DIR` | none | Keep each slot's conversation cache in `DIR/slot-N` across restarts. See [Conversation caching](#conversation-caching) |
+| `--models-dir DIR` | none | Offer the other chat GGUFs in `DIR`, loaded when a request's `model` names one. See [Several models](#several-models) |
 | `--idle-unload SECS` | 0 (never) | Free the model after `SECS` seconds without a request; the next request loads it again. See [Conversation caching](#conversation-caching) |
 | `-np`, `--parallel N` | `1` | Requests served at once, one slot each (1–8). See [Parallel requests](#parallel-requests) |
 | `-c`, `--context N\|auto` | `auto` | Context length of each slot |
