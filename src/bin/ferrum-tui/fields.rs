@@ -157,6 +157,15 @@ pub fn fields() -> Vec<Field> {
             "K/V cache precision. q8 needs about half the memory (auto context grows) and is faster at long context; f16 is exact.",
         ),
         field(
+            "gpu_share",
+            "GPU share",
+            m,
+            Both,
+            Kind::Cycle(&["off", "75", "50", "25"]),
+            "off",
+            "Percent of the time the model may keep the GPU busy. Below 100 it pauses between steps and reads prompts in short pieces, so video and the desktop stay smooth; replies are slower by about that share.",
+        ),
+        field(
             "session_cache",
             "Session cache",
             m,

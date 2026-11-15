@@ -38,8 +38,8 @@ use std::{
 use worker::{Event, Job, Route, Shared, Status, Work};
 
 const HELP: &str = "\
-ferrum-server: OpenAI/Anthropic-compatible server for Qwen3.5-family GGUF models
-(experimental: Flint, Spark)
+ferrum-server: OpenAI/Anthropic-compatible server for Qwen3.5-family GGUF models,
+Qwen3.8-Flash-Next, Flint, Spark and LFM3 (gaps: docs/models.md)
 
 usage: ferrum-server --model FILE.gguf [--image-model DIR] [options]
        ferrum-server --image-model DIR [options]       (images only)
@@ -55,7 +55,16 @@ server:
   -np, --parallel N         requests served at once, each in its own session with its
                             own context-sized cache (1-8, default 1); requests go to
                             the session whose cache holds most of their prompt
+  --gpu-share PCT|off       keep the GPU busy at most PCT% of the time (5-100), so
+                            video and the desktop stay smooth while requests run:
+                            each step is followed by a pause in proportion, and
+                            prompts are read 128 tokens at a time (default
+                            FERRUM_GPU_SHARE, else off)
+  --slot-save-path DIR      keep every session's cache in DIR across restarts: saved
+                            on SIGINT/SIGTERM, loaded at startup when the model
+                            file, context and K/V format are the same
   -v, --verbose             debug logging (request bodies, outputs, first-token times)
+  -V, --version             print the version
 memory:
   -c, --context N|auto      context length of each session (default auto: largest that
                             fits --parallel sessions)
@@ -231,6 +240,8 @@ struct Options {
     image_model: Option<String>,
     image_alias: Option<String>,
     image_settings: ferrum::diffusion::pipeline::Settings,
+    gpu_share: u32,
+    slot_save: Option<PathBuf>,
 }
 
 fn parse() -> Result<Options, String> {
@@ -256,12 +267,18 @@ fn parse() -> Result<Options, String> {
         image_model: None,
         image_alias: None,
         image_settings: ferrum::diffusion::pipeline::Settings::default(),
+        gpu_share: ferrum::hybrid::runtime::gpu_share_from_env(),
+        slot_save: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(key) = args.next() {
         match key.as_str() {
             "-h" | "--help" => {
                 print!("{HELP}");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("ferrum-server {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             "-v" | "--verbose" => {
@@ -287,6 +304,11 @@ fn parse() -> Result<Options, String> {
             "--api-key" => o.api_key = Some(value.clone()),
             "--cors" => o.cors.push(value.trim_end_matches('/').to_owned()),
             "--alias" => o.alias = Some(value.clone()),
+            "--gpu-share" => {
+                o.gpu_share =
+                    ferrum::hybrid::runtime::parse_gpu_share(&value).map_err(|e| e.to_string())?
+            }
+            "--slot-save-path" => o.slot_save = Some(value.clone().into()),
             "-np" | "--parallel" => {
                 o.parallel = number()?;
                 if !(1..=worker::MAX_PARALLEL).contains(&o.parallel) {
@@ -482,6 +504,15 @@ fn run(o: Options) -> Result<(), String> {
         o.port,
         if chat { "; model loading…" } else { "" }
     );
+    // The first SIGINT/SIGTERM lets the model thread save its slots and end
+    // the process (`Scheduler::shut_down`); with no chat model, or on a
+    // second signal, the process ends here.
+    let _ = ctrlc::set_handler(move || {
+        if !chat || worker::SHUTDOWN.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        info!(None, "signal received: finishing up (again to quit now)");
+    });
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         let server = server.clone();
@@ -524,6 +555,10 @@ fn start_llm(o: &Options, shared: &Arc<Shared>) -> Result<Llm, String> {
             max_tokens: o.image_tokens,
             min_tokens: o.image_min_tokens,
         },
+        worker::Tuning {
+            gpu_share: o.gpu_share,
+            slot_save: o.slot_save.clone(),
+        },
         shared.clone(),
     );
     if !o.vars.is_empty() {
@@ -549,6 +584,17 @@ fn start_llm(o: &Options, shared: &Arc<Shared>) -> Result<Llm, String> {
         },
         model_path: o.model.clone(),
     })
+}
+
+/// Whether `given` is the API key, comparing every byte so the time taken
+/// does not tell a caller how much of a guess was right.
+fn same_key(given: &str, key: &str) -> bool {
+    let (given, key) = (given.as_bytes(), key.as_bytes());
+    let mut diff = given.len() ^ key.len();
+    for i in 0..given.len().max(key.len()) {
+        diff |= (given.get(i).copied().unwrap_or(0) ^ key.get(i).copied().unwrap_or(0)) as usize;
+    }
+    diff == 0
 }
 
 /// Why a request from a web page is refused, if it is. Browsers send
@@ -669,7 +715,8 @@ fn handle(
             .header("authorization")
             .and_then(|v| v.strip_prefix("Bearer "))
             .map(str::trim);
-        let ok = bearer == Some(key.as_str()) || r.header("x-api-key") == Some(key.as_str());
+        let matches = |given: Option<&str>| given.is_some_and(|g| same_key(g, key));
+        let ok = matches(bearer) || matches(r.header("x-api-key"));
         if !ok && !matches!(path, "/health" | "/v1/health") {
             warn!(Some(id), "rejected: missing or wrong API key");
             return http::json(

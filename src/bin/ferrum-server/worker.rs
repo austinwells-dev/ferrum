@@ -23,13 +23,25 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{Receiver, Sender, TryRecvError, channel},
+        mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel},
     },
     time::{Duration, Instant},
 };
 
 /// Most `--parallel` slots.
 pub const MAX_PARALLEL: usize = 8;
+
+/// Set by SIGINT/SIGTERM: the model thread stops stepping, saves its slots
+/// (`--slot-save-path`) and ends the process.
+pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// What the model thread is started with besides the model.
+pub struct Tuning {
+    /// `--gpu-share` (`Runtime::set_gpu_share`).
+    pub gpu_share: u32,
+    /// `--slot-save-path`: slot caches are loaded from here and saved on exit.
+    pub slot_save: Option<PathBuf>,
+}
 
 pub enum Work {
     Chat(Box<ChatRequest>),
@@ -165,12 +177,13 @@ pub fn spawn(
     spec: Option<SpecOptions>,
     alias: Option<String>,
     vision: Vision,
+    tuning: Tuning,
     shared: Arc<Shared>,
 ) -> Sender<Job> {
     let (tx, rx) = channel::<Job>();
     std::thread::Builder::new()
         .name("model".into())
-        .spawn(move || run(path, options, spec, alias, vision, shared, rx))
+        .spawn(move || run(path, options, spec, alias, vision, tuning, shared, rx))
         .expect("spawn model thread");
     tx
 }
@@ -181,6 +194,7 @@ fn run(
     spec: Option<SpecOptions>,
     alias: Option<String>,
     vision: Vision,
+    tuning: Tuning,
     shared: Arc<Shared>,
     jobs: Receiver<Job>,
 ) {
@@ -276,6 +290,25 @@ fn run(
         Ok(()) => info!(None, "warmed up in {:.1} s", warm.elapsed().as_secs_f64()),
         Err(e) => warn!(None, "warmup failed: {e}"),
     }
+    rt.set_gpu_share(tuning.gpu_share);
+    if tuning.gpu_share < 100 {
+        info!(
+            None,
+            "GPU share {}%: generation pauses between steps so video and the desktop stay smooth",
+            tuning.gpu_share
+        );
+    }
+    if let Some(dir) = &tuning.slot_save {
+        for slot in 0..rt.parallel() {
+            match rt.load_slot(slot, &dir.join(format!("slot-{slot}"))) {
+                Ok(Some(tokens)) => {
+                    info!(None, "slot {slot}: restored {} cached tokens", n(tokens))
+                }
+                Ok(None) => {}
+                Err(e) => warn!(None, "slot {slot}: saved cache not loaded: {e}"),
+            }
+        }
+    }
     let d = &rt.default_sampling;
     info!(
         None,
@@ -321,6 +354,7 @@ fn run(
         slots: (0..parallel).map(|_| Slot::default()).collect(),
         queue: VecDeque::new(),
         clock: 0,
+        slot_save: tuning.slot_save,
     }
     .run(jobs);
 }
@@ -347,16 +381,22 @@ struct Scheduler {
     /// Jobs waiting for a slot, oldest first.
     queue: VecDeque<Job>,
     clock: u64,
+    /// `--slot-save-path` (`shut_down`).
+    slot_save: Option<PathBuf>,
 }
 
 impl Scheduler {
     fn run(mut self, jobs: Receiver<Job>) {
         loop {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                self.shut_down();
+            }
             // Wait only when nothing runs; otherwise just collect arrivals.
             if self.queue.is_empty() && self.slots.iter().all(|s| s.active.is_none()) {
-                match jobs.recv() {
+                match jobs.recv_timeout(Duration::from_millis(200)) {
                     Ok(job) => self.queue.push_back(job),
-                    Err(_) => return,
+                    Err(RecvTimeoutError::Timeout) => continue,
+                    Err(RecvTimeoutError::Disconnected) => return,
                 }
             }
             loop {
@@ -379,6 +419,32 @@ impl Scheduler {
                 }
             }
         }
+    }
+
+    /// SIGINT/SIGTERM: save every slot's cache (`--slot-save-path`) and end
+    /// the process. Requests in flight are dropped where they are; what
+    /// their slots had cached up to the last step is saved.
+    fn shut_down(&mut self) -> ! {
+        if let Some(dir) = &self.slot_save {
+            for slot in 0..self.slots.len() {
+                if self.rt.slot(slot).is_empty() {
+                    continue;
+                }
+                let start = Instant::now();
+                match self.rt.save_slot(slot, &dir.join(format!("slot-{slot}"))) {
+                    Ok(stats) => info!(
+                        None,
+                        "slot {slot}: saved {} cached tokens ({:.1} MiB) in {:.1} s",
+                        n(self.rt.slot(slot).len()),
+                        stats.bytes as f64 / (1u64 << 20) as f64,
+                        start.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => warn!(None, "slot {slot}: cache not saved: {e}"),
+                }
+            }
+        }
+        info!(None, "shutting down");
+        std::process::exit(0);
     }
 
     /// Start queued jobs on free slots, oldest first; a job pinned to a busy

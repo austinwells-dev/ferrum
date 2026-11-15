@@ -682,12 +682,36 @@ impl Runtime {
             .load_from(&self.device, model, dir, &self.cache_identity)
     }
 
+    /// `save_session` for any slot (the server's `--slot-save-path`).
+    pub fn save_slot(&self, slot: usize, dir: &Path) -> Result<SaveStats> {
+        self.slot(slot).save_to(dir, &self.cache_identity)
+    }
+
+    /// `load_session` for any slot.
+    pub fn load_slot(&mut self, slot: usize, dir: &Path) -> Result<Option<usize>> {
+        let session = match slot {
+            0 => &mut self.session,
+            i => &mut self.slots[i - 1],
+        };
+        session.load_from(&self.device, &self.loaded.model, dir, &self.cache_identity)
+    }
+
     pub fn supports_vision(&self) -> bool {
         self.vision.is_some()
     }
 
     pub fn supports_audio(&self) -> bool {
         self.audio.is_some()
+    }
+
+    /// Keep the GPU busy at most `percent` of the time in every session
+    /// (`Session::set_gpu_share`), so the desktop and video stay smooth
+    /// while the model runs. 100 turns it off.
+    pub fn set_gpu_share(&mut self, percent: u32) {
+        self.session.set_gpu_share(percent);
+        for slot in &mut self.slots {
+            slot.set_gpu_share(percent);
+        }
     }
 
     /// Sessions (slot 0 plus `slots`).
@@ -1365,6 +1389,31 @@ pub fn normalize_thinking(template: &str, vars: &mut Map<String, Json>) {
         "reasoning_effort".into(),
         Json::String(LEVELS[nearest].into()),
     );
+}
+
+/// A `--gpu-share` value: a percentage from 5 to 100, or `off` (100).
+pub fn parse_gpu_share(value: &str) -> Result<u32> {
+    if value == "off" {
+        return Ok(100);
+    }
+    value
+        .trim_end_matches('%')
+        .parse()
+        .ok()
+        .filter(|p| (5..=100).contains(p))
+        .ok_or_else(|| {
+            Error::Parameter(format!(
+                "GPU share {value:?} must be a percentage from 5 to 100, or off"
+            ))
+        })
+}
+
+/// The front ends' default GPU share: `FERRUM_GPU_SHARE`, else 100 (off).
+pub fn gpu_share_from_env() -> u32 {
+    std::env::var("FERRUM_GPU_SHARE")
+        .ok()
+        .and_then(|v| parse_gpu_share(&v).ok())
+        .unwrap_or(100)
 }
 
 /// The GGUF's recommended sampling (`general.sampling.*`), with Qwen defaults.

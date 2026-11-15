@@ -199,6 +199,23 @@ pub struct Session {
     /// Where the next generation also snapshots, and whether to pin it
     /// (`set_checkpoint`).
     checkpoint: Option<(usize, bool)>,
+    /// Percent of the time this session keeps the GPU busy (`set_gpu_share`).
+    gpu_share: u32,
+}
+
+/// Longest prompt piece under a GPU share below 100: the window server and
+/// video decoders get the GPU between pieces, so a piece must be short.
+const SHARED_PREFILL_ROWS: usize = 128;
+/// Longest pause after one step, so a cancel is still noticed promptly.
+const SHARED_PAUSE_MAX: Duration = Duration::from_secs(2);
+
+/// The idle time that follows a step of `busy` under `share` percent.
+fn shared_pause(share: u32, busy: Duration) -> Duration {
+    if share >= 100 {
+        return Duration::ZERO;
+    }
+    let share = share.max(1) as f64 / 100.;
+    busy.mul_f64((1. - share) / share).min(SHARED_PAUSE_MAX)
 }
 
 impl Session {
@@ -235,7 +252,23 @@ impl Session {
             spec_stats: SpecStats::default(),
             pending_media: Vec::new(),
             checkpoint: None,
+            gpu_share: 100,
         })
+    }
+
+    /// Keep the GPU busy at most `percent` of the time (1 to 100; 100, the
+    /// default, never pauses): after every prompt piece and decode step the
+    /// session sleeps in proportion to the time the step took, and prompts
+    /// are read in pieces of at most `SHARED_PREFILL_ROWS` tokens. The
+    /// desktop, video playback and other GPU clients run in the gaps. The
+    /// tokens are the ones an unpaced session produces, up to the rounding
+    /// a different `--chunk` gives.
+    pub fn set_gpu_share(&mut self, percent: u32) {
+        self.gpu_share = percent.clamp(1, 100);
+    }
+
+    pub fn gpu_share(&self) -> u32 {
+        self.gpu_share
     }
 
     /// Declare the images of the next prompt: each span covers pad-token
@@ -709,15 +742,17 @@ impl Session {
         g: &mut Generation,
         hooks: &mut impl GenerationHooks,
     ) -> Result<Option<Completion>> {
-        let stop = match g.next {
-            None => match self.prefill_step(d, model, g, hooks)? {
-                Some(stop) => stop,
-                None => return Ok(None),
-            },
-            Some(_) => match self.decode_step(d, model, g, hooks)? {
-                Some(stop) => stop,
-                None => return Ok(None),
-            },
+        let started = Instant::now();
+        let step = match g.next {
+            None => self.prefill_step(d, model, g, hooks)?,
+            Some(_) => self.decode_step(d, model, g, hooks)?,
+        };
+        let Some(stop) = step else {
+            let pause = shared_pause(self.gpu_share, started.elapsed());
+            if !pause.is_zero() {
+                std::thread::sleep(pause);
+            }
+            return Ok(None);
         };
         if stop == StopReason::Cancelled {
             return Ok(Some(Completion {
@@ -763,6 +798,9 @@ impl Session {
         if g.processed < body_len {
             let at = g.reused + g.processed;
             let mut n = model.chunk().min(body_len - g.processed);
+            if self.gpu_share < 100 {
+                n = n.min(SHARED_PREFILL_ROWS);
+            }
             if let Some((checkpoint, pin)) = g.checkpoint {
                 if checkpoint == at {
                     self.snapshot(d, pin)?;
@@ -1253,6 +1291,15 @@ mod tests {
     }
 
     /// Position-keyed draws follow the sampling distribution.
+    #[test]
+    fn gpu_share_pauses_in_proportion() {
+        let busy = Duration::from_millis(100);
+        assert_eq!(shared_pause(100, busy), Duration::ZERO);
+        assert_eq!(shared_pause(50, busy), busy);
+        assert_eq!(shared_pause(25, busy), 3 * busy);
+        assert_eq!(shared_pause(1, Duration::from_secs(60)), SHARED_PAUSE_MAX);
+    }
+
     #[test]
     fn position_draws_follow_the_distribution() {
         let logits = vec![(3, 2.0f32), (8, 1.5), (1, 1.0), (6, 0.2), (4, -1.0)];

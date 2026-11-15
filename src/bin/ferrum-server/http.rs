@@ -233,9 +233,13 @@ impl Chunked {
         if data.is_empty() {
             return Ok(());
         }
-        write!(self.stream, "{:x}\r\n", data.len())?;
-        self.stream.write_all(data)?;
-        self.stream.write_all(b"\r\n")?;
+        // One write per chunk: the socket has TCP_NODELAY, so three writes
+        // would leave as three packets for every streamed token.
+        let mut chunk = Vec::with_capacity(data.len() + 20);
+        write!(chunk, "{:x}\r\n", data.len())?;
+        chunk.extend_from_slice(data);
+        chunk.extend_from_slice(b"\r\n");
+        self.stream.write_all(&chunk)?;
         self.stream.flush()
     }
 
