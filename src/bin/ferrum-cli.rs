@@ -505,6 +505,7 @@ fn run() -> Result<()> {
             reasoning_budget: o.reasoning_budget,
             raw_reasoning: false,
             image_budget: detail,
+            grammar: None,
         };
         INTERRUPTED.store(false, Ordering::Relaxed);
         GENERATING.store(true, Ordering::Relaxed);

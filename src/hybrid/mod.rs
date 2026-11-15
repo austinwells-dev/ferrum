@@ -10,6 +10,7 @@ pub mod chat;
 pub mod config;
 pub mod draft;
 pub mod engine;
+pub mod grammar;
 #[cfg(test)]
 mod hc_tests;
 #[cfg(test)]

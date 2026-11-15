@@ -498,6 +498,7 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                     reasoning_budget: opts.budget,
                     raw_reasoning: false,
                     image_budget: Default::default(),
+                    grammar: None,
                 };
                 let hooks = Hooks {
                     tx: &tx,

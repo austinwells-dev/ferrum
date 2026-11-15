@@ -39,7 +39,7 @@ Speculative decoding runs on slot 0 only; the other slots decode without the dra
 
 ### Conversation caching
 
-Each slot keeps its previous conversation. If the next request extends it, only the new tokens are processed, and `usage.prompt_tokens_details.cached_tokens` reports how many were reused. An identical retry reuses everything except the last token.
+Each slot keeps its previous conversation. If the next request extends it, only the new tokens are processed, and `usage.prompt_tokens_details.cached_tokens` reports how many were reused. `usage.completion_tokens_details.reasoning_tokens` is the part of `completion_tokens` spent on reasoning. An identical retry reuses everything except the last token.
 
 With several slots, a request goes to the free slot that suits its cache best, so concurrent conversations each keep their own:
 
@@ -70,6 +70,29 @@ Any of these request fields turn reasoning on or off, or set its effort:
 | `reasoning_format: none` | Keep `<think>` inline in the content |
 
 Server-wide defaults: `--no-think`, `--reasoning-effort`, `--reasoning-budget`, `--reasoning-format`, `--chat-template-kwargs`.
+
+### Structured output
+
+`/v1/chat/completions` can hold a reply to JSON. Every token is checked against a grammar before it is chosen, so the content always parses (unless `max_tokens` cuts it short, which reports `finish_reason: "length"`).
+
+| Request field | Reply |
+|---|---|
+| `response_format: {"type": "json_object"}` | One JSON object, any keys |
+| `response_format: {"type": "json_schema", "json_schema": {"schema": {...}}}` | One value matching the schema (OpenAI's form) |
+| `response_format: {"type": "json_object", "schema": {...}}`, or a top-level `json_schema: {...}` | The same (llama-server's forms) |
+
+Schemas may use `type` (also a list of types), `properties`, `required`, `additionalProperties`, `items`, `minItems` and `maxItems` (up to 64), `enum`, `const`, `anyOf`, `oneOf`, `nullable` and local `$ref`s (`#/$defs/...`, recursive ones included). Things to know:
+
+- **Property order is the schema's.** An object writes its properties in the order `properties` lists them (optional ones may be left out), and nothing else. A model does not get to reorder them. An object schema without `properties` is free-form.
+- **Not enforced, with a warning in the log:** `pattern`, `format`, `minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `uniqueItems`, `minProperties`, `maxProperties`. The reply has the right shape but may break these.
+- **Refused with 400:** anything else that changes what is valid (`allOf`, `not`, `if`, `patternProperties`, remote `$ref`s, ...), rather than returning JSON that silently ignores it.
+- **Reasoning is not constrained.** With thinking on, the model reasons freely and the grammar starts after `</think>`.
+- **Tools win.** A request that also has `tools` is not constrained (a constrained reply could not call a tool); the log says so. `tool_choice: "required"` is still not enforced.
+- **Speed.** A constrained reply reads the full logits and does not use the drafter, so speculative decoding does not speed it up. On Spark-X2.6-4B a schema reply ran at 32–35 tok/s against 37 unconstrained ([record](measurements/qol-2026-11/structured-output-2026-11-15.txt)).
+- **Whitespace** between JSON tokens is at most one space, or a newline and up to 20 spaces or tabs.
+- A token that is only part of a multi-byte character is never chosen inside a constrained reply, so text in scripts the tokenizer splits below the character may come out worse than unconstrained.
+
+A constraint steers the model, it does not make it smarter: a small model held to a tight schema (for example `maxItems` it wants to exceed) can run on inside a string until `max_tokens`. `/v1/completions`, `/v1/messages`, `grammar` (GBNF) and `logprobs` are not supported; the last two are ignored with a warning. What was checked: [models.md](models.md#structured-output).
 
 ### Streaming
 

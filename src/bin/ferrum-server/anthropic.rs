@@ -177,6 +177,7 @@ fn request(body: &Json, server: &Server, id: u64) -> Result<ChatRequest, String>
         reasoning_budget: t.budget,
         raw_reasoning: false,
         image_budget: openai::image_budget(body)?,
+        grammar: None,
     })
 }
 

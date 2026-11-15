@@ -100,6 +100,21 @@ pub trait GenerationHooks {
     }
     /// A sampled, non-EOS token.
     fn token(&mut self, token: u32) -> Result<Flow>;
+    /// Whether the next token must pass `allows` (or, for an
+    /// end-of-sequence token, `may_end`): constrained output such as a JSON
+    /// schema. Asked after `token` heard the newest token. While it holds,
+    /// the session reads the full logits and does not speculate.
+    fn constrained(&self) -> bool {
+        false
+    }
+    /// With `constrained`: whether `token` may come next.
+    fn allows(&mut self, _token: u32) -> bool {
+        true
+    }
+    /// With `constrained`: whether the output may end here.
+    fn may_end(&self) -> bool {
+        true
+    }
 }
 
 impl<F: FnMut(u32) -> Result<bool>> GenerationHooks for F {
@@ -822,11 +837,23 @@ impl Session {
             .is_some_and(|(at, pin)| pin && at == self.tokens.len());
         self.snapshot(d, pin)?;
         let tail = [g.prompt[g.prompt.len() - 1]];
-        let produced = self.step(d, model, &tail, g.output())?;
+        let output = if hooks.constrained() {
+            Output::Logits
+        } else {
+            g.output()
+        };
+        let produced = self.step(d, model, &tail, output)?;
         hooks.prefill(body_len + 1, body_len + 1);
         g.prefill = g.start.elapsed();
         g.decode_start = Instant::now();
-        g.next = Some(select(produced, &g.params, self.state.len())?);
+        g.next = Some(choose(
+            produced,
+            &g.params,
+            &g.generated,
+            &g.eos,
+            self.state.len(),
+            hooks,
+        )?);
         Ok(None)
     }
 
@@ -842,8 +869,10 @@ impl Session {
         let (eos, max_tokens) = (&g.eos[..], g.max_tokens);
         let next = g.next.expect("decoding follows the prompt's last token");
         let generated = &mut g.generated;
-        let output = |generated: &[u32]| -> Output {
-            if params.uses_candidates() {
+        let output = |generated: &[u32], constrained: bool| -> Output {
+            if constrained {
+                Output::Logits
+            } else if params.uses_candidates() {
                 Output::Candidates(penalties(params, generated))
             } else {
                 Output::Argmax
@@ -872,7 +901,9 @@ impl Session {
         // sampling its draw with the uniform of the position it fills, as
         // plain decoding draws it), so the output is plain decoding's.
         let room = self.capacity() - self.state.len() - 1;
-        let k = if g.speculate && feed.len() == 1 {
+        // Drafts are not checked against a constraint, so none are made.
+        let constrained = hooks.constrained();
+        let k = if g.speculate && feed.len() == 1 && !constrained {
             let drafter = self.drafter.as_ref().expect("speculate implies a drafter");
             drafter
                 .max_drafts()
@@ -914,9 +945,16 @@ impl Session {
             DraftTree::default()
         };
         if drafts.is_empty() {
-            let produced = self.step(d, model, &feed, output(generated))?;
+            let produced = self.step(d, model, &feed, output(generated, constrained))?;
             generated.extend_from_slice(&feed[1..]);
-            g.next = Some(select(produced, params, self.state.len())?);
+            g.next = Some(choose(
+                produced,
+                params,
+                generated,
+                eos,
+                self.state.len(),
+                hooks,
+            )?);
             return Ok(None);
         }
         let t0 = Instant::now();
@@ -1009,6 +1047,14 @@ impl Session {
                 stopped = Some(StopReason::Length);
                 break;
             }
+            if hooks.constrained() {
+                // This token turned a constraint on (it closed the
+                // reasoning): the drafts after it were not checked against
+                // it, so it is fed again alone and its successor chosen
+                // under the constraint.
+                inject = Some((token, Vec::new()));
+                break;
+            }
             keep += 1;
         }
         let pos = self.state.len();
@@ -1027,9 +1073,16 @@ impl Session {
             if self.state.len() + feed.len() > self.capacity() {
                 return Ok(Some(StopReason::ContextFull));
             }
-            let produced = self.step(d, model, &feed, output(generated))?;
+            let produced = self.step(d, model, &feed, output(generated, hooks.constrained()))?;
             generated.extend_from_slice(&feed[1..]);
-            g.next = Some(select(produced, params, self.state.len())?);
+            g.next = Some(choose(
+                produced,
+                params,
+                generated,
+                eos,
+                self.state.len(),
+                hooks,
+            )?);
             return Ok(None);
         }
         g.next = Some(bonus);
@@ -1141,6 +1194,83 @@ fn select(produced: Produced, params: &SamplingParams, pos: usize) -> Result<u32
         Produced::Candidates(mut c) => sample(&mut c, params, uniform(params.seed, pos)),
         _ => Err(Error::Parameter("forward produced no token".into())),
     }
+}
+
+/// Most tokens, by logit, a constrained choice considers before it looks at
+/// the whole vocabulary.
+const CONSTRAINED_HEAD: usize = 1024;
+
+/// `select`, or for full logits (`GenerationHooks::constrained`) the token
+/// among those the hooks allow: penalties as the GPU applies them
+/// (`h_penalize`), then the allowed tokens among the `CONSTRAINED_HEAD`
+/// likeliest (every allowed token when none of those is), sampled as usual.
+/// Greedy output is the likeliest allowed token.
+fn choose(
+    produced: Produced,
+    params: &SamplingParams,
+    generated: &[u32],
+    eos: &[u32],
+    pos: usize,
+    hooks: &mut impl GenerationHooks,
+) -> Result<u32> {
+    let mut logits = match produced {
+        Produced::Logits(logits) => logits,
+        other => return select(other, params, pos),
+    };
+    let p = penalties(params, generated);
+    if p.active() {
+        for &(token, count) in &p.tokens {
+            let Some(v) = logits.get_mut(token as usize) else {
+                continue;
+            };
+            if p.repetition != 1. {
+                *v = if *v > 0. {
+                    *v / p.repetition
+                } else {
+                    *v * p.repetition
+                };
+            }
+            *v -= p.presence + p.frequency * count as f32;
+        }
+    }
+    let mut order: Vec<u32> = (0..logits.len() as u32)
+        .filter(|&t| logits[t as usize].is_finite())
+        .collect();
+    let by_logit = |a: &u32, b: &u32| {
+        logits[*b as usize]
+            .total_cmp(&logits[*a as usize])
+            .then(a.cmp(b))
+    };
+    let head = CONSTRAINED_HEAD.min(order.len());
+    if head > 0 && head < order.len() {
+        order.select_nth_unstable_by(head - 1, by_logit);
+    }
+    let mut allowed = |token: &u32| {
+        if eos.contains(token) {
+            hooks.may_end()
+        } else {
+            hooks.allows(*token)
+        }
+    };
+    let pair = |token: &u32| (*token, logits[*token as usize]);
+    let mut candidates: Vec<(u32, f32)> = order[..head]
+        .iter()
+        .filter(|t| allowed(t))
+        .map(pair)
+        .collect();
+    if candidates.is_empty() {
+        candidates = order[head..]
+            .iter()
+            .filter(|t| allowed(t))
+            .map(pair)
+            .collect();
+    }
+    if candidates.is_empty() {
+        return Err(Error::Parameter(
+            "the output constraint allows no token here".into(),
+        ));
+    }
+    sample(&mut candidates, params, uniform(params.seed, pos))
 }
 
 /// Temperature, top-k, min-p then top-p over GPU candidates, drawn with the
@@ -1294,6 +1424,80 @@ mod tests {
     }
 
     /// Position-keyed draws follow the sampling distribution.
+    /// Hooks that allow only even tokens, and the end only when `end`.
+    struct Even {
+        end: bool,
+    }
+    impl GenerationHooks for Even {
+        fn token(&mut self, _token: u32) -> Result<Flow> {
+            Ok(Flow::Continue)
+        }
+        fn constrained(&self) -> bool {
+            true
+        }
+        fn allows(&mut self, token: u32) -> bool {
+            token.is_multiple_of(2)
+        }
+        fn may_end(&self) -> bool {
+            self.end
+        }
+    }
+
+    #[test]
+    fn constrained_choice_is_the_likeliest_allowed_token() {
+        let greedy = SamplingParams::default();
+        let eos = [5u32];
+        // Token 5 (the end) and the odd tokens outrank every even one.
+        let logits = || Produced::Logits(vec![0., 9., 2., 8., 1., 10., f32::NEG_INFINITY]);
+        let mut closed = Even { end: false };
+        assert_eq!(
+            choose(logits(), &greedy, &[], &eos, 0, &mut closed).unwrap(),
+            2
+        );
+        let mut open = Even { end: true };
+        assert_eq!(
+            choose(logits(), &greedy, &[], &eos, 0, &mut open).unwrap(),
+            5
+        );
+        // Penalties apply as on the GPU: token 2, seen twice, falls behind 4.
+        let penalized = SamplingParams {
+            frequency_penalty: 1.,
+            ..SamplingParams::default()
+        };
+        assert_eq!(
+            choose(logits(), &penalized, &[2, 2], &eos, 0, &mut closed).unwrap(),
+            4
+        );
+        // Allowed tokens past the likeliest `CONSTRAINED_HEAD` are still found.
+        let mut wide = vec![1.; 2 * CONSTRAINED_HEAD + 1];
+        for (i, l) in wide.iter_mut().enumerate() {
+            if i % 2 == 0 {
+                *l = -(i as f32);
+            }
+        }
+        assert_eq!(
+            choose(Produced::Logits(wide), &greedy, &[], &eos, 0, &mut closed).unwrap(),
+            0
+        );
+        // Sampling draws only allowed tokens.
+        let sampled = SamplingParams {
+            temperature: 1.,
+            ..SamplingParams::default()
+        };
+        for pos in 0..200 {
+            let t = choose(logits(), &sampled, &[], &eos, pos, &mut closed).unwrap();
+            assert!(t.is_multiple_of(2) && t != 6, "{t}");
+        }
+        // Nothing allowed is an error, not an arbitrary token.
+        let none = Produced::Logits(vec![f32::NEG_INFINITY, 1., f32::NEG_INFINITY]);
+        assert!(choose(none, &greedy, &[], &eos, 0, &mut closed).is_err());
+        // Candidates and argmax outputs pass through unchanged.
+        assert_eq!(
+            choose(Produced::Token(7), &greedy, &[], &eos, 0, &mut closed).unwrap(),
+            7
+        );
+    }
+
     #[test]
     fn gpu_share_pauses_in_proportion() {
         let busy = Duration::from_millis(100);

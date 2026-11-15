@@ -7,6 +7,7 @@ use crate::{
 };
 use ferrum::{
     hybrid::{
+        grammar::Grammar,
         runtime::{ChatRequest, ChatResult, Delta},
         session::{Completion, SamplingParams},
     },
@@ -246,12 +247,39 @@ fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, b
         ),
         _ => {}
     }
-    for unsupported in ["response_format", "logprobs", "grammar", "json_schema"] {
+    for unsupported in ["logprobs", "grammar"] {
         if body
             .get(unsupported)
-            .is_some_and(|v| !v.is_null() && v != &json!(false) && v != &json!({"type": "text"}))
+            .is_some_and(|v| !v.is_null() && v != &json!(false))
         {
             warn!(Some(id), "ignoring unsupported field {unsupported}");
+        }
+    }
+    // OpenAI's `response_format`, or llama-server's bare `json_schema`.
+    let mut grammar = match (body.get("response_format"), body.get("json_schema")) {
+        (Some(format), _) if !format.is_null() => {
+            Grammar::from_response_format(format).map_err(|e| e.to_string())?
+        }
+        (_, Some(schema)) if !schema.is_null() => {
+            Some(Grammar::from_schema(schema).map_err(|e| e.to_string())?)
+        }
+        _ => None,
+    };
+    if let Some(g) = &grammar {
+        if !g.ignored.is_empty() {
+            warn!(
+                Some(id),
+                "response schema: accepted but not enforced: {}",
+                g.ignored.join(", ")
+            );
+        }
+        if !tools.is_empty() {
+            // A constrained reply could not call a tool.
+            warn!(
+                Some(id),
+                "response_format is not enforced in a request with tools"
+            );
+            grammar = None;
         }
     }
     let t = thinking(body, server);
@@ -269,6 +297,7 @@ fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, b
         reasoning_budget: t.budget,
         raw_reasoning: t.raw,
         image_budget: image_budget(body)?,
+        grammar: grammar.map(Arc::new),
     };
     Ok((request, t.exclude))
 }
@@ -338,6 +367,13 @@ fn usage(c: &Completion) -> Json {
         "total_tokens": c.prompt_tokens + c.tokens.len(),
         "prompt_tokens_details": {"cached_tokens": c.reused_tokens},
     })
+}
+
+/// `usage` with the reasoning's share of the completion, as OpenAI reports it.
+fn chat_usage(result: &ChatResult) -> Json {
+    let mut usage = usage(&result.completion);
+    usage["completion_tokens_details"] = json!({"reasoning_tokens": result.reasoning_tokens});
+    usage
 }
 
 fn tool_calls(result: &ChatResult, id: u64) -> Vec<Json> {
@@ -446,7 +482,7 @@ pub fn chat(
                 "created": now(),
                 "model": server.model_name(),
                 "choices": [{"index": 0, "message": message(&result, id, exclude), "finish_reason": finish_reason(&result)}],
-                "usage": usage(&result.completion),
+                "usage": chat_usage(&result),
                 "timings": timings(&result.completion),
             })),
             _ => None,
@@ -642,12 +678,12 @@ fn chat_stream(
                     tail.push_str(&data(&chunk(json!({"tool_calls": calls}), None)));
                 }
                 let mut last = chunk(json!({}), Some(finish_reason(&result)));
-                last["usage"] = usage(&result.completion);
+                last["usage"] = chat_usage(&result);
                 last["timings"] = timings(&result.completion);
                 tail.push_str(&data(&last));
                 if include_usage {
                     tail.push_str(&data(&json!({"id": format!("chatcmpl-{id}"), "object": "chat.completion.chunk",
-                        "created": now(), "model": model, "choices": [], "usage": usage(&result.completion)})));
+                        "created": now(), "model": model, "choices": [], "usage": chat_usage(&result)})));
                 }
                 tail.push_str("data: [DONE]\n\n");
                 out.send(tail.as_bytes()).map_err(|e| fail(e, cancel))?;

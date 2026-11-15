@@ -9,6 +9,7 @@ use super::{
     draft::{DraftModel, DraftOptions, DraftQuant, TreeSearch, check_drafter_tokenizer},
     engine::ImageSpan,
     engine::{SpecGeometry, spec_bytes},
+    grammar::{Grammar, Matcher},
     lookup::Lookup,
     mtp::{Mtp, mtp_state_bytes, mtp_weight_bytes},
     plan::{DraftMemory, PlanOptions},
@@ -28,6 +29,7 @@ use serde_json::{Map, Value as Json};
 use std::{
     path::{Path, PathBuf},
     rc::Rc,
+    sync::Arc,
 };
 
 /// The placeholder token a chat template emits for one image.
@@ -363,6 +365,10 @@ pub struct ChatRequest {
     /// Token limits for this request's images; an image part's own
     /// `detail`, `min_tokens` or `max_tokens` take precedence.
     pub image_budget: ImageBudget,
+    /// Constrain the reply's content (not its reasoning) to this grammar,
+    /// such as a JSON schema (`Grammar::from_response_format`). The reply
+    /// then cannot call tools, and is decoded without the drafter.
+    pub grammar: Option<Arc<Grammar>>,
 }
 
 impl ChatRequest {
@@ -377,6 +383,7 @@ impl ChatRequest {
             reasoning_budget: None,
             raw_reasoning: false,
             image_budget: ImageBudget::default(),
+            grammar: None,
         }
     }
 }
@@ -480,6 +487,8 @@ pub struct Runtime {
     pub audio: Option<Audio>,
     /// The model file as a saved session depends on it (`save_session`).
     cache_identity: String,
+    /// `Tokenizer::pieces`, built by the first constrained request.
+    pieces: Option<Rc<Vec<Option<Box<str>>>>>,
 }
 
 impl Runtime {
@@ -666,6 +675,7 @@ impl Runtime {
                 Some(mmproj) => format!("{} + {}", cache_identity(path), cache_identity(mmproj)),
                 None => cache_identity(path),
             },
+            pieces: None,
         })
     }
 
@@ -965,7 +975,9 @@ impl Runtime {
             } else {
                 None
             },
-            true,
+            // A constrained reply is its grammar's text, never a tool call.
+            request.grammar.is_none(),
+            request.grammar.clone(),
             hooks,
         )?;
         turn.chat = Some(ChatTurn {
@@ -1048,6 +1060,7 @@ impl Runtime {
             false,
             None,
             false,
+            None,
             hooks,
         )
     }
@@ -1064,10 +1077,26 @@ impl Runtime {
         split_reasoning: bool,
         reasoning_budget: Option<usize>,
         tools: bool,
+        grammar: Option<Arc<Grammar>>,
         hooks: &mut impl ChatHooks,
     ) -> Result<Turn> {
         let close_text = reasoning_close(self.loaded.model.config.variant);
+        let constraint = match grammar {
+            Some(grammar) => {
+                if self.pieces.is_none() {
+                    self.pieces = Some(Rc::new(self.loaded.tokenizer.pieces()?));
+                }
+                Some(Constraint {
+                    matcher: Matcher::new(&grammar),
+                    grammar,
+                    pieces: self.pieces.clone().expect("just built"),
+                    lost: false,
+                })
+            }
+            None => None,
+        };
         let mut driver = Driver {
+            constraint,
             stream: TextStream::default(),
             splitter: Splitter::new(split_reasoning, stop, tools),
             failure: None,
@@ -1205,7 +1234,19 @@ impl TextStream {
 }
 
 /// Per-turn state that turns sampled tokens into deltas.
+/// A reply's output grammar and where the content so far is in it.
+struct Constraint {
+    grammar: Arc<Grammar>,
+    matcher: Matcher,
+    /// `Tokenizer::pieces`.
+    pieces: Rc<Vec<Option<Box<str>>>>,
+    /// The content left the grammar (text the tokenizer joined differently
+    /// than `pieces` predicted): the rest of the reply is unconstrained.
+    lost: bool,
+}
+
 struct Driver {
+    constraint: Option<Constraint>,
     stream: TextStream,
     splitter: Splitter,
     failure: Option<Error>,
@@ -1243,17 +1284,58 @@ impl<H: ChatHooks> GenerationHooks for Hooked<'_, H> {
     fn prefill(&mut self, processed: usize, total: usize) -> bool {
         self.hooks.prefill(processed, total) && !self.hooks.cancelled()
     }
+    fn constrained(&self) -> bool {
+        !self.driver.splitter.in_reasoning
+            && self.driver.constraint.as_ref().is_some_and(|c| !c.lost)
+    }
+    fn allows(&mut self, token: u32) -> bool {
+        let Some(c) = &self.driver.constraint else {
+            return true;
+        };
+        match c.pieces.get(token as usize) {
+            Some(Some(piece)) => c.matcher.allows(&c.grammar, piece),
+            _ => false,
+        }
+    }
+    fn may_end(&self) -> bool {
+        self.driver
+            .constraint
+            .as_ref()
+            .is_none_or(|c| c.lost || c.matcher.complete())
+    }
     fn token(&mut self, token: u32) -> Result<Flow> {
         self.driver.count += 1;
         self.hooks.generated(self.driver.count);
-        if self.driver.splitter.in_reasoning {
+        let was_reasoning = self.driver.splitter.in_reasoning;
+        if was_reasoning {
             self.driver.reasoning_tokens += 1;
         }
         let piece = self.driver.stream.step(self.tokenizer, token)?;
-        if let Some(piece) = piece
-            && !self.emit(&piece)
-        {
-            return Ok(Flow::Stop);
+        if let Some(piece) = piece {
+            if !self.emit(&piece) {
+                return Ok(Flow::Stop);
+            }
+            if !self.driver.splitter.in_reasoning
+                && let Some(c) = self.driver.constraint.as_mut().filter(|c| !c.lost)
+            {
+                // Content only: of the piece that closed the reasoning, what
+                // follows the closing tag.
+                let content = if was_reasoning {
+                    piece.rsplit_once("</think>").map_or("", |(_, rest)| rest)
+                } else {
+                    piece.as_str()
+                };
+                // Blank lines after the closing tag are the template's, not
+                // the grammar's.
+                let content = if was_reasoning {
+                    content.trim_start()
+                } else {
+                    content
+                };
+                if !c.matcher.accept_str(&c.grammar, content) {
+                    c.lost = true;
+                }
+            }
         }
         if self.driver.splitter.stopped || self.hooks.cancelled() {
             return Ok(Flow::Stop);
