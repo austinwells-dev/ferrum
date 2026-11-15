@@ -1,0 +1,29 @@
+# models-dir.sh, 2026-11-15, Apple M5 32 GB; small = Spark-X2.6-4B-Q4_K_M.gguf, big = Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+   models: [('small', 'ready', 557824), ('big', 'unloaded', None)]
+1 no model field
+   served by small | 'Paris' | 0.345204 s
+2 model big (switch)
+   served by big | 'Paris' | 5.478882 s
+   models: [('small', 'unloaded', None), ('big', 'ready', 262144)]
+3 model big again (no switch)
+   served by big | 'Paris' | 0.040109 s
+4 an unknown model name (back to the --model)
+   served by small | 'Paris' | 1.563597 s
+   models: [('small', 'ready', 557824), ('big', 'unloaded', None)]
+5 two requests at once, big then small
+  a
+     b
+   served by big | 'Paris' | 5.447076 s
+served by small | 'Paris' | 6.702388 s
+6 /tokenize "Hello world" per model
+   small {"tokens":[26240,3179]} big {"tokens":[9419,1814]}
+INF also offered, loaded when a request's model names one: big
+INF loaded small (Spark, 36 layers, 36 attention) in 0.7 s
+INF switching model: DIR/small.gguf -> DIR/big.gguf
+INF loaded big (Moe, 40 layers, 10 attention) in 3.4 s
+INF switching model: DIR/big.gguf -> DIR/small.gguf
+INF loaded small (Spark, 36 layers, 36 attention) in 0.7 s
+INF switching model: DIR/small.gguf -> DIR/big.gguf
+INF loaded big (Moe, 40 layers, 10 attention) in 3.2 s
+INF switching model: DIR/big.gguf -> DIR/small.gguf
+INF loaded small (Spark, 36 layers, 36 attention) in 0.7 s

@@ -22,12 +22,12 @@ ferrum-server --model model.gguf --port 8080      # http://127.0.0.1:8080/v1
 
 | Kind | Paths |
 |---|---|
-| OpenAI | `/v1/chat/completions`, `/v1/completions`, `/v1/models` |
+| OpenAI | `/v1/chat/completions`, `/v1/responses`, `/v1/completions`, `/v1/models` |
 | Anthropic | `/v1/messages`, `/v1/messages/count_tokens` |
 | Images | `/v1/images/generations` (needs `--image-model`; see [Image generation](#image-generation)) |
 | Utility | `/health`, `/props`, `/slots`, `/metrics` (Prometheus), `/tokenize`, `/detokenize`, `/apply-template` |
 
-The model runs on its own thread behind a FIFO queue, and each connection gets a thread, so `/health` and `/metrics` respond while a request is generating. By default requests are processed one at a time.
+The model runs on its own thread behind a FIFO queue, and each connection gets a thread, so `/health` and `/metrics` respond while a request is generating. By default requests are processed one at a time. At most 256 connections are open at once; further ones get 503.
 
 ### Parallel requests
 
@@ -39,7 +39,7 @@ Speculative decoding runs on slot 0 only; the other slots decode without the dra
 
 ### Conversation caching
 
-Each slot keeps its previous conversation. If the next request extends it, only the new tokens are processed, and `usage.prompt_tokens_details.cached_tokens` reports how many were reused. An identical retry reuses everything except the last token.
+Each slot keeps its previous conversation. If the next request extends it, only the new tokens are processed, and `usage.prompt_tokens_details.cached_tokens` reports how many were reused. `usage.completion_tokens_details.reasoning_tokens` is the part of `completion_tokens` spent on reasoning. An identical retry reuses everything except the last token.
 
 With several slots, a request goes to the free slot that suits its cache best, so concurrent conversations each keep their own:
 
@@ -49,6 +49,16 @@ With several slots, a request goes to the free slot that suits its cache best, s
 4. Otherwise, the least recently used free slot, empty ones first.
 
 Hybrid models can't rewind linear-attention state the way a KV cache can, and a sliding-window layer's ring overwrites its oldest rows, so each slot snapshots both (`--snapshots N`, default 2): the recurrent state and a copy of every ring. A request that diverges restores the deepest snapshot at or before that point. Full-attention K/V rows stay valid. Chat templates that drop a past reply's reasoning diverge a few tokens before the end of the previous prompt; the session also snapshots there. See [architecture](architecture.md#the-hybrid-engine) and [models.md](models.md#sessions).
+
+**Across restarts.** With `--slot-save-path DIR`, SIGINT or SIGTERM (Ctrl-C, `kill`) makes the model thread save every slot that holds a conversation to `DIR/slot-N` before the process ends, and the next start loads them back when the model file, context and K/V format are the same. A request in flight is dropped where it is; what its slot had cached by its last step is saved. A second signal quits at once without saving. Without the flag the same signals just end the process. An example is in [measurements/gpu-share](measurements/gpu-share/README.md#slot-caches-across-a-restart---slot-save-path).
+
+**Idle unload.** With `--idle-unload SECS` the model thread drops the model once no request has run or waited for that long, which returns its memory (weights and every slot's K/V cache) to the system. The server keeps listening and `/health` keeps answering `ok`; `/v1/models` reports `"status": "unloaded"`. The next request loads the model again and waits for the load and warmup, so it starts a few seconds late. Slot caches are lost on unload unless `--slot-save-path` is set, in which case they are saved before the unload and restored after the reload. On a 4B model with a 23 GiB plan the process went from 23 GB to 81 MB while unloaded, and the request that woke it took 5.9 s instead of 1.7 s: [record](measurements/qol-2026-11/idle-unload-2026-11-15.txt).
+
+### Sharing the GPU
+
+A model that runs flat out can make video stutter and the desktop lag, because the window server and video decoders wait for the same GPU. `--gpu-share PCT` (5–100, or `off`) keeps Ferrum's share of the GPU's time at about PCT%: after every prompt piece and every decode step the session sleeps in proportion to how long the step took, and prompts are read 128 tokens at a time instead of `--chunk`, so no single step holds the GPU for long. The text is the same as without it; speeds drop to about that share (on Spark-X2.6-4B, 36.0 tok/s decode becomes 15.9 at 50 and 7.8 at 25: [measurement](measurements/gpu-share/README.md)). Reported speeds include the pauses.
+
+`FERRUM_GPU_SHARE=50` sets the default for `ferrum-server`, `ferrum-cli` and the TUI's chats, agents and server (the TUI's *GPU share* setting wins). Benchmarks and the developer tools ignore it. Whether a share is low enough for a given video on a given model has not been measured: start at 50 and lower it if playback still drops frames.
 
 ### Thinking controls
 
@@ -62,6 +72,70 @@ Any of these request fields turn reasoning on or off, or set its effort:
 | `reasoning_format: none` | Keep `<think>` inline in the content |
 
 Server-wide defaults: `--no-think`, `--reasoning-effort`, `--reasoning-budget`, `--reasoning-format`, `--chat-template-kwargs`.
+
+### Structured output
+
+`/v1/chat/completions` can hold a reply to JSON. Every token is checked against a grammar before it is chosen, so the content always parses (unless `max_tokens` cuts it short, which reports `finish_reason: "length"`).
+
+| Request field | Reply |
+|---|---|
+| `response_format: {"type": "json_object"}` | One JSON object, any keys |
+| `response_format: {"type": "json_schema", "json_schema": {"schema": {...}}}` | One value matching the schema (OpenAI's form) |
+| `response_format: {"type": "json_object", "schema": {...}}`, or a top-level `json_schema: {...}` | The same (llama-server's forms) |
+
+Schemas may use `type` (also a list of types), `properties`, `required`, `additionalProperties`, `items`, `minItems` and `maxItems` (up to 64), `enum`, `const`, `anyOf`, `oneOf`, `nullable` and local `$ref`s (`#/$defs/...`, recursive ones included). Things to know:
+
+- **Property order is the schema's.** An object writes its properties in the order `properties` lists them (optional ones may be left out), and nothing else. A model does not get to reorder them. An object schema without `properties` is free-form.
+- **Not enforced, with a warning in the log:** `pattern`, `format`, `minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `uniqueItems`, `minProperties`, `maxProperties`. The reply has the right shape but may break these.
+- **Refused with 400:** anything else that changes what is valid (`allOf`, `not`, `if`, `patternProperties`, remote `$ref`s, ...), rather than returning JSON that silently ignores it.
+- **Reasoning is not constrained.** With thinking on, the model reasons freely and the grammar starts after `</think>`.
+- **Tools win.** A request that also has `tools` is not constrained (a constrained reply could not call a tool); the log says so. A forced `tool_choice` is a separate mechanism (below).
+- **Speed.** A constrained reply reads the full logits and does not use the drafter, so speculative decoding does not speed it up. On Spark-X2.6-4B constrained replies ran at 31.9–36.1 tok/s against 37.2 unconstrained ([record](measurements/qol-2026-11/README.md#structured-output)).
+- **Whitespace** between JSON tokens is at most one space, or a newline and up to 20 spaces or tabs.
+- A token that is only part of a multi-byte character is never chosen inside a constrained reply, so text in scripts the tokenizer splits below the character may come out worse than unconstrained.
+
+A constraint steers the model, it does not make it smarter: a small model held to a tight schema (for example `maxItems` it wants to exceed) can run on inside a string until `max_tokens`. Constraints are not available on `/v1/completions` or `/v1/messages`, and `logprobs` is ignored with a warning. What was checked: [models.md](models.md#structured-output).
+
+**GBNF grammars.** `grammar` takes llama.cpp's grammar text and holds the content to its `root` rule, with the same rules as a schema (reasoning is free, tools win, no drafter). It cannot be combined with `response_format`. Supported: quoted literals with escapes, character classes (ranges, `^` negation), `.`, rule names, groups, `|`, and the repetitions `*`, `+`, `?`, `{m}`, `{m,}`, `{m,n}` (counts up to 256). Refused with 400: token references (`<[id]>`), and left recursion, including a repetition of something that can be empty such as `("a"?)*`. Checked on Spark-X2.6-4B: [record](measurements/qol-2026-11/README.md#gbnf).
+
+**`n`.** `/v1/chat/completions` returns up to 8 choices for `n`, run one after another with seeds `seed`, `seed + 1`, ..., each reusing the cached prompt. `usage` counts the prompt once and adds the completions up. `n` above 1 cannot be streamed.
+
+**`tool_choice`.** `"none"` drops the tools. `"required"`, or a named function (`{"type": "function", "function": {"name": N}}`; on `/v1/messages`, `{"type": "any"}` and `{"type": "tool", "name": N}`), makes the reply call a tool: the server writes the opening of the model's tool-call format where the reply's content starts (after the reasoning when thinking is on, including a reasoning budget's forced close), and the model continues from there. A name that is not in `tools` is refused with 400. Things to know:
+
+- This is enforced for Qwen3.5-family models (dense and MoE) and Flint, whose tool-call formats the server knows how to open. For Spark and LFM3 it is not: the request runs, the model decides, and the log says so.
+- Only the opening is forced (and for a named function, its name). The arguments are the model's and are not checked against the tool's schema; a call the parser cannot read comes back as content.
+- With thinking on and reasoning left inline (`--reasoning-format none`), nothing is forced.
+- Checked on a 35B MoE: [record](measurements/qol-2026-11/README.md#tool_choice). Flint's opening has not been run.
+
+**`logit_bias`** on `/v1/chat/completions` is OpenAI's map of token id to a value from -100 to 100, added to that token's logit at every step (reasoning included) after the penalties; llama-server's list form `[[id, bias], ...]` is accepted too, where `false` bans the token. Ids outside the vocabulary are ignored. Like a schema, a biased reply reads the full logits, samples from the 1024 likeliest tokens and does not use the drafter.
+
+### Responses API
+
+`/v1/responses` is OpenAI's Responses API, stateless: every request carries its whole conversation in `input`, and `previous_response_id` is refused with 400 (nothing is stored, so `store` is ignored). It runs the same path as `/v1/chat/completions`, so conversation caching, thinking controls, `tool_choice`, `logit_bias`, `grammar` and this server's sampling fields work the same way.
+
+| Request | Meaning |
+|---|---|
+| `input` | A string, or items: messages (`role` with `input_text`, `output_text` and `input_image` parts; `developer` is the system role), `function_call`, `function_call_output`; `reasoning` items are dropped |
+| `instructions` | The system message |
+| `tools`, `tool_choice` | Function tools; other tool types (web search, file search, ...) are ignored with a warning |
+| `text.format` | `json_schema` or `json_object`, as [Structured output](#structured-output) |
+| `reasoning.effort` | As `reasoning_effort`; `none` turns thinking off |
+| `max_output_tokens` | The token limit; a reply cut by it has `status: "incomplete"` |
+
+The reply's `output` holds a `reasoning` item (the thinking, as `reasoning_text` content), a `message` with one `output_text` part, and one `function_call` per tool call. With `stream: true` the events are `response.created`, `response.in_progress`, then for each item `response.output_item.added`, its text as `response.reasoning_text.delta` or `response.output_text.delta`, and `response.output_item.done`, ending with `response.completed` (or `response.incomplete`). Function calls arrive whole after the text, since a call is parsed when the reply ends. Checked on a 35B MoE: [record](measurements/qol-2026-11/README.md#responses-api).
+
+### Several models
+
+With `--models-dir DIR` the server also offers every other chat GGUF in `DIR`, named by its file name without `.gguf` (projector files are skipped, and a file whose tokenizer or chat template cannot be read is left out with a warning). `/v1/models` lists them with `status` `ready` or `unloaded`. One model is in memory at a time:
+
+- A request whose `model` names one of them is for that model. Any other `model` value, or none, means the `--model`.
+- When the oldest waiting request is for a model that is not loaded, nothing new starts, the running requests finish, the server unloads the model and loads the other one. The request waits for the load. Clients that alternate between two models therefore reload on every request.
+- A switched-to model gets the largest context that fits, its own sibling `mmproj` projector, its GGUF's recommended sampling under the same command-line overrides, and no drafter: `--draft`, `--alias` and `--mmproj` apply to the `--model` only.
+- Slot caches do not survive a switch. With `--slot-save-path` they are saved before it, but the directory holds one model's slots at a time: the next model to save replaces them, and a model only loads slots it wrote itself.
+- If the model fails to load, its requests get 503 and the server goes back to the `--model`. This path has not been exercised.
+- `/tokenize`, `/detokenize`, `/apply-template` and `/v1/messages/count_tokens` take `model` too; `/props` describes the `--model`.
+
+Checked with a 4B and a 35B model: [record](measurements/qol-2026-11/README.md#several-models).
 
 ### Streaming
 
@@ -80,9 +154,13 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 | Flag | Default | Meaning |
 |---|---|---|
 | `--host`, `--port` | `127.0.0.1`, `8080` | Bind address |
-| `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY`. `FERRUM_API_KEY=KEY` does the same without putting the key in the process list |
+| `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY`. `FERRUM_API_KEY=KEY` does the same without putting the key in the process list. A request without the key may carry a body of at most 64 KiB (it gets 401); a larger one is refused before its body is read |
 | `--cors ORIGIN` | localhost pages only | Let web pages from `ORIGIN` (e.g. `https://chat.example.com`) call the server; repeatable, `*` for any. Requests from other sites' pages get 403, so a site you visit can't use your model. Clients that aren't browsers (curl, SDKs, agents) send no `Origin` and are unaffected |
 | `--alias NAME` | file name | Model name reported to clients |
+| `--gpu-share PCT\|off` | `off` | Keep the GPU busy at most PCT% of the time (5–100). See [Sharing the GPU](#sharing-the-gpu) |
+| `--slot-save-path DIR` | none | Keep each slot's conversation cache in `DIR/slot-N` across restarts. See [Conversation caching](#conversation-caching) |
+| `--models-dir DIR` | none | Offer the other chat GGUFs in `DIR`, loaded when a request's `model` names one. See [Several models](#several-models) |
+| `--idle-unload SECS` | 0 (never) | Free the model after `SECS` seconds without a request; the next request loads it again. See [Conversation caching](#conversation-caching) |
 | `-np`, `--parallel N` | `1` | Requests served at once, one slot each (1–8). See [Parallel requests](#parallel-requests) |
 | `-c`, `--context N\|auto` | `auto` | Context length of each slot |
 | `--kv-cache f16\|q8` | `f16` | K/V cache format (also `-ctk`/`-ctv`). `q8` nearly halves K/V memory, so `auto` fits about twice the context, and decodes faster at long context. See [K/V cache format](#kv-cache-format) |
@@ -105,6 +183,10 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 ```sh
 ferrum-cli --model model.gguf     # --kv-cache q8 as for the server
 ```
+
+`--prompt TEXT` (`-p`) answers one message and exits, with the reply on stdout and the statistics on stderr; text piped on stdin is appended to it (`cat notes.txt | ferrum-cli -m model.gguf -p "Summarize:"`). `--gpu-share PCT` works as for the server ([Sharing the GPU](#sharing-the-gpu)). `--version` prints the version, as it does for `ferrum-server`.
+
+In a terminal the prompt has line editing and history (↑/↓, kept in `~/.cache/ferrum/cli-history`, or under `$XDG_CACHE_HOME`). Ctrl-C stops the reply being written and keeps the conversation; at the prompt, Ctrl-C or Ctrl-D leaves. Piped input without `--prompt` is read one message per line, as before.
 
 Commands: `/reset`, `/think on|off`, `/image PATH [low|high|auto|N]`, `/detail low|high|auto|N`, `/stats`, `/exit`. To continue a message on the next line, end the line with `\`. A size after `/image PATH` applies to that image; `/detail` sets it for the images that follow (see [Image size per request](#image-size-per-request)).
 

@@ -19,17 +19,47 @@ use ferrum::{
 use serde::Serialize;
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
-        mpsc::{Receiver, Sender, TryRecvError, channel},
+        mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel},
     },
     time::{Duration, Instant},
 };
 
 /// Most `--parallel` slots.
 pub const MAX_PARALLEL: usize = 8;
+
+/// Set by SIGINT/SIGTERM: the model thread stops stepping, saves its slots
+/// (`--slot-save-path`) and ends the process.
+pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// What the model thread is started with besides the model.
+#[derive(Clone)]
+pub struct Tuning {
+    /// `--alias`: the model name reported to clients.
+    pub alias: Option<String>,
+    /// `--gpu-share` (`Runtime::set_gpu_share`).
+    pub gpu_share: u32,
+    /// `--slot-save-path`: slot caches are loaded from here and saved on exit.
+    pub slot_save: Option<PathBuf>,
+    /// `--idle-unload`: free the model after this long without a request.
+    pub idle_unload: Option<Duration>,
+}
+
+/// Why the scheduler returned.
+enum Exit {
+    /// The server is going away (every job sender was dropped).
+    Closed,
+    /// `--idle-unload` elapsed with nothing running or queued.
+    Idle,
+    /// The oldest queued request is for this other model; the queue comes
+    /// back to be served by it.
+    Switch(PathBuf, VecDeque<Job>),
+    /// A model switched to did not load; the queue comes back.
+    Failed(String, VecDeque<Job>),
+}
 
 pub enum Work {
     Chat(Box<ChatRequest>),
@@ -65,6 +95,7 @@ pub enum Event {
 }
 
 /// Vision projector settings for the model thread.
+#[derive(Clone)]
 pub struct Vision {
     pub mmproj: Option<PathBuf>,
     pub max_tokens: usize,
@@ -77,6 +108,9 @@ pub struct Vision {
 pub struct Route {
     pub slot: Option<usize>,
     pub key: Option<String>,
+    /// The model file the request is for (`--models-dir`); None is
+    /// whichever model is loaded.
+    pub model: Option<PathBuf>,
 }
 
 pub struct Job {
@@ -104,6 +138,11 @@ pub struct SlotStatus {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Status {
     pub state: &'static str,
+    /// The model file that is loaded, or was last.
+    pub path: PathBuf,
+    /// `--idle-unload` freed the model; `state` stays "ready" because the
+    /// next request loads it again.
+    pub unloaded: bool,
     pub load_error: Option<String>,
     pub model: String,
     /// Context of each slot.
@@ -163,36 +202,150 @@ pub fn spawn(
     path: PathBuf,
     options: PlanOptions,
     spec: Option<SpecOptions>,
-    alias: Option<String>,
     vision: Vision,
+    tuning: Tuning,
     shared: Arc<Shared>,
 ) -> Sender<Job> {
     let (tx, rx) = channel::<Job>();
     std::thread::Builder::new()
         .name("model".into())
-        .spawn(move || run(path, options, spec, alias, vision, shared, rx))
+        .spawn(move || run(path, options, spec, vision, tuning, shared, rx))
         .expect("spawn model thread");
     tx
 }
 
+/// The model thread: serve until the server closes, and with
+/// `--idle-unload` drop the model whenever it has been idle that long and
+/// load it again for the next request (which waits for the load).
 fn run(
     path: PathBuf,
     options: PlanOptions,
     spec: Option<SpecOptions>,
-    alias: Option<String>,
     vision: Vision,
+    tuning: Tuning,
     shared: Arc<Shared>,
     jobs: Receiver<Job>,
 ) {
+    let mut backlog = VecDeque::new();
+    // The model to load next: the `--model`, until a request names another.
+    let mut current = path.clone();
+    loop {
+        let first = current == path;
+        // The drafter, alias and --mmproj were chosen for the --model;
+        // another model gets its own sibling projector and no drafter.
+        let (model_spec, model_vision, model_tuning) = if first {
+            (spec.clone(), vision.clone(), tuning.clone())
+        } else {
+            let mmproj = ferrum::vision::resolve_projector(&current, None)
+                .ok()
+                .flatten();
+            (
+                None,
+                Vision {
+                    mmproj,
+                    ..vision.clone()
+                },
+                Tuning {
+                    alias: None,
+                    ..tuning.clone()
+                },
+            )
+        };
+        match serve(
+            &current,
+            first,
+            options,
+            &model_spec,
+            &model_vision,
+            &model_tuning,
+            &shared,
+            &jobs,
+            backlog,
+        ) {
+            Exit::Closed => return,
+            Exit::Idle => {}
+            Exit::Switch(next, queue) => {
+                info!(
+                    None,
+                    "switching model: {} -> {}",
+                    current.display(),
+                    next.display()
+                );
+                current = next;
+                backlog = queue;
+                continue;
+            }
+            Exit::Failed(message, queue) => {
+                // Its requests fail; the rest go back to the --model.
+                backlog = VecDeque::new();
+                for job in queue {
+                    if job.route.model.as_deref() == Some(current.as_path()) {
+                        shared.queued.fetch_sub(1, Ordering::SeqCst);
+                        shared.update(|s| s.failed += 1);
+                        let _ = job.events.send(Event::Failed {
+                            status: 503,
+                            message: format!("model failed to load: {message}"),
+                        });
+                    } else {
+                        backlog.push_back(job);
+                    }
+                }
+                current = path.clone();
+                continue;
+            }
+        }
+        // The runtime is dropped: its memory is free until a request comes.
+        info!(
+            None,
+            "model unloaded after {} s idle; the next request loads it again",
+            tuning.idle_unload.map_or(0, |d| d.as_secs())
+        );
+        shared.update(|s| s.unloaded = true);
+        backlog = VecDeque::new();
+        loop {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                info!(None, "shutting down");
+                std::process::exit(0);
+            }
+            match jobs.recv_timeout(Duration::from_millis(200)) {
+                Ok(job) => {
+                    backlog.push_back(job);
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        shared.update(|s| s.unloaded = false);
+    }
+}
+
+/// Load the model and run its scheduler, starting with `backlog`.
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    path: &Path,
+    first: bool,
+    options: PlanOptions,
+    spec: &Option<SpecOptions>,
+    vision: &Vision,
+    tuning: &Tuning,
+    shared: &Arc<Shared>,
+    jobs: &Receiver<Job>,
+    backlog: VecDeque<Job>,
+) -> Exit {
     let start = Instant::now();
     let mut rt = match Runtime::load_multimodal(
-        &path,
+        path,
         options,
         spec.as_ref(),
         vision.mmproj.as_deref(),
         vision.max_tokens,
     ) {
         Ok(rt) => rt,
+        Err(e) if !first => {
+            error!(None, "failed to load {}: {e}", path.display());
+            return Exit::Failed(e.to_string(), backlog);
+        }
         Err(e) => {
             error!(None, "failed to load {}: {e}", path.display());
             shared.update(|s| {
@@ -200,16 +353,16 @@ fn run(
                 s.load_error = Some(e.to_string());
             });
             // Fail every request instead of hanging.
-            for job in jobs {
+            for job in backlog.into_iter().chain(jobs.iter()) {
                 let _ = job.events.send(Event::Failed {
                     status: 503,
                     message: format!("model failed to load: {e}"),
                 });
             }
-            return;
+            return Exit::Closed;
         }
     };
-    if let Some(alias) = alias {
+    if let Some(alias) = tuning.alias.clone() {
         rt.model_name = alias;
     }
     let plan = rt.loaded.plan.clone();
@@ -276,6 +429,25 @@ fn run(
         Ok(()) => info!(None, "warmed up in {:.1} s", warm.elapsed().as_secs_f64()),
         Err(e) => warn!(None, "warmup failed: {e}"),
     }
+    rt.set_gpu_share(tuning.gpu_share);
+    if tuning.gpu_share < 100 {
+        info!(
+            None,
+            "GPU share {}%: generation pauses between steps so video and the desktop stay smooth",
+            tuning.gpu_share
+        );
+    }
+    if let Some(dir) = &tuning.slot_save {
+        for slot in 0..rt.parallel() {
+            match rt.load_slot(slot, &dir.join(format!("slot-{slot}"))) {
+                Ok(Some(tokens)) => {
+                    info!(None, "slot {slot}: restored {} cached tokens", n(tokens))
+                }
+                Ok(None) => {}
+                Err(e) => warn!(None, "slot {slot}: saved cache not loaded: {e}"),
+            }
+        }
+    }
     let d = &rt.default_sampling;
     info!(
         None,
@@ -300,6 +472,7 @@ fn run(
     }
     shared.update(|s| {
         s.state = "ready";
+        s.path = path.to_owned();
         s.model = rt.model_name.clone();
         s.context = plan.context;
         s.vision = rt.supports_vision();
@@ -317,12 +490,16 @@ fn run(
     });
     Scheduler {
         rt,
-        shared,
+        shared: shared.clone(),
         slots: (0..parallel).map(|_| Slot::default()).collect(),
-        queue: VecDeque::new(),
+        queue: backlog,
         clock: 0,
+        slot_save: tuning.slot_save.clone(),
+        idle_unload: tuning.idle_unload,
+        path: path.to_owned(),
+        switch: None,
     }
-    .run(jobs);
+    .run(jobs)
 }
 
 /// A request running on a slot.
@@ -347,25 +524,47 @@ struct Scheduler {
     /// Jobs waiting for a slot, oldest first.
     queue: VecDeque<Job>,
     clock: u64,
+    /// `--slot-save-path` (`shut_down`).
+    slot_save: Option<PathBuf>,
+    idle_unload: Option<Duration>,
+    /// The loaded model's file.
+    path: PathBuf,
+    /// The other model the oldest queued request is for (`admit`): nothing
+    /// new starts, and once the slots are idle the scheduler returns it.
+    switch: Option<PathBuf>,
 }
 
 impl Scheduler {
-    fn run(mut self, jobs: Receiver<Job>) {
+    fn run(mut self, jobs: &Receiver<Job>) -> Exit {
+        let mut idle_since = Instant::now();
         loop {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                self.shut_down();
+            }
             // Wait only when nothing runs; otherwise just collect arrivals.
             if self.queue.is_empty() && self.slots.iter().all(|s| s.active.is_none()) {
-                match jobs.recv() {
+                match jobs.recv_timeout(Duration::from_millis(200)) {
                     Ok(job) => self.queue.push_back(job),
-                    Err(_) => return,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if self.idle_unload.is_some_and(|d| idle_since.elapsed() >= d) {
+                            // Dropping `self` frees the model; the caches
+                            // survive only on disk.
+                            self.save_slots();
+                            return Exit::Idle;
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return Exit::Closed,
                 }
             }
+            idle_since = Instant::now();
             loop {
                 match jobs.try_recv() {
                     Ok(job) => self.queue.push_back(job),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) if self.queue.is_empty() => {
                         if self.slots.iter().all(|s| s.active.is_none()) {
-                            return;
+                            return Exit::Closed;
                         }
                         break;
                     }
@@ -373,9 +572,46 @@ impl Scheduler {
                 }
             }
             self.admit();
+            if self.switch.is_some() && self.slots.iter().all(|s| s.active.is_none()) {
+                // The slots hold the old model's conversations.
+                self.save_slots();
+                let next = self.switch.take().expect("checked");
+                return Exit::Switch(next, std::mem::take(&mut self.queue));
+            }
             for i in 0..self.slots.len() {
                 if self.slots[i].active.is_some() {
                     self.step(i);
+                }
+            }
+        }
+    }
+
+    /// SIGINT/SIGTERM: save every slot's cache (`--slot-save-path`) and end
+    /// the process. Requests in flight are dropped where they are; what
+    /// their slots had cached up to the last step is saved.
+    fn shut_down(&mut self) -> ! {
+        self.save_slots();
+        info!(None, "shutting down");
+        std::process::exit(0);
+    }
+
+    /// Save every slot that holds a conversation (`--slot-save-path`).
+    fn save_slots(&self) {
+        if let Some(dir) = &self.slot_save {
+            for slot in 0..self.slots.len() {
+                if self.rt.slot(slot).is_empty() {
+                    continue;
+                }
+                let start = Instant::now();
+                match self.rt.save_slot(slot, &dir.join(format!("slot-{slot}"))) {
+                    Ok(stats) => info!(
+                        None,
+                        "slot {slot}: saved {} cached tokens ({:.1} MiB) in {:.1} s",
+                        n(self.rt.slot(slot).len()),
+                        stats.bytes as f64 / (1u64 << 20) as f64,
+                        start.elapsed().as_secs_f64()
+                    ),
+                    Err(e) => warn!(None, "slot {slot}: cache not saved: {e}"),
                 }
             }
         }
@@ -385,7 +621,13 @@ impl Scheduler {
     /// slot waits without holding up the others.
     fn admit(&mut self) {
         let mut waiting = VecDeque::new();
+        self.switch = None;
         while let Some(job) = self.queue.pop_front() {
+            if self.switch.is_some() {
+                // Behind a request for another model: nothing overtakes it.
+                waiting.push_back(job);
+                continue;
+            }
             if job.cancel.load(Ordering::SeqCst) {
                 self.shared.queued.fetch_sub(1, Ordering::SeqCst);
                 info!(Some(job.id), "client left while queued; skipped");
@@ -406,6 +648,11 @@ impl Scheduler {
                     status: 400,
                     message,
                 });
+                continue;
+            }
+            if let Some(model) = job.route.model.as_ref().filter(|m| **m != self.path) {
+                self.switch = Some(model.clone());
+                waiting.push_back(job);
                 continue;
             }
             let free = self.slots.iter().any(|s| s.active.is_none());
@@ -463,6 +710,12 @@ impl Scheduler {
         let shared = self.shared.clone();
         let started = guarded(|| match &job.work {
             Work::Chat(request) => {
+                if request.force_tool.is_some() && !self.rt.forces_tools() {
+                    warn!(
+                        Some(job.id),
+                        "tool_choice is not enforced for this model's tool-call format; the model decides"
+                    );
+                }
                 let prompt = self.rt.chat_prompt(request)?;
                 let slot = self.choose_for(&job.route, &prompt.tokens, &prompt.spans);
                 let mut hooks = Hooks::new(&job, &shared, &mut timing, slot);

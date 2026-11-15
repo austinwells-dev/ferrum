@@ -1,0 +1,20 @@
+# responses.sh, 2026-11-15, Apple M5 32 GB, Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf, working tree after 02db606
+1 string input, instructions, thinking on
+   completed None | [('reasoning', 269, 'chars'), ('message', '51')] | {'input_tokens': 30, 'input_tokens_details': {'cached_tokens': 0}, 'output_tokens': 112, 'output_tokens_details': {'reasoning_tokens': 109}, 'total_tokens': 142}
+2 same again (cache)
+   completed None | [('reasoning', 269, 'chars'), ('message', '51')] | {'input_tokens': 30, 'input_tokens_details': {'cached_tokens': 29}, 'output_tokens': 112, 'output_tokens_details': {'reasoning_tokens': 109}, 'total_tokens': 142}
+3 reasoning effort none, cut at 5 tokens
+   incomplete {'reason': 'max_output_tokens'} | [('message', '**The Abyssal Song')] | {'input_tokens': 20, 'input_tokens_details': {'cached_tokens': 0}, 'output_tokens': 5, 'output_tokens_details': {'reasoning_tokens': 0}, 'total_tokens': 25}
+4 text.format json_schema
+   completed None | [('message', '{\n  "capital": "Paris"\n}')] | {'input_tokens': 18, 'input_tokens_details': {'cached_tokens': 0}, 'output_tokens': 11, 'output_tokens_details': {'reasoning_tokens': 0}, 'total_tokens': 29}
+5 tool call (required)
+   completed None | [('function_call', 'get_time', '{"city":"Oslo"}', 'call_5_0')] | {'input_tokens': 278, 'input_tokens_details': {'cached_tokens': 0}, 'output_tokens': 24, 'output_tokens_details': {'reasoning_tokens': 0}, 'total_tokens': 302}
+6 tool result fed back
+   completed None | [('message', 'The current time in Oslo is 14:35.')] | {'input_tokens': 325, 'input_tokens_details': {'cached_tokens': 302}, 'output_tokens': 13, 'output_tokens_details': {'reasoning_tokens': 0}, 'total_tokens': 338}
+7 previous_response_id
+   ERROR 400 previous_response_id is not supported: responses are not stored, send the conversation in input
+8 streamed, thinking on: event types in order (deltas counted), then the text
+   response.created > response.in_progress > response.output_item.added > response.reasoning_text.delta x108 > response.reasoning_text.done > response.output_item.done > response.output_item.added > response.content_part.added > response.output_text.delta x2 > response.output_text.done > response.content_part.done > response.output_item.done > response.completed
+   sequence numbers consecutive: True | text '51' | final status completed ['reasoning', 'message']
+9 streamed tool call
+   arguments {"city":"Oslo"} | final [('function_call', 'get_time')]

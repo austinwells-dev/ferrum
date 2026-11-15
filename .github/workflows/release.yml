@@ -1,0 +1,40 @@
+name: Release
+
+# Pushing a tag `vX.Y.Z` (cut from main) builds the four binaries for Apple
+# Silicon and attaches them to a GitHub release. The binaries are not signed
+# or notarized: a download made with a browser is quarantined by Gatekeeper
+# (README, Install).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: Swatinem/rust-cache@v2
+      - name: Tag must match the crate version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 | python3 -c 'import json,sys; print(json.load(sys.stdin)["packages"][0]["version"])')
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - run: cargo build --release --locked
+      - name: Package
+        run: |
+          name="ferrum-$GITHUB_REF_NAME-aarch64-apple-darwin"
+          mkdir "$name"
+          cp target/release/ferrum target/release/ferrum-tui target/release/ferrum-cli target/release/ferrum-server "$name/"
+          cp README.md LICENSE-MIT LICENSE-APACHE THIRD_PARTY_NOTICES "$name/"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" ferrum-*.tar.gz ferrum-*.tar.gz.sha256 --title "$GITHUB_REF_NAME" --generate-notes --verify-tag
