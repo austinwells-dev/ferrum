@@ -36,6 +36,8 @@ pub struct ChatOpts {
     pub show_thinking: bool,
     /// Keep each chat's session cache on disk (`sessions::cache_dir`).
     pub session_cache: bool,
+    /// Percent of the time the model may keep the GPU busy (100: no pauses).
+    pub gpu_share: u32,
     pub budget: Option<usize>,
     pub overrides: Vec<(&'static str, f32)>,
     pub spec: Option<SpecOptions>,
@@ -171,6 +173,10 @@ impl ChatOpts {
                 .filter(|s| !s.is_empty() && s != "default"),
             show_thinking: app.value("show") != "hide",
             session_cache: app.value("session_cache") != "off",
+            gpu_share: match app.value("gpu_share") {
+                "" => ferrum::hybrid::runtime::gpu_share_from_env(),
+                v => ferrum::hybrid::runtime::parse_gpu_share(v).map_err(|e| e.to_string())?,
+            },
             budget: count("budget"),
             overrides,
             spec,
@@ -262,6 +268,8 @@ enum FromWorker {
         prompt: usize,
         reused: usize,
     },
+    /// Encoding image `.0 + 1` of `.1` before the prefill reads them.
+    Encoding(usize, usize),
     Prefill(usize, usize),
     Delta {
         reasoning: bool,
@@ -290,6 +298,10 @@ impl ChatHooks for Hooks<'_> {
     }
     fn begin(&mut self, prompt: usize, reused: usize) {
         let _ = self.tx.send(FromWorker::Begin { prompt, reused });
+    }
+    fn encoding(&mut self, done: usize, total: usize) -> bool {
+        let _ = self.tx.send(FromWorker::Encoding(done, total));
+        !self.cancel.load(Ordering::SeqCst)
     }
     fn prefill(&mut self, processed: usize, total: usize) -> bool {
         let _ = self.tx.send(FromWorker::Prefill(processed, total));
@@ -322,6 +334,7 @@ fn load(opts: &ChatOpts, mmproj: Option<&Path>, stage: &dyn Fn(&str)) -> ferrum:
     }
     stage("warming up kernels");
     rt.warmup()?;
+    rt.set_gpu_share(opts.gpu_share);
     Ok(rt)
 }
 
@@ -491,6 +504,9 @@ fn worker(opts: ChatOpts, rx: Receiver<ToWorker>, tx: Sender<FromWorker>, cancel
                     reasoning_budget: opts.budget,
                     raw_reasoning: false,
                     image_budget: Default::default(),
+                    grammar: None,
+                    logit_bias: Vec::new(),
+                    force_tool: None,
                 };
                 let hooks = Hooks {
                     tx: &tx,
@@ -761,6 +777,8 @@ pub struct Chat {
     first_token: Option<Instant>,
     gen_tokens: usize,
     prefill: Option<(usize, usize)>,
+    /// Images encoded so far and in all, while a turn encodes them.
+    encoding: Option<(usize, usize)>,
     ctx: Option<(usize, usize)>,
     follow: bool,
     top: Cell<usize>,
@@ -958,6 +976,7 @@ impl Chat {
             first_token: None,
             gen_tokens: 0,
             prefill: None,
+            encoding: None,
             ctx: None,
             follow: true,
             top: Cell::new(0),
@@ -1096,6 +1115,14 @@ impl Chat {
         matches!(self.phase, Phase::Generating | Phase::Tools)
     }
 
+    /// Something on screen changes without a key press: a load, a reply, a
+    /// tool run or a full-screen preview. An idle chat needs no fast redraws.
+    pub fn animating(&self) -> bool {
+        !matches!(self.phase, Phase::Ready | Phase::Failed(_))
+            || self.preview.is_some()
+            || self.exec_rx.is_some()
+    }
+
     pub fn accepts_input(&self) -> bool {
         !matches!(self.phase, Phase::Loading(_) | Phase::Failed(_))
     }
@@ -1223,9 +1250,14 @@ impl Chat {
                 FromWorker::Begin { prompt, reused } => {
                     self.prefill = Some((reused, prompt));
                 }
-                FromWorker::Prefill(done, total) => self.prefill = Some((done, total)),
+                FromWorker::Encoding(done, total) => self.encoding = Some((done, total)),
+                FromWorker::Prefill(done, total) => {
+                    self.encoding = None;
+                    self.prefill = Some((done, total));
+                }
                 FromWorker::Delta { reasoning, text } => {
                     self.prefill = None;
+                    self.encoding = None;
                     self.first_token.get_or_insert_with(Instant::now);
                     if let Some(t) = self.turns.last_mut() {
                         if reasoning {
@@ -1263,6 +1295,7 @@ impl Chat {
         self.gen_started = None;
         self.first_token = None;
         self.prefill = None;
+        self.encoding = None;
     }
 
     fn finish(&mut self, d: TurnDone) {
@@ -3508,9 +3541,10 @@ impl App {
                         out.push(to_line(&row, vec![indent()]));
                     }
                 } else if turn.reasoning.is_empty() && !turn.done {
-                    let msg = match chat.prefill {
-                        Some((d, tot)) => format!("reading prompt {d} / {tot}"),
-                        None => "starting".to_string(),
+                    let msg = match (chat.encoding, chat.prefill) {
+                        (Some((d, tot)), _) => format!("encoding image {} / {tot}", d + 1),
+                        (None, Some((d, tot))) => format!("reading prompt {d} / {tot}"),
+                        (None, None) => "starting".to_string(),
                     };
                     out.push(Line::from(vec![
                         indent(),

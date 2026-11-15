@@ -403,6 +403,9 @@ impl HybridState {
     pub fn media(&self) -> &[ImageSpan] {
         &self.media
     }
+    pub fn media_mut(&mut self) -> &mut [ImageSpan] {
+        &mut self.media
+    }
     /// Rotary positions for `m` rows starting at cache position `pos`.
     fn rope_plan(&self, d: &MetalDevice, pos: usize, m: usize) -> Result<RopePlan> {
         let delta = rope_position(&self.media, pos) as i64 - pos as i64;

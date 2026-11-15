@@ -224,6 +224,7 @@ impl App {
             let flag = match f.key {
                 "context" => "--context",
                 "kv_cache" => "--kv-cache",
+                "gpu_share" => "--gpu-share",
                 "max_tokens" => "--max-tokens",
                 "effort" => "--reasoning-effort",
                 "budget" => "--reasoning-budget",

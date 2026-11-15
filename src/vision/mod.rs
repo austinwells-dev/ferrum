@@ -863,6 +863,25 @@ impl VisionModel {
         }
     }
 
+    /// The token grid `encode_with(bytes, budget)` produces, from the image's
+    /// header alone: a chat places every image of its history, but encodes
+    /// only those its session cache does not already hold.
+    pub fn grid_of(&self, bytes: &[u8], budget: ImageBudget) -> Result<(usize, usize)> {
+        let (width, height) = image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .map_err(|e| Error::Parameter(format!("cannot decode image: {e}")))?
+            .into_dimensions()
+            .map_err(|e| Error::Parameter(format!("cannot decode image: {e}")))?;
+        if width.max(height) > MAX_SOURCE_SIDE || width == 0 || height == 0 {
+            return Err(Error::Parameter(format!(
+                "image of {width}x{height} pixels is unsupported"
+            )));
+        }
+        let f = self.config.factor();
+        let (w, h) = self.target_size_with(width as usize, height as usize, budget);
+        Ok((h / f, w / f))
+    }
+
     /// Language-model tokens an image of this prepared size produces.
     pub fn grid(&self, prepared: &Prepared) -> (usize, usize) {
         let f = self.config.factor();

@@ -1,0 +1,6 @@
+# greedy reply md5 (ferrum-cli --prompt 'Count to five.' --max-tokens 30 --temperature 0 --no-think), base 716e9b4 against the final tree, 2026-11-15
+Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf: base 95ba296e82498b91f1ef6663b0cfe775 branch 95ba296e82498b91f1ef6663b0cfe775
+Spark-X2.6-4B-Q4_K_M.gguf: base 69f1dbace0d19f1cf7efe9fe30eaa4b2 branch 69f1dbace0d19f1cf7efe9fe30eaa4b2
+# hybrid_session_check and hybrid_spec_check on the final tree
+Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf: session_check PASS | spec_check replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 22.8), argmax 709 vs 709
+Spark-X2.6-4B-Q4_K_M.gguf: session_check PASS | spec_check replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 35.0), argmax 198 vs 198

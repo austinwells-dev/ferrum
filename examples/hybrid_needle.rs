@@ -91,6 +91,9 @@ fn main() -> Result<()> {
             reasoning_budget: None,
             raw_reasoning: false,
             image_budget: Default::default(),
+            grammar: None,
+            logit_bias: Vec::new(),
+            force_tool: None,
         };
         rt.session.reset();
         let result = rt.chat(&request, |_| Ok(()))?;

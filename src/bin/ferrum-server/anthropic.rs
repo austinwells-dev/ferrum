@@ -9,7 +9,7 @@ use crate::{
     worker::{Event, Work},
 };
 use ferrum::hybrid::runtime::{
-    ChatRequest, ChatResult, Delta, generation_prefix, normalize_thinking,
+    ChatRequest, ChatResult, Delta, ForcedTool, generation_prefix, normalize_thinking,
 };
 use serde_json::{Value as Json, json};
 use std::{
@@ -36,7 +36,10 @@ fn text_of(content: &Json) -> String {
 }
 
 /// Anthropic messages and tools → OpenAI-style messages and tools.
-fn convert(body: &Json, id: u64) -> Result<(Vec<Json>, Vec<Json>), String> {
+/// The request's messages and tools in OpenAI's shape, and the tool its
+/// `tool_choice` forces.
+#[allow(clippy::type_complexity)]
+fn convert(body: &Json, id: u64) -> Result<(Vec<Json>, Vec<Json>, Option<ForcedTool>), String> {
     let mut messages = Vec::new();
     if let Some(system) = body.get("system") {
         let text = text_of(system);
@@ -155,14 +158,26 @@ fn convert(body: &Json, id: u64) -> Result<(Vec<Json>, Vec<Json>), String> {
             _ => warn!(Some(id), "ignoring server tool {}", t.get("type").and_then(Json::as_str).unwrap_or("?")),
         }
     }
-    if body.pointer("/tool_choice/type").and_then(Json::as_str) == Some("none") {
-        tools.clear();
-    }
-    Ok((messages, tools))
+    let force_tool = match body.pointer("/tool_choice/type").and_then(Json::as_str) {
+        Some("none") => {
+            tools.clear();
+            None
+        }
+        Some("any") if !tools.is_empty() => Some(ForcedTool::Any),
+        Some("tool") => {
+            let name = body
+                .pointer("/tool_choice/name")
+                .and_then(Json::as_str)
+                .ok_or("tool_choice of type tool needs a name")?;
+            Some(openai::named_tool(&tools, name)?)
+        }
+        _ => None,
+    };
+    Ok((messages, tools, force_tool))
 }
 
 fn request(body: &Json, server: &Server, id: u64) -> Result<ChatRequest, String> {
-    let (messages, tools) = convert(body, id)?;
+    let (messages, tools, force_tool) = convert(body, id)?;
     if messages.is_empty() {
         return Err("messages must not be empty".into());
     }
@@ -177,6 +192,9 @@ fn request(body: &Json, server: &Server, id: u64) -> Result<ChatRequest, String>
         reasoning_budget: t.budget,
         raw_reasoning: false,
         image_budget: openai::image_budget(body)?,
+        grammar: None,
+        logit_bias: Vec::new(),
+        force_tool,
     })
 }
 
@@ -218,12 +236,12 @@ pub fn count_tokens(
     id: u64,
     keep_alive: bool,
 ) -> std::io::Result<()> {
-    let result = convert(body, id).and_then(|(messages, tools)| {
+    let result = convert(body, id).and_then(|(messages, tools, _)| {
         // Count the prompt `messages` would feed the model, thinking switch included.
         let mut vars = openai::thinking(body, server).vars;
-        normalize_thinking(server.llm().template.source(), &mut vars);
+        normalize_thinking(server.model(body).template.source(), &mut vars);
         server
-            .llm()
+            .model(body)
             .template
             .render(
                 &messages,
@@ -232,8 +250,8 @@ pub fn count_tokens(
                 &vars,
             )
             .and_then(|mut text| {
-                text.push_str(generation_prefix(&server.llm().template, &vars));
-                server.llm().tokenizer.encode(&text)
+                text.push_str(generation_prefix(&server.model(body).template, &vars));
+                server.model(body).tokenizer.encode(&text)
             })
             .map_err(|e| e.to_string())
     });
@@ -251,7 +269,7 @@ pub fn messages(
     keep_alive: bool,
 ) -> std::io::Result<()> {
     let parsed = request(body, server, id).and_then(|r| {
-        let mut route = openai::route(body)?;
+        let mut route = openai::route(body, server)?;
         // Claude Code's user_id names the session, so it keeps one slot.
         if route.key.is_none() {
             route.key = body
@@ -286,7 +304,7 @@ pub fn messages(
             .map_or(String::new(), |b| format!(", budget {b}"))
     );
     let (rx, cancel) = server.submit(id, Work::Chat(Box::new(req)), route, stream);
-    let model = server.model_name();
+    let model = server.model_name(body);
     if !streaming {
         return openai::wait_json(stream, &rx, &cancel, id, keep_alive, |event| match event {
             Event::Chat(r) => {

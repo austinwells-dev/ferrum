@@ -1,0 +1,49 @@
+# tool-choice.sh, 2026-11-15, Apple M5 32 GB, working tree after 716e9b4
+## Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+1 auto, thinking off
+   finish stop | reasoning 0 tok | content 'Bonjour !' | calls []
+2 required, thinking off
+   finish tool_calls | reasoning 0 tok | content '' | calls [('get_weather', '{"city":"Paris"}')]
+3 required, thinking on
+   finish tool_calls | reasoning 130 tok | content '' | calls [('get_weather', '{"city":"Paris"}')]
+4 named get_time, thinking off
+   finish tool_calls | reasoning 0 tok | content '' | calls [('get_time', '{"city":"Paris"}')]
+5 named get_time, thinking on
+   finish tool_calls | reasoning 130 tok | content '' | calls [('get_time', '{"city":"Paris"}')]
+6 required, thinking budget 16
+   finish tool_calls | reasoning 16 tok | content '' | calls [('get_weather', '{"city":"Paris"}')]
+7 named tool that is not in tools
+   ERROR 400 tool_choice names "nope", which is not in tools
+8 required, streamed, thinking off
+   finish tool_calls | call get_weather {"city":"Paris"}
+9 Anthropic /v1/messages, tool_choice any
+   stop tool_use | [('tool_use', 'get_weather', {'city': 'Paris'})]
+   1 WRN [req 7] bad request: tool_choice names "nope", which is not in tools
+
+## Spark-X2.6-4B-Q4_K_M.gguf (a tool-call format the runtime does not open: not enforced)
+1 auto, thinking off
+   finish stop | reasoning 0 tok | content 'Bonjour' | calls []
+2 required, thinking off
+   finish stop | reasoning 0 tok | content 'Bonjour' | calls []
+3 required, thinking on
+   finish stop | reasoning 17 tok | content 'Bonjour' | calls []
+4 named get_time, thinking off
+   finish stop | reasoning 0 tok | content 'Bonjour' | calls []
+5 named get_time, thinking on
+   finish stop | reasoning 17 tok | content 'Bonjour' | calls []
+6 required, thinking budget 16
+   finish stop | reasoning 16 tok | content 'Bonjour' | calls []
+7 named tool that is not in tools
+   ERROR 400 tool_choice names "nope", which is not in tools
+8 required, streamed, thinking off
+   finish stop | call  
+9 Anthropic /v1/messages, tool_choice any
+   stop end_turn | [('text', None, None)]
+   1 WRN [req 2] tool_choice is not enforced for this model's tool-call format; the model decides
+   1 WRN [req 3] tool_choice is not enforced for this model's tool-call format; the model decides
+   1 WRN [req 4] tool_choice is not enforced for this model's tool-call format; the model decides
+   1 WRN [req 5] tool_choice is not enforced for this model's tool-call format; the model decides
+   1 WRN [req 6] tool_choice is not enforced for this model's tool-call format; the model decides
+   1 WRN [req 7] bad request: tool_choice names "nope", which is not in tools
+   1 WRN [req 8] tool_choice is not enforced for this model's tool-call format; the model decides
+   1 WRN [req 9] tool_choice is not enforced for this model's tool-call format; the model decides

@@ -1,0 +1,20 @@
+1. schema (city), greedy, thinking off
+  content: {"city": "Paris", "population_millions": 2.1, "landmarks": ["Eiffel Tower", "Louvre Museum", "Notre-Dame Cathedral (Paris, France), Notre-Dame Cathedral (Paris, France), Notre-Dame Cathedral (Paris, France), Notre-Dame Cathedral (Paris, France), Notre-Dame Cathedral (Paris, France), Notre-Dame Cathedral (Paris, France), Notre-Dame Cathedral (Paris, France), Notre-Dame Cathedral (Paris, France), No
+  NOT JSON (Unterminated string starting at: line 1 column 94 (char 93)); finish length; 200 tokens (0 reasoning chars) at 31.9 tok/s; drafts 0 accepted 0
+2. json_object, greedy, thinking off
+  content: {"title": "Rust's Embrace", "lines": ["Iron weathers slow", "Metal turns to gray", "Time's quiet kiss"]}
+  valid JSON; finish stop; 32 tokens (0 reasoning chars) at 35.6 tok/s; drafts 0 accepted 0
+3. schema (sum), thinking on, temperature 0.6 seed 5
+  content: {"answer": 4, "explanation": "2 + 2 = 4"}
+  valid JSON; finish stop; 87 tokens (261 reasoning chars) at 36.1 tok/s; drafts 0 accepted 0
+4. unconstrained, greedy, thinking off (speed reference)
+  66 tokens at 37.2 tok/s
+5. schema with allOf (refused)
+  error: invalid operation parameter: response schema: "allOf" is not supported
+6. streamed schema (sum), greedy, thinking off
+  content: {"answer": 81, "explanation": "9 multiplied by 9 equals 81."}
+  valid JSON
+7. schema (sum), thinking on, reasoning_budget 120, greedy, --draft lookup
+  content: {"answer": 391, "explanation": "17 × 23 = 391. The phrase is repeated as requested: the quick brown fox jumps over the lazy dog, the quick brown fox jumps over the lazy dog."}
+  valid JSON; finish stop; 175 tokens (341 reasoning chars) at 44.7 tok/s; drafts 75 accepted 43
+DONE

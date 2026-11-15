@@ -498,8 +498,8 @@ impl MetalDevice {
         Ok(())
     }
     /// Zeroed shared storage for model weights, added to the resident set.
-    pub(crate) fn allocate_resident(&self, bytes: usize) -> Result<MetalBuffer> {
-        let mut buffer = self.allocate(bytes)?;
+    pub(crate) fn allocate_resident(&self, bytes: usize, touch: bool) -> Result<MetalBuffer> {
+        let mut buffer = self.allocate_pages(bytes, touch)?;
         if let (true, Some(set)) = (self.resident_weights.get(), &self.residency) {
             set.addAllocation(ProtocolObject::from_ref(&*buffer.raw));
             self.residency_dirty.set(true);
@@ -719,6 +719,12 @@ impl MetalDevice {
         self.pipelines.borrow().len()
     }
     pub fn allocate(&self, bytes: usize) -> Result<MetalBuffer> {
+        self.allocate_pages(bytes, true)
+    }
+    /// A zeroed shared buffer. Metal hands out zero-filled storage either
+    /// way; `touch` writes the zeros again so every page is backed now
+    /// rather than at its first use.
+    fn allocate_pages(&self, bytes: usize, touch: bool) -> Result<MetalBuffer> {
         let start = Instant::now();
         let length = bytes.max(4);
         if length > self.max_buffer_length() {
@@ -728,9 +734,11 @@ impl MetalDevice {
             .raw
             .newBufferWithLength_options(length, MTLResourceOptions::StorageModeShared)
             .ok_or(Error::Allocation(bytes))?;
-        // SAFETY: newBuffer owns length writable shared bytes and is not submitted anywhere.
-        unsafe {
-            std::ptr::write_bytes(raw.contents().as_ptr().cast::<u8>(), 0, length);
+        if touch {
+            // SAFETY: newBuffer owns length writable shared bytes and is not submitted anywhere.
+            unsafe {
+                std::ptr::write_bytes(raw.contents().as_ptr().cast::<u8>(), 0, length);
+            }
         }
         let mut counters = self.counters.get();
         counters.allocations += 1;

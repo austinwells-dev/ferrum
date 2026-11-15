@@ -1,0 +1,6 @@
+# n > 1 on /v1/chat/completions, 2026-11-15, Spark-X2.6-4B-Q4_K_M, thinking off, max_tokens 12
+n=3, temperature 1, seed 5:  ([(0, 'Emberlyx', 'stop'), (1, 'Emberion', 'stop'), (2, 'Emberlyx', 'stop')], {'prompt_tokens': 31, 'completion_tokens': 11, 'total_tokens': 42, 'prompt_tokens_details': {'cached_tokens': 0}, 'completion_tokens_details': {'reasoning_tokens': 0}})
+same request again:          ([(0, 'Emberlyx', 'stop'), (1, 'Emberion', 'stop'), (2, 'Emberlyx', 'stop')], {'prompt_tokens': 31, 'completion_tokens': 11, 'total_tokens': 42, 'prompt_tokens_details': {'cached_tokens': 30}, 'completion_tokens_details': {'reasoning_tokens': 0}})
+n=2, temperature 0:          ([(0, 'Emberlyx', 'stop'), (1, 'Emberlyx', 'stop')], {'prompt_tokens': 31, 'completion_tokens': 8, 'total_tokens': 39, 'prompt_tokens_details': {'cached_tokens': 30}, 'completion_tokens_details': {'reasoning_tokens': 0}})
+n=2, stream:                 n above 1 cannot be streamed
+n=9:                         n must be a whole number from 1 to 8

@@ -101,6 +101,16 @@ Qwen-Image-2.1 drawing and editing is documented in [server.md](server.md#image-
 
 Record: [experimental branch notes](history/experimental-branch-notes.md#image-generation) and [measurements/image-gen](measurements/image-gen/).
 
+## Structured output
+
+`response_format` on `/v1/chat/completions` ([server.md](server.md#structured-output)), new in November 2026.
+
+**Checked** ([record](measurements/qol-2026-11/structured-output-2026-11-15.txt)), all on Spark-X2.6-4B Q4_K_M through `ferrum-server`: a schema with a string, a number, a bounded array and an enum; `json_object`; thinking on with the reasoning closed by the model and by `reasoning_budget`; sampling (temperature 0.6–0.7) and greedy; a streamed reply; a prompt-lookup drafter loaded (it drafts the reasoning and stops at the grammar). Every reply that finished parsed as JSON; the greedy bounded-array request ran to `max_tokens` inside a string. The grammar itself and the constrained choice have unit tests (`hybrid::grammar`, `hybrid::session`).
+
+**Not checked:** any other model or tokenizer (Qwen3.5-family, Flint, LFM3, Qwen3.8-Flash-Next); MTP, DFlash and DSpark drafters beside a constraint; `--parallel` above 1; schema-conformance suites; long outputs. The first constrained request builds a table of every token's text, which was not timed separately.
+
+**Gaps:** GBNF token references and left-recursive rules are refused, tool arguments are not held to their schema (a forced `tool_choice` only opens the call: [server.md](server.md#structured-output)), no constraint on `/v1/messages` or `/v1/completions`, no string patterns or numeric ranges. Property order is fixed by the schema.
+
 ## Sessions
 
 A chat's cache (tokens, full-attention K/V, recurrent state, sliding-window rings and snapshots) can be saved and loaded. The TUI writes it when the chat would otherwise lose it ([tui.md](tui.md#sessions)). Snapshots copy the sliding-window rings, so LFM3 keeps a long turn after the live ring has moved on. The [session reuse](measurements/session-reuse/README.md) write-up describes LFM3 losing its cache once a turn adds more than about 570 tokens after a snapshot. That description is `experimental` at `ab8f57e`, the base of the change, not the tree after `aa2b402`. As of `15fb296`, that record's branch column matches this tree: a few tokens redone at a rewritten reply header, and `hybrid_session_check` passing on LFM3-VL, Spark, Flint and the Qwen3.5 models that were run. Disk round-trip times are in [session cache](measurements/session-cache/README.md).

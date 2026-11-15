@@ -416,6 +416,9 @@ pub fn generate_streaming(
         reasoning_budget: thinking,
         raw_reasoning: false,
         image_budget: Default::default(),
+        grammar: None,
+        logit_bias: Vec::new(),
+        force_tool: None,
     };
     let r = rt
         .chat(&request, Streaming { stop, on })

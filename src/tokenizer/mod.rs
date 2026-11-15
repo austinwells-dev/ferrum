@@ -191,6 +191,44 @@ impl Tokenizer {
             .as_ref()
             .map_or_else(|| self.0.id_to_token(id).is_some(), |ids| ids.contains(&id))
     }
+    /// Every token's text as it reads in the middle of a reply, for matching
+    /// tokens against an output grammar; `None` for ids that are undefined,
+    /// special (control tokens) or not whole characters on their own (a
+    /// fragment of a multi-byte character).
+    pub fn pieces(&self) -> Result<Vec<Option<Box<str>>>> {
+        // Decoding after another token keeps a leading space that decoding
+        // a token alone would drop.
+        let anchor = *self
+            .encode(".")?
+            .last()
+            .ok_or_else(|| Error::Tokenizer("the tokenizer encodes \".\" to nothing".into()))?;
+        let decode = |ids: &[u32], skip_special: bool| {
+            self.0
+                .decode(ids, skip_special)
+                .map_err(|e| Error::Tokenizer(e.to_string()))
+        };
+        let prefix = decode(&[anchor], false)?;
+        let mut pieces = Vec::with_capacity(self.vocab_size());
+        for id in 0..self.vocab_size() as u32 {
+            if !self.is_defined(id) {
+                pieces.push(None);
+                continue;
+            }
+            let text = decode(&[anchor, id], false)?;
+            let piece = match text.strip_prefix(prefix.as_str()) {
+                Some(piece)
+                    if !piece.is_empty()
+                        && !piece.contains('\u{FFFD}')
+                        && decode(&[anchor, id], true)? == text =>
+                {
+                    Some(piece.into())
+                }
+                _ => None,
+            };
+            pieces.push(piece);
+        }
+        Ok(pieces)
+    }
     pub fn vocab_size(&self) -> usize {
         self.0.get_vocab_size(true)
     }
