@@ -37,6 +37,8 @@ pub static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
 /// What the model thread is started with besides the model.
 pub struct Tuning {
+    /// `--alias`: the model name reported to clients.
+    pub alias: Option<String>,
     /// `--gpu-share` (`Runtime::set_gpu_share`).
     pub gpu_share: u32,
     /// `--slot-save-path`: slot caches are loaded from here and saved on exit.
@@ -175,7 +177,6 @@ pub fn spawn(
     path: PathBuf,
     options: PlanOptions,
     spec: Option<SpecOptions>,
-    alias: Option<String>,
     vision: Vision,
     tuning: Tuning,
     shared: Arc<Shared>,
@@ -183,7 +184,7 @@ pub fn spawn(
     let (tx, rx) = channel::<Job>();
     std::thread::Builder::new()
         .name("model".into())
-        .spawn(move || run(path, options, spec, alias, vision, tuning, shared, rx))
+        .spawn(move || run(path, options, spec, vision, tuning, shared, rx))
         .expect("spawn model thread");
     tx
 }
@@ -192,7 +193,6 @@ fn run(
     path: PathBuf,
     options: PlanOptions,
     spec: Option<SpecOptions>,
-    alias: Option<String>,
     vision: Vision,
     tuning: Tuning,
     shared: Arc<Shared>,
@@ -223,7 +223,7 @@ fn run(
             return;
         }
     };
-    if let Some(alias) = alias {
+    if let Some(alias) = tuning.alias {
         rt.model_name = alias;
     }
     let plan = rt.loaded.plan.clone();

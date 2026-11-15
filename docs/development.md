@@ -26,6 +26,8 @@ The general engine (`ferrum run`, `smoke`, `transformer-smoke`, `profile`, the i
 
 `.cargo/config.toml` sets `MACOSX_DEPLOYMENT_TARGET=15.0` because the Metal compile options Ferrum uses need macOS 15. The release profile keeps build-time proc-macro dylibs unstripped, because macOS 27's dyld rejects some stripped ones ([Phase 1 results](history/phase1-results.md) has the details).
 
+Pushing a tag `vX.Y.Z` that matches the version in `Cargo.toml` runs [`release.yml`](../.github/workflows/release.yml): it builds the release binaries on a hosted Apple Silicon runner, packs them with the licenses and attaches the archive and its SHA-256 to a GitHub release. Cut tags from `main`. The workflow has not run yet.
+
 ## Developer subcommands
 
 ```sh
@@ -53,6 +55,8 @@ cargo run --release -- hybrid --model /path/to/model.gguf --raw --prompt 'The ca
 - `profile` also prints machine-readable `SUMMARY` and per-operation records.
 - `FERRUM_BATCH_LIMIT=1` gives cleaner per-kernel timings but changes how work is executed, so leave it unset when you measure throughput.
 - `FERRUM_NATIVE_MATMUL=0` switches to a slower diagnostic matrix-multiply fallback.
+- `FERRUM_GPU_SHARE=N` makes the front ends pace generation to N% of the GPU's time ([server.md](server.md#sharing-the-gpu)). The `ferrum` developer binary, the examples and the TUI's benchmarks never pace.
+- `FERRUM_HYBRID_PROFILE=1` prints per-kernel timings from `ferrum hybrid`; `FERRUM_HYBRID_DUMP=1` prints the sum of each intermediate tensor, and `FERRUM_HYBRID_REFERENCE_ATTENTION=1` / `FERRUM_HYBRID_SIMD_ATTENTION=1` force the reference and simdgroup attention kernels for A/B checks.
 - `FERRUM_KV_CACHE=q8` makes every tool and front end default to the 8-bit K/V cache (an explicit `--kv-cache` or TUI setting wins).
 - `FERRUM_EARLY_COMMIT=N` commits each execution's first command buffer after N kernels (default 32) without waiting, so the GPU starts while the CPU encodes the rest of the step. `0` restores one command buffer per step. Worth about 2–3% decode on the 35B MoE; neutral on the dense 27B.
 - Streamed experts (Qwen3.8-Flash-Next always; [architecture.md](architecture.md#the-hybrid-engine)): `FERRUM_STREAM_EXPERTS=1` streams any MoE model's experts, to compare against it loaded whole; `FERRUM_EXPERT_ARENA_GIB=N` sets the arena size (default: all the memory the plan leaves); `FERRUM_STREAM_THREADS=N` sets the I/O threads (default 6); `FERRUM_STREAM_AHEAD=0` turns read-ahead off; `FERRUM_HC_BF16=1` keeps the hyper-connection projections BF16 instead of Q8_0.

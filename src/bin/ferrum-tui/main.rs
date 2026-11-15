@@ -266,7 +266,8 @@ impl App {
     }
 
     pub fn poll_interval(&self) -> Duration {
-        let busy = self.chat.is_some()
+        let chat = self.chat.as_ref();
+        let busy = chat.is_some_and(|c| c.animating())
             || self.serve.is_some()
             || self.image.running()
             || self.audio.running()
@@ -277,6 +278,9 @@ impl App {
         Duration::from_millis(match self.screen {
             Screen::Splash | Screen::Home => 33,
             _ if busy => 33,
+            // A loaded, idle chat: keys still wake the loop at once, and
+            // this only paces thumbnails arriving and the clock.
+            _ if chat.is_some() => 100,
             _ => 200,
         })
     }

@@ -1103,6 +1103,14 @@ impl Chat {
         matches!(self.phase, Phase::Generating | Phase::Tools)
     }
 
+    /// Something on screen changes without a key press: a load, a reply, a
+    /// tool run or a full-screen preview. An idle chat needs no fast redraws.
+    pub fn animating(&self) -> bool {
+        !matches!(self.phase, Phase::Ready | Phase::Failed(_))
+            || self.preview.is_some()
+            || self.exec_rx.is_some()
+    }
+
     pub fn accepts_input(&self) -> bool {
         !matches!(self.phase, Phase::Loading(_) | Phase::Failed(_))
     }

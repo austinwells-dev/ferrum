@@ -27,6 +27,7 @@ You give it a model file and then either chat in the terminal, use the full-scre
 - **Plans memory before loading weights.** Every buffer is predicted from GGUF metadata, and Ferrum picks the largest context that fits: 101K tokens for the 27B model (190K with the optional 8-bit KV cache, `--kv-cache q8`), the full 262K for the 35B MoE. Predictions match Metal's own accounting to within a few MiB.
 - **Matches llama.cpp's output.** Mean KL divergence against llama.cpp's own logits is 1.2×10⁻⁴ on the 27B model, with the same top token at 99.5% of positions.
 - **Drop-in server.** OpenAI `/v1/chat/completions`, Anthropic `/v1/messages`, tool calls, reasoning controls, image input, and conversation caching that only processes the new suffix of each request.
+- **Plays nicely with the rest of the Mac.** `--gpu-share 50` (or the TUI's *GPU share* setting) paces generation so video and the desktop stay smooth while a model runs ([server guide](docs/server.md#sharing-the-gpu)).
 - **Coding agent in a sandbox.** The TUI's agent can edit a project, run commands and fetch pages inside a macOS Seatbelt profile that can only write to that project.
 
 ## Install
@@ -49,6 +50,8 @@ This builds an optimized release and puts four binaries on your `PATH` (in `~/.c
 | `ferrum` | Developer tool: device info and a one-shot hybrid-engine runner (smoke tests and the small-model runner need `--features legacy-engine`) |
 
 If you'd rather not install, `cargo build --release` puts the same binaries in `target/release/`.
+
+**Prebuilt binaries.** Tagged versions have a `ferrum-vX.Y.Z-aarch64-apple-darwin.tar.gz` on the [releases page](https://github.com/austinwells-dev/ferrum/releases) with the same four binaries (none has been published yet). They are not signed or notarized, so fetch the archive with `curl -LO` rather than a browser, or clear the quarantine afterwards with `xattr -dr com.apple.quarantine ferrum-*`.
 
 ## Get a model
 

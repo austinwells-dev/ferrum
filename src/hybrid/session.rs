@@ -927,8 +927,11 @@ impl Session {
         let depths = drafts.depths();
         let row_output = if params.uses_candidates() {
             // Each row's penalties see its own root path.
+            // Penalties read only the last `penalty_last_n` tokens, so the
+            // paths start from that tail, not the whole reply.
+            let tail = generated.len().saturating_sub(params.penalty_last_n);
             let mut seen: Vec<Vec<u32>> = Vec::with_capacity(rows.len());
-            seen.push(generated.clone());
+            seen.push(generated[tail..].to_vec());
             for (i, &token) in drafts.tokens.iter().enumerate() {
                 let mut path = seen[drafts.parents[i].map_or(0, |p| p + 1)].clone();
                 path.push(token);

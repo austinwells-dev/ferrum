@@ -50,6 +50,14 @@ With several slots, a request goes to the free slot that suits its cache best, s
 
 Hybrid models can't rewind linear-attention state the way a KV cache can, and a sliding-window layer's ring overwrites its oldest rows, so each slot snapshots both (`--snapshots N`, default 2): the recurrent state and a copy of every ring. A request that diverges restores the deepest snapshot at or before that point. Full-attention K/V rows stay valid. Chat templates that drop a past reply's reasoning diverge a few tokens before the end of the previous prompt; the session also snapshots there. See [architecture](architecture.md#the-hybrid-engine) and [models.md](models.md#sessions).
 
+**Across restarts.** With `--slot-save-path DIR`, SIGINT or SIGTERM (Ctrl-C, `kill`) makes the model thread save every slot that holds a conversation to `DIR/slot-N` before the process ends, and the next start loads them back when the model file, context and K/V format are the same. A request in flight is dropped where it is; what its slot had cached by its last step is saved. A second signal quits at once without saving. Without the flag the same signals just end the process. An example is in [measurements/gpu-share](measurements/gpu-share/README.md#slot-caches-across-a-restart---slot-save-path).
+
+### Sharing the GPU
+
+A model that runs flat out can make video stutter and the desktop lag, because the window server and video decoders wait for the same GPU. `--gpu-share PCT` (5–100, or `off`) keeps Ferrum's share of the GPU's time at about PCT%: after every prompt piece and every decode step the session sleeps in proportion to how long the step took, and prompts are read 128 tokens at a time instead of `--chunk`, so no single step holds the GPU for long. The text is the same as without it; speeds drop to about that share (on Spark-X2.6-4B, 36.0 tok/s decode becomes 15.9 at 50 and 7.8 at 25: [measurement](measurements/gpu-share/README.md)). Reported speeds include the pauses.
+
+`FERRUM_GPU_SHARE=50` sets the default for `ferrum-server`, `ferrum-cli` and the TUI's chats, agents and server (the TUI's *GPU share* setting wins). Benchmarks and the developer tools ignore it. Whether a share is low enough for a given video on a given model has not been measured: start at 50 and lower it if playback still drops frames.
+
 ### Thinking controls
 
 Any of these request fields turn reasoning on or off, or set its effort:
@@ -83,6 +91,8 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 | `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY`. `FERRUM_API_KEY=KEY` does the same without putting the key in the process list |
 | `--cors ORIGIN` | localhost pages only | Let web pages from `ORIGIN` (e.g. `https://chat.example.com`) call the server; repeatable, `*` for any. Requests from other sites' pages get 403, so a site you visit can't use your model. Clients that aren't browsers (curl, SDKs, agents) send no `Origin` and are unaffected |
 | `--alias NAME` | file name | Model name reported to clients |
+| `--gpu-share PCT\|off` | `off` | Keep the GPU busy at most PCT% of the time (5–100). See [Sharing the GPU](#sharing-the-gpu) |
+| `--slot-save-path DIR` | none | Keep each slot's conversation cache in `DIR/slot-N` across restarts. See [Conversation caching](#conversation-caching) |
 | `-np`, `--parallel N` | `1` | Requests served at once, one slot each (1–8). See [Parallel requests](#parallel-requests) |
 | `-c`, `--context N\|auto` | `auto` | Context length of each slot |
 | `--kv-cache f16\|q8` | `f16` | K/V cache format (also `-ctk`/`-ctv`). `q8` nearly halves K/V memory, so `auto` fits about twice the context, and decodes faster at long context. See [K/V cache format](#kv-cache-format) |
@@ -105,6 +115,10 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 ```sh
 ferrum-cli --model model.gguf     # --kv-cache q8 as for the server
 ```
+
+`--prompt TEXT` (`-p`) answers one message and exits, with the reply on stdout and the statistics on stderr; text piped on stdin is appended to it (`cat notes.txt | ferrum-cli -m model.gguf -p "Summarize:"`). `--gpu-share PCT` works as for the server ([Sharing the GPU](#sharing-the-gpu)). `--version` prints the version, as it does for `ferrum-server`.
+
+In a terminal the prompt has line editing and history (↑/↓, kept in `~/.cache/ferrum/cli-history`, or under `$XDG_CACHE_HOME`). Ctrl-C stops the reply being written and keeps the conversation; at the prompt, Ctrl-C or Ctrl-D leaves. Piped input without `--prompt` is read one message per line, as before.
 
 Commands: `/reset`, `/think on|off`, `/image PATH [low|high|auto|N]`, `/detail low|high|auto|N`, `/stats`, `/exit`. To continue a message on the next line, end the line with `\`. A size after `/image PATH` applies to that image; `/detail` sets it for the images that follow (see [Image size per request](#image-size-per-request)).
 

@@ -13,6 +13,8 @@ Ferrum looks for models in the current folder, `./models`, `~/models`, `~/Downlo
 
 Type `/help` in any chat for the full command list.
 
+Environment: `FERRUM_MODELS` adds model folders (colon separated), `FERRUM_NO_SPLASH=1` skips the startup animation, `FERRUM_HOME` moves KFlash's learned calibration (`$FERRUM_HOME/kflash` instead of `~/.cache/ferrum/kflash`), and `FERRUM_GPU_SHARE` sets the default *GPU share*.
+
 ## Layout
 
 Every screen fills the window with panes, and one pane in each split takes whatever room the others leave, so no rows go unused. On a narrow window (under 100 columns by default) the panes stack, and Bench shows one group at a time (`tab` moves between them).
@@ -34,7 +36,7 @@ They are saved in `~/.config/ferrum/tui.json` under `layout`. The key bar lists 
 
 In a chat, typing goes to the message box. Esc on an empty box hands the keys to the conversation: ↑↓ scroll, the number keys (1–9) switch tabs, and typing goes back to the box. ctrl-d there unloads the model.
 
-Each setup's **Model** group has *Context* and *KV cache*. *KV cache* `q8` stores the attention cache in 8 bits, which nearly halves its memory (so `auto` context grows) and speeds up long conversations; `f16` (the default) is exact. It applies to Chat, Agents, Serve and the Benchmark tab, and is saved with favorites. See [K/V cache format](server.md#kv-cache-format). *Session cache* (chat, on by default) keeps each chat's cache on disk; see [Sessions](#sessions).
+Each setup's **Model** group has *Context* and *KV cache*. *KV cache* `q8` stores the attention cache in 8 bits, which nearly halves its memory (so `auto` context grows) and speeds up long conversations; `f16` (the default) is exact. It applies to Chat, Agents, Serve and the Benchmark tab, and is saved with favorites. See [K/V cache format](server.md#kv-cache-format). *Session cache* (chat, on by default) keeps each chat's cache on disk; see [Sessions](#sessions). *GPU share* (`off`, `75`, `50`, `25`) makes the model pause between steps so video and the rest of the desktop stay smooth while it runs, at about that share of its speed; it applies to Chat, Agents and Serve, not to benchmarks. See [Sharing the GPU](server.md#sharing-the-gpu).
 
 ## Chat
 

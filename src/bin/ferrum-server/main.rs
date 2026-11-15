@@ -549,13 +549,13 @@ fn start_llm(o: &Options, shared: &Arc<Shared>) -> Result<Llm, String> {
         o.model.clone(),
         o.plan,
         o.spec.clone(),
-        o.alias.clone(),
         worker::Vision {
             mmproj,
             max_tokens: o.image_tokens,
             min_tokens: o.image_min_tokens,
         },
         worker::Tuning {
+            alias: o.alias.clone(),
             gpu_share: o.gpu_share,
             slot_save: o.slot_save.clone(),
         },
