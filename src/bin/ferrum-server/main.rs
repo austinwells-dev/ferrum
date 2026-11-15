@@ -63,6 +63,10 @@ server:
   --slot-save-path DIR      keep every session's cache in DIR across restarts: saved
                             on SIGINT/SIGTERM, loaded at startup when the model
                             file, context and K/V format are the same
+  --idle-unload SECS        free the model after SECS seconds without a request and
+                            load it again for the next one, which waits for the
+                            load (default 0: keep it loaded). With --slot-save-path
+                            the session caches are saved and come back too
   -v, --verbose             debug logging (request bodies, outputs, first-token times)
   -V, --version             print the version
 memory:
@@ -256,6 +260,7 @@ struct Options {
     image_settings: ferrum::diffusion::pipeline::Settings,
     gpu_share: u32,
     slot_save: Option<PathBuf>,
+    idle_unload: Option<std::time::Duration>,
 }
 
 fn parse() -> Result<Options, String> {
@@ -283,6 +288,7 @@ fn parse() -> Result<Options, String> {
         image_settings: ferrum::diffusion::pipeline::Settings::default(),
         gpu_share: ferrum::hybrid::runtime::gpu_share_from_env(),
         slot_save: None,
+        idle_unload: None,
     };
     let mut args = std::env::args().skip(1);
     while let Some(key) = args.next() {
@@ -323,6 +329,10 @@ fn parse() -> Result<Options, String> {
                     ferrum::hybrid::runtime::parse_gpu_share(&value).map_err(|e| e.to_string())?
             }
             "--slot-save-path" => o.slot_save = Some(value.clone().into()),
+            "--idle-unload" => {
+                let secs = number()? as u64;
+                o.idle_unload = (secs > 0).then(|| std::time::Duration::from_secs(secs));
+            }
             "-np" | "--parallel" => {
                 o.parallel = number()?;
                 if !(1..=worker::MAX_PARALLEL).contains(&o.parallel) {
@@ -592,6 +602,7 @@ fn start_llm(o: &Options, shared: &Arc<Shared>) -> Result<Llm, String> {
             alias: o.alias.clone(),
             gpu_share: o.gpu_share,
             slot_save: o.slot_save.clone(),
+            idle_unload: o.idle_unload,
         },
         shared.clone(),
     );
@@ -1101,7 +1112,7 @@ fn models(server: &Server, status: &Status) -> Vec<Json> {
     if server.llm.is_some() {
         data.push(json!({
             "id": server.name, "object": "model", "created": openai::now(), "owned_by": "ferrum",
-            "meta": {"n_ctx_train": status.context, "n_ctx": status.context, "status": status.state}
+            "meta": {"n_ctx_train": status.context, "n_ctx": status.context, "status": if status.unloaded { "unloaded" } else { status.state }}
         }));
     }
     if let Some(images) = &server.images {

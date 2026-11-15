@@ -52,6 +52,8 @@ Hybrid models can't rewind linear-attention state the way a KV cache can, and a 
 
 **Across restarts.** With `--slot-save-path DIR`, SIGINT or SIGTERM (Ctrl-C, `kill`) makes the model thread save every slot that holds a conversation to `DIR/slot-N` before the process ends, and the next start loads them back when the model file, context and K/V format are the same. A request in flight is dropped where it is; what its slot had cached by its last step is saved. A second signal quits at once without saving. Without the flag the same signals just end the process. An example is in [measurements/gpu-share](measurements/gpu-share/README.md#slot-caches-across-a-restart---slot-save-path).
 
+**Idle unload.** With `--idle-unload SECS` the model thread drops the model once no request has run or waited for that long, which returns its memory (weights and every slot's K/V cache) to the system. The server keeps listening and `/health` keeps answering `ok`; `/v1/models` reports `"status": "unloaded"`. The next request loads the model again and waits for the load and warmup, so it starts a few seconds late. Slot caches are lost on unload unless `--slot-save-path` is set, in which case they are saved before the unload and restored after the reload. On a 4B model with a 23 GiB plan the process went from 23 GB to 81 MB while unloaded, and the request that woke it took 5.9 s instead of 1.7 s: [record](measurements/qol-2026-11/idle-unload-2026-11-15.txt).
+
 ### Sharing the GPU
 
 A model that runs flat out can make video stutter and the desktop lag, because the window server and video decoders wait for the same GPU. `--gpu-share PCT` (5–100, or `off`) keeps Ferrum's share of the GPU's time at about PCT%: after every prompt piece and every decode step the session sleeps in proportion to how long the step took, and prompts are read 128 tokens at a time instead of `--chunk`, so no single step holds the GPU for long. The text is the same as without it; speeds drop to about that share (on Spark-X2.6-4B, 36.0 tok/s decode becomes 15.9 at 50 and 7.8 at 25: [measurement](measurements/gpu-share/README.md)). Reported speeds include the pauses.
@@ -116,6 +118,7 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 | `--alias NAME` | file name | Model name reported to clients |
 | `--gpu-share PCT\|off` | `off` | Keep the GPU busy at most PCT% of the time (5–100). See [Sharing the GPU](#sharing-the-gpu) |
 | `--slot-save-path DIR` | none | Keep each slot's conversation cache in `DIR/slot-N` across restarts. See [Conversation caching](#conversation-caching) |
+| `--idle-unload SECS` | 0 (never) | Free the model after `SECS` seconds without a request; the next request loads it again. See [Conversation caching](#conversation-caching) |
 | `-np`, `--parallel N` | `1` | Requests served at once, one slot each (1–8). See [Parallel requests](#parallel-requests) |
 | `-c`, `--context N\|auto` | `auto` | Context length of each slot |
 | `--kv-cache f16\|q8` | `f16` | K/V cache format (also `-ctk`/`-ctv`). `q8` nearly halves K/V memory, so `auto` fits about twice the context, and decodes faster at long context. See [K/V cache format](#kv-cache-format) |

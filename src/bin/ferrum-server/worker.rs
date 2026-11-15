@@ -19,7 +19,7 @@ use ferrum::{
 use serde::Serialize;
 use std::{
     collections::VecDeque,
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -43,6 +43,16 @@ pub struct Tuning {
     pub gpu_share: u32,
     /// `--slot-save-path`: slot caches are loaded from here and saved on exit.
     pub slot_save: Option<PathBuf>,
+    /// `--idle-unload`: free the model after this long without a request.
+    pub idle_unload: Option<Duration>,
+}
+
+/// Why the scheduler returned.
+enum Exit {
+    /// The server is going away (every job sender was dropped).
+    Closed,
+    /// `--idle-unload` elapsed with nothing running or queued.
+    Idle,
 }
 
 pub enum Work {
@@ -118,6 +128,9 @@ pub struct SlotStatus {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct Status {
     pub state: &'static str,
+    /// `--idle-unload` freed the model; `state` stays "ready" because the
+    /// next request loads it again.
+    pub unloaded: bool,
     pub load_error: Option<String>,
     pub model: String,
     /// Context of each slot.
@@ -189,6 +202,9 @@ pub fn spawn(
     tx
 }
 
+/// The model thread: serve until the server closes, and with
+/// `--idle-unload` drop the model whenever it has been idle that long and
+/// load it again for the next request (which waits for the load).
 fn run(
     path: PathBuf,
     options: PlanOptions,
@@ -198,9 +214,55 @@ fn run(
     shared: Arc<Shared>,
     jobs: Receiver<Job>,
 ) {
+    let mut backlog = VecDeque::new();
+    loop {
+        match serve(
+            &path, options, &spec, &vision, &tuning, &shared, &jobs, backlog,
+        ) {
+            Exit::Closed => return,
+            Exit::Idle => {}
+        }
+        // The runtime is dropped: its memory is free until a request comes.
+        info!(
+            None,
+            "model unloaded after {} s idle; the next request loads it again",
+            tuning.idle_unload.map_or(0, |d| d.as_secs())
+        );
+        shared.update(|s| s.unloaded = true);
+        backlog = VecDeque::new();
+        loop {
+            if SHUTDOWN.load(Ordering::SeqCst) {
+                info!(None, "shutting down");
+                std::process::exit(0);
+            }
+            match jobs.recv_timeout(Duration::from_millis(200)) {
+                Ok(job) => {
+                    backlog.push_back(job);
+                    break;
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return,
+            }
+        }
+        shared.update(|s| s.unloaded = false);
+    }
+}
+
+/// Load the model and run its scheduler, starting with `backlog`.
+#[allow(clippy::too_many_arguments)]
+fn serve(
+    path: &Path,
+    options: PlanOptions,
+    spec: &Option<SpecOptions>,
+    vision: &Vision,
+    tuning: &Tuning,
+    shared: &Arc<Shared>,
+    jobs: &Receiver<Job>,
+    backlog: VecDeque<Job>,
+) -> Exit {
     let start = Instant::now();
     let mut rt = match Runtime::load_multimodal(
-        &path,
+        path,
         options,
         spec.as_ref(),
         vision.mmproj.as_deref(),
@@ -214,16 +276,16 @@ fn run(
                 s.load_error = Some(e.to_string());
             });
             // Fail every request instead of hanging.
-            for job in jobs {
+            for job in backlog.into_iter().chain(jobs.iter()) {
                 let _ = job.events.send(Event::Failed {
                     status: 503,
                     message: format!("model failed to load: {e}"),
                 });
             }
-            return;
+            return Exit::Closed;
         }
     };
-    if let Some(alias) = tuning.alias {
+    if let Some(alias) = tuning.alias.clone() {
         rt.model_name = alias;
     }
     let plan = rt.loaded.plan.clone();
@@ -350,13 +412,14 @@ fn run(
     });
     Scheduler {
         rt,
-        shared,
+        shared: shared.clone(),
         slots: (0..parallel).map(|_| Slot::default()).collect(),
-        queue: VecDeque::new(),
+        queue: backlog,
         clock: 0,
-        slot_save: tuning.slot_save,
+        slot_save: tuning.slot_save.clone(),
+        idle_unload: tuning.idle_unload,
     }
-    .run(jobs);
+    .run(jobs)
 }
 
 /// A request running on a slot.
@@ -383,10 +446,12 @@ struct Scheduler {
     clock: u64,
     /// `--slot-save-path` (`shut_down`).
     slot_save: Option<PathBuf>,
+    idle_unload: Option<Duration>,
 }
 
 impl Scheduler {
-    fn run(mut self, jobs: Receiver<Job>) {
+    fn run(mut self, jobs: &Receiver<Job>) -> Exit {
+        let mut idle_since = Instant::now();
         loop {
             if SHUTDOWN.load(Ordering::SeqCst) {
                 self.shut_down();
@@ -395,17 +460,26 @@ impl Scheduler {
             if self.queue.is_empty() && self.slots.iter().all(|s| s.active.is_none()) {
                 match jobs.recv_timeout(Duration::from_millis(200)) {
                     Ok(job) => self.queue.push_back(job),
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => return,
+                    Err(RecvTimeoutError::Timeout) => {
+                        if self.idle_unload.is_some_and(|d| idle_since.elapsed() >= d) {
+                            // Dropping `self` frees the model; the caches
+                            // survive only on disk.
+                            self.save_slots();
+                            return Exit::Idle;
+                        }
+                        continue;
+                    }
+                    Err(RecvTimeoutError::Disconnected) => return Exit::Closed,
                 }
             }
+            idle_since = Instant::now();
             loop {
                 match jobs.try_recv() {
                     Ok(job) => self.queue.push_back(job),
                     Err(TryRecvError::Empty) => break,
                     Err(TryRecvError::Disconnected) if self.queue.is_empty() => {
                         if self.slots.iter().all(|s| s.active.is_none()) {
-                            return;
+                            return Exit::Closed;
                         }
                         break;
                     }
@@ -425,6 +499,13 @@ impl Scheduler {
     /// the process. Requests in flight are dropped where they are; what
     /// their slots had cached up to the last step is saved.
     fn shut_down(&mut self) -> ! {
+        self.save_slots();
+        info!(None, "shutting down");
+        std::process::exit(0);
+    }
+
+    /// Save every slot that holds a conversation (`--slot-save-path`).
+    fn save_slots(&self) {
         if let Some(dir) = &self.slot_save {
             for slot in 0..self.slots.len() {
                 if self.rt.slot(slot).is_empty() {
@@ -443,8 +524,6 @@ impl Scheduler {
                 }
             }
         }
-        info!(None, "shutting down");
-        std::process::exit(0);
     }
 
     /// Start queued jobs on free slots, oldest first; a job pinned to a busy

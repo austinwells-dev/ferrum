@@ -1,0 +1,34 @@
+# Idle unload check, 2026-11-15
+# Machine: Apple M5, 32 GB; commit 3280ccf plus the idle-unload change
+# Model: Spark-X2.6-4B-Q4_K_M.gguf
+# Command: ferrum-server -m MODEL --port 18391 --idle-unload 4 --slot-save-path DIR
+# Two identical chat requests (max_tokens 40, temperature 0), 7 s apart; footprint(1) after each step:
+#   after request 1: 23 GB; after 4 s idle: 81 MB; after request 2: 23 GB; after second unload: 434 MB
+#   request 1: 1.71 s; request 2 (reload + warmup + cache restore): 5.92 s, 73 of 74 prompt tokens reused
+
+12:50:20.897 INF ferrum-server 0.1.0 starting: ~/Models/Spark-X2.6-4B-GGUF/Spark-X2.6-4B-Q4_K_M.gguf
+12:50:21.077 INF listening on http://127.0.0.1:18391 (OpenAI: /v1/chat/completions, /v1/images/generations, /v1/images/edits; Anthropic: /v1/messages); model loading…
+12:50:24.356 INF loaded Spark-X2.6-4B-Q4_K_M (Spark, 36 layers, 36 attention) in 3.3 s
+12:50:24.356 INF context 557,824 tokens (largest that fits: 557,824, trained 1,048,576); memory 23.00 GiB of 23.00 GiB budget: weights 3.30, KV 19.26 (f16, 36.0 KiB/token), recurrent+snapshots 0.22, scratch 0.12
+12:50:28.165 INF warmed up in 3.8 s
+12:50:28.167 INF default sampling: temperature 1 top-p 0.95 top-k 20 min-p 0
+12:50:28.391 INF [req 1] POST /v1/chat/completions from 127.0.0.1:57338 (0.1 KiB) [curl/8.7.1]
+12:50:28.393 INF [req 1] chat: 1 messages, 0 tools, no stream, max 40 tok; temperature 0 top-p 0.95 top-k 20 min-p 0; thinking on
+12:50:28.605 INF [req 1] prompt 74 tok: 0 reused from cache, 74 to prefill
+12:50:30.096 INF [req 1] done (length) in 1.70 s: prompt 74 tok (0 cached), prefill 74 tok in 0.14 s (534 tok/s); generated 40 tok in 1.35 s (29.6 tok/s), reasoning 40 tok
+12:50:34.348 INF slot 0: saved 113 cached tokens (233.5 MiB) in 0.2 s
+12:50:35.122 INF model unloaded after 4 s idle; the next request loads it again
+12:50:37.612 INF [req 2] POST /v1/chat/completions from 127.0.0.1:57362 (0.1 KiB) [curl/8.7.1]
+12:50:37.613 INF [req 2] chat: 1 messages, 0 tools, no stream, max 40 tok; temperature 0 top-p 0.95 top-k 20 min-p 0; thinking on
+12:50:40.129 INF loaded Spark-X2.6-4B-Q4_K_M (Spark, 36 layers, 36 attention) in 2.5 s
+12:50:40.129 INF context 557,824 tokens (largest that fits: 557,824, trained 1,048,576); memory 23.00 GiB of 23.00 GiB budget: weights 3.30, KV 19.26 (f16, 36.0 KiB/token), recurrent+snapshots 0.22, scratch 0.12
+12:50:42.027 INF warmed up in 1.9 s
+12:50:42.196 INF slot 0: restored 113 cached tokens
+12:50:42.196 INF default sampling: temperature 1 top-p 0.95 top-k 20 min-p 0
+12:50:42.196 INF [req 2] started after 4.6 s in queue
+12:50:42.213 INF [req 2] prompt 74 tok: 73 reused from cache, 1 to prefill
+12:50:43.533 INF [req 2] done (length) in 5.92 s: prompt 74 tok (73 cached), prefill 1 tok in 0.03 s (32 tok/s); generated 40 tok in 1.29 s (31.0 tok/s), reasoning 40 tok
+12:50:47.706 INF slot 0: saved 113 cached tokens (114.8 MiB) in 0.1 s
+12:50:47.792 INF model unloaded after 4 s idle; the next request loads it again
+12:50:50.938 INF signal received: finishing up (again to quit now)
+12:50:51.054 INF shutting down

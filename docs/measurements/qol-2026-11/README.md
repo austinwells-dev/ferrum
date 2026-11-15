@@ -30,3 +30,7 @@ KL divergence against llama.cpp was not run: there is no `--kl-divergence-base` 
 ## Structured output
 
 [structured-output.sh](structured-output.sh) → [structured-output-2026-11-15.txt](structured-output-2026-11-15.txt), Spark 4B through `ferrum-server`. Six of seven requests ended as the request intended (five replies that parse as JSON, one schema refused with 400). Request 1, a greedy reply to a schema with `maxItems: 3`, ran on inside its third string until `max_tokens` and so did not parse: the limitation [server.md](../../server.md#structured-output) describes. Constrained replies ran at 31.9–36.1 tok/s against 37.2 unconstrained; request 7's 44.7 tok/s includes reasoning drafted by prompt lookup.
+
+## Idle unload
+
+[idle-unload-2026-11-15.txt](idle-unload-2026-11-15.txt): `ferrum-server --idle-unload 4 --slot-save-path DIR` on Spark 4B, two identical requests 7 s apart. `footprint` read 23 GB loaded and 81 MB after the first unload (434 MB after the second). The request that woke the server took 5.92 s against 1.71 s, of which 4.6 s was load, warmup and restoring the slot; it reused 73 of its 74 prompt tokens from the restored cache.
