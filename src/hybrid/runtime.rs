@@ -400,6 +400,11 @@ pub trait ChatHooks {
     fn delta(&mut self, delta: Delta) -> Result<()>;
     /// Prompt length and tokens reused from the session, before prefill.
     fn begin(&mut self, _prompt: usize, _reused: usize) {}
+    /// Before encoding image `done + 1` of the `total` a turn's prefill reads
+    /// (after `begin`, before the first `prefill`); false cancels.
+    fn encoding(&mut self, _done: usize, _total: usize) -> bool {
+        true
+    }
     /// Prefill progress over the new prompt tokens; false cancels.
     fn prefill(&mut self, _processed: usize, _total: usize) -> bool {
         true
@@ -722,14 +727,12 @@ impl Runtime {
 
     /// Encode `images` (cached by content and size), failing when no
     /// projector is loaded. `budget` fills what each image leaves unset.
+    /// Adds to `last_encode`, which `place_images` resets per request.
     fn embed_images(
         &mut self,
         images: &[media::ImageInput],
         budget: ImageBudget,
     ) -> Result<Vec<Rc<ImageEmbedding>>> {
-        if let Some(vision) = self.vision.as_mut() {
-            vision.last_encode = std::time::Duration::ZERO;
-        }
         if images.is_empty() {
             return Ok(Vec::new());
         }
@@ -830,7 +833,13 @@ impl Runtime {
     /// Encode the placed images session `slot` will prefill: those ending
     /// past its `reused` prefix. The rest are only compared by hash and
     /// positioned, so their placeholder rows are never read.
-    fn encode_placed(&mut self, slot: usize, reused: usize, placed: &Placed) -> Result<()> {
+    fn encode_placed(
+        &mut self,
+        slot: usize,
+        reused: usize,
+        placed: &Placed,
+        hooks: &mut impl ChatHooks,
+    ) -> Result<()> {
         let pending = |span: &ImageSpan| {
             span.end() > reused && Rc::ptr_eq(&span.embedding, &placed.placeholder)
         };
@@ -848,7 +857,14 @@ impl Runtime {
                     .ok_or_else(|| Error::Parameter("an image span has no source".into()))
             })
             .collect::<Result<Vec<_>>>()?;
-        let embeddings = self.embed_images(&inputs, ImageBudget::default())?;
+        let mut embeddings = Vec::with_capacity(inputs.len());
+        for (done, input) in inputs.iter().enumerate() {
+            if !hooks.encoding(done, inputs.len()) {
+                return Err(Error::Cancelled);
+            }
+            embeddings
+                .extend(self.embed_images(std::slice::from_ref(input), ImageBudget::default())?);
+        }
         let spans = self
             .slot_mut(slot)
             .media_mut()
@@ -1051,7 +1067,7 @@ impl Runtime {
             hooks,
         )?;
         if let Some(placed) = &prompt.placed {
-            self.encode_placed(slot, turn.generation.prompt().1, placed)?;
+            self.encode_placed(slot, turn.generation.prompt().1, placed, hooks)?;
         }
         turn.chat = Some(ChatTurn {
             starts_in_reasoning,

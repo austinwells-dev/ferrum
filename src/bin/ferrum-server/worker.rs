@@ -851,6 +851,15 @@ impl ChatHooks for Hooks<'_> {
         );
         self.send(Event::Started { prompt, reused });
     }
+    fn encoding(&mut self, done: usize, total: usize) -> bool {
+        if done == 0 {
+            info!(
+                Some(self.job.id),
+                "encoding {total} image(s) past the cache"
+            );
+        }
+        !self.job.cancel.load(Ordering::SeqCst)
+    }
     fn prefill(&mut self, processed: usize, total: usize) -> bool {
         self.send(Event::Progress { processed, total });
         if self.t.last_log.elapsed() > Duration::from_secs(5) && processed < total {

@@ -3,8 +3,9 @@
 //! history every turn; only pictures past the session's cached prefix should
 //! be encoded.
 //!
-//! Per turn it prints the image count, prompt length, reused tokens, time
-//! encoding pictures, time until the first output token, and a hash of the
+//! Per turn it prints the image count, prompt length, reused tokens, the
+//! pictures it encoded (as `ChatHooks::encoding` reports them), time
+//! encoding them, time until the first output token, and a hash of the
 //! greedy reply (to compare builds turn by turn).
 //!
 //! usage: hybrid_image_turns MODEL.gguf --mmproj FILE [--turns N]
@@ -22,6 +23,8 @@ use std::time::Instant;
 
 struct Hooks {
     reused: usize,
+    /// Images the turn reported encoding (`ChatHooks::encoding`).
+    encoded: usize,
 }
 
 impl ChatHooks for Hooks {
@@ -30,6 +33,10 @@ impl ChatHooks for Hooks {
     }
     fn begin(&mut self, _prompt: usize, reused: usize) {
         self.reused = reused;
+    }
+    fn encoding(&mut self, _done: usize, total: usize) -> bool {
+        self.encoded = total;
+        true
     }
 }
 
@@ -97,8 +104,8 @@ fn main() -> Result<()> {
     };
     let size = count("--size", 1024) as u32;
     let mut messages = vec![json!({"role": "system", "content": "You are a helpful assistant."})];
-    println!("| turn | images | prompt | reused | encode s | first token s | reply |");
-    println!("|---|---|---|---|---|---|---|");
+    println!("| turn | images | prompt | reused | encoded | encode s | first token s | reply |");
+    println!("|---|---|---|---|---|---|---|---|");
     for turn in 0..count("--turns", 12) {
         messages.push(json!({"role": "user", "content": [
             {"type": "image_url", "image_url": {"url": picture(turn, size)}},
@@ -109,7 +116,10 @@ fn main() -> Result<()> {
         request
             .template_vars
             .insert("enable_thinking".into(), json!(false));
-        let mut hooks = Hooks { reused: 0 };
+        let mut hooks = Hooks {
+            reused: 0,
+            encoded: 0,
+        };
         let started = Instant::now();
         let prompt = rt.chat_prompt(&request)?;
         let len = prompt.tokens.len();
@@ -131,9 +141,10 @@ fn main() -> Result<()> {
             (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
         });
         println!(
-            "| {turn} | {} | {len} | {} | {encode:.2} | {:.2} | {:08x} |",
+            "| {turn} | {} | {len} | {} | {} | {encode:.2} | {:.2} | {:08x} |",
             turn + 1,
             hooks.reused,
+            hooks.encoded,
             first.unwrap_or_default(),
             hash >> 32
         );
