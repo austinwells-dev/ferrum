@@ -246,6 +246,12 @@ impl Session {
         self.pending_media = media;
     }
 
+    /// The images of the sequence `begin` started, for filling in embeddings
+    /// of the ones past the reused prefix before the first `advance`.
+    pub fn media_mut(&mut self) -> &mut [ImageSpan] {
+        self.state.media_mut()
+    }
+
     /// Also snapshot the next prompt at `position` (when it lies past the
     /// reused prefix), pinned when `pin`. A chat passes where the reply's
     /// header starts: templates rewrite a past reply (dropping its

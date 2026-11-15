@@ -445,12 +445,22 @@ impl Turn {
 /// A rendered chat prompt (`Runtime::chat_prompt`).
 pub struct ChatPrompt {
     pub tokens: Vec<u32>,
-    /// Where its images sit in `tokens`.
+    /// Where its images sit in `tokens`. Images are placed but not yet
+    /// encoded: `start_chat` encodes those its session has not cached.
     pub spans: Vec<ImageSpan>,
+    placed: Option<Placed>,
     pub text: String,
     /// Where the reply's header starts, and whether the prompt ends in a
     /// user message (`Session::set_checkpoint`).
     pub checkpoint: Option<(usize, bool)>,
+}
+
+/// A prompt's images, sized but not encoded: their spans share `placeholder`
+/// as embedding until `Runtime::encode_placed` fills the ones a prefill reads.
+struct Placed {
+    placeholder: Rc<crate::tensor::Tensor>,
+    /// Content hash, grid and source of each image, its budget resolved.
+    images: Vec<(u64, (usize, usize), media::ImageInput)>,
 }
 
 /// What a finished `Turn` produced.
@@ -761,6 +771,102 @@ impl Runtime {
         Ok(out)
     }
 
+    /// Size `images` from their headers without encoding them: embeddings
+    /// whose rows are a shared placeholder, and what `encode_placed` needs to
+    /// encode each later. A long image chat re-sends its whole history every
+    /// turn, and most of it already sits in the session's cache.
+    fn place_images(
+        &mut self,
+        images: &[media::ImageInput],
+        budget: ImageBudget,
+    ) -> Result<(Vec<Rc<ImageEmbedding>>, Option<Placed>)> {
+        if let Some(vision) = self.vision.as_mut() {
+            vision.last_encode = std::time::Duration::ZERO;
+        }
+        if images.is_empty() {
+            return Ok((Vec::new(), None));
+        }
+        let Some(vision) = self.vision.as_ref() else {
+            return Err(Error::Parameter(
+                "this model was loaded without a vision projector, so it cannot read images (load an mmproj file with --mmproj)"
+                    .into(),
+            ));
+        };
+        let placeholder = Rc::new(crate::tensor::Tensor::zeros(
+            &self.device,
+            [1],
+            crate::tensor::DType::F32,
+        )?);
+        let mut out = Vec::with_capacity(images.len());
+        let mut placed = Vec::with_capacity(images.len());
+        for image in images {
+            let budget = image.budget.or(budget);
+            let hash = crate::vision::content_hash(&image.bytes);
+            let grid = vision.model.grid_of(&image.bytes, budget)?;
+            out.push(Rc::new(ImageEmbedding {
+                hash,
+                grid,
+                rows: placeholder.clone(),
+                deepstack: Vec::new(),
+            }));
+            placed.push((
+                hash,
+                grid,
+                media::ImageInput {
+                    bytes: image.bytes.clone(),
+                    budget,
+                },
+            ));
+        }
+        Ok((
+            out,
+            Some(Placed {
+                placeholder,
+                images: placed,
+            }),
+        ))
+    }
+
+    /// Encode the placed images session `slot` will prefill: those ending
+    /// past its `reused` prefix. The rest are only compared by hash and
+    /// positioned, so their placeholder rows are never read.
+    fn encode_placed(&mut self, slot: usize, reused: usize, placed: &Placed) -> Result<()> {
+        let pending = |span: &ImageSpan| {
+            span.end() > reused && Rc::ptr_eq(&span.embedding, &placed.placeholder)
+        };
+        let inputs = self
+            .slot_mut(slot)
+            .media_mut()
+            .iter()
+            .filter(|s| pending(s))
+            .map(|s| {
+                placed
+                    .images
+                    .iter()
+                    .find(|(hash, grid, _)| (*hash, *grid) == (s.hash, s.grid))
+                    .map(|(_, _, input)| input.clone())
+                    .ok_or_else(|| Error::Parameter("an image span has no source".into()))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let embeddings = self.embed_images(&inputs, ImageBudget::default())?;
+        let spans = self
+            .slot_mut(slot)
+            .media_mut()
+            .iter_mut()
+            .filter(|s| pending(s));
+        for (span, e) in spans.zip(embeddings) {
+            if e.grid != span.grid {
+                return Err(Error::Shape(format!(
+                    "image encoded to a {:?} grid but was placed as {:?}",
+                    e.grid, span.grid
+                )));
+            }
+            span.embedding = e.rows.clone();
+            span.deepstack = e.deepstack.clone();
+        }
+        Ok(())
+    }
+
     /// Encode WAV `clips` (cached by content), failing when no speech
     /// projector is loaded.
     fn embed_audio(&mut self, clips: &[Vec<u8>]) -> Result<Vec<Rc<ImageEmbedding>>> {
@@ -944,6 +1050,9 @@ impl Runtime {
             true,
             hooks,
         )?;
+        if let Some(placed) = &prompt.placed {
+            self.encode_placed(slot, turn.generation.prompt().1, placed)?;
+        }
         turn.chat = Some(ChatTurn {
             starts_in_reasoning,
             raw_reasoning: request.raw_reasoning,
@@ -958,7 +1067,7 @@ impl Runtime {
     pub fn chat_prompt(&mut self, request: &ChatRequest) -> Result<ChatPrompt> {
         let (messages, encoded) = media::take_images(&request.messages)?;
         let (messages, clips) = media::take_audio(&messages)?;
-        let images = self.embed_images(&encoded, request.image_budget)?;
+        let (images, placed) = self.place_images(&encoded, request.image_budget)?;
         let clips = self.embed_audio(&clips)?;
         let text = self.render_messages(&messages, request)?;
         let (tokens, spans) = self.expand_media(&text, &images, &clips)?;
@@ -971,6 +1080,7 @@ impl Runtime {
         Ok(ChatPrompt {
             tokens,
             spans,
+            placed,
             text,
             checkpoint,
         })

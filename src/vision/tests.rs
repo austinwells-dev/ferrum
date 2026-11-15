@@ -350,6 +350,42 @@ fn prepare_decodes_resizes_and_normalises() {
 }
 
 #[test]
+fn header_grid_matches_the_encoded_grid() {
+    let d = MetalDevice::new().unwrap();
+    let mut model = synthetic(&d, tiny_config(), 1);
+    model.max_tokens = 64;
+    model.min_tokens = 4;
+    let budgets = [
+        ImageBudget::default(),
+        ImageBudget {
+            min_tokens: None,
+            max_tokens: Some(9),
+        },
+    ];
+    for (w, h) in [(2, 2), (37, 101), (640, 480), (300, 17)] {
+        for format in [image::ImageFormat::Png, image::ImageFormat::Jpeg] {
+            let img = image::RgbImage::from_fn(w, h, |x, y| image::Rgb([x as u8, y as u8, 7]));
+            let mut bytes = Vec::new();
+            img.write_to(&mut std::io::Cursor::new(&mut bytes), format)
+                .unwrap();
+            for budget in budgets {
+                let encoded = model.encode_with(&d, &bytes, budget).unwrap();
+                assert_eq!(
+                    model.grid_of(&bytes, budget).unwrap(),
+                    encoded.grid,
+                    "{w}x{h} {format:?} {budget:?}"
+                );
+            }
+        }
+    }
+    assert!(
+        model
+            .grid_of(b"not an image", ImageBudget::default())
+            .is_err()
+    );
+}
+
+#[test]
 fn request_budgets_stay_within_the_projector_cap() {
     let d = MetalDevice::new().unwrap();
     let mut model = synthetic(&d, tiny_config(), 1);
