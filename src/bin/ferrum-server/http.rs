@@ -12,6 +12,7 @@ use std::{
     time::Duration,
 };
 
+#[derive(Debug)]
 pub struct Request {
     pub method: String,
     pub path: String,
@@ -43,8 +44,20 @@ fn read_line(reader: &mut BufReader<TcpStream>, line: &mut String) -> io::Result
     Ok(n)
 }
 
+/// Whether a request's headers (lower-cased names) carry the API key.
+pub type Authorized<'a> = dyn Fn(&[(String, String)]) -> bool + 'a;
+
+/// Largest body read from a caller that has not shown the API key.
+const MAX_UNAUTHORIZED_BODY: usize = 64 << 10;
+
 /// Read one request. `Ok(None)` means the client closed the connection.
-pub fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option<Request>> {
+/// `authorized` sees the headers before the body is read: a caller it
+/// refuses may send only a small body (enough for the route to answer 401),
+/// and a larger one fails with `PermissionDenied` without being read.
+pub fn read_request(
+    reader: &mut BufReader<TcpStream>,
+    authorized: &Authorized,
+) -> std::io::Result<Option<Request>> {
     let mut line = String::new();
     // Blank lines between pipelined requests are skipped (not recursed on:
     // a stream of them would overflow the stack).
@@ -92,6 +105,18 @@ pub fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option
     }
     let chunked =
         get("transfer-encoding").is_some_and(|v| v.to_ascii_lowercase().contains("chunked"));
+    let max_body = if authorized(&headers) {
+        MAX_BODY
+    } else {
+        MAX_UNAUTHORIZED_BODY
+    };
+    let too_large = || {
+        if max_body == MAX_BODY {
+            io::Error::other("request body too large")
+        } else {
+            io::Error::new(io::ErrorKind::PermissionDenied, "invalid API key")
+        }
+    };
     let body = if chunked {
         let mut body = Vec::new();
         loop {
@@ -109,8 +134,8 @@ pub fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option
                 }
                 break;
             }
-            if body.len() + size > MAX_BODY {
-                return Err(std::io::Error::other("request body too large"));
+            if body.len() + size > max_body {
+                return Err(too_large());
             }
             let start = body.len();
             body.resize(start + size, 0);
@@ -123,8 +148,8 @@ pub fn read_request(reader: &mut BufReader<TcpStream>) -> std::io::Result<Option
         let length: usize = get("content-length")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        if length > MAX_BODY {
-            return Err(std::io::Error::other("request body too large"));
+        if length > max_body {
+            return Err(too_large());
         }
         let mut body = vec![0; length];
         reader.read_exact(&mut body)?;
@@ -330,7 +355,10 @@ mod tests {
             }
         });
         let (stream, _) = listener.accept()?;
-        let parsed = read_request(&mut BufReader::new(stream));
+        // Callers with an `x-key: yes` header count as authorized.
+        let authorized =
+            |headers: &[(String, String)]| headers.iter().any(|(k, v)| k == "x-key" && v == "yes");
+        let parsed = read_request(&mut BufReader::new(stream), &authorized);
         // The reader is dropped, so a client still writing a flood fails fast.
         let _ = client.join();
         parsed
@@ -352,6 +380,31 @@ mod tests {
         assert_eq!(
             (ok.path.as_str(), ok.header("host")),
             ("/health", Some("localhost"))
+        );
+    }
+
+    #[test]
+    fn large_bodies_need_the_key_before_they_are_read() {
+        let post = |key: &str, length: usize, sent: usize| {
+            let mut bytes = format!(
+                "POST /v1/chat/completions HTTP/1.1\r\nX-Key: {key}\r\nContent-Length: {length}\r\n\r\n"
+            )
+            .into_bytes();
+            bytes.extend(std::iter::repeat_n(b'a', sent));
+            parse(bytes)
+        };
+        let big = MAX_UNAUTHORIZED_BODY + 1;
+        // Refused on the header alone: none of the body was sent.
+        let refused = post("no", big, 0).unwrap_err();
+        assert_eq!(refused.kind(), io::ErrorKind::PermissionDenied);
+        // A small body is read either way, so the route can answer 401.
+        assert_eq!(post("no", 100, 100).unwrap().unwrap().body.len(), 100);
+        assert_eq!(post("yes", big, big).unwrap().unwrap().body.len(), big);
+        let chunked =
+            b"POST / HTTP/1.1\r\nX-Key: no\r\nTransfer-Encoding: chunked\r\n\r\n20000\r\n".to_vec();
+        assert_eq!(
+            parse(chunked).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
         );
     }
 }

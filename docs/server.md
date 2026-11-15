@@ -27,7 +27,7 @@ ferrum-server --model model.gguf --port 8080      # http://127.0.0.1:8080/v1
 | Images | `/v1/images/generations` (needs `--image-model`; see [Image generation](#image-generation)) |
 | Utility | `/health`, `/props`, `/slots`, `/metrics` (Prometheus), `/tokenize`, `/detokenize`, `/apply-template` |
 
-The model runs on its own thread behind a FIFO queue, and each connection gets a thread, so `/health` and `/metrics` respond while a request is generating. By default requests are processed one at a time.
+The model runs on its own thread behind a FIFO queue, and each connection gets a thread, so `/health` and `/metrics` respond while a request is generating. By default requests are processed one at a time. At most 256 connections are open at once; further ones get 503.
 
 ### Parallel requests
 
@@ -88,7 +88,7 @@ Schemas may use `type` (also a list of types), `properties`, `required`, `additi
 - **Refused with 400:** anything else that changes what is valid (`allOf`, `not`, `if`, `patternProperties`, remote `$ref`s, ...), rather than returning JSON that silently ignores it.
 - **Reasoning is not constrained.** With thinking on, the model reasons freely and the grammar starts after `</think>`.
 - **Tools win.** A request that also has `tools` is not constrained (a constrained reply could not call a tool); the log says so. `tool_choice: "required"` is still not enforced.
-- **Speed.** A constrained reply reads the full logits and does not use the drafter, so speculative decoding does not speed it up. On Spark-X2.6-4B a schema reply ran at 32–35 tok/s against 37 unconstrained ([record](measurements/qol-2026-11/structured-output-2026-11-15.txt)).
+- **Speed.** A constrained reply reads the full logits and does not use the drafter, so speculative decoding does not speed it up. On Spark-X2.6-4B constrained replies ran at 31.9–36.1 tok/s against 37.2 unconstrained ([record](measurements/qol-2026-11/README.md#structured-output)).
 - **Whitespace** between JSON tokens is at most one space, or a newline and up to 20 spaces or tabs.
 - A token that is only part of a multi-byte character is never chosen inside a constrained reply, so text in scripts the tokenizer splits below the character may come out worse than unconstrained.
 
@@ -111,7 +111,7 @@ Each request logs one line when it arrives, a progress line every few seconds, a
 | Flag | Default | Meaning |
 |---|---|---|
 | `--host`, `--port` | `127.0.0.1`, `8080` | Bind address |
-| `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY`. `FERRUM_API_KEY=KEY` does the same without putting the key in the process list |
+| `--api-key KEY` | none | Require `Authorization: Bearer KEY` or `x-api-key: KEY`. `FERRUM_API_KEY=KEY` does the same without putting the key in the process list. A request without the key may carry a body of at most 64 KiB (it gets 401); a larger one is refused before its body is read |
 | `--cors ORIGIN` | localhost pages only | Let web pages from `ORIGIN` (e.g. `https://chat.example.com`) call the server; repeatable, `*` for any. Requests from other sites' pages get 403, so a site you visit can't use your model. Clients that aren't browsers (curl, SDKs, agents) send no `Origin` and are unaffected |
 | `--alias NAME` | file name | Model name reported to clients |
 | `--gpu-share PCT\|off` | `off` | Keep the GPU busy at most PCT% of the time (5–100). See [Sharing the GPU](#sharing-the-gpu) |

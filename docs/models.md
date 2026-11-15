@@ -105,7 +105,7 @@ Record: [experimental branch notes](history/experimental-branch-notes.md#image-g
 
 `response_format` on `/v1/chat/completions` ([server.md](server.md#structured-output)), new in November 2026.
 
-**Checked** ([record](measurements/qol-2026-11/structured-output-2026-11-15.txt)), all on Spark-X2.6-4B Q4_K_M through `ferrum-server`: a schema with a string, a number, a bounded array and an enum; `json_object`; thinking on with the reasoning closed by the model and by `reasoning_budget`; sampling (temperature 0.6–0.7) and greedy; a streamed reply; a prompt-lookup drafter loaded (it drafts the reasoning and stops at the grammar). Every finished reply parsed as JSON. The grammar itself and the constrained choice have unit tests (`hybrid::grammar`, `hybrid::session`).
+**Checked** ([record](measurements/qol-2026-11/structured-output-2026-11-15.txt)), all on Spark-X2.6-4B Q4_K_M through `ferrum-server`: a schema with a string, a number, a bounded array and an enum; `json_object`; thinking on with the reasoning closed by the model and by `reasoning_budget`; sampling (temperature 0.6–0.7) and greedy; a streamed reply; a prompt-lookup drafter loaded (it drafts the reasoning and stops at the grammar). Every reply that finished parsed as JSON; the greedy bounded-array request ran to `max_tokens` inside a string. The grammar itself and the constrained choice have unit tests (`hybrid::grammar`, `hybrid::session`).
 
 **Not checked:** any other model or tokenizer (Qwen3.5-family, Flint, LFM3, Qwen3.8-Flash-Next); MTP, DFlash and DSpark drafters beside a constraint; `--parallel` above 1; schema-conformance suites; long outputs. The first constrained request builds a table of every token's text, which was not timed separately.
 

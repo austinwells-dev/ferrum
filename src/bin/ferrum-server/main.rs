@@ -160,6 +160,20 @@ pub struct Server {
 }
 
 impl Server {
+    /// Whether these headers carry the API key (always, when none is set).
+    fn authorized(&self, authorization: Option<&str>, x_api_key: Option<&str>) -> bool {
+        let Some(key) = &self.api_key else {
+            return true;
+        };
+        let bearer = authorization
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(str::trim);
+        [bearer, x_api_key]
+            .into_iter()
+            .flatten()
+            .any(|given| same_key(given, key))
+    }
+
     pub fn model_name(&self) -> String {
         self.name.clone()
     }
@@ -513,12 +527,32 @@ fn run(o: Options) -> Result<(), String> {
         }
         info!(None, "signal received: finishing up (again to quit now)");
     });
+    let open = Arc::new(AtomicUsize::new(0));
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
-        let server = server.clone();
-        let _ = std::thread::Builder::new()
-            .name("conn".into())
-            .spawn(move || connection(&server, stream));
+        let Ok(mut stream) = stream else { continue };
+        // Every connection has a thread: past the cap, new ones are turned
+        // away instead of piling up threads.
+        if open.load(Ordering::SeqCst) >= MAX_CONNECTIONS {
+            let _ = http::json(
+                &mut stream,
+                503,
+                &error_json("too many open connections", "server_error"),
+                false,
+            );
+            continue;
+        }
+        open.fetch_add(1, Ordering::SeqCst);
+        let (server, open) = (server.clone(), open.clone());
+        let spawned = std::thread::Builder::new().name("conn".into()).spawn({
+            let open = open.clone();
+            move || {
+                connection(&server, stream);
+                open.fetch_sub(1, Ordering::SeqCst);
+            }
+        });
+        if spawned.is_err() {
+            open.fetch_sub(1, Ordering::SeqCst);
+        }
     }
     Ok(())
 }
@@ -586,6 +620,9 @@ fn start_llm(o: &Options, shared: &Arc<Shared>) -> Result<Llm, String> {
     })
 }
 
+/// Most connections open at once (each has a thread).
+const MAX_CONNECTIONS: usize = 256;
+
 /// Whether `given` is the API key, comparing every byte so the time taken
 /// does not tell a caller how much of a guess was right.
 fn same_key(given: &str, key: &str) -> bool {
@@ -646,9 +683,31 @@ fn connection(server: &Server, mut stream: TcpStream) {
     };
     let mut reader = BufReader::new(read_half);
     loop {
-        let request = match http::read_request(&mut reader) {
+        let authorized = |headers: &[(String, String)]| {
+            let header = |name: &str| {
+                headers
+                    .iter()
+                    .find(|(k, _)| k == name)
+                    .map(|(_, v)| v.as_str())
+            };
+            server.authorized(header("authorization"), header("x-api-key"))
+        };
+        let request = match http::read_request(&mut reader, &authorized) {
             Ok(Some(r)) => r,
             Ok(None) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                warn!(
+                    None,
+                    "{peer}: large request without the API key refused unread"
+                );
+                let _ = http::json(
+                    &mut stream,
+                    401,
+                    &error_json("invalid API key", "authentication_error"),
+                    false,
+                );
+                return;
+            }
             Err(e) => {
                 if e.kind() != std::io::ErrorKind::WouldBlock
                     && e.kind() != std::io::ErrorKind::TimedOut
@@ -710,13 +769,8 @@ fn handle(
             ))
         );
     }
-    if let Some(key) = &server.api_key {
-        let bearer = r
-            .header("authorization")
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::trim);
-        let matches = |given: Option<&str>| given.is_some_and(|g| same_key(g, key));
-        let ok = matches(bearer) || matches(r.header("x-api-key"));
+    if server.api_key.is_some() {
+        let ok = server.authorized(r.header("authorization"), r.header("x-api-key"));
         if !ok && !matches!(path, "/health" | "/v1/health") {
             warn!(Some(id), "rejected: missing or wrong API key");
             return http::json(

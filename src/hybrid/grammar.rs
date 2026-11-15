@@ -585,10 +585,7 @@ impl Matcher {
 /// class (or it is empty): finished sequences return to their caller, and a
 /// rule reference becomes one stack per alternative.
 fn expand(grammar: &Grammar, mut stack: Vec<Pos>, out: &mut Vec<Vec<Pos>>) {
-    loop {
-        let Some(&(rule, alternative, index)) = stack.last() else {
-            break;
-        };
+    while let Some(&(rule, alternative, index)) = stack.last() {
         let seq = &grammar.rules[rule as usize][alternative as usize];
         match seq.get(index as usize) {
             None => {
