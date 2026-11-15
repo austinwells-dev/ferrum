@@ -109,7 +109,7 @@ Record: [experimental branch notes](history/experimental-branch-notes.md#image-g
 
 **Not checked:** any other model or tokenizer (Qwen3.5-family, Flint, LFM3, Qwen3.8-Flash-Next); MTP, DFlash and DSpark drafters beside a constraint; `--parallel` above 1; schema-conformance suites; long outputs. The first constrained request builds a table of every token's text, which was not timed separately.
 
-**Gaps:** no GBNF grammars, no `tool_choice: "required"`, no constraint on `/v1/messages` or `/v1/completions`, no string patterns or numeric ranges. Property order is fixed by the schema.
+**Gaps:** no GBNF grammars, tool arguments are not held to their schema (a forced `tool_choice` only opens the call: [server.md](server.md#structured-output)), no constraint on `/v1/messages` or `/v1/completions`, no string patterns or numeric ranges. Property order is fixed by the schema.
 
 ## Sessions
 

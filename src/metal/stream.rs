@@ -113,7 +113,7 @@ impl ExpertArena {
             .and_then(|b| b.checked_mul(slots))
             .filter(|&b| b > 0)
             .ok_or_else(|| Error::Parameter("empty or oversized expert arena".into()))?;
-        let buffer = Rc::new(device.allocate_resident(bytes)?);
+        let buffer = Rc::new(device.allocate_resident(bytes, true)?);
         for file in &files {
             // SAFETY: F_NOCACHE takes an integer argument and only changes the
             // caching policy of a descriptor this process owns.

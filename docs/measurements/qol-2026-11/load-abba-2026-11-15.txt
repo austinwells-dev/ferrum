@@ -1,0 +1,50 @@
+# load-abba.sh, 2026-11-15, Apple M5 32 GB, base 716e9b4, branch = 716e9b4 + the allocation change (later committed)
+# caffeinate -dims sh docs/measurements/qol-2026-11/load-abba.sh BIN_DIR
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 314.2% of one core; limit 220.0%).
+   99.9% of one core  (another process)
+   71.4% of one core  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+   45.9% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   31.4% of one core  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
+Waiting 10s before checking again.
+CPU preflight BLOCKED: competing CPU load exceeds the benchmark limit (total 355.1% of one core; limit 220.0%).
+  106.2% of one core  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds_stores
+   49.5% of one core  /System/Library/PrivateFrameworks/SkyLight.framework/Resources/WindowServer -daemon
+   31.4% of one core  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/Metadata.framework/Versions/A/Support/mds
+Waiting 10s before checking again.
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 214.5% of one core; largest process 54.4% of one core.
+== Spark-X2.6-4B-Q4_K_M.gguf
+1 base   bench: | model | test | t/s | |---|---|---| | Dense F32 | pp512 | 1212.80 ± 1.41 | | Dense F32 | pp2048 | 1141.07 ± 1.53 | | Dense F32 | tg128 | 37.22 ± 0.21 | decode step: wall 27.24 ms; 544 dispatches in 2 command buffers; encode 0.21 ms; wait 26.86 ms; GPU 26.95 ms 
+1 base   chat:  loaded in 0.5 s | prompt 992 tokens (0 reused), prefill 1121 tok/s; 200 generated at 35.1 tok/s; stop Length | wall 10.70 s | reply md5 d84863487b11800f3c24e303d98a733a
+1 branch bench: | model | test | t/s | |---|---|---| | Dense F32 | pp512 | 1208.29 ± 8.27 | | Dense F32 | pp2048 | 1111.07 ± 8.99 | | Dense F32 | tg128 | 38.99 ± 0.16 | decode step: wall 27.83 ms; 544 dispatches in 2 command buffers; encode 0.28 ms; wait 27.34 ms; GPU 27.48 ms 
+1 branch chat:  loaded in 0.4 s | prompt 992 tokens (0 reused), prefill 1097 tok/s; 200 generated at 36.5 tok/s; stop Length | wall 7.90 s | reply md5 d84863487b11800f3c24e303d98a733a
+1 branch bench: | model | test | t/s | |---|---|---| | Dense F32 | pp512 | 1166.74 ± 4.64 | | Dense F32 | pp2048 | 1097.83 ± 4.76 | | Dense F32 | tg128 | 38.75 ± 0.06 | decode step: wall 26.31 ms; 544 dispatches in 2 command buffers; encode 0.22 ms; wait 25.94 ms; GPU 26.07 ms 
+1 branch chat:  loaded in 0.4 s | prompt 992 tokens (0 reused), prefill 1082 tok/s; 200 generated at 36.2 tok/s; stop Length | wall 7.82 s | reply md5 d84863487b11800f3c24e303d98a733a
+1 base   bench: | model | test | t/s | |---|---|---| | Dense F32 | pp512 | 1165.70 ± 2.95 | | Dense F32 | pp2048 | 1094.23 ± 2.48 | | Dense F32 | tg128 | 38.85 ± 0.06 | decode step: wall 25.96 ms; 544 dispatches in 2 command buffers; encode 0.21 ms; wait 25.58 ms; GPU 25.69 ms 
+1 base   chat:  loaded in 0.5 s | prompt 992 tokens (0 reused), prefill 1096 tok/s; 200 generated at 36.2 tok/s; stop Length | wall 9.44 s | reply md5 d84863487b11800f3c24e303d98a733a
+2 base   bench: | model | test | t/s | |---|---|---| | Dense F32 | pp512 | 1175.95 ± 5.41 | | Dense F32 | pp2048 | 1102.11 ± 2.06 | | Dense F32 | tg128 | 38.87 ± 0.01 | decode step: wall 26.22 ms; 544 dispatches in 2 command buffers; encode 0.21 ms; wait 25.86 ms; GPU 25.87 ms 
+2 base   chat:  loaded in 0.4 s | prompt 992 tokens (0 reused), prefill 1100 tok/s; 200 generated at 36.4 tok/s; stop Length | wall 9.35 s | reply md5 d84863487b11800f3c24e303d98a733a
+2 branch bench: | model | test | t/s | |---|---|---| | Dense F32 | pp512 | 1180.33 ± 6.65 | | Dense F32 | pp2048 | 1105.02 ± 0.88 | | Dense F32 | tg128 | 38.66 ± 0.29 | decode step: wall 26.58 ms; 544 dispatches in 2 command buffers; encode 0.21 ms; wait 26.20 ms; GPU 26.32 ms 
+2 branch chat:  loaded in 0.4 s | prompt 992 tokens (0 reused), prefill 1089 tok/s; 200 generated at 36.4 tok/s; stop Length | wall 7.75 s | reply md5 d84863487b11800f3c24e303d98a733a
+2 branch bench: | model | test | t/s | |---|---|---| | Dense F32 | pp512 | 1178.89 ± 3.61 | | Dense F32 | pp2048 | 1104.69 ± 1.72 | | Dense F32 | tg128 | 38.90 ± 0.02 | decode step: wall 25.95 ms; 544 dispatches in 2 command buffers; encode 0.21 ms; wait 25.59 ms; GPU 25.66 ms 
+2 branch chat:  loaded in 0.4 s | prompt 992 tokens (0 reused), prefill 1101 tok/s; 200 generated at 36.5 tok/s; stop Length | wall 7.60 s | reply md5 d84863487b11800f3c24e303d98a733a
+2 base   bench: | model | test | t/s | |---|---|---| | Dense F32 | pp512 | 1184.19 ± 3.89 | | Dense F32 | pp2048 | 1106.61 ± 1.23 | | Dense F32 | tg128 | 38.89 ± 0.09 | decode step: wall 25.89 ms; 544 dispatches in 2 command buffers; encode 0.22 ms; wait 25.49 ms; GPU 25.61 ms 
+2 base   chat:  loaded in 0.5 s | prompt 992 tokens (0 reused), prefill 1114 tok/s; 200 generated at 36.4 tok/s; stop Length | wall 9.49 s | reply md5 d84863487b11800f3c24e303d98a733a
+== Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive-IQ4_XS.gguf
+1 base   bench: | model | test | t/s | |---|---|---| | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 954.85 ± 2.64 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 914.25 ± 4.70 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.22 ± 0.07 | decode step: wall 18.81 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 18.25 ms; GPU 18.51 ms 
+1 base   chat:  loaded in 4.5 s | prompt 988 tokens (0 reused), prefill 906 tok/s; 200 generated at 53.1 tok/s; stop Length | wall 11.88 s | reply md5 d84863487b11800f3c24e303d98a733a
+1 branch bench: | model | test | t/s | |---|---|---| | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 950.27 ± 2.10 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 908.98 ± 4.36 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.48 ± 0.10 | decode step: wall 20.93 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 17.94 ms; GPU 18.21 ms 
+1 branch chat:  loaded in 3.3 s | prompt 988 tokens (0 reused), prefill 908 tok/s; 200 generated at 53.0 tok/s; stop Length | wall 11.08 s | reply md5 d84863487b11800f3c24e303d98a733a
+1 branch bench: | model | test | t/s | |---|---|---| | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 951.61 ± 1.62 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 910.90 ± 4.23 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.73 ± 0.03 | decode step: wall 21.57 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 18.08 ms; GPU 18.31 ms 
+1 branch chat:  loaded in 3.3 s | prompt 988 tokens (0 reused), prefill 907 tok/s; 200 generated at 53.0 tok/s; stop Length | wall 11.10 s | reply md5 d84863487b11800f3c24e303d98a733a
+1 base   bench: | model | test | t/s | |---|---|---| | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 953.43 ± 2.59 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 915.50 ± 4.02 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.58 ± 0.03 | decode step: wall 21.04 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 18.04 ms; GPU 18.29 ms 
+1 base   chat:  loaded in 4.4 s | prompt 988 tokens (0 reused), prefill 911 tok/s; 200 generated at 53.2 tok/s; stop Length | wall 11.98 s | reply md5 d84863487b11800f3c24e303d98a733a
+2 base   bench: | model | test | t/s | |---|---|---| | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 957.09 ± 3.29 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 919.40 ± 4.58 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.68 ± 0.15 | decode step: wall 21.15 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 18.16 ms; GPU 18.42 ms 
+2 base   chat:  loaded in 4.4 s | prompt 988 tokens (0 reused), prefill 914 tok/s; 200 generated at 53.1 tok/s; stop Length | wall 12.03 s | reply md5 d84863487b11800f3c24e303d98a733a
+2 branch bench: | model | test | t/s | |---|---|---| | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 957.97 ± 3.08 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 920.54 ± 3.29 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.74 ± 0.12 | decode step: wall 21.12 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 18.14 ms; GPU 18.40 ms 
+2 branch chat:  loaded in 3.2 s | prompt 988 tokens (0 reused), prefill 914 tok/s; 200 generated at 53.4 tok/s; stop Length | wall 11.21 s | reply md5 d84863487b11800f3c24e303d98a733a
+2 branch bench: | model | test | t/s | |---|---|---| | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 955.67 ± 3.91 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 920.70 ± 3.32 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.74 ± 0.12 | decode step: wall 18.67 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 18.12 ms; GPU 18.38 ms 
+2 branch chat:  loaded in 3.3 s | prompt 988 tokens (0 reused), prefill 910 tok/s; 200 generated at 53.3 tok/s; stop Length | wall 11.21 s | reply md5 d84863487b11800f3c24e303d98a733a
+2 base   bench: | model | test | t/s | |---|---|---| | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 961.94 ± 1.30 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 924.12 ± 2.85 | | Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.75 ± 0.08 | decode step: wall 19.26 ms; 864 dispatches in 2 command buffers; encode 0.38 ms; wait 18.46 ms; GPU 18.72 ms 
+2 base   chat:  loaded in 4.7 s | prompt 988 tokens (0 reused), prefill 899 tok/s; 200 generated at 52.3 tok/s; stop Length | wall 13.74 s | reply md5 d84863487b11800f3c24e303d98a733a
+DONE

@@ -9,6 +9,8 @@ pub mod bench;
 pub mod chat;
 pub mod config;
 pub mod draft;
+#[cfg(test)]
+mod e2e_tests;
 pub mod engine;
 pub mod grammar;
 #[cfg(test)]

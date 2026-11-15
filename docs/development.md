@@ -97,6 +97,12 @@ cargo bench --features legacy-engine --bench runtime -- --noplot
 
 The `examples/hybrid_*` programs measure the hybrid engine: `hybrid_bench` (prefill and decode), `hybrid_kld` (KL divergence against llama.cpp logits), `hybrid_spec` (speculative decoding, `--depth N --filler FILE` for long context, `--sweep 0,4,8,15` for draft-tree budgets), `hybrid_verify_cost` (verify cost against block width), `hybrid_tree_check` (draft-tree verify and path commit against plain decoding and a chain, with oracle trees), `hybrid_tree_cost` (tree verify and commit cost against a chain's), `hybrid_mtp_tree_check` (best-first MTP trees against MTP's own chain, logit for logit), `hybrid_attention` and `hybrid_prefill_attention` (attention kernels alone, per query width and K/V format), `hybrid_plan` (memory plan per K/V format), `hybrid_needle` (long-context retrieval), `hybrid_session_check` (greedy output after cache reuse, snapshot rewinds and a pinned checkpoint against a fresh session), `hybrid_chat_reuse` (how much of each turn of a scripted chat with a tool round, `--image` for a picture, comes from the cache; `--strict N` fails when a turn reuses more than N tokens less than it could), `hybrid_audio_check` (an LFM3-Audio clip's encoder rows against a llama.cpp dump; `--memory` for the planner's projector budget against Metal's allocations), and `hybrid_session_disk` (a session saved to disk and loaded into a reloaded runtime: identical output, reuse, save and load time against prefill, bytes written).
 
+The chat runtime has one end-to-end test on a real model (`src/hybrid/e2e_tests.rs`): a greedy reply repeats itself from the cache, a `logit_bias` ban changes it, a schema-constrained reply parses, and a forced tool call is made. It takes a few seconds:
+
+```sh
+FERRUM_TEST_MODEL=/path/to/model.gguf cargo test --release --lib e2e -- --ignored
+```
+
 To check that a drafter (or a kernel change) keeps plain decoding's answers, run the benchmark's `≈` answer check headless. It asks the 30 bundled math questions with and without the drafter and fails if the drafter loses more than one net answer:
 
 ```sh

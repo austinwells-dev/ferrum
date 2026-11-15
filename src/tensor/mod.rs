@@ -115,7 +115,9 @@ impl Tensor {
     ) -> Result<Self> {
         let shape = Shape::new(dims)?;
         let layout = Layout::contiguous(&shape)?;
-        let storage = Rc::new(device.allocate_resident(shape.byte_size(dtype)?)?);
+        // Metal's buffers start zero-filled. Writing the zeros again would
+        // only touch every page of a K/V cache of many GiB before its use.
+        let storage = Rc::new(device.allocate_resident(shape.byte_size(dtype)?, false)?);
         Ok(Self {
             storage,
             offset: 0,
@@ -197,7 +199,9 @@ impl Tensor {
         let shape = Shape::new(dims)?;
         let layout = Layout::contiguous(&shape)?;
         // Readers load model weights, which stay resident for the model's life.
-        let mut storage = device.allocate_resident(shape.byte_size(dtype)?)?;
+        // `fill` writes every page, so zeroing them first would only touch
+        // each one twice.
+        let mut storage = device.allocate_resident(shape.byte_size(dtype)?, false)?;
         storage.with_bytes_mut(fill)?;
         Ok(Self {
             storage: Rc::new(storage),
@@ -350,7 +354,7 @@ impl PackedStorage {
         if byte_len == 0 {
             return Err(Error::Shape("packed storage must be nonempty".into()));
         }
-        let mut storage = device.allocate_resident(byte_len)?;
+        let mut storage = device.allocate_resident(byte_len, false)?;
         storage.with_bytes_mut(fill)?;
         Ok(Self {
             storage: Rc::new(storage),

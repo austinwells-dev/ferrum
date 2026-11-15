@@ -89,12 +89,21 @@ Schemas may use `type` (also a list of types), `properties`, `required`, `additi
 - **Not enforced, with a warning in the log:** `pattern`, `format`, `minLength`, `maxLength`, `minimum`, `maximum`, `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `uniqueItems`, `minProperties`, `maxProperties`. The reply has the right shape but may break these.
 - **Refused with 400:** anything else that changes what is valid (`allOf`, `not`, `if`, `patternProperties`, remote `$ref`s, ...), rather than returning JSON that silently ignores it.
 - **Reasoning is not constrained.** With thinking on, the model reasons freely and the grammar starts after `</think>`.
-- **Tools win.** A request that also has `tools` is not constrained (a constrained reply could not call a tool); the log says so. `tool_choice: "required"` is still not enforced.
+- **Tools win.** A request that also has `tools` is not constrained (a constrained reply could not call a tool); the log says so. A forced `tool_choice` is a separate mechanism (below).
 - **Speed.** A constrained reply reads the full logits and does not use the drafter, so speculative decoding does not speed it up. On Spark-X2.6-4B constrained replies ran at 31.9–36.1 tok/s against 37.2 unconstrained ([record](measurements/qol-2026-11/README.md#structured-output)).
 - **Whitespace** between JSON tokens is at most one space, or a newline and up to 20 spaces or tabs.
 - A token that is only part of a multi-byte character is never chosen inside a constrained reply, so text in scripts the tokenizer splits below the character may come out worse than unconstrained.
 
 A constraint steers the model, it does not make it smarter: a small model held to a tight schema (for example `maxItems` it wants to exceed) can run on inside a string until `max_tokens`. `/v1/completions`, `/v1/messages`, `grammar` (GBNF) and `logprobs` are not supported; the last two are ignored with a warning. What was checked: [models.md](models.md#structured-output).
+
+**`tool_choice`.** `"none"` drops the tools. `"required"`, or a named function (`{"type": "function", "function": {"name": N}}`; on `/v1/messages`, `{"type": "any"}` and `{"type": "tool", "name": N}`), makes the reply call a tool: the server writes the opening of the model's tool-call format where the reply's content starts (after the reasoning when thinking is on, including a reasoning budget's forced close), and the model continues from there. A name that is not in `tools` is refused with 400. Things to know:
+
+- This is enforced for Qwen3.5-family models (dense and MoE) and Flint, whose tool-call formats the server knows how to open. For Spark and LFM3 it is not: the request runs, the model decides, and the log says so.
+- Only the opening is forced (and for a named function, its name). The arguments are the model's and are not checked against the tool's schema; a call the parser cannot read comes back as content.
+- With thinking on and reasoning left inline (`--reasoning-format none`), nothing is forced.
+- Checked on a 35B MoE: [record](measurements/qol-2026-11/README.md#tool_choice). Flint's opening has not been run.
+
+**`logit_bias`** on `/v1/chat/completions` is OpenAI's map of token id to a value from -100 to 100, added to that token's logit at every step (reasoning included) after the penalties; llama-server's list form `[[id, bias], ...]` is accepted too, where `false` bans the token. Ids outside the vocabulary are ignored. Like a schema, a biased reply reads the full logits, samples from the 1024 likeliest tokens and does not use the drafter.
 
 ### Streaming
 

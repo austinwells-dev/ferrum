@@ -369,6 +369,39 @@ pub struct ChatRequest {
     /// such as a JSON schema (`Grammar::from_response_format`). The reply
     /// then cannot call tools, and is decoded without the drafter.
     pub grammar: Option<Arc<Grammar>>,
+    /// Added to these tokens' logits at every step, reasoning included
+    /// (OpenAI's `logit_bias`). A biased reply is decoded without the
+    /// drafter, from the full logits.
+    pub logit_bias: Vec<(u32, f32)>,
+    /// Make the reply call a tool (OpenAI's `tool_choice` "required" or a
+    /// named function): its content starts with the model's tool-call
+    /// opening, written for it. Only where `Runtime::forces_tools`.
+    pub force_tool: Option<ForcedTool>,
+}
+
+/// `ChatRequest::force_tool`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForcedTool {
+    /// Any of the request's tools.
+    Any,
+    /// The tool with this name.
+    Named(String),
+}
+
+/// What a forced tool call's content starts with in `variant`'s tool-call
+/// format (`chat::parse_tool_call`); None where that format is not known.
+fn tool_opening(variant: Variant, tool: &ForcedTool) -> Option<String> {
+    Some(match (variant, tool) {
+        (Variant::Dense | Variant::Moe | Variant::Qwen4Exp, ForcedTool::Any) => {
+            "<tool_call>\n".into()
+        }
+        (Variant::Dense | Variant::Moe | Variant::Qwen4Exp, ForcedTool::Named(name)) => {
+            format!("<tool_call>\n<function={name}>\n")
+        }
+        (Variant::Flint, ForcedTool::Any) => "<tool_call>".into(),
+        (Variant::Flint, ForcedTool::Named(name)) => format!("<tool_call>{name}"),
+        (Variant::Spark | Variant::Lfm3, _) => return None,
+    })
 }
 
 impl ChatRequest {
@@ -384,6 +417,8 @@ impl ChatRequest {
             raw_reasoning: false,
             image_budget: ImageBudget::default(),
             grammar: None,
+            logit_bias: Vec::new(),
+            force_tool: None,
         }
     }
 }
@@ -706,6 +741,12 @@ impl Runtime {
         session.load_from(&self.device, &self.loaded.model, dir, &self.cache_identity)
     }
 
+    /// Whether `ChatRequest::force_tool` is enforced for this model (its
+    /// tool-call format is one the runtime can open).
+    pub fn forces_tools(&self) -> bool {
+        tool_opening(self.loaded.model.config.variant, &ForcedTool::Any).is_some()
+    }
+
     pub fn supports_vision(&self) -> bool {
         self.vision.is_some()
     }
@@ -962,6 +1003,19 @@ impl Runtime {
         if let Some((at, pin)) = prompt.checkpoint {
             self.slot_mut(slot).set_checkpoint(at, pin);
         }
+        // A reply that reasons inline (`raw_reasoning`) has no point the
+        // runtime can see where its content starts, so nothing is forced.
+        let variant = self.loaded.model.config.variant;
+        let forced = request
+            .force_tool
+            .as_ref()
+            .filter(|_| !request.tools.is_empty())
+            .filter(|_| !(starts_in_reasoning && request.raw_reasoning))
+            .and_then(|tool| tool_opening(variant, tool));
+        let forced = forced.map(|text| Forced {
+            text,
+            at_start: !starts_in_reasoning,
+        });
         let mut turn = self.start(
             slot,
             &prompt.tokens,
@@ -978,6 +1032,8 @@ impl Runtime {
             // A constrained reply is its grammar's text, never a tool call.
             request.grammar.is_none(),
             request.grammar.clone(),
+            request.logit_bias.clone(),
+            forced,
             hooks,
         )?;
         turn.chat = Some(ChatTurn {
@@ -1061,6 +1117,8 @@ impl Runtime {
             None,
             false,
             None,
+            Vec::new(),
+            None,
             hooks,
         )
     }
@@ -1078,8 +1136,17 @@ impl Runtime {
         reasoning_budget: Option<usize>,
         tools: bool,
         grammar: Option<Arc<Grammar>>,
+        bias: Vec<(u32, f32)>,
+        mut forced: Option<Forced>,
         hooks: &mut impl ChatHooks,
     ) -> Result<Turn> {
+        // A forced opening with no reasoning before it is part of the prompt.
+        let mut opened = prompt.to_vec();
+        let opening = forced.take_if(|f| f.at_start);
+        if let Some(f) = &opening {
+            opened.extend(self.loaded.tokenizer.encode(&f.text)?);
+        }
+        let prompt = &opened[..];
         let close_text = reasoning_close(self.loaded.model.config.variant);
         let constraint = match grammar {
             Some(grammar) => {
@@ -1097,6 +1164,8 @@ impl Runtime {
         };
         let mut driver = Driver {
             constraint,
+            bias,
+            forced,
             stream: TextStream::default(),
             splitter: Splitter::new(split_reasoning, stop, tools),
             failure: None,
@@ -1112,6 +1181,16 @@ impl Runtime {
             i => &mut self.slots[i - 1],
         };
         session.set_media(spans);
+        if let Some(f) = &opening {
+            let mut hooked = Hooked {
+                driver: &mut driver,
+                hooks,
+                tokenizer: &self.loaded.tokenizer,
+            };
+            if !hooked.emit(&f.text) {
+                return Err(driver.failure.take().expect("emit failed with an error"));
+            }
+        }
         let generation = session.begin(
             &self.device,
             &self.loaded.model,
@@ -1247,6 +1326,10 @@ struct Constraint {
 
 struct Driver {
     constraint: Option<Constraint>,
+    /// `ChatRequest::logit_bias`.
+    bias: Vec<(u32, f32)>,
+    /// A tool-call opening still to be written (`ChatRequest::force_tool`).
+    forced: Option<Forced>,
     stream: TextStream,
     splitter: Splitter,
     failure: Option<Error>,
@@ -1256,6 +1339,24 @@ struct Driver {
     close: Vec<u32>,
     close_text: &'static str,
     count: usize,
+}
+
+/// The opening of a forced tool call: the text the reply's content starts
+/// with.
+struct Forced {
+    text: String,
+    /// It goes right after the prompt rather than after the reasoning.
+    at_start: bool,
+}
+
+impl Driver {
+    /// The grammar the next token must follow: none while the reply is
+    /// reasoning, or once its content has left the grammar.
+    fn grammar(&self) -> Option<&Constraint> {
+        self.constraint
+            .as_ref()
+            .filter(|c| !c.lost && !self.splitter.in_reasoning)
+    }
 }
 
 /// A `Driver` with the caller's hooks for one `Session::begin`/`advance` call.
@@ -1285,11 +1386,10 @@ impl<H: ChatHooks> GenerationHooks for Hooked<'_, H> {
         self.hooks.prefill(processed, total) && !self.hooks.cancelled()
     }
     fn constrained(&self) -> bool {
-        !self.driver.splitter.in_reasoning
-            && self.driver.constraint.as_ref().is_some_and(|c| !c.lost)
+        !self.driver.bias.is_empty() || self.driver.grammar().is_some()
     }
     fn allows(&mut self, token: u32) -> bool {
-        let Some(c) = &self.driver.constraint else {
+        let Some(c) = self.driver.grammar() else {
             return true;
         };
         match c.pieces.get(token as usize) {
@@ -1298,10 +1398,10 @@ impl<H: ChatHooks> GenerationHooks for Hooked<'_, H> {
         }
     }
     fn may_end(&self) -> bool {
-        self.driver
-            .constraint
-            .as_ref()
-            .is_none_or(|c| c.lost || c.matcher.complete())
+        self.driver.grammar().is_none_or(|c| c.matcher.complete())
+    }
+    fn bias(&self) -> &[(u32, f32)] {
+        &self.driver.bias
     }
     fn token(&mut self, token: u32) -> Result<Flow> {
         self.driver.count += 1;
@@ -1311,6 +1411,7 @@ impl<H: ChatHooks> GenerationHooks for Hooked<'_, H> {
             self.driver.reasoning_tokens += 1;
         }
         let piece = self.driver.stream.step(self.tokenizer, token)?;
+        let piece_tail = piece.clone().unwrap_or_default();
         if let Some(piece) = piece {
             if !self.emit(&piece) {
                 return Ok(Flow::Stop);
@@ -1340,6 +1441,26 @@ impl<H: ChatHooks> GenerationHooks for Hooked<'_, H> {
         if self.driver.splitter.stopped || self.hooks.cancelled() {
             return Ok(Flow::Stop);
         }
+        if was_reasoning
+            && !self.driver.splitter.in_reasoning
+            && let Some(forced) = self.driver.forced.take()
+        {
+            // The model closed its reasoning: the content opens with the
+            // call, after whatever the closing text (`close_text`) still
+            // lacks of the gap the template puts between the two.
+            let gap = self
+                .driver
+                .close_text
+                .rsplit("</think>")
+                .next()
+                .unwrap_or("");
+            let have = piece_tail.len() - piece_tail.trim_end_matches('\n').len();
+            let text = format!("{}{}", &gap[have.min(gap.len())..], forced.text);
+            if !self.emit(&text) {
+                return Ok(Flow::Stop);
+            }
+            return Ok(Flow::Inject(self.tokenizer.encode(&text)?));
+        }
         if self.driver.splitter.in_reasoning
             && self
                 .driver
@@ -1351,7 +1472,14 @@ impl<H: ChatHooks> GenerationHooks for Hooked<'_, H> {
             if !self.emit(text) {
                 return Ok(Flow::Stop);
             }
-            return Ok(Flow::Inject(self.driver.close.clone()));
+            let mut inject = self.driver.close.clone();
+            if let Some(forced) = self.driver.forced.take() {
+                if !self.emit(&forced.text) {
+                    return Ok(Flow::Stop);
+                }
+                inject.extend(self.tokenizer.encode(&forced.text)?);
+            }
+            return Ok(Flow::Inject(inject));
         }
         Ok(Flow::Continue)
     }
@@ -1912,6 +2040,20 @@ mod thinking_tests {
         assert_eq!(generation_prefix(&qwen, &Map::new()), "");
         let plain = ChatTemplate::new("{{ messages[0].content }}").unwrap();
         assert_eq!(generation_prefix(&plain, &Map::new()), "");
+        let named = ForcedTool::Named("read".into());
+        assert_eq!(
+            tool_opening(Variant::Moe, &ForcedTool::Any).as_deref(),
+            Some("<tool_call>\n")
+        );
+        assert_eq!(
+            tool_opening(Variant::Dense, &named).as_deref(),
+            Some("<tool_call>\n<function=read>\n")
+        );
+        assert_eq!(
+            tool_opening(Variant::Flint, &named).as_deref(),
+            Some("<tool_call>read")
+        );
+        assert_eq!(tool_opening(Variant::Spark, &ForcedTool::Any), None);
         assert_eq!(reasoning_close(Variant::Flint), "</think>");
         assert_eq!(reasoning_close(Variant::Spark), "</think>");
         assert_eq!(reasoning_close(Variant::Lfm3), "</think>");

@@ -1,0 +1,7 @@
+# logit_bias check, 2026-11-15, Spark-X2.6-4B-Q4_K_M through ferrum-server, greedy, thinking off
+# prompt: "What is the capital of France? Answer with one word."  ("Paris" is token 110949, " Paris" 19500)
+no bias:                        ("'Paris'", 1)
+ban 110949 (-100):              ("'Paris'", 2)
+ban 110949 and 19500 (false):   ("'Paris'", 2)
+id past the vocabulary:         ("'Paris'", 1)
+bias 500 (out of range):        {'message': 'logit_bias must map token ids to numbers from -100 to 100', 'type': 'invalid_request_error', 'code': 400}

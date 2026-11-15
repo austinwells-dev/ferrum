@@ -506,6 +506,8 @@ fn run() -> Result<()> {
             raw_reasoning: false,
             image_budget: detail,
             grammar: None,
+            logit_bias: Vec::new(),
+            force_tool: None,
         };
         INTERRUPTED.store(false, Ordering::Relaxed);
         GENERATING.store(true, Ordering::Relaxed);

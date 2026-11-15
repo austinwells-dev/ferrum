@@ -115,6 +115,11 @@ pub trait GenerationHooks {
     fn may_end(&self) -> bool {
         true
     }
+    /// With `constrained`: values added to these tokens' logits before one
+    /// is chosen (OpenAI's `logit_bias`).
+    fn bias(&self) -> &[(u32, f32)] {
+        &[]
+    }
 }
 
 impl<F: FnMut(u32) -> Result<bool>> GenerationHooks for F {
@@ -1204,7 +1209,8 @@ const CONSTRAINED_HEAD: usize = 1024;
 /// among those the hooks allow: penalties as the GPU applies them
 /// (`h_penalize`), then the allowed tokens among the `CONSTRAINED_HEAD`
 /// likeliest (every allowed token when none of those is), sampled as usual.
-/// Greedy output is the likeliest allowed token.
+/// Greedy output is the likeliest allowed token. `GenerationHooks::bias` is
+/// added after the penalties.
 fn choose(
     produced: Produced,
     params: &SamplingParams,
@@ -1231,6 +1237,11 @@ fn choose(
                 };
             }
             *v -= p.presence + p.frequency * count as f32;
+        }
+    }
+    for &(token, bias) in hooks.bias() {
+        if let Some(v) = logits.get_mut(token as usize) {
+            *v += bias;
         }
     }
     let mut order: Vec<u32> = (0..logits.len() as u32)
@@ -1441,6 +1452,34 @@ mod tests {
         fn may_end(&self) -> bool {
             self.end
         }
+    }
+
+    struct Biased(Vec<(u32, f32)>);
+
+    impl GenerationHooks for Biased {
+        fn token(&mut self, _token: u32) -> Result<Flow> {
+            Ok(Flow::Continue)
+        }
+        fn constrained(&self) -> bool {
+            true
+        }
+        fn bias(&self) -> &[(u32, f32)] {
+            &self.0
+        }
+    }
+
+    #[test]
+    fn logit_bias_moves_and_bans_tokens() {
+        let greedy = SamplingParams::default();
+        let logits = || Produced::Logits(vec![1., 5., 4., 3.]);
+        let pick = |bias: Vec<(u32, f32)>| {
+            choose(logits(), &greedy, &[], &[], 0, &mut Biased(bias)).unwrap()
+        };
+        assert_eq!(pick(vec![]), 1);
+        assert_eq!(pick(vec![(3, 2.5)]), 3);
+        assert_eq!(pick(vec![(1, f32::NEG_INFINITY)]), 2);
+        // A token outside the vocabulary is ignored.
+        assert_eq!(pick(vec![(99, 100.)]), 1);
     }
 
     #[test]

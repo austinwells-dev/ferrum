@@ -8,7 +8,7 @@ use crate::{
 use ferrum::{
     hybrid::{
         grammar::Grammar,
-        runtime::{ChatRequest, ChatResult, Delta},
+        runtime::{ChatRequest, ChatResult, Delta, ForcedTool},
         session::{Completion, SamplingParams},
     },
     vision::{ImageBudget, media},
@@ -155,6 +155,49 @@ pub fn sampling(body: &Json, server: &Server) -> Result<SamplingParams, String> 
     Ok(s)
 }
 
+/// A `tool_choice` naming one of `tools`.
+pub fn named_tool(tools: &[Json], name: &str) -> Result<ForcedTool, String> {
+    let known = tools
+        .iter()
+        .any(|t| t.pointer("/function/name").and_then(Json::as_str) == Some(name));
+    if !known {
+        return Err(format!("tool_choice names {name:?}, which is not in tools"));
+    }
+    Ok(ForcedTool::Named(name.to_owned()))
+}
+
+/// `logit_bias`: OpenAI's map of token id to a bias in [-100, 100], or
+/// llama-server's list of `[id, bias]` pairs where `false` bans the token.
+fn logit_bias(body: &Json) -> Result<Vec<(u32, f32)>, String> {
+    let bad = || "logit_bias must map token ids to numbers from -100 to 100".to_owned();
+    let value = |v: &Json| match v {
+        Json::Bool(false) => Ok(f32::NEG_INFINITY),
+        v => v
+            .as_f64()
+            .filter(|b| (-100. ..=100.).contains(b))
+            .map(|b| b as f32)
+            .ok_or_else(bad),
+    };
+    match body.get("logit_bias") {
+        None | Some(Json::Null) => Ok(Vec::new()),
+        Some(Json::Object(map)) => map
+            .iter()
+            .map(|(id, v)| Ok((id.parse::<u32>().map_err(|_| bad())?, value(v)?)))
+            .collect(),
+        Some(Json::Array(pairs)) => pairs
+            .iter()
+            .map(|pair| match pair.as_array().map(Vec::as_slice) {
+                Some([id, v]) => {
+                    let id = id.as_u64().and_then(|id| u32::try_from(id).ok());
+                    Ok((id.ok_or_else(bad)?, value(v)?))
+                }
+                _ => Err(bad()),
+            })
+            .collect(),
+        Some(_) => Err(bad()),
+    }
+}
+
 pub fn stop_strings(body: &Json, key: &str) -> Vec<String> {
     match body.get(key) {
         Some(Json::String(s)) => vec![s.clone()],
@@ -233,19 +276,26 @@ fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, b
         .and_then(Json::as_array)
         .cloned()
         .unwrap_or_default();
-    match body.get("tool_choice") {
-        Some(Json::String(c)) if c == "none" => tools.clear(),
-        Some(Json::String(c)) if c == "required" => {
-            warn!(
-                Some(id),
-                "tool_choice \"required\" is not enforced (no grammar); the model decides"
-            )
+    let force_tool = match body.get("tool_choice") {
+        Some(Json::String(c)) if c == "none" => {
+            tools.clear();
+            None
         }
-        Some(Json::Object(_)) => warn!(
-            Some(id),
-            "a forced tool_choice is not enforced; the model decides"
-        ),
-        _ => {}
+        Some(Json::String(c)) if c == "required" => Some(ForcedTool::Any),
+        // {"type": "function", "function": {"name": N}}, or the Responses
+        // form {"type": "function", "name": N}.
+        Some(choice @ Json::Object(_)) => {
+            let name = choice
+                .pointer("/function/name")
+                .or_else(|| choice.get("name"))
+                .and_then(Json::as_str)
+                .ok_or("tool_choice must name a function")?;
+            Some(named_tool(&tools, name)?)
+        }
+        _ => None,
+    };
+    if force_tool.is_some() && tools.is_empty() {
+        return Err("tool_choice needs tools".into());
     }
     for unsupported in ["logprobs", "grammar"] {
         if body
@@ -298,6 +348,8 @@ fn chat_request(body: &Json, server: &Server, id: u64) -> Result<(ChatRequest, b
         raw_reasoning: t.raw,
         image_budget: image_budget(body)?,
         grammar: grammar.map(Arc::new),
+        logit_bias: logit_bias(body)?,
+        force_tool,
     };
     Ok((request, t.exclude))
 }

@@ -608,6 +608,12 @@ impl Scheduler {
         let shared = self.shared.clone();
         let started = guarded(|| match &job.work {
             Work::Chat(request) => {
+                if request.force_tool.is_some() && !self.rt.forces_tools() {
+                    warn!(
+                        Some(job.id),
+                        "tool_choice is not enforced for this model's tool-call format; the model decides"
+                    );
+                }
                 let prompt = self.rt.chat_prompt(request)?;
                 let slot = self.choose_for(&job.route, &prompt.tokens, &prompt.spans);
                 let mut hooks = Hooks::new(&job, &shared, &mut timing, slot);
