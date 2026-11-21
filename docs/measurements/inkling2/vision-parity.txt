@@ -1,0 +1,20 @@
+== test-1.png
+ferrum: 208 tokens (grid (13, 16)); llama.cpp: 208 x 2304
+all rows: cosine 0.999987, max |diff| 0.0217, relative RMS 0.00520
+worst row 165: cosine 0.999254, max |diff| 0.0217, relative RMS 0.03906
+== sq640.png
+ferrum: 256 tokens (grid (16, 16)); llama.cpp: 256 x 2304
+all rows: cosine 0.999971, max |diff| 0.0293, relative RMS 0.00767
+worst row 182: cosine 0.998571, max |diff| 0.0293, relative RMS 0.05429
+== pre.png
+ferrum: 1008 tokens (grid (24, 42)); llama.cpp: 1008 x 2304
+all rows: cosine 0.999960, max |diff| 0.0876, relative RMS 0.00899
+worst row 285: cosine 0.983267, max |diff| 0.0653, relative RMS 0.18429
+== big.png (2600x1500, --image-max-tokens 1024, both scale down)
+ferrum: 1008 tokens (grid (24, 42)); llama.cpp: 1008 x 2304
+all rows: cosine 0.999049, max |diff| 0.3152, relative RMS 0.04365
+worst row 769: cosine 0.786851, max |diff| 0.2212, relative RMS 0.63087
+== test-1.jpeg
+ferrum: 208 tokens (grid (13, 16)); llama.cpp: 208 x 2304
+all rows: cosine 0.999473, max |diff| 0.1168, relative RMS 0.03250
+worst row 13: cosine 0.976979, max |diff| 0.1168, relative RMS 0.21369

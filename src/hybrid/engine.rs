@@ -10,9 +10,20 @@ use super::{
 use crate::{DType, Error, MetalDevice, Result, Tensor, metal::MetalBuffer};
 use std::cell::RefCell;
 
+mod inkling;
 mod qwen4exp;
 
 type Binding<'a> = (&'a MetalBuffer, usize, usize);
+
+/// Inkling 2's relative-position bias: each query row's 16-wide position
+/// vectors (`rel`, `[m, heads, 16]`) dotted with row `q - k` of `table`
+/// (`[extent, 16]`); distances of `extent` or more add nothing.
+#[derive(Clone, Copy)]
+pub(crate) struct RelBias<'a> {
+    pub(crate) rel: &'a Tensor,
+    pub(crate) table: &'a Tensor,
+    pub(crate) extent: usize,
+}
 
 /// Little-endian kernel parameter block.
 #[derive(Default)]
@@ -324,7 +335,15 @@ impl HybridState {
                 let rows = if ring > 0 { ring } else { kv_rows };
                 state.k.push(Some(c.kv_cache.alloc(d, rows, kv_row)?));
                 state.v.push(Some(c.kv_cache.alloc(d, rows, kv_row)?));
-                state.conv.push(None);
+                // Inkling visits also keep their short convolutions' inputs.
+                state.conv.push(match c.inkling {
+                    Some(_) => Some(Tensor::zeros_resident(
+                        d,
+                        [(c.conv_kernel - 1) * super::config::inkling_conv_channels(c)],
+                        DType::F32,
+                    )?),
+                    None => None,
+                });
                 state.ssm.push(None);
             } else if c.variant == Variant::Lfm3 {
                 // Previous B*x rows only. No delta-rule matrix: `page(0)` would
@@ -659,6 +678,7 @@ pub(crate) struct Scratch {
     pub(crate) candidates: Tensor,
     moe: Option<MoeScratch>,
     hc: Option<qwen4exp::HcScratch>,
+    ink: Option<inkling::InkScratch>,
 }
 
 /// Routing and expert buffers for `chunk * experts_used` routes.
@@ -1016,7 +1036,7 @@ pub fn scratch_bytes(c: &HybridConfig, chunk: usize, logit_rows: usize) -> usize
         true => super::stream::ahead_bytes(c, chunk),
         false => 0,
     };
-    total + qwen4exp::scratch_bytes(c, chunk) + ahead
+    total + qwen4exp::scratch_bytes(c, chunk) + inkling::scratch_bytes(c, chunk) + ahead
 }
 
 /// Bytes of a `HybridState` for `capacity` positions, page-rounded.
@@ -1052,6 +1072,10 @@ pub fn kv_ring_bytes(c: &HybridConfig, max_rows: usize) -> usize {
 /// Convolution windows and delta-rule matrices of every recurrent layer.
 /// LFM3 counts only the short-conv window (`(l_cache - 1) * hidden`).
 pub fn recurrent_bytes(c: &HybridConfig) -> usize {
+    if c.inkling.is_some() {
+        let conv = (c.conv_kernel - 1) * super::config::inkling_conv_channels(c) * 4;
+        return c.layers * page(conv);
+    }
     if c.variant == Variant::Lfm3 {
         let conv = page((c.conv_kernel - 1) * c.hidden * 4);
         return c.recurrent_layer_count() * conv;
@@ -1127,6 +1151,7 @@ impl Scratch {
             token: f(&[1])?,
             candidates: f(&[c.vocab.div_ceil(1024) * 64])?,
             hc: qwen4exp::HcScratch::new(d, c, chunk)?,
+            ink: inkling::InkScratch::new(d, c, chunk)?,
             moe: match c.moe {
                 None => None,
                 Some(moe) => {
@@ -1189,6 +1214,7 @@ impl Scratch {
                 .as_ref()
                 .map_or(0, |m| m.tensors().iter().map(|t| page(t.byte_size())).sum())
             + self.hc.as_ref().map_or(0, qwen4exp::HcScratch::byte_size)
+            + self.ink.as_ref().map_or(0, inkling::InkScratch::byte_size)
     }
 }
 
@@ -1293,6 +1319,11 @@ impl HybridModel {
                 "aux layer {bad} beyond the {} trunk layers",
                 c.layers
             )));
+        }
+        if c.inkling.is_some() {
+            return Err(Error::Config(
+                "speculative decoding is not available for Inkling 2 yet".into(),
+            ));
         }
         *self.spec.borrow_mut() = None;
         let f = |dims: &[usize]| Tensor::zeros_resident(d, dims, DType::F32);
@@ -1767,6 +1798,7 @@ impl HybridModel {
         let logits = rows(&spec.logits, 0, m, c.vocab)?;
         let e = d.execution_with_shared_encoder(true)?;
         Self::project(d, &self.weights.output, &xn, m, &logits)?;
+        self.softcap(d, &logits)?;
         match output {
             RowOutput::Logits => {
                 e.finish()?;
@@ -1973,7 +2005,14 @@ impl HybridModel {
         };
         let spec = self.spec.borrow();
         let spec = spec.as_ref();
-        if self.weights.hc_head.is_some() {
+        if self.weights.inkling.is_some() {
+            if tree.is_some() || verify {
+                return Err(Error::Parameter(
+                    "speculative verifies are not available for Inkling 2 yet".into(),
+                ));
+            }
+            self.inkling_layers(d, &s, state, &x0, &xn, m, pos)?;
+        } else if self.weights.hc_head.is_some() {
             if tree.is_some() {
                 return Err(Error::Parameter(
                     "draft trees are not available for hyper-connection models".into(),
@@ -2063,6 +2102,7 @@ impl HybridModel {
         let produced = if let Some(all) = all_logits {
             let logits = rows(&s.logits, 0, m, c.vocab)?;
             Self::project(d, &self.weights.output, &xn, m, &logits)?;
+            self.softcap(d, &logits)?;
             execution.finish()?;
             *all = logits.to_f32();
             Produced::None
@@ -2076,6 +2116,7 @@ impl HybridModel {
                     let last = rows(&xn, m - 1, 1, h)?;
                     let logits = rows(&s.logits, 0, 1, c.vocab)?;
                     Self::project(d, &self.weights.output, &last, 1, &logits)?;
+                    self.softcap(d, &logits)?;
                     if penalties.active() {
                         let ids = Tensor::from_le_bytes(
                             d,
@@ -2136,6 +2177,7 @@ impl HybridModel {
                     let last = rows(&xn, m - 1, 1, h)?;
                     let logits = rows(&s.logits, 0, 1, c.vocab)?;
                     Self::project(d, &self.weights.output, &last, 1, &logits)?;
+                    self.softcap(d, &logits)?;
                     if matches!(output, Output::Argmax) {
                         d.dispatch_hybrid(
                             "h_argmax",
@@ -2387,6 +2429,33 @@ impl HybridModel {
         ring: usize,
         tree: Option<(&Tensor, usize)>,
     ) -> Result<()> {
+        self.flash_attention_in(
+            d, s, kv, q, kc, vc, qg, att, m, pos, spec, sinks, ring, tree, None,
+        )
+    }
+
+    /// `flash_attention`, or with `rel` (Inkling 2) adding each row's
+    /// relative-position bias (`RelBias`) to its scores, with `sinks` one
+    /// logit per row and head (`[m, heads]`) rather than per head.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn flash_attention_in(
+        &self,
+        d: &MetalDevice,
+        s: &Scratch,
+        kv: KvCache,
+        q: &Tensor,
+        kc: &Tensor,
+        vc: &Tensor,
+        qg: &Tensor,
+        att: &Tensor,
+        m: usize,
+        pos: usize,
+        spec: AttnSpec,
+        sinks: Option<&Tensor>,
+        ring: usize,
+        tree: Option<(&Tensor, usize)>,
+        rel: Option<RelBias>,
+    ) -> Result<()> {
         let c = &self.config;
         let group = c.heads / c.kv_heads;
         let (tree, tree_root) = (tree.map(|t| t.0), tree.map_or(pos, |t| t.1));
@@ -2426,6 +2495,13 @@ impl HybridModel {
                 "a draft-tree verify takes at most {TREE_MAX_ROWS} rows on the TensorOps \
                  or reference attention kernels"
             )));
+        }
+        if rel.is_some() && (legacy || flags().reference_attention || wide || tree.is_some()) {
+            return Err(Error::Config(
+                "relative-position attention runs only on the TensorOps kernels with \
+                 128-wide heads and no draft tree"
+                    .into(),
+            ));
         }
         let sinks_on = usize::from(sinks.is_some());
         let tree_on = usize::from(tree.is_some());
@@ -2480,8 +2556,19 @@ impl HybridModel {
                 .u(usize::from(spec.gated))?
                 .u(sinks_on)?
                 .u(ring)?
+                // FaRelArgs: the bias table's extent follows FaArgs.
+                .u(rel.map_or(0, |r| r.extent))?
                 .0)
         };
+        let rel_inputs = rel.map(|r| [r.rel.binding(), r.table.binding()]);
+        fn chain<'a>(inputs: &[Binding<'a>], rel: Option<[Binding<'a>; 2]>) -> Vec<Binding<'a>> {
+            inputs
+                .iter()
+                .copied()
+                .chain(rel.into_iter().flatten())
+                .collect()
+        }
+        let with_rel = |inputs| chain(inputs, rel_inputs);
         // Sinks ride as the fifth input; the legacy kernels predate them. The
         // `_tree` variants take the tree as the sixth.
         let base = [q.binding(), kc.binding(), vc.binding(), qg.binding()];
@@ -2497,6 +2584,10 @@ impl HybridModel {
         if m >= MPP_ATTENTION_MIN_TOKENS && !flags().simd_attention {
             let args = fa(0, 1)?;
             let name = match (q8, legacy, wide, tree.is_some()) {
+                _ if rel.is_some() => match q8 {
+                    true => "h_flash_attn_mpp_q8_d128_rel",
+                    false => "h_flash_attn_mpp_staged_d128_rel",
+                },
                 (true, _, true, false) => "h_flash_attn_mpp_q8",
                 (true, _, false, false) => "h_flash_attn_mpp_q8_d128",
                 (false, false, true, false) => "h_flash_attn_mpp_staged",
@@ -2511,12 +2602,12 @@ impl HybridModel {
             // than reading the cache as a device tensor.
             return d.dispatch_hybrid(
                 name,
-                if legacy {
-                    &base
+                &if legacy {
+                    base.to_vec()
                 } else if tree.is_some() {
-                    &tree_inputs
+                    tree_inputs.to_vec()
                 } else {
-                    &sink_inputs
+                    with_rel(&sink_inputs)
                 },
                 &[att.binding()],
                 &args,
@@ -2527,7 +2618,9 @@ impl HybridModel {
         }
         let reduce = |args: &[u8]| {
             d.dispatch_hybrid(
-                if wide {
+                if rel.is_some() {
+                    "h_flash_reduce_rel_d128"
+                } else if wide {
                     "h_flash_reduce"
                 } else {
                     "h_flash_reduce_d128"
@@ -2556,6 +2649,10 @@ impl HybridModel {
             let splits = keys.div_ceil(keys_per_split);
             let args = fa(keys_per_split, splits)?;
             let name = match (q8, wide) {
+                _ if rel.is_some() => match q8 {
+                    true => "h_attn_decode_q8_d128_rel",
+                    false => "h_attn_decode_d128_rel",
+                },
                 (false, true) => "h_attn_decode",
                 (true, true) => "h_attn_decode_q8",
                 (false, false) => "h_attn_decode_d128",
@@ -2563,7 +2660,7 @@ impl HybridModel {
             };
             d.dispatch_hybrid(
                 name,
-                &sink_inputs,
+                &with_rel(&sink_inputs),
                 &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
                 &args,
                 [c.kv_heads, splits, 1],
@@ -2607,6 +2704,10 @@ impl HybridModel {
                 br * 64 * 4 + br * 64 * 2 + 3 * br * 4
             };
             let name = match (q8, wide, tree.is_some()) {
+                _ if rel.is_some() => match q8 {
+                    true => "h_attn_verify_mpp_32_q8_d128_rel",
+                    false => "h_attn_verify_mpp_32_d128_rel",
+                },
                 (false, true, false) => "h_attn_verify_mpp_32",
                 (true, true, false) => "h_attn_verify_mpp_32_q8",
                 (false, false, false) => "h_attn_verify_mpp_32_d128",
@@ -2628,7 +2729,10 @@ impl HybridModel {
                 // F16 reads K/V directly: staging only pays off for prompt
                 // chunks. Q8 must stage to dequantize.
                 name,
-                &qk_inputs[..if tree.is_some() { 6 } else { 5 }],
+                &match tree.is_some() {
+                    true => qk_inputs.to_vec(),
+                    false => with_rel(&qk_inputs[..5]),
+                },
                 &[att.binding(), s.attn_partial.binding(), s.attn_ml.binding()],
                 &args,
                 [row_blocks, c.kv_heads, splits],
@@ -3197,6 +3301,7 @@ impl HybridModel {
             Format::Q5_0 => ("h_mm_id_q5_0", "h_mm_id_slot_q5_0"),
             Format::Q3K => ("h_mm_id_q3_k", "h_mm_id_slot_q3_k"),
             Format::Iq4Nl => ("h_mm_id_iq4_nl", "h_mm_id_slot_iq4_nl"),
+            Format::Nvfp4 => ("h_mm_id_nvfp4", "h_mm_id_slot_nvfp4"),
             Format::F32 | Format::Bf16 | Format::Mlx4 => {
                 return Err(Error::Gguf(format!(
                     "{} experts are unsupported",
@@ -3478,6 +3583,7 @@ impl HybridModel {
                 Format::Q5_0 => "h_mm_q5_0",
                 Format::Q3K => "h_mm_q3_k",
                 Format::Iq4Nl => "h_mm_iq4_nl",
+                Format::Nvfp4 => "h_mm_nvfp4",
                 Format::Mlx4 => "h_mm_mlx4",
             };
             return d.dispatch_hybrid(
@@ -3605,6 +3711,7 @@ fn mvb_kernel(format: Format) -> &'static str {
         Format::Q5_0 => "h_mvb_q5_0",
         Format::Q3K => "h_mvb_q3_k",
         Format::Iq4Nl => "h_mvb_iq4_nl",
+        Format::Nvfp4 => "h_mvb_nvfp4",
         Format::Mlx4 => "h_mvb_mlx4",
         Format::F32 => "h_mvb_f32",
         Format::Bf16 => "h_mvb_bf16",
@@ -3627,6 +3734,7 @@ fn mms_kernel(format: Format) -> &'static str {
         Format::Q5_0 => "h_mms_q5_0",
         Format::Q3K => "h_mms_q3_k",
         Format::Iq4Nl => "h_mms_iq4_nl",
+        Format::Nvfp4 => "h_mms_nvfp4",
         Format::Mlx4 => "h_mms_mlx4",
         Format::F32 => "h_mms_f32",
         Format::Bf16 => "h_mms_bf16",
@@ -3653,6 +3761,7 @@ fn mv_kernel(format: Format, expert: bool) -> (&'static str, usize, usize, usize
         Format::Q5_0 => (pick("h_mv_q5_0", "h_mv_id_q5_0"), 8, 2, 0),
         Format::Q3K => (pick("h_mv_q3_k", "h_mv_id_q3_k"), 8, 2, 0),
         Format::Iq4Nl => (pick("h_mv_iq4_nl", "h_mv_id_iq4_nl"), 8, 2, 0),
+        Format::Nvfp4 => (pick("h_mv_nvfp4", "h_mv_id_nvfp4"), 8, 2, 0),
         // Expert matrices are never MLX (`moe_ffn` refuses them first). One row
         // per SIMD group with 16-byte loads beat Kapitsa's 2 x 8 (its M4 Pro
         // tuning) on every 27B shape on the M5.

@@ -159,6 +159,8 @@ pub struct VisionModel {
     score_bytes: usize,
     /// LFM3-VL tower. Absent on the Qwen path.
     lfm3: Option<lfm3::Tower>,
+    /// Inkling 2 tower (`inkling2v`). Absent on the Qwen path.
+    inkling: Option<inkling::Tower>,
     /// Placeholder the chat template emits once per image (`<|image_pad|>` or
     /// `<|image|>`). Repeated once per language-model token.
     marker: &'static str,
@@ -532,7 +534,7 @@ impl VisionModel {
             _ => return unsupported("missing clip.projector_type".into()),
         };
         match projector {
-            "qwen3vl_merger" | "lfm3vl" => {}
+            "qwen3vl_merger" | "lfm3vl" | "inkling2v" => {}
             "lfm3a" | "lfm3a_gen" => {
                 return unsupported(format!(
                     "projector type {projector} (audio is not implemented; still images only)"
@@ -540,7 +542,7 @@ impl VisionModel {
             }
             other => {
                 return unsupported(format!(
-                    "projector type {other} (only qwen3vl_merger and lfm3vl are implemented)"
+                    "projector type {other} (only qwen3vl_merger, lfm3vl and inkling2v are implemented)"
                 ));
             }
         }
@@ -580,6 +582,39 @@ impl VisionModel {
         let mut source = GgufSource(file);
         if projector == "lfm3vl" {
             return Self::load_lfm3(d, config, &md, &mut source, max_tokens);
+        }
+        if projector == "inkling2v" {
+            let tower = inkling::load(d, &config, &mut source)?;
+            let z = || Tensor::zeros(d, [1], DType::F32);
+            let m = || Tensor::zeros(d, [1, 1], DType::F16);
+            // llama.cpp caps an image at 4096 tokens; the score matrix may cap lower.
+            let max_tokens = max_tokens
+                .clamp(4, 4096)
+                .min(lfm3::score_language_cap(config.merge, SCORE_BYTES));
+            return Ok(Self {
+                config,
+                max_tokens,
+                min_tokens: 1,
+                layers: Vec::new(),
+                patch: (m()?, z()?),
+                position: Vec::new(),
+                merger: Merger {
+                    norm: (z()?, z()?),
+                    fc1: (m()?, z()?),
+                    fc2: (m()?, z()?),
+                    post_shuffle: false,
+                },
+                deepstack: Vec::new(),
+                zero: z()?,
+                weight_bytes: tower.weight_bytes,
+                score_bytes: SCORE_BYTES,
+                lfm3: None,
+                inkling: Some(tower),
+                // The template writes `<|content_image|><|unused_200054|><|end_message|>`.
+                marker: "<|unused_200054|>",
+                // llama.cpp's default for this projector: antialiased bicubic.
+                filter: image::imageops::FilterType::CatmullRom,
+            });
         }
         Self::build(d, config, &[], &mut source, max_tokens)
     }
@@ -639,6 +674,7 @@ impl VisionModel {
             weight_bytes: tower.weight_bytes,
             score_bytes: SCORE_BYTES,
             lfm3: Some(tower),
+            inkling: None,
             marker: "<|image|>",
             filter,
         })
@@ -751,6 +787,7 @@ impl VisionModel {
             weight_bytes,
             score_bytes: SCORE_BYTES,
             lfm3: None,
+            inkling: None,
             marker: "<|image_pad|>",
             filter: image::imageops::FilterType::CatmullRom,
         })
@@ -763,7 +800,7 @@ impl VisionModel {
 
     /// Language-model positions are one per token (LFM3), not a 2-D grid.
     pub fn linear_positions(&self) -> bool {
-        self.lfm3.is_some()
+        self.lfm3.is_some() || self.inkling.is_some()
     }
 
     pub fn weight_bytes(&self) -> usize {
@@ -808,6 +845,9 @@ impl VisionModel {
     ) -> (usize, usize) {
         let f = self.config.factor();
         let (min, max) = self.limits(budget);
+        if self.inkling.is_some() {
+            return inkling::sizes(width, height, f, max).1;
+        }
         smart_resize(height, width, f, min * f * f, max * f * f)
     }
 
@@ -820,6 +860,9 @@ impl VisionModel {
     pub fn prepare_with(&self, bytes: &[u8], budget: ImageBudget) -> Result<Prepared> {
         let hash = content_hash(bytes);
         let rgb = on_white(&decode(bytes)?);
+        if let Some(tower) = &self.inkling {
+            return Ok(tower.prepare(self, &rgb, hash, self.limits(budget).1));
+        }
         let (width, height) =
             self.target_size_with(rgb.width() as usize, rgb.height() as usize, budget);
         let rgb = if (rgb.width() as usize, rgb.height() as usize) == (width, height) {
@@ -906,6 +949,9 @@ impl VisionModel {
 
     pub fn encode_prepared(&self, d: &MetalDevice, image: &Prepared) -> Result<ImageEmbedding> {
         if let Some(tower) = &self.lfm3 {
+            return tower.encode(self, d, image);
+        }
+        if let Some(tower) = &self.inkling {
             return tower.encode(self, d, image);
         }
         let c = &self.config;
@@ -1627,6 +1673,7 @@ pub fn smart_resize(
 }
 
 pub mod audio;
+mod inkling;
 mod lfm3;
 mod lfm3a;
 pub mod media;

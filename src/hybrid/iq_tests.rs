@@ -1,5 +1,5 @@
 //! Parity of the IQ2_S, IQ3_XXS and IQ3_S projection kernels, of the Q2_0,
-//! Q5_0, IQ4_NL and Q3_K kernels Qwen3.8's GSQ-RCO packs need, and of Q3_K
+//! Q5_0, IQ4_NL and Q3_K kernels Qwen3.8's GSQ-RCO packs need, of NVFP4 (Inkling 2), and of Q3_K
 //! weights loaded as Q6_K, against a CPU dequantizer ported from llama.cpp
 //! (ggml-quants.c). The grids are generated from ggml-common.h and the Metal
 //! shader, so the tables match byte for byte.
@@ -1617,6 +1617,35 @@ fn dequant_iq4_nl(x: &[u8], out: &mut [f32]) {
     }
 }
 
+/// ggml's `dequantize_row_nvfp4`: four 16-value sub-blocks, each with an
+/// unsigned E4M3 scale; byte j of a sub-block holds values j (low nibble)
+/// and j + 8. Codes are E2M1 doubled, so the scale is halved.
+fn dequant_nvfp4(x: &[u8], out: &mut [f32]) {
+    const VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+    let ue4m3 = |x: u8| {
+        if x == 0 || x == 0x7F {
+            return 0.;
+        }
+        let (e, m) = (i32::from((x >> 3) & 15), f32::from(x & 7));
+        let raw = if e == 0 {
+            m * 2f32.powi(-9)
+        } else {
+            (1. + m / 8.) * 2f32.powi(e - 7)
+        };
+        raw * 0.5
+    };
+    for (b, y) in x.chunks_exact(36).zip(out.chunks_exact_mut(64)) {
+        for s in 0..4 {
+            let d = ue4m3(b[s]);
+            for j in 0..8 {
+                let q = b[4 + s * 8 + j];
+                y[s * 16 + j] = d * f32::from(VALUES[(q & 15) as usize]);
+                y[s * 16 + j + 8] = d * f32::from(VALUES[(q >> 4) as usize]);
+            }
+        }
+    }
+}
+
 /// A block format of the Qwen3.8 GSQ-RCO pack: `elements` values in `block`
 /// bytes, with its F16 scale at byte `scale_at`.
 #[derive(Clone, Copy)]
@@ -1628,7 +1657,7 @@ struct Packed {
     dequant: fn(&[u8], &mut [f32]),
 }
 
-const PACKED: [Packed; 4] = [
+const PACKED: [Packed; 5] = [
     Packed {
         format: Format::Q2_0,
         elements: 64,
@@ -1657,6 +1686,14 @@ const PACKED: [Packed; 4] = [
         scale_at: 108,
         dequant: dequant_q3_k,
     },
+    // Inkling 2's experts; its scales are set apart (`Packed::blocks`).
+    Packed {
+        format: Format::Nvfp4,
+        elements: 64,
+        block: 36,
+        scale_at: 0,
+        dequant: dequant_nvfp4,
+    },
 ];
 
 impl Packed {
@@ -1664,6 +1701,13 @@ impl Packed {
     fn blocks(self, values: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
         let mut bytes = random_blocks(values / self.elements, self.block, seed);
         for b in bytes.chunks_exact_mut(self.block) {
+            if let Format::Nvfp4 = self.format {
+                // UE4M3 scales of 2^-5 to 2^-3, every mantissa.
+                for s in 0..4 {
+                    b[s] = 0x10 + b[4 + s] % 24;
+                }
+                continue;
+            }
             let scale = half::f16::from_f32(0.002 + 0.001 * b[2] as f32 / 255.);
             b[self.scale_at..self.scale_at + 2].copy_from_slice(&scale.to_le_bytes());
         }
@@ -1683,7 +1727,7 @@ fn dot_rows(x: &[f32], dense: &[f32], cols: usize, row: usize) -> f32 {
         .sum::<f64>() as f32
 }
 
-/// Q2_0, Q5_0, IQ4_NL and Q3_K on every dense path (M = 1, 3, 16 and 64:
+/// Q2_0, Q5_0, IQ4_NL, Q3_K and NVFP4 on every dense path (M = 1, 3, 16 and 64:
 /// the GEMV, batched GEMV, narrow-tile and tensor-op kernels) against the
 /// CPU decode, at widths that are not multiples of 256.
 #[test]
@@ -1795,7 +1839,11 @@ fn gsq_formats_project_experts_like_the_cpu_dequant() {
 fn gsq_formats_look_up_rows_like_the_cpu_dequant() {
     let d = MetalDevice::new().unwrap();
     let rows = 37;
-    for kind in PACKED {
+    // NVFP4 only stores experts, which are never looked up.
+    for kind in PACKED
+        .into_iter()
+        .filter(|k| !matches!(k.format, Format::Nvfp4))
+    {
         let cols = kind.cols();
         let (bytes, dense) = kind.blocks(rows * cols, 3 + kind.block as u64);
         let w = Matrix::from_packed(&d, rows, cols, 1, kind.format, &bytes).unwrap();

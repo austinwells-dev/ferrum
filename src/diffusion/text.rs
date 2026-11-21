@@ -66,6 +66,7 @@ fn hybrid_config(cfg: &TextConfig) -> Result<HybridConfig> {
         ssm_grouped_heads: false,
         moe: None,
         qwen4exp: None,
+        inkling: None,
         trained_context: cfg.context,
         kv_cache: KvCache::F16,
     };
@@ -141,6 +142,7 @@ impl TextEncoder {
             hc_head: None,
             stream: None,
             ple_table: None,
+            inkling: None,
         };
         Self::with_weights(d, config, weights, cfg, max_tokens)
     }

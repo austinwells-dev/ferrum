@@ -19,6 +19,8 @@ struct block_q2_0 { half d; uchar qs[16]; };
 struct block_q4_0 { half d; uchar qs[16]; };
 struct block_q5_0 { half d; uchar qh[4]; uchar qs[16]; };
 struct block_iq4_nl { half d; uchar qs[16]; };
+// NVFP4: four UE4M3 scales (one per 16 values), then 32 bytes of E2M1 codes.
+struct block_nvfp4 { uchar d[4]; uchar qs[32]; };
 struct block_q3_K { uchar hmask[32]; uchar qs[64]; uchar scales[12]; half d; };
 struct block_q8_0 { half d; char qs[32]; };
 struct block_q4_K { half d; half dmin; uchar scales[12]; uchar qs[128]; };
@@ -471,6 +473,34 @@ void dequantize_iq4_nl(device const block_iq4_nl * xb, short il, thread type4x4 
     float4x4 reg_f;
     for (int i = 0; i < 16; i++) {
         reg_f[i/4][i%4] = d * kvalues_iq4nl_f[il ? (xb->qs[i] >> 4) : (xb->qs[i] & 15)];
+    }
+    reg = (type4x4) reg_f;
+}
+
+// E2M1 code values, doubled (llama.cpp's kvalues_mxfp4); ue4m3_to_float halves
+// the scale to match.
+constexpr constant static float kvalues_fp4_f[16] = {
+    0.f, 1.f, 2.f, 3.f, 4.f, 6.f, 8.f, 12.f, 0.f, -1.f, -2.f, -3.f, -4.f, -6.f, -8.f, -12.f
+};
+
+// Unsigned E4M3 scale (ggml_ue4m3_to_fp32): 0 and 0x7F (NaN) decode to 0.
+inline float ue4m3_to_float(uchar x) {
+    if (x == 0 || x == 0x7F) return 0.f;
+    const int e = (x >> 3) & 15, m = x & 7;
+    const float raw = e == 0 ? float(m) * 0x1p-9f : ldexp(1.f + float(m) / 8.f, e - 7);
+    return raw * 0.5f;
+}
+
+// NVFP4: chunk il is sub-block il; its byte j holds values j (low nibble) and
+// j + 8 (high), code values times the sub-block's scale.
+template <typename type4x4>
+void dequantize_nvfp4(device const block_nvfp4 * xb, short il, thread type4x4 & reg) {
+    const float d = ue4m3_to_float(xb->d[il]);
+    device const uchar * q = xb->qs + il * 8;
+    float4x4 reg_f;
+    for (int j = 0; j < 8; j++) {
+        reg_f[j / 4][j % 4] = d * kvalues_fp4_f[q[j] & 15];
+        reg_f[2 + j / 4][j % 4] = d * kvalues_fp4_f[q[j] >> 4];
     }
     reg = (type4x4) reg_f;
 }
@@ -1392,6 +1422,7 @@ MVB_FORMAT(q2_0, block_q2_0, 4, dequantize_q2_0)
 MVB_FORMAT(q5_0, block_q5_0, 2, dequantize_q5_0)
 MVB_FORMAT(iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
 MVB_FORMAT(q3_k, block_q3_K, 16, dequantize_q3_K)
+MVB_FORMAT(nvfp4, block_nvfp4, 4, dequantize_nvfp4)
 
 // Generic M=1 GEMV for formats without a hand-tuned kernel: the small-batch
 // loop with one activation row. NR0 rows per SIMD group; grid (ceil(n /
@@ -1407,6 +1438,7 @@ MV_DEQ(q2_0, block_q2_0, 4, dequantize_q2_0)
 MV_DEQ(q5_0, block_q5_0, 2, dequantize_q5_0)
 MV_DEQ(iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
 MV_DEQ(q3_k, block_q3_K, 16, dequantize_q3_K)
+MV_DEQ(nvfp4, block_nvfp4, 4, dequantize_nvfp4)
 
 // TensorOps GEMM after llama.cpp's kernel_mul_mm (tensor path): a 64-row
 // weight tile is dequantized to F16 in threadgroup memory; 128 activation
@@ -1493,6 +1525,7 @@ MMS_FORMAT(q2_0, block_q2_0, 4, dequantize_q2_0)
 MMS_FORMAT(q5_0, block_q5_0, 2, dequantize_q5_0)
 MMS_FORMAT(iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
 MMS_FORMAT(q3_k, block_q3_K, 16, dequantize_q3_K)
+MMS_FORMAT(nvfp4, block_nvfp4, 4, dequantize_nvfp4)
 MM_KERNEL(h_mm_q4_k, block_q4_K, 16, dequantize_q4_K)
 MM_KERNEL(h_mm_q5_k, block_q5_K, 16, dequantize_q5_K)
 MM_KERNEL(h_mm_q6_k, block_q6_K, 16, dequantize_q6_K)
@@ -1508,6 +1541,7 @@ MM_KERNEL(h_mm_q2_0, block_q2_0, 4, dequantize_q2_0)
 MM_KERNEL(h_mm_q5_0, block_q5_0, 2, dequantize_q5_0)
 MM_KERNEL(h_mm_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
 MM_KERNEL(h_mm_q3_k, block_q3_K, 16, dequantize_q3_K)
+MM_KERNEL(h_mm_nvfp4, block_nvfp4, 4, dequantize_nvfp4)
 
 // ---------------------------------------------------------------- embedding
 
@@ -2426,6 +2460,7 @@ MV_ID_KERNEL(h_mv_id_q2_0, mv_q2_0, 4, 2)
 MV_ID_KERNEL(h_mv_id_q5_0, mv_q5_0, 4, 2)
 MV_ID_KERNEL(h_mv_id_iq4_nl, mv_iq4_nl, 4, 2)
 MV_ID_KERNEL(h_mv_id_q3_k, mv_q3_k, 4, 2)
+MV_ID_KERNEL(h_mv_id_nvfp4, mv_nvfp4, 4, 2)
 
 // Expert GEMM over expert-sorted rows: z = expert; rows offsets[z]..offsets[z+1]
 // of x (gathered) and y. grid (ceil(max_rows/128), ceil(expert_rows/64), experts).
@@ -2508,6 +2543,7 @@ MM_ID_KERNEL(h_mm_id_q2_0, block_q2_0, 4, dequantize_q2_0)
 MM_ID_KERNEL(h_mm_id_q5_0, block_q5_0, 2, dequantize_q5_0)
 MM_ID_KERNEL(h_mm_id_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
 MM_ID_KERNEL(h_mm_id_q3_k, block_q3_K, 16, dequantize_q3_K)
+MM_ID_KERNEL(h_mm_id_nvfp4, block_nvfp4, 4, dequantize_nvfp4)
 MM_ID_SLOT_KERNEL(h_mm_id_slot_q4_k, block_q4_K, 16, dequantize_q4_K)
 MM_ID_SLOT_KERNEL(h_mm_id_slot_q5_k, block_q5_K, 16, dequantize_q5_K)
 MM_ID_SLOT_KERNEL(h_mm_id_slot_q6_k, block_q6_K, 16, dequantize_q6_K)
@@ -2521,6 +2557,7 @@ MM_ID_SLOT_KERNEL(h_mm_id_slot_q2_0, block_q2_0, 4, dequantize_q2_0)
 MM_ID_SLOT_KERNEL(h_mm_id_slot_q5_0, block_q5_0, 2, dequantize_q5_0)
 MM_ID_SLOT_KERNEL(h_mm_id_slot_iq4_nl, block_iq4_nl, 2, dequantize_iq4_nl)
 MM_ID_SLOT_KERNEL(h_mm_id_slot_q3_k, block_q3_K, 16, dequantize_q3_K)
+MM_ID_SLOT_KERNEL(h_mm_id_slot_nvfp4, block_nvfp4, 4, dequantize_nvfp4)
 
 // ---------------------------------------------------------------- flash attention
 
@@ -2541,6 +2578,24 @@ struct FaArgs {
     uint sinks;          // sink logits (sinks buffer) join the softmax denominator
     uint ring;           // see kv_row; ring layers align first_key to 64
 };
+
+// The `_rel` kernels (Inkling 2) add a learned relative-position bias to every
+// score and read one sink logit per query row (sinks[t * heads + h]) instead of
+// one per head. Each row has a 16-wide position vector in `rel` (rel[(t * heads
+// + h) * 16]); the bias of a key `dist` positions back is its dot product with
+// table[dist * 16], and 0 from `extent` on.
+struct FaRelArgs {
+    FaArgs fa;
+    uint extent;
+};
+
+inline float rel_bias(device const float * r, device const float * table, uint extent, uint qpos, uint key) {
+    const uint dist = qpos - key;
+    if (dist >= extent) return 0.f;
+    device const float4 * e = (device const float4 *)(table + (ulong)dist * 16);
+    device const float4 * rv = (device const float4 *)r;
+    return dot(rv[0], e[0]) + dot(rv[1], e[1]) + dot(rv[2], e[2]) + dot(rv[3], e[3]);
+}
 
 // Causal attention over the F16 cache for query rows r = t*group + g of one
 // KV head. Each SIMD group owns 8 rows; keys stream in blocks of 32 with an
@@ -2718,15 +2773,16 @@ kernel void h_flash_attn_1(constant FaArgs & p [[buffer(7)]],
 
 // Merge split partials: one threadgroup of head_dim threads per (token, head).
 // The sink logit, when present, joins the denominator here (splits never add it).
-template <int D>
+template <int D, bool ROWSINK = false>
 void flash_reduce_impl(constant FaArgs & p, device const float * po, device const float * pml,
                        device const float * qg, device const float * sinks, device float * out,
                        uint row, ushort d) {
     const ulong rows = (ulong)p.tokens * p.heads;
     const uint t = row / p.heads, h = row % p.heads;
-    float mx = p.sinks != 0 ? sinks[h] : -INFINITY;
+    const float sink = p.sinks != 0 ? sinks[ROWSINK ? row : h] : -INFINITY;
+    float mx = sink;
     for (uint s = 0; s < p.splits; s++) mx = max(mx, pml[(s * rows + row) * 2]);
-    float l = p.sinks != 0 ? exp(sinks[h] - mx) : 0.f;
+    float l = p.sinks != 0 ? exp(sink - mx) : 0.f;
     float acc = 0.f;
     for (uint s = 0; s < p.splits; s++) {
         const float ms = pml[(s * rows + row) * 2];
@@ -2749,6 +2805,12 @@ kernel void name(constant FaArgs & p [[buffer(5)]], device const float * po [[bu
 }
 FLASH_REDUCE(h_flash_reduce, 256)
 FLASH_REDUCE(h_flash_reduce_d128, 128)
+kernel void h_flash_reduce_rel_d128(constant FaRelArgs & p [[buffer(5)]], device const float * po [[buffer(0)]],
+                                    device const float * pml [[buffer(1)]], device const float * qg [[buffer(2)]],
+                                    device const float * sinks [[buffer(3)]], device float * out [[buffer(4)]],
+                                    uint row [[threadgroup_position_in_grid]], ushort d [[thread_index_in_threadgroup]]) {
+    flash_reduce_impl<128, true>(p.fa, po, pml, qg, sinks, out, row, d);
+}
 
 // Bandwidth probe: each threadgroup streams a contiguous span with 16-byte loads.
 kernel void h_bw_read(constant EltArgs & a [[buffer(2)]], device const uint4 * x [[buffer(0)]],
@@ -2907,11 +2969,12 @@ inline void stage_kv_half(threadgroup half * Hs, device const half * cache, devi
 // aliases the score tile, which is only live between the K and V phases. Keys
 // start at the first one the tile's lowest-positioned row sees (sliding windows).
 // grid (ceil(tokens/64), heads); threads 128; 64*64*4 + 64*64*2 + 3*64*4 bytes.
-template <bool Q8, int D, bool TREE>
+template <bool Q8, int D, bool TREE, bool REL = false>
 void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device half * kc,
                                 device half * vc, device const float * qg, device const float * sinks,
                                 device const uint * tree, device float * out, threadgroup char * shared, threadgroup uint & rescale,
-                                uint2 tgpig, ushort tid) {
+                                uint2 tgpig, ushort tid, device const float * rel = nullptr,
+                                device const float * table = nullptr, uint extent = 0) {
     constexpr int W = D < 128 ? D : 128, NH = D / W, BR = 64, BC = 64;
     threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
     threadgroup half  * Hs = (threadgroup half *)shared;                  // [BC][W], aliases Ss
@@ -2952,7 +3015,8 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
     for (uint i = 0; i < cO0.get_capacity(); i++) { cO0[i] = 0.f; cO1[i] = 0.f; }
     // The sink seeds each row's running max with unit mass.
     if (tid < BR) {
-        mrow[tid] = p.sinks != 0 ? sinks[h] : -INFINITY;
+        const uint st = min(uint(t0) + tid, p.tokens - 1);
+        mrow[tid] = p.sinks != 0 ? sinks[REL ? st * p.heads + h : h] : -INFINITY;
         lrow[tid] = p.sinks != 0 ? 1.f : 0.f;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2960,7 +3024,9 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
     const int my_row = tid / 2;
     const int c0 = (tid % 2) * 32;
     // Threads past the last row only feed masked scores; give them a valid row.
-    const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, min(uint(t0 + my_row), p.tokens - 1));
+    const uint my_t = min(uint(t0 + my_row), p.tokens - 1);
+    const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, my_t);
+    device const float * my_rel = REL ? rel + ((ulong)my_t * p.heads + h) * 16 : nullptr;
     for (uint j0 = lo / BC * BC; j0 < total_keys && j0 <= last_key; j0 += BC) {
         for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
         stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, total_keys, p.cache_stride, head_off, 0, tid, p.ring);
@@ -2981,6 +3047,7 @@ void flash_attn_mpp_staged_impl(constant FaArgs & p, device half * q, device hal
             const uint key = j0 + uint(c0 + c);
             const bool ok = my_row < rows && key < total_keys && key_visible<TREE>(mask, key);
             s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
+            if (REL && ok) s[c] += rel_bias(my_rel, table, extent, p.position + my_t, key);
             mx = max(mx, s[c]);
         }
         mx = max(mx, simd_shuffle_xor(mx, 1));
@@ -3077,6 +3144,23 @@ FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_staged_tree, false, 256)
 FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_q8_tree, true, 256)
 FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_staged_d128_tree, false, 128)
 FLASH_MPP_STAGED_TREE(h_flash_attn_mpp_q8_d128_tree, true, 128)
+// Relative-position bias and per-row sinks (see FaRelArgs) after the sinks.
+#define FLASH_MPP_STAGED_REL(name, q8, D)                                                       \
+kernel void name(constant FaRelArgs & p [[buffer(8)]],                                          \
+                 device half * q [[buffer(0)]], device half * kc [[buffer(1)]],                 \
+                 device half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],         \
+                 device const float * sinks [[buffer(4)]], device const float * rel [[buffer(5)]], \
+                 device const float * table [[buffer(6)]], device float * out [[buffer(7)]],    \
+                 threadgroup char * shared [[threadgroup(0)]],                                  \
+                 uint2 tgpig [[threadgroup_position_in_grid]],                                  \
+                 ushort tid [[thread_index_in_threadgroup]]) {                                  \
+    threadgroup uint rescale;                                                                   \
+    flash_attn_mpp_staged_impl<q8, D, false, true>(p.fa, q, kc, vc, qg, sinks, nullptr, out,    \
+                                                   shared, rescale, tgpig, tid, rel, table,     \
+                                                   p.extent);                                   \
+}
+FLASH_MPP_STAGED_REL(h_flash_attn_mpp_staged_d128_rel, false, 128)
+FLASH_MPP_STAGED_REL(h_flash_attn_mpp_q8_d128_rel, true, 128)
 
 // Copy F16 queries [tokens][heads][head_dim] to KV-head-major rows
 // [kv_heads][tokens * group][head_dim] (row t*group + g), so each KV head's query
@@ -3093,11 +3177,13 @@ kernel void h_q_by_kv_head(constant FaArgs & p [[buffer(2)]], device const half 
 // Online-softmax step shared by the TensorOps verify kernels: thread tid owns
 // row tid / TPR and CPT columns of the [BR][BC] score tile; scores of keys
 // outside [.., key_end) or that the row does not see (`mask`) are masked. Writes P (F16) and updates the running max / sum / correction rows.
-template <int BR, int BC, bool TREE>
+template <int BR, int BC, bool TREE, bool REL = false>
 inline void verify_softmax(threadgroup const float * Ss, threadgroup half * Ps,
                            threadgroup float * corr, threadgroup float * mrow,
                            threadgroup float * lrow, threadgroup uint & rescale,
-                           int rows, uint j0, uint key_end, thread const KeyMask & mask, ushort tid) {
+                           int rows, uint j0, uint key_end, thread const KeyMask & mask, ushort tid,
+                           device const float * my_rel = nullptr, device const float * table = nullptr,
+                           uint extent = 0) {
     constexpr int TPR = 128 / BR, CPT = BC / TPR;
     const int my_row = tid / TPR;
     const int c0 = (tid % TPR) * CPT;
@@ -3107,6 +3193,7 @@ inline void verify_softmax(threadgroup const float * Ss, threadgroup half * Ps,
         const uint key = j0 + uint(c0 + c);
         const bool ok = my_row < rows && key < key_end && key_visible<TREE>(mask, key);
         s[c] = ok ? Ss[my_row * BC + c0 + c] : -INFINITY;
+        if (REL && ok) s[c] += rel_bias(my_rel, table, extent, mask.qpos, key);
         mx = max(mx, s[c]);
     }
     for (ushort o = 1; o < TPR; o *= 2) mx = max(mx, simd_shuffle_xor(mx, o));
@@ -3158,10 +3245,11 @@ inline void verify_store_ml(constant FaArgs & p, device float * pml, uint kvh, u
 // Initial (max, mass) of verify row r of the tile at r0: the sink seeds it when
 // the split is the only one, so the normalizer carries the sink exactly once.
 inline void verify_seed(constant FaArgs & p, device const float * sinks, uint kvh,
-                        uint rr, bool valid, threadgroup float * mrow, threadgroup float * lrow, ushort tid) {
+                        uint rr, bool valid, threadgroup float * mrow, threadgroup float * lrow, ushort tid,
+                        bool row_sinks = false) {
     const uint h = kvh * p.group + rr % p.group;
     const bool seed = p.sinks != 0 && p.splits == 1 && valid;
-    mrow[tid] = seed ? sinks[h] : -INFINITY;
+    mrow[tid] = seed ? sinks[row_sinks ? (rr / p.group) * p.heads + h : h] : -INFINITY;
     lrow[tid] = seed ? 1.f : 0.f;
 }
 
@@ -3171,11 +3259,13 @@ inline void verify_seed(constant FaArgs & p, device const float * sinks, uint kv
 // one key split; S = Q Kᵀ and O += P V run as matmul2d on 64-key blocks read
 // straight from the F16 cache, with the online softmax in threadgroup memory.
 // grid (row_blocks, kv_heads, splits); threads 128; BR*64*4 + BR*64*2 + 3*BR*4 bytes.
-template <int BR, int D, bool TREE>
+template <int BR, int D, bool TREE, bool REL = false>
 void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * kc,
                           device half * vc, device const float * qg, device const float * sinks,
                           device const uint * tree, device float * out, device float * po, device float * pml,
-                          threadgroup char * shared, threadgroup uint & rescale, uint3 tgpig, ushort tid) {
+                          threadgroup char * shared, threadgroup uint & rescale, uint3 tgpig, ushort tid,
+                          device const float * rel = nullptr, device const float * table = nullptr,
+                          uint extent = 0) {
     constexpr int BC = 64;
     threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
     threadgroup half  * Ps = (threadgroup half *)(Ss + BR * BC);          // [BR][BC]
@@ -3218,18 +3308,21 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
     auto cS = mm_s.template get_destination_cooperative_tensor<decltype(tQ), decltype(tK), float>();
     auto cO = mm_o.template get_destination_cooperative_tensor<decltype(tP), decltype(tV), float>();
     for (uint i = 0; i < cO.get_capacity(); i++) cO[i] = 0.f;
-    if (tid < BR) verify_seed(p, sinks, kvh, uint(r0) + tid, int(tid) < rows, mrow, lrow, tid);
+    if (tid < BR) verify_seed(p, sinks, kvh, uint(r0) + tid, int(tid) < rows, mrow, lrow, tid, REL);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Threads past the last row only feed masked scores; give them a valid row.
-    const uint my_t = min(uint(r0 + int(tid / (128 / BR))) / p.group, p.tokens - 1);
+    const uint my_rr = min(uint(r0 + int(tid / (128 / BR))), rows_total - 1);
+    const uint my_t = my_rr / p.group;
     const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, my_t);
+    device const float * my_rel = REL ? rel + ((ulong)my_t * p.heads + kvh * p.group + my_rr % p.group) * 16 : nullptr;
     for (uint j0 = j_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
         auto mK = tK.slice(0, int(kv_row(j0, p.ring)));
         mm_s.run(tQ, mK, cS);
         cS.store(tS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        verify_softmax<BR, BC, TREE>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, mask, tid);
+        verify_softmax<BR, BC, TREE, REL>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, mask, tid,
+                                          my_rel, table, extent);
         if (rescale) {
             for (uint i = 0; i < cO.get_capacity(); i++) {
                 if (cO.is_valid_element(i)) {
@@ -3258,12 +3351,14 @@ void attn_verify_mpp_impl(constant FaArgs & p, device half * qk, device half * k
 // into threadgroup memory 128 dims at a time (as h_flash_attn_mpp_staged);
 // the staging buffer aliases S.
 // shared bytes max(64*128*2, BR*64*4) + BR*64*2 + 3*BR*4.
-template <int BR, bool Q8, int D, bool TREE>
+template <int BR, bool Q8, int D, bool TREE, bool REL = false>
 void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device half * kc,
                              device half * vc, device const float * qg, device const float * sinks,
                              device const uint * tree, device float * out, device float * po, device float * pml,
                              threadgroup char * shared,
-                             threadgroup uint & rescale, uint3 tgpig, ushort tid) {
+                             threadgroup uint & rescale, uint3 tgpig, ushort tid,
+                             device const float * rel = nullptr, device const float * table = nullptr,
+                             uint extent = 0) {
     constexpr int W = D < 128 ? D : 128, NH = D / W, BC = 64;
     constexpr int SBYTES = (BC * W * 2 > BR * BC * 4) ? BC * W * 2 : BR * BC * 4;
     threadgroup float * Ss = (threadgroup float *)shared;                 // [BR][BC]
@@ -3309,12 +3404,14 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
     auto cO0 = mm_o.template get_destination_cooperative_tensor<decltype(tP), decltype(tH), float>();
     auto cO1 = mm_o.template get_destination_cooperative_tensor<decltype(tP), decltype(tH), float>();
     for (uint i = 0; i < cO0.get_capacity(); i++) { cO0[i] = 0.f; cO1[i] = 0.f; }
-    if (tid < BR) verify_seed(p, sinks, kvh, uint(r0) + tid, int(tid) < rows, mrow, lrow, tid);
+    if (tid < BR) verify_seed(p, sinks, kvh, uint(r0) + tid, int(tid) < rows, mrow, lrow, tid, REL);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Threads past the last row only feed masked scores; give them a valid row.
-    const uint my_t = min(uint(r0 + int(tid / (128 / BR))) / p.group, p.tokens - 1);
+    const uint my_rr = min(uint(r0 + int(tid / (128 / BR))), rows_total - 1);
+    const uint my_t = my_rr / p.group;
     const KeyMask mask = key_mask<TREE>(tree, p.position, p.window, my_t);
+    device const float * my_rel = REL ? rel + ((ulong)my_t * p.heads + kvh * p.group + my_rr % p.group) * 16 : nullptr;
     for (uint j0 = j_begin; j0 < key_end && j0 <= last_key; j0 += BC) {
         for (uint i = 0; i < cS.get_capacity(); i++) cS[i] = 0.f;
         stage_kv_half<Q8, BC, 128>(Hs, kc, ks, j0, key_end, p.cache_stride, head_off, 0, tid, p.ring);
@@ -3329,7 +3426,8 @@ void attn_verify_mpp_staged_impl(constant FaArgs & p, device half * qk, device h
         }
         cS.store(tS);
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        verify_softmax<BR, BC, TREE>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, mask, tid);
+        verify_softmax<BR, BC, TREE, REL>(Ss, Ps, corr, mrow, lrow, rescale, rows, j0, key_end, mask, tid,
+                                          my_rel, table, extent);
         if (rescale) {
             for (uint i = 0; i < cO0.get_capacity(); i++) {
                 if (cO0.is_valid_element(i)) {
@@ -3398,6 +3496,23 @@ ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_tree, (attn_verify_mpp_impl<32, 256, t
 ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_q8_tree, (attn_verify_mpp_staged_impl<32, true, 256, true>))
 ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_d128_tree, (attn_verify_mpp_impl<32, 128, true>))
 ATTN_VERIFY_MPP_TREE(h_attn_verify_mpp_32_q8_d128_tree, (attn_verify_mpp_staged_impl<32, true, 128, true>))
+// Relative-position bias and per-row sinks (see FaRelArgs) after the sinks.
+#define ATTN_VERIFY_MPP_REL(name, call)                                                          \
+kernel void name(constant FaRelArgs & p [[buffer(10)]],                                         \
+                 device half * qk [[buffer(0)]], device half * kc [[buffer(1)]],                \
+                 device half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],         \
+                 device const float * sinks [[buffer(4)]], device const float * rel [[buffer(5)]], \
+                 device const float * table [[buffer(6)]], device float * out [[buffer(7)]],    \
+                 device float * po [[buffer(8)]], device float * pml [[buffer(9)]],             \
+                 threadgroup char * shared [[threadgroup(0)]],                                  \
+                 uint3 tgpig [[threadgroup_position_in_grid]],                                  \
+                 ushort tid [[thread_index_in_threadgroup]]) {                                  \
+    threadgroup uint rescale;                                                                   \
+    call(p.fa, qk, kc, vc, qg, sinks, nullptr, out, po, pml, shared, rescale, tgpig, tid, rel,  \
+         table, p.extent);                                                                      \
+}
+ATTN_VERIFY_MPP_REL(h_attn_verify_mpp_32_d128_rel, (attn_verify_mpp_impl<32, 128, false, true>))
+ATTN_VERIFY_MPP_REL(h_attn_verify_mpp_32_q8_d128_rel, (attn_verify_mpp_staged_impl<32, true, 128, false, true>))
 
 // Gathers `N` consecutive cached values (N = 8 or 4) from element e, unscaled.
 template <bool Q8, int N>
@@ -3419,11 +3534,12 @@ inline void kv_load_n(device const half * cache, ulong e, thread float4 & a, thr
 // blocks of this split's range and merge before writing a partial (or, with one
 // split, the output). With one split the sink logit seeds SIMD group 0.
 // grid (kv_heads, splits); threads 128; 8*D*2 + 4*8*2*4 + 2*8*D*4 bytes.
-template <bool Q8, int D>
+template <bool Q8, int D, bool REL = false>
 void attn_decode_impl(constant FaArgs & p, device const half * q, device const half * kc,
                       device const half * vc, device const float * qg, device const float * sinks,
                       device float * out, device float * po, device float * pml, threadgroup char * shared,
-                      uint2 tgpig, ushort sg, ushort lane) {
+                      uint2 tgpig, ushort sg, ushort lane, device const float * rel = nullptr,
+                      device const float * table = nullptr, uint extent = 0) {
     constexpr int G = 8, NSG = 4, VPL = D / 32;
     device const half * ks = kv_scales(kc, p.kv_rows, p.cache_stride);
     device const half * vs = kv_scales(vc, p.kv_rows, p.cache_stride);
@@ -3486,6 +3602,11 @@ void attn_decode_impl(constant FaArgs & p, device const half * q, device const h
                 }
                 const float sc = kv_scale<Q8>(ks, kr + b * 32);
                 for (int g = 0; g < G; g++) s[g] += sb[g] * sc;
+            }
+        }
+        if (REL && ok) {
+            for (uint g = 0; g < group; g++) {
+                s[g] += rel_bias(rel + (ulong)(kvh * group + g) * 16, table, extent, p.position, key);
             }
         }
         float pr[G];
@@ -3577,6 +3698,24 @@ ATTN_DECODE(h_attn_decode, false, 256)
 ATTN_DECODE(h_attn_decode_q8, true, 256)
 ATTN_DECODE(h_attn_decode_d128, false, 128)
 ATTN_DECODE(h_attn_decode_q8_d128, true, 128)
+// Relative-position bias (see FaRelArgs) after the sinks; one row, so the
+// per-row sinks are the per-head ones.
+#define ATTN_DECODE_REL(name, q8, D)                                                            \
+kernel void name(constant FaRelArgs & p [[buffer(10)]],                                        \
+                 device const half * q [[buffer(0)]], device const half * kc [[buffer(1)]],    \
+                 device const half * vc [[buffer(2)]], device const float * qg [[buffer(3)]],  \
+                 device const float * sinks [[buffer(4)]], device const float * rel [[buffer(5)]], \
+                 device const float * table [[buffer(6)]], device float * out [[buffer(7)]],   \
+                 device float * po [[buffer(8)]], device float * pml [[buffer(9)]],            \
+                 threadgroup char * shared [[threadgroup(0)]],                                 \
+                 uint2 tgpig [[threadgroup_position_in_grid]],                                 \
+                 ushort sg [[simdgroup_index_in_threadgroup]],                                 \
+                 ushort lane [[thread_index_in_simdgroup]]) {                                  \
+    attn_decode_impl<q8, D, true>(p.fa, q, kc, vc, qg, sinks, out, po, pml, shared, tgpig, sg, \
+                                  lane, rel, table, p.extent);                                 \
+}
+ATTN_DECODE_REL(h_attn_decode_d128_rel, false, 128)
+ATTN_DECODE_REL(h_attn_decode_q8_d128_rel, true, 128)
 
 // ---------------------------------------------------------------- sampling support
 

@@ -311,6 +311,7 @@ pub fn config(dir: &Path) -> Result<HybridConfig> {
         ssm_grouped_heads: true,
         moe: None,
         qwen4exp: None,
+        inkling: None,
         trained_context: u("max_position_embeddings")?,
         kv_cache: KvCache::F16,
     };
@@ -451,6 +452,7 @@ pub(crate) fn load_weights(d: &MetalDevice, dir: &Path, c: &HybridConfig) -> Res
         hc_head: None,
         stream: None,
         ple_table: None,
+        inkling: None,
     })
 }
 

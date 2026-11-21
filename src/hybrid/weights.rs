@@ -36,6 +36,9 @@ pub enum Format {
     Iq2S,
     Iq4Nl,
     Iq4Xs,
+    /// 64 values per block: four UE4M3 scales (one per 16 values), then
+    /// 4-bit E2M1 codes (Inkling 2's experts).
+    Nvfp4,
     /// MLX affine 4-bit, group 64: each row holds its `cols / 8` code words,
     /// then its `cols / 64` bf16 scales, then as many bf16 biases
     /// (`Matrix::from_mlx`).
@@ -58,6 +61,7 @@ impl Format {
             21 => Self::Iq3S,
             22 => Self::Iq2S,
             23 => Self::Iq4Xs,
+            40 => Self::Nvfp4,
             42 => Self::Q2_0,
             _ => return None,
         })
@@ -81,6 +85,7 @@ impl Format {
             Self::Iq2S => 22,
             Self::Iq4Nl => 20,
             Self::Iq4Xs => 23,
+            Self::Nvfp4 => 40,
             Self::Mlx4 => return None,
         })
     }
@@ -101,6 +106,7 @@ impl Format {
             Self::Iq2S => "iq2_s",
             Self::Iq4Nl => "iq4_nl",
             Self::Iq4Xs => "iq4_xs",
+            Self::Nvfp4 => "nvfp4",
             Self::Mlx4 => "mlx4",
         }
     }
@@ -311,6 +317,134 @@ pub struct Weights {
     pub stream: Option<Rc<StreamedExperts>>,
     /// qwen4exp: the n-gram embedding table, read on the host.
     pub ple_table: Option<PleTable>,
+    /// Inkling 2: its stored layers (`layers` is empty).
+    pub inkling: Option<InklingWeights>,
+}
+
+/// One Inkling 2 loop controller: `z = down · [rms(x); rms(m)]`, then
+/// `x - tanh(forget z) x + tanh(gain z) m`. `gain` and `forget` are F32
+/// `[hidden][rank]`.
+pub struct InklingController {
+    pub down: Matrix,
+    pub gain: Tensor,
+    pub forget: Tensor,
+}
+
+/// Inputs of one Inkling 2 attention block: one RMSNorm shared by Q, K and V
+/// on sliding-window layers; on full-attention layers one each, and the
+/// input-dependent K and V convolution taps (`[kv_heads * 4, hidden]`).
+// One per stored layer (24), so the size gap between variants costs nothing.
+#[allow(clippy::large_enum_variant)]
+pub enum InklingNorms {
+    Sliding(Tensor),
+    Global {
+        q: Tensor,
+        k: Tensor,
+        v: Tensor,
+        k_taps: Matrix,
+        v_taps: Matrix,
+    },
+}
+
+pub struct InklingLayer {
+    /// `attn_q` and `attn_gate` interleaved per head ([q | gate] of each
+    /// head, the layout of Qwen's gated query), so the attention kernels
+    /// apply the output gate.
+    pub qg: Matrix,
+    pub k: Matrix,
+    pub v: Matrix,
+    pub o: Matrix,
+    /// Relative-position vectors (`[heads * 16, hidden]`) and the per-row
+    /// sink logits (`[heads, hidden]`).
+    pub rel: Matrix,
+    pub sink: Matrix,
+    /// Per-channel scales of the Q and relative-vector clips, and the
+    /// `[extent][16]` bias table (extent: the window on sliding layers).
+    pub q_clip: Tensor,
+    pub rel_clip: Tensor,
+    pub rel_bias: Tensor,
+    /// Depthwise kernel-4 convolutions, `[channels][4]`.
+    pub k_conv: Tensor,
+    pub v_conv: Tensor,
+    pub attn_conv: Tensor,
+    pub ffn_conv: Tensor,
+    pub norms: InklingNorms,
+    /// Depth-attention queries of the attention input (1 sliding, 3
+    /// full-attention; none on layer 0) and of the expert input.
+    pub attn_query: Option<Tensor>,
+    pub ffn_query: Tensor,
+    pub ffn_norm: Tensor,
+    pub router: Matrix,
+    /// Selection-only bias added to the router's sigmoids.
+    pub router_bias: Tensor,
+    /// `[experts][2 * expert_ffn][hidden]`: each expert's gate rows, then its up rows.
+    pub gate_up: Matrix,
+    pub down: Matrix,
+    /// Per-expert output scales of the NVFP4 experts (absent otherwise).
+    pub gate_up_scale: Option<Tensor>,
+    pub down_scale: Option<Tensor>,
+    /// Looped core layers: the controllers of Q, K, V and the expert input,
+    /// and their four message queries (`[4][hidden]`, same order).
+    pub loop_ctrl: Option<(Box<[InklingController; 4]>, Tensor)>,
+}
+
+pub struct InklingWeights {
+    pub layers: Vec<InklingLayer>,
+    /// RMSNorm of token embeddings (image rows skip it).
+    pub embedding_norm: Tensor,
+    pub output_query: Tensor,
+}
+
+impl InklingWeights {
+    fn byte_size(&self) -> usize {
+        let t = |x: &Tensor| x.byte_size();
+        let m = |x: &Matrix| x.byte_size();
+        let mut total = t(&self.embedding_norm) + t(&self.output_query);
+        for l in &self.layers {
+            total += [
+                &l.qg, &l.k, &l.v, &l.o, &l.rel, &l.sink, &l.router, &l.gate_up, &l.down,
+            ]
+            .into_iter()
+            .map(m)
+            .sum::<usize>();
+            total += [
+                &l.q_clip,
+                &l.rel_clip,
+                &l.rel_bias,
+                &l.k_conv,
+                &l.v_conv,
+                &l.attn_conv,
+                &l.ffn_conv,
+                &l.ffn_query,
+                &l.ffn_norm,
+                &l.router_bias,
+            ]
+            .into_iter()
+            .chain(&l.attn_query)
+            .chain(&l.gate_up_scale)
+            .chain(&l.down_scale)
+            .map(t)
+            .sum::<usize>();
+            total += match &l.norms {
+                InklingNorms::Sliding(n) => t(n),
+                InklingNorms::Global {
+                    q,
+                    k,
+                    v,
+                    k_taps,
+                    v_taps,
+                } => t(q) + t(k) + t(v) + m(k_taps) + m(v_taps),
+            };
+            if let Some((ctrl, queries)) = &l.loop_ctrl {
+                total += t(queries);
+                total += ctrl
+                    .iter()
+                    .map(|c| m(&c.down) + t(&c.gain) + t(&c.forget))
+                    .sum::<usize>();
+            }
+        }
+        total
+    }
 }
 
 impl Weights {
@@ -357,6 +491,7 @@ impl Weights {
             total += layer.ple.as_ref().map_or(0, PleWeights::byte_size);
         }
         total += self.hc_head.as_ref().map_or(0, HcWeights::byte_size);
+        total += self.inkling.as_ref().map_or(0, InklingWeights::byte_size);
         // Every layer's expert views share the arena: count it once.
         if let Some(stream) = &self.stream {
             let views: usize = self
@@ -846,6 +981,14 @@ fn load_weights(
     head: bool,
     stream: Option<Rc<StreamedExperts>>,
 ) -> Result<Weights> {
+    if c.variant == Variant::Inkling {
+        if stream.is_some() || !head {
+            return Err(Error::Config(
+                "inkling2 loads only whole, with its experts resident".into(),
+            ));
+        }
+        return load_inkling(device, file, c);
+    }
     let qwen4exp = c.variant == Variant::Qwen4Exp;
     if qwen4exp && (stream.is_none() || !head) {
         return Err(Error::Config(
@@ -1039,6 +1182,221 @@ fn load_weights(
         hc_head,
         stream,
         ple_table: None,
+        inkling: None,
+    })
+}
+
+impl Loader<'_> {
+    /// Two `[heads * head_dim, cols]` matrices of one encoding interleaved per
+    /// head: head h's rows of `a`, then its rows of `b`.
+    fn interleave_heads(
+        &mut self,
+        a: &str,
+        b: &str,
+        heads: usize,
+        head_dim: usize,
+        cols: usize,
+    ) -> Result<Matrix> {
+        let rows = heads * head_dim;
+        let ia = self.file.tensor(a)?.clone();
+        let ib = self.file.tensor(b)?.clone();
+        let bad = |name: &str, message: &str| Error::Weight {
+            name: name.into(),
+            message: message.into(),
+        };
+        if ia.dimensions != [cols, rows] || ib.dimensions != [cols, rows] {
+            return Err(bad(b, "expected two [heads * head_dim, hidden] matrices"));
+        }
+        if ia.type_id != ib.type_id {
+            return Err(bad(b, "encoding differs from the query's"));
+        }
+        let format = Format::from_type(ia.type_id)
+            .ok_or_else(|| bad(a, "GGML type has no hybrid kernel"))?;
+        let row_bytes = ia.byte_len / rows;
+        if row_bytes * rows != ia.byte_len || !cols.is_multiple_of(PROJECTION_K_STEP) {
+            return Err(bad(a, "byte length differs from geometry"));
+        }
+        let mut qa = vec![0; ia.byte_len];
+        let mut qb = vec![0; ib.byte_len];
+        self.file.read_tensor_into(a, &mut qa)?;
+        self.file.read_tensor_into(b, &mut qb)?;
+        let block = head_dim * row_bytes;
+        let storage = PackedStorage::from_reader(self.device, 2 * ia.byte_len, |dst| {
+            for (h, out) in dst.chunks_exact_mut(2 * block).enumerate() {
+                out[..block].copy_from_slice(&qa[h * block..(h + 1) * block]);
+                out[block..].copy_from_slice(&qb[h * block..(h + 1) * block]);
+            }
+            Ok(())
+        })?;
+        Ok(Matrix {
+            rows: 2 * rows,
+            cols,
+            experts: 1,
+            format,
+            row_bytes,
+            storage,
+        })
+    }
+
+    /// An optional F32 vector.
+    fn vector_if(&mut self, name: &str, len: usize) -> Result<Option<Tensor>> {
+        match self.file.tensors().contains_key(name) {
+            true => self.vector(name, len).map(Some),
+            false => Ok(None),
+        }
+    }
+
+    fn inkling_layer(&mut self, c: &HybridConfig, i: usize) -> Result<InklingLayer> {
+        let ink = c.inkling.as_ref().expect("inkling geometry");
+        let moe = c.moe.expect("inkling experts");
+        let n = |s: &str| format!("blk.{i}.{s}");
+        let (h, q, kv, r) = (
+            c.hidden,
+            c.heads * c.head_dim,
+            c.kv_heads * c.head_dim,
+            c.heads * ink.rel_len,
+        );
+        // Every visit of a layer has its first visit's window.
+        let window = c.attn[ink.visit_of(i)].window;
+        let sliding = window.is_some();
+        // Sliding layers bias distances inside their window only.
+        let extent = window.unwrap_or(ink.rel_extent);
+        let norms = match sliding {
+            true => InklingNorms::Sliding(self.vector(&n("attn_norm.weight"), h)?),
+            false => InklingNorms::Global {
+                q: self.vector(&n("attn_q_inp_norm.weight"), h)?,
+                k: self.vector(&n("attn_k_inp_norm.weight"), h)?,
+                v: self.vector(&n("attn_v_inp_norm.weight"), h)?,
+                k_taps: self.matrix_or_bf16(&n("attn_k_conv_proj.weight"), c.kv_heads * 4, h)?,
+                v_taps: self.matrix_or_bf16(&n("attn_v_conv_proj.weight"), c.kv_heads * 4, h)?,
+            },
+        };
+        let queries = if sliding { 1 } else { 3 };
+        let attn_query = match i {
+            0 => None,
+            _ => Some(self.vector(&n("attn_res_query.weight"), queries * h)?),
+        };
+        let core = (ink.core_start..ink.core_end).contains(&i);
+        let loop_ctrl = match core {
+            false => None,
+            true => {
+                let mut ctrl = |part: &str| -> Result<InklingController> {
+                    Ok(InklingController {
+                        down: self.matrix_or_bf16(
+                            &n(&format!("loop_{part}_down.weight")),
+                            ink.gate_rank,
+                            2 * h,
+                        )?,
+                        gain: self
+                            .vector(&n(&format!("loop_{part}_gain.weight")), h * ink.gate_rank)?,
+                        forget: self
+                            .vector(&n(&format!("loop_{part}_forget.weight")), h * ink.gate_rank)?,
+                    })
+                };
+                let ctrl = Box::new([ctrl("attn")?, ctrl("k")?, ctrl("v")?, ctrl("mlp")?]);
+                Some((
+                    ctrl,
+                    Tensor::zeros_resident(self.device, [4 * h], DType::F32)?,
+                ))
+            }
+        };
+        Ok(InklingLayer {
+            qg: self.interleave_heads(
+                &n("attn_q.weight"),
+                &n("attn_gate.weight"),
+                c.heads,
+                c.head_dim,
+                h,
+            )?,
+            k: self.matrix(&n("attn_k.weight"), kv, h)?,
+            v: self.matrix(&n("attn_v.weight"), kv, h)?,
+            o: self.matrix(&n("attn_output.weight"), h, q)?,
+            rel: self.matrix(&n("attn_rel.weight"), r, h)?,
+            sink: self.matrix_or_bf16(&n("attn_sink_proj.weight"), c.heads, h)?,
+            q_clip: self.vector(&n("attn_q_clip.weight"), q)?,
+            rel_clip: self.vector(&n("attn_rel_clip.weight"), r)?,
+            rel_bias: self.vector(&n("attn_rel_bias.weight"), extent * ink.rel_len)?,
+            k_conv: self.vector(&n("attn_k_conv.weight"), kv * 4)?,
+            v_conv: self.vector(&n("attn_v_conv.weight"), kv * 4)?,
+            attn_conv: self.vector(&n("attn_post_conv.weight"), h * 4)?,
+            ffn_conv: self.vector(&n("ffn_post_conv.weight"), h * 4)?,
+            norms,
+            attn_query,
+            ffn_query: self.vector(&n("ffn_res_query.weight"), h)?,
+            ffn_norm: self.vector(&n("ffn_norm.weight"), h)?,
+            router: self.matrix_or_bf16(&n("ffn_gate_inp.weight"), moe.experts, h)?,
+            router_bias: self.vector(&n("exp_probs_b.bias"), moe.experts)?,
+            gate_up: self.stacked(
+                &n("ffn_gate_up_exps.weight"),
+                moe.experts,
+                2 * moe.expert_ffn,
+                h,
+            )?,
+            down: self.stacked(&n("ffn_down_exps.weight"), moe.experts, h, moe.expert_ffn)?,
+            gate_up_scale: self.vector_if(&n("ffn_gate_up_exps.scale"), moe.experts)?,
+            down_scale: self.vector_if(&n("ffn_down_exps.scale"), moe.experts)?,
+            loop_ctrl,
+        })
+    }
+}
+
+/// Inkling 2's weights: the stored layers, the padded embedding and LM head
+/// (the head keeps only the `vocab` real rows), and the loop message queries
+/// regrouped per core layer: layer `core_start + i` mixes its Q, K, V and
+/// expert messages with rows 2i and 2i + 1 of `loop_res_query` and of
+/// `loop_kv_res_query`, ordered q[2i], kv[2i], kv[2i + 1], q[2i + 1].
+pub fn load_inkling(
+    device: &MetalDevice,
+    file: &mut GgufFile,
+    c: &HybridConfig,
+) -> Result<Weights> {
+    let ink = c.inkling.as_ref().expect("inkling geometry");
+    let h = c.hidden;
+    let mut l = Loader {
+        device,
+        file,
+        q3k_as_q6k: false,
+    };
+    let embedding = l.matrix_or_bf16("token_embd.weight", ink.vocab_padded, h)?;
+    let output = l
+        .matrix_or_bf16("output.weight", ink.vocab_padded, h)?
+        .prefix_rows(c.vocab);
+    let mut layers = Vec::with_capacity(ink.stored_layers);
+    for i in 0..ink.stored_layers {
+        layers.push(l.inkling_layer(c, i)?);
+    }
+    let core = ink.core_end - ink.core_start;
+    let q = l.vector("loop_res_query.weight", 2 * core * h)?.to_f32();
+    let kv = l.vector("loop_kv_res_query.weight", 2 * core * h)?.to_f32();
+    for (i, layer) in layers[ink.core_start..ink.core_end].iter_mut().enumerate() {
+        let row = |t: &[f32], r: usize| t[r * h..(r + 1) * h].to_vec();
+        let values = [
+            row(&q, 2 * i),
+            row(&kv, 2 * i),
+            row(&kv, 2 * i + 1),
+            row(&q, 2 * i + 1),
+        ]
+        .concat();
+        let (_, queries) = layer
+            .loop_ctrl
+            .as_mut()
+            .expect("core layers have controllers");
+        *queries = Tensor::from_f32(device, [4 * h], DType::F32, &values)?;
+    }
+    Ok(Weights {
+        embedding,
+        output_norm: l.vector("output_norm.weight", h)?,
+        output,
+        rope_freqs: None,
+        layers: Vec::new(),
+        hc_head: None,
+        stream: None,
+        ple_table: None,
+        inkling: Some(InklingWeights {
+            layers,
+            embedding_norm: l.vector("token_embd_norm.weight", h)?,
+            output_query: l.vector("output_res_query.weight", h)?,
+        }),
     })
 }
 

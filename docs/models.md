@@ -32,6 +32,28 @@ Record: [experimental branch notes](history/experimental-branch-notes.md#qwen38-
 
 Record: [experimental branch notes](history/experimental-branch-notes.md#spark-x26-4b).
 
+## Inkling 2 Mini
+
+[`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF), file `Inkling-2-Mini-UD-Q4_K_XL.gguf` (17.6 GB) with `mmproj-F16.gguf` (639 MB) for images. `general.architecture = inkling2`. Q8_0 attention, NVFP4 experts. On a 32 GB M5 the automatic context is 177,408 tokens, or 137,728 with the projector loaded (trained: 1,048,576). Measured there: 535.7 tok/s prefill at 512 tokens (501.5 at 2,048) and 24.2 tok/s decode, against 259.6, 221.9 and 23.1 for the reference build's `llama-bench`.
+
+```sh
+hf download unsloth/Inkling-2-Mini-GGUF \
+  Inkling-2-Mini-UD-Q4_K_XL.gguf mmproj-F16.gguf --local-dir ~/models/Inkling-2-Mini-GGUF
+ferrum-cli --model ~/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-UD-Q4_K_XL.gguf
+```
+
+The reference is Unsloth's llama.cpp build (`b12568-mix-8eebad4`, built from source); stock llama.cpp produces garbage on these files. Checked on this one quant:
+
+- Greedy raw continuation identical to the reference.
+- KLD against the reference's Metal backend over 8 chunks of 512: mean 0.0020, same top token 98.3%, perplexity 5.121 against 5.100. On the first two chunks, single-row decode and 8-row verify attention give 0.0022 against 0.0020 for the default 64-row forwards (`FERRUM_KLD_ROWS`). The reference's own CPU backend disagrees with its Metal backend (perplexity 5.76, KLD 0.23 from Ferrum), so it is not used.
+- Memory prediction within 2 MiB; `hybrid_session_check` passes (prefix reuse and snapshot rewinds with the convolution state).
+- Chat: reasoning splits from the answer, and one weather-tool request returned its call and then used the result. Thinking off sets the template's effort level to 0. Without tools the model then answers directly; with tools it may still reason briefly before calling one, as it does under llama.cpp, which also adds no opening to the reply.
+- Images: the tower's output matches llama.cpp's `mtmd` to cosine 0.99999 on PNG input ([vision.md](vision.md#inkling-2)).
+
+Gaps: speculative decoding is refused (the file has no MTP block, prompt lookup and draft trees are not wired, and the DSpark drafter llama.cpp's build runs is not loaded). Experts do not stream, so the whole file must fit. Long contexts are not validated: the longest checked prompt is 1,033 tokens, just past the 1,024-token window and bias extent (the kernel tests cover both cut-offs). Other quants are not validated either. JPEGs decode slightly differently from llama.cpp's stb_image, and an image over the token cap is scaled down with a resampler that rounds differently from the reference's (upstream Inkling never resizes). One image is capped at 1773 tokens (llama.cpp: 4096). Audio input is not supported by the model.
+
+Record: [measurements/inkling2](measurements/inkling2/README.md).
+
 ## LFM3
 
 LiquidAI's `lfm3` language model. The three checked language files are below. Speech output is not implemented. Draft trees are refused on every one of them (`draft trees are not supported for this model`), because a tree row would need its parent's short-conv window. `--draft lookup` can verify a chain. `general.sampling.penalty_repeat` is read only for `lfm3`.

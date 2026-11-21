@@ -31,6 +31,13 @@ pub enum Variant {
     /// Indexer tensors stay in the file: attention is dense, which matches
     /// the indexer only up to its top-k of 2,048 positions.
     Qwen4Exp,
+    /// `inkling2` (Inkling 2 Mini): attention on every layer with no RoPE (a
+    /// learned relative-position bias instead), short convolutions around
+    /// attention and the experts, depth attention over block residuals, and a
+    /// looped core of layers run several times (`InklingConfig`). The trunk's
+    /// `layers` are the visits: each has its own K/V and convolution state,
+    /// and visits of one stored layer share its weights.
+    Inkling,
 }
 
 /// How one attention layer masks, rotates and gates its keys and queries.
@@ -122,6 +129,102 @@ pub struct MoeConfig {
     pub norm_weights: bool,
     /// The shared expert has a sigmoid gate (`ffn_gate_inp_shexp`).
     pub shared_gate: bool,
+}
+
+/// The Inkling 2 geometry beyond `HybridConfig`'s, from its GGUF metadata.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InklingConfig {
+    /// Stored layers: visits `0..core_start` run layers `0..core_start`, then
+    /// `passes` passes over `core_start..core_end`, then the rest once.
+    pub stored_layers: usize,
+    pub core_start: usize,
+    pub core_end: usize,
+    pub passes: usize,
+    /// Width of the loop controllers' bottleneck.
+    pub gate_rank: usize,
+    /// A layer whose stored index is a multiple of this starts a new residual
+    /// block (`attn_res.block_size`).
+    pub block_size: usize,
+    /// Width of the relative-position vectors and the distances the bias
+    /// table covers (`attention.relative_length`, `relative_extent`).
+    pub rel_len: usize,
+    pub rel_extent: usize,
+    pub qk_clip: f32,
+    pub rel_clip: f32,
+    /// Full-attention layers scale q and r by 1 + alpha * log(max(1, (pos + 1) / floor)).
+    pub log_floor: f32,
+    pub log_alpha: f32,
+    pub softcap: f32,
+    pub situ_beta: f32,
+    pub situ_linear_beta: f32,
+    pub expert_weights_scale: f32,
+    /// Rows of the stored embedding and LM head (`vocab_size`); `vocab` is the
+    /// unpadded count.
+    pub vocab_padded: usize,
+}
+
+impl InklingConfig {
+    /// The stored layer a visit runs.
+    pub fn layer_of(&self, visit: usize) -> usize {
+        let core = self.core_end - self.core_start;
+        if visit < self.core_start {
+            visit
+        } else if visit < self.core_start + self.passes * core {
+            self.core_start + (visit - self.core_start) % core
+        } else {
+            visit - (self.passes - 1) * core
+        }
+    }
+    /// The first visit of a stored layer (whose metadata entries describe it).
+    pub fn visit_of(&self, layer: usize) -> usize {
+        match layer < self.core_end {
+            true => layer,
+            false => layer + (self.passes - 1) * (self.core_end - self.core_start),
+        }
+    }
+    /// Which pass of the core a visit belongs to (0 outside the core).
+    pub fn pass_of(&self, visit: usize) -> usize {
+        let core = self.core_end - self.core_start;
+        if visit < self.core_start || visit >= self.core_start + self.passes * core {
+            0
+        } else {
+            (visit - self.core_start) / core
+        }
+    }
+    /// The deepest block stack the visit schedule builds, and the most
+    /// blocks a later pass's messages read (besides the previous pass's row).
+    pub fn stack_depth(&self) -> (usize, usize) {
+        let (mut blocks, mut deepest, mut bank, mut prelude) = (0usize, 0, 0, 0);
+        for v in 0..self.visits() {
+            let ip = self.layer_of(v);
+            if ip == self.core_start {
+                match self.pass_of(v) {
+                    0 => prelude = blocks,
+                    _ => {
+                        bank = bank.max(blocks.saturating_sub(prelude + 1));
+                        blocks = prelude;
+                    }
+                }
+            }
+            if ip.is_multiple_of(self.block_size) {
+                blocks += 1;
+                deepest = deepest.max(blocks);
+            }
+        }
+        (deepest, bank)
+    }
+    pub fn visits(&self) -> usize {
+        self.stored_layers + (self.passes - 1) * (self.core_end - self.core_start)
+    }
+}
+
+/// Most streams one Inkling depth mix reads (`h_ink_mix`).
+pub const INKLING_MIX_SOURCES: usize = 6;
+
+/// Channels of one Inkling visit's convolution state row: K, V, the attention
+/// output and the expert output.
+pub fn inkling_conv_channels(c: &HybridConfig) -> usize {
+    2 * c.kv_heads * c.head_dim + 2 * c.hidden
 }
 
 /// What `qwen4exp` adds to the `qwen35moe` geometry, from its GGUF metadata.
@@ -221,6 +324,7 @@ pub struct HybridConfig {
     pub ssm_grouped_heads: bool,
     pub moe: Option<MoeConfig>,
     pub qwen4exp: Option<Qwen4ExpConfig>,
+    pub inkling: Option<InklingConfig>,
     pub trained_context: usize,
     /// K/V cache format (a load option, not GGUF metadata).
     pub kv_cache: KvCache,
@@ -237,6 +341,7 @@ impl HybridConfig {
             "spark2_5" => Variant::Spark,
             "lfm3" => Variant::Lfm3,
             "qwen4exp" => Variant::Qwen4Exp,
+            "inkling2" => return inkling(file),
             other => {
                 return Err(Error::Config(format!(
                     "GGUF architecture {other:?} is not a supported hybrid"
@@ -345,7 +450,8 @@ impl HybridConfig {
             }
         };
         let moe = match variant {
-            Variant::Dense | Variant::Spark | Variant::Lfm3 => None,
+            // `inkling` returns before reaching this.
+            Variant::Dense | Variant::Spark | Variant::Lfm3 | Variant::Inkling => None,
             Variant::Moe | Variant::Qwen4Exp => Some(MoeConfig {
                 experts: uint(md, &key("expert_count"))?,
                 experts_used: uint(md, &key("expert_used_count"))?,
@@ -394,7 +500,7 @@ impl HybridConfig {
         };
         let leading_dense = match variant {
             Variant::Dense | Variant::Spark | Variant::Lfm3 => layers,
-            Variant::Moe | Variant::Qwen4Exp => 0,
+            Variant::Moe | Variant::Qwen4Exp | Variant::Inkling => 0,
             Variant::Flint => uint_or(md, &key("leading_dense_block_count"), 0)?,
         };
         let attn = attention_specs(md, &key, variant, layers)?;
@@ -428,9 +534,11 @@ impl HybridConfig {
         let embedding = file.tensor("token_embd.weight")?.logical_matrix_shape()?;
         let rope_dims = match variant {
             Variant::Flint | Variant::Spark => uint_or(md, &key("rope.dimension_count"), head_dim)?,
-            Variant::Dense | Variant::Moe | Variant::Lfm3 | Variant::Qwen4Exp => {
-                uint(md, &key("rope.dimension_count"))?
-            }
+            Variant::Dense
+            | Variant::Moe
+            | Variant::Lfm3
+            | Variant::Qwen4Exp
+            | Variant::Inkling => uint(md, &key("rope.dimension_count"))?,
         };
         let rope_theta = float(md, &key("rope.freq_base"))?;
         // llama.cpp falls back to the global width and base for either key.
@@ -475,7 +583,7 @@ impl HybridConfig {
             rope_sections: rope_sections(md, &key("rope.dimension_sections")),
             eps: float(md, &key("attention.layer_norm_rms_epsilon"))?,
             ffn: match variant {
-                Variant::Moe | Variant::Qwen4Exp => 0,
+                Variant::Moe | Variant::Qwen4Exp | Variant::Inkling => 0,
                 Variant::Dense | Variant::Flint | Variant::Spark | Variant::Lfm3 => {
                     uint(md, &key("feed_forward_length"))?
                 }
@@ -488,6 +596,7 @@ impl HybridConfig {
             ssm_grouped_heads: false,
             moe,
             qwen4exp,
+            inkling: None,
             trained_context: uint(md, &key("context_length"))?,
             kv_cache: KvCache::F16,
         };
@@ -503,6 +612,7 @@ impl HybridConfig {
         let head_dim_ok = match self.variant {
             Variant::Flint | Variant::Spark => matches!(self.head_dim, 128 | 256),
             Variant::Lfm3 => self.head_dim == 128 && self.rope_dims == self.head_dim,
+            Variant::Inkling => self.head_dim == 128,
             Variant::Dense | Variant::Moe | Variant::Qwen4Exp => self.head_dim == 256,
         };
         let rope_ok = |dims: usize| dims <= self.head_dim && dims.is_multiple_of(2);
@@ -604,6 +714,9 @@ impl HybridConfig {
     /// LFM3 keeps only the short-conv window, `(l_cache - 1) * hidden` per
     /// conv layer, and no delta-rule matrix.
     pub fn recurrent_state_bytes(&self) -> usize {
+        if self.inkling.is_some() {
+            return self.layers * (self.conv_kernel - 1) * inkling_conv_channels(self) * 4;
+        }
         if self.variant == Variant::Lfm3 {
             let conv = (self.conv_kernel - 1) * self.hidden * 4;
             return self.recurrent_layer_count() * conv;
@@ -612,6 +725,153 @@ impl HybridConfig {
         let ssm = self.ssm_v_heads * self.ssm_head_dim * self.ssm_head_dim * 4;
         self.recurrent_layer_count() * (conv + ssm)
     }
+}
+
+/// The `inkling2` layout as Unsloth's GGUFs store it: per-visit arrays of
+/// `block_count` (48) entries, `num_loops` passes over
+/// `loop.core_start..loop.core_end`, and `vocab_size` padded rows.
+fn inkling<R: std::io::Read + std::io::Seek>(file: &GgufReader<R>) -> Result<HybridConfig> {
+    let md = file.metadata();
+    let key = |suffix: &str| format!("inkling2.{suffix}");
+    let bad = |m: String| Err(Error::Config(format!("inkling2: {m}")));
+    let visits = uint(md, &key("block_count"))?;
+    let (core_start, core_end) = (
+        uint(md, &key("loop.core_start"))?,
+        uint(md, &key("loop.core_end"))?,
+    );
+    let passes = uint(md, &key("num_loops"))?;
+    let block_size = uint(md, &key("attn_res.block_size"))?;
+    let core = core_end.saturating_sub(core_start);
+    if core == 0 || passes == 0 || block_size == 0 || visits < passes * core {
+        return bad(format!(
+            "loop core {core_start}..{core_end} x {passes} in {visits} visits"
+        ));
+    }
+    let stored_layers = visits - (passes - 1) * core;
+    if core_end > stored_layers
+        || !core_start.is_multiple_of(block_size)
+        || !core_end.is_multiple_of(block_size)
+        || core_start == 0
+    {
+        return bad(format!(
+            "loop core {core_start}..{core_end} must span whole blocks of {block_size} after the first"
+        ));
+    }
+    let heads = i32_array(md, &key("attention.head_count"), visits)?;
+    let kv_heads = i32_array(md, &key("attention.head_count_kv"), visits)?;
+    if heads.iter().any(|&h| h != heads[0]) || kv_heads.iter().any(|&h| h != kv_heads[0]) {
+        return bad("per-layer head counts must agree".into());
+    }
+    let sliding = bool_array(md, &key("attention.sliding_window_pattern"), visits)?
+        .ok_or_else(|| Error::Config("inkling2: missing sliding_window_pattern".into()))?;
+    let window = uint(md, &key("attention.sliding_window"))?;
+    let head_dim = uint(md, &key("attention.key_length"))?;
+    if uint(md, &key("attention.value_length"))? != head_dim
+        || uint_or(md, &key("rope.dimension_count"), 0)? != 0
+    {
+        return bad("K/V widths must agree and RoPE must be absent".into());
+    }
+    let float_or = |k: &str, d: f32| -> Result<f32> {
+        match md.get(&key(k)) {
+            Some(_) => float(md, &key(k)),
+            None => Ok(d),
+        }
+    };
+    let ink = InklingConfig {
+        stored_layers,
+        core_start,
+        core_end,
+        passes,
+        gate_rank: uint(md, &key("loop.gate_rank"))?,
+        block_size,
+        rel_len: uint(md, &key("attention.relative_length"))?,
+        rel_extent: uint(md, &key("attention.relative_extent"))?,
+        qk_clip: float(md, &key("attention.qk_clip"))?,
+        rel_clip: float(md, &key("attention.relative_clip"))?,
+        log_floor: uint(md, &key("attention.log_scale_floor"))? as f32,
+        log_alpha: float(md, &key("attention.log_scale_alpha"))?,
+        softcap: float_or("final_logit_softcapping", 0.)?,
+        situ_beta: float(md, &key("activation.situ_beta"))?,
+        situ_linear_beta: float(md, &key("activation.situ_linear_beta"))?,
+        expert_weights_scale: float_or("expert_weights_scale", 1.)?,
+        vocab_padded: uint(md, &key("vocab_size"))?,
+    };
+    let vocab = uint(md, &key("vocab_size_unpadded"))?;
+    if ink.rel_len != 16
+        || ink.rel_extent == 0
+        || uint(md, &key("shortconv.l_cache"))? != 4
+        || vocab > ink.vocab_padded
+        || ink.gate_rank == 0
+        || !ink.gate_rank.is_multiple_of(4)
+    {
+        return bad("relative length 16, convolution kernel 4 and a vocabulary within the padding are required".into());
+    }
+    let (blocks, bank) = ink.stack_depth();
+    if blocks >= INKLING_MIX_SOURCES || bank >= INKLING_MIX_SOURCES {
+        return bad(format!("{blocks} residual blocks exceed the depth mix"));
+    }
+    // The pattern repeats per stored layer: every visit of a layer must agree.
+    for v in 0..visits {
+        if sliding[v] != sliding[ink.visit_of(ink.layer_of(v))] {
+            return bad(format!(
+                "visit {v} disagrees with its layer's sliding window"
+            ));
+        }
+    }
+    let config = HybridConfig {
+        variant: Variant::Inkling,
+        name: md
+            .get("general.name")
+            .and_then(|v| match v {
+                MetadataValue::String(s) => Some(s.clone()),
+                _ => None,
+            })
+            .unwrap_or_default(),
+        vocab,
+        hidden: uint(md, &key("embedding_length"))?,
+        layers: visits,
+        attention_layers: vec![true; visits],
+        attn: sliding
+            .iter()
+            .map(|&s| AttnSpec {
+                window: s.then_some(window),
+                rope: false,
+                sinks: true,
+                gated: true,
+            })
+            .collect(),
+        leading_dense: 0,
+        heads: heads[0] as usize,
+        kv_heads: kv_heads[0] as usize,
+        head_dim,
+        rope_dims: 0,
+        rope_theta: 1.,
+        swa_rope: None,
+        rope_sections: [0; 4],
+        eps: float(md, &key("attention.layer_norm_rms_epsilon"))?,
+        ffn: 0,
+        gelu_ffn: false,
+        conv_kernel: 4,
+        ssm_head_dim: 0,
+        ssm_k_heads: 0,
+        ssm_v_heads: 0,
+        ssm_grouped_heads: false,
+        moe: Some(MoeConfig {
+            experts: uint(md, &key("expert_count"))?,
+            experts_used: uint(md, &key("expert_used_count"))?,
+            expert_ffn: uint(md, &key("expert_feed_forward_length"))?,
+            shared_ffn: 0,
+            sigmoid: true,
+            norm_weights: true,
+            shared_gate: false,
+        }),
+        qwen4exp: None,
+        inkling: Some(ink),
+        trained_context: uint(md, &key("context_length"))?,
+        kv_cache: KvCache::F16,
+    };
+    config.validate()?;
+    Ok(config)
 }
 
 /// Per-layer attention options. Flint and Spark mask layers flagged in

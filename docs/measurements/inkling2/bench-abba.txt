@@ -1,0 +1,278 @@
+start Sat Nov 21 08:23:19 GMT 2026 commit-base 0c20d64 branch 0c20d64+worktree
+Apple M5
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 68.7% of one core; largest process 30.8% of one core.
+preflight exit 0
+== QWEN36 1 base screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 938.88 ± 1.28 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 907.32 ± 5.80 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.07 ± 0.42 |
+decode step: wall 18.15 ms; 864 dispatches in 2 command buffers; encode 0.39 ms; wait 17.52 ms; GPU 17.67 ms
+-- screen=unlocked
+== QWEN36 2 branch screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 926.79 ± 11.72 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 903.39 ± 6.35 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 52.57 ± 0.53 |
+decode step: wall 20.25 ms; 864 dispatches in 2 command buffers; encode 0.33 ms; wait 19.72 ms; GPU 20.02 ms
+-- screen=unlocked
+== QWEN36 3 branch screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 928.91 ± 1.07 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 882.05 ± 10.10 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 52.89 ± 0.17 |
+decode step: wall 19.49 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 18.95 ms; GPU 19.17 ms
+-- screen=unlocked
+== QWEN36 4 base screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 907.28 ± 14.46 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 874.55 ± 2.03 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 52.70 ± 0.09 |
+decode step: wall 22.06 ms; 864 dispatches in 2 command buffers; encode 0.36 ms; wait 19.05 ms; GPU 19.31 ms
+-- screen=unlocked
+== QWEN36 5 base screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 910.40 ± 8.29 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 870.18 ± 4.38 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 51.10 ± 0.62 |
+decode step: wall 19.72 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 19.16 ms; GPU 19.45 ms
+-- screen=unlocked
+== QWEN36 6 branch screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 906.60 ± 2.12 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 863.72 ± 3.29 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 50.86 ± 0.73 |
+decode step: wall 18.88 ms; 864 dispatches in 2 command buffers; encode 0.34 ms; wait 18.30 ms; GPU 18.60 ms
+-- screen=unlocked
+== QWEN36 7 branch screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 912.49 ± 4.78 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 870.71 ± 1.09 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 50.81 ± 0.67 |
+decode step: wall 19.94 ms; 864 dispatches in 2 command buffers; encode 0.34 ms; wait 19.36 ms; GPU 19.60 ms
+-- screen=unlocked
+== QWEN36 8 base screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp512 | 788.47 ± 28.27 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | pp2048 | 822.71 ± 29.50 |
+| Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive | tg128 | 53.70 ± 0.09 |
+decode step: wall 21.73 ms; 864 dispatches in 2 command buffers; encode 0.32 ms; wait 18.23 ms; GPU 18.44 ms
+-- screen=unlocked
+== SPARK 1 base screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Dense F32 | pp512 | 1169.46 ± 6.12 |
+| Dense F32 | pp2048 | 1098.32 ± 1.77 |
+| Dense F32 | tg128 | 39.65 ± 0.01 |
+decode step: wall 25.59 ms; 544 dispatches in 2 command buffers; encode 0.20 ms; wait 25.23 ms; GPU 25.26 ms
+-- screen=unlocked
+== SPARK 2 branch screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Dense F32 | pp512 | 1181.08 ± 3.53 |
+| Dense F32 | pp2048 | 1097.87 ± 2.15 |
+| Dense F32 | tg128 | 39.63 ± 0.05 |
+decode step: wall 25.55 ms; 544 dispatches in 2 command buffers; encode 0.20 ms; wait 25.20 ms; GPU 25.24 ms
+-- screen=unlocked
+== SPARK 3 branch screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Dense F32 | pp512 | 1179.37 ± 2.50 |
+| Dense F32 | pp2048 | 1106.70 ± 1.97 |
+| Dense F32 | tg128 | 39.63 ± 0.02 |
+decode step: wall 25.65 ms; 544 dispatches in 2 command buffers; encode 0.21 ms; wait 25.30 ms; GPU 25.36 ms
+-- screen=unlocked
+== SPARK 4 base screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Dense F32 | pp512 | 1175.28 ± 1.94 |
+| Dense F32 | pp2048 | 1103.28 ± 2.67 |
+| Dense F32 | tg128 | 39.65 ± 0.03 |
+decode step: wall 25.62 ms; 544 dispatches in 2 command buffers; encode 0.20 ms; wait 25.27 ms; GPU 25.31 ms
+-- screen=unlocked
+== SPARK 5 base screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Dense F32 | pp512 | 1175.43 ± 1.66 |
+| Dense F32 | pp2048 | 1101.33 ± 2.35 |
+| Dense F32 | tg128 | 39.57 ± 0.07 |
+decode step: wall 25.61 ms; 544 dispatches in 2 command buffers; encode 0.20 ms; wait 25.24 ms; GPU 25.28 ms
+-- screen=unlocked
+== SPARK 6 branch screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Dense F32 | pp512 | 1174.52 ± 1.97 |
+| Dense F32 | pp2048 | 1101.80 ± 2.52 |
+| Dense F32 | tg128 | 39.54 ± 0.06 |
+decode step: wall 25.61 ms; 544 dispatches in 2 command buffers; encode 0.21 ms; wait 25.25 ms; GPU 25.29 ms
+-- screen=unlocked
+== SPARK 7 branch screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Dense F32 | pp512 | 1176.67 ± 1.29 |
+| Dense F32 | pp2048 | 1104.75 ± 2.17 |
+| Dense F32 | tg128 | 39.59 ± 0.04 |
+decode step: wall 25.52 ms; 544 dispatches in 2 command buffers; encode 0.20 ms; wait 25.16 ms; GPU 25.21 ms
+-- screen=unlocked
+== SPARK 8 base screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Dense F32 | pp512 | 1176.10 ± 1.09 |
+| Dense F32 | pp2048 | 1104.18 ± 2.29 |
+| Dense F32 | tg128 | 39.61 ± 0.04 |
+decode step: wall 25.62 ms; 544 dispatches in 2 command buffers; encode 0.20 ms; wait 25.28 ms; GPU 25.38 ms
+-- screen=unlocked
+== INKLING 1 ferrum screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Inkling-2-Mini | pp512 | 535.70 ± 2.14 |
+| Inkling-2-Mini | pp2048 | 501.45 ± 2.52 |
+| Inkling-2-Mini | tg128 | 24.24 ± 0.02 |
+decode step: wall 41.46 ms; 1550 dispatches in 4 command buffers; encode 0.62 ms; wait 40.41 ms; GPU 40.89 ms
+== INKLING 1 llama.cpp screen=unlocked
+ggml_metal_device_init: testing tensor API for f16 support
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'dummy_kernel', name = 'dummy_kernel'
+ggml_metal_library_compile_pipeline: loaded dummy_kernel                                  0x104c66af0 | th_max = 1024 | th_width =   32
+ggml_metal_device_init: testing tensor API for bfloat support
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'dummy_kernel', name = 'dummy_kernel'
+ggml_metal_library_compile_pipeline: loaded dummy_kernel                                  0x104c66c70 | th_max = 1024 | th_width =   32
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_compile_all: compiled 'fa_aux' library in 0.004 sec
+ggml_metal_library_compile_all: compiled 'fa_f16' library in 0.006 sec
+ggml_metal_library_compile_all: compiled 'fa_f32' library in 0.022 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_0' library in 0.037 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_1' library in 0.012 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_0' library in 0.021 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_1' library in 0.013 sec
+ggml_metal_library_compile_all: compiled 'fa_q8_0' library in 0.022 sec
+ggml_metal_library_compile_all: compiled 'fa_tensor' library in 0.002 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f16' library in 0.026 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f32' library in 0.044 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_0' library in 0.044 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_1' library in 0.040 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_0' library in 0.029 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_1' library in 0.019 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q8_0' library in 0.032 sec
+ggml_metal_library_compile_all: compiled 'mul_mv' library in 0.036 sec
+ggml_metal_library_compile_all: compiled 'mul_mv_mma' library in 0.011 sec
+ggml_metal_library_compile_all: compiled 'mul_mm' library in 0.016 sec
+ggml_metal_library_compile_all: compiled 'quantize' library in 0.033 sec
+ggml_metal_library_compile_all: compiled 'softmax' library in 0.001 sec
+ggml_metal_library_compile_all: compiled 'norm' library in 0.002 sec
+ggml_metal_library_compile_all: compiled 'unary' library in 0.002 sec
+ggml_metal_library_compile_all: compiled 'binbcast' library in 0.002 sec
+ggml_metal_library_compile_all: compiled 'reduce' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'tri' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'ssm' library in 0.032 sec
+ggml_metal_library_compile_all: compiled 'wkv' library in 0.034 sec
+ggml_metal_library_compile_all: compiled 'gated_delta_net' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'solve_tri' library in 0.025 sec
+ggml_metal_library_compile_all: compiled 'rope' library in 0.025 sec
+ggml_metal_library_compile_all: compiled 'conv' library in 0.029 sec
+ggml_metal_library_compile_all: compiled 'upscale' library in 0.014 sec
+ggml_metal_library_compile_all: compiled 'argsort' library in 0.011 sec
+ggml_metal_library_compile_all: compiled 'pool' library in 0.011 sec
+ggml_metal_library_compile_all: compiled 'misc' library in 0.012 sec
+ggml_metal_library_compile_all: loaded 36 libraries from embedded data in 0.044 sec (max single = 0.044 sec)
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M5)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple10  (1010)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = true
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 25769.80 MB
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |           pp512 |        259.60 ± 0.12 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |          pp2048 |        221.56 ± 0.26 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |           tg128 |         23.08 ± 0.02 |
+
+build: b9b9c0345 (12568)
+-- screen=unlocked
+== INKLING 2 ferrum screen=unlocked
+| model | test | t/s |
+|---|---|---|
+| Inkling-2-Mini | pp512 | 531.92 ± 2.13 |
+| Inkling-2-Mini | pp2048 | 497.75 ± 2.39 |
+| Inkling-2-Mini | tg128 | 23.97 ± 0.04 |
+decode step: wall 41.80 ms; 1550 dispatches in 4 command buffers; encode 0.62 ms; wait 40.73 ms; GPU 41.31 ms
+== INKLING 2 llama.cpp screen=unlocked
+ggml_metal_device_init: testing tensor API for f16 support
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'dummy_kernel', name = 'dummy_kernel'
+ggml_metal_library_compile_pipeline: loaded dummy_kernel                                  0x10295d920 | th_max = 1024 | th_width =   32
+ggml_metal_device_init: testing tensor API for bfloat support
+ggml_metal_library_compile_pipeline: compiling pipeline: base = 'dummy_kernel', name = 'dummy_kernel'
+ggml_metal_library_compile_pipeline: loaded dummy_kernel                                  0x10295d8e0 | th_max = 1024 | th_width =   32
+ggml_metal_library_init: using embedded metal library
+ggml_metal_library_compile_all: compiled 'fa_aux' library in 0.017 sec
+ggml_metal_library_compile_all: compiled 'fa_f16' library in 0.030 sec
+ggml_metal_library_compile_all: compiled 'fa_f32' library in 0.018 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_0' library in 0.016 sec
+ggml_metal_library_compile_all: compiled 'fa_q4_1' library in 0.012 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_0' library in 0.034 sec
+ggml_metal_library_compile_all: compiled 'fa_q5_1' library in 0.007 sec
+ggml_metal_library_compile_all: compiled 'fa_q8_0' library in 0.028 sec
+ggml_metal_library_compile_all: compiled 'fa_tensor' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f16' library in 0.039 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_f32' library in 0.033 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_0' library in 0.042 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q4_1' library in 0.045 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_0' library in 0.015 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q5_1' library in 0.024 sec
+ggml_metal_library_compile_all: compiled 'fa_vec_q8_0' library in 0.021 sec
+ggml_metal_library_compile_all: compiled 'mul_mv' library in 0.027 sec
+ggml_metal_library_compile_all: compiled 'mul_mv_mma' library in 0.011 sec
+ggml_metal_library_compile_all: compiled 'mul_mm' library in 0.033 sec
+ggml_metal_library_compile_all: compiled 'quantize' library in 0.035 sec
+ggml_metal_library_compile_all: compiled 'softmax' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'norm' library in 0.006 sec
+ggml_metal_library_compile_all: compiled 'unary' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'binbcast' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'reduce' library in 0.003 sec
+ggml_metal_library_compile_all: compiled 'tri' library in 0.002 sec
+ggml_metal_library_compile_all: compiled 'ssm' library in 0.014 sec
+ggml_metal_library_compile_all: compiled 'wkv' library in 0.020 sec
+ggml_metal_library_compile_all: compiled 'gated_delta_net' library in 0.010 sec
+ggml_metal_library_compile_all: compiled 'solve_tri' library in 0.023 sec
+ggml_metal_library_compile_all: compiled 'rope' library in 0.037 sec
+ggml_metal_library_compile_all: compiled 'conv' library in 0.028 sec
+ggml_metal_library_compile_all: compiled 'upscale' library in 0.011 sec
+ggml_metal_library_compile_all: compiled 'argsort' library in 0.016 sec
+ggml_metal_library_compile_all: compiled 'pool' library in 0.008 sec
+ggml_metal_library_compile_all: compiled 'misc' library in 0.009 sec
+ggml_metal_library_compile_all: loaded 36 libraries from embedded data in 0.045 sec (max single = 0.045 sec)
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M5)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple10  (1010)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = true
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 25769.80 MB
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |           pp512 |        259.60 ± 0.09 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |          pp2048 |        221.87 ± 0.17 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |           tg128 |         23.10 ± 0.01 |
+
+build: b9b9c0345 (12568)
+-- screen=unlocked
+DONE Sat Nov 21 08:33:37 GMT 2026

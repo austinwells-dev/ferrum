@@ -17,6 +17,8 @@ pub mod grammar;
 #[cfg(test)]
 mod hc_tests;
 #[cfg(test)]
+mod inkling_tests;
+#[cfg(test)]
 mod iq_tests;
 pub mod kflash;
 pub mod lookup;
@@ -71,6 +73,10 @@ const SPARK_PATTERNS: [&str; 4] = [
     r##"[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+| ?[\p{P}\p{S}]+|[\r\n]|\s+(?!\S)|\s+"##,
     r"\p{N}",
 ];
+
+/// Inkling 2 pre-tokenizer (`tokenizer.ggml.pre = inkling2`, llama.cpp's
+/// `LLAMA_VOCAB_PRE_TYPE_GPT4O`): the o200k split, with no normalization.
+const INKLING2_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 pub struct LoadedHybrid {
     pub model: HybridModel,
@@ -176,7 +182,9 @@ pub fn load_with(
 /// model under `FERRUM_STREAM_EXPERTS=1` (to compare against it resident).
 pub fn streams_experts(c: &HybridConfig) -> bool {
     c.variant == config::Variant::Qwen4Exp
-        || (c.moe.is_some() && std::env::var("FERRUM_STREAM_EXPERTS").is_ok_and(|v| v == "1"))
+        || (c.moe.is_some()
+            && c.variant != config::Variant::Inkling
+            && std::env::var("FERRUM_STREAM_EXPERTS").is_ok_and(|v| v == "1"))
 }
 
 /// I/O threads reading experts (`FERRUM_STREAM_THREADS`, default 6).
@@ -298,9 +306,10 @@ fn tokenizer(file: &GgufFile, vocab: usize) -> Result<(Tokenizer, Vec<u32>)> {
         "flint" => (&FLINT_PATTERNS, false, false),
         "spark2_5" => (&SPARK_PATTERNS, false, false),
         "lfm2" => (&[LFM2_PATTERN], false, true),
+        "inkling2" => (&[INKLING2_PATTERN], false, false),
         other => {
             return Err(Error::Tokenizer(format!(
-                "hybrid GGUF pre-tokenizer {other:?} is not supported (qwen35, flint, spark2_5, lfm2)"
+                "hybrid GGUF pre-tokenizer {other:?} is not supported (qwen35, flint, spark2_5, lfm2, inkling2)"
             )));
         }
     };

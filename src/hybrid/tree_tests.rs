@@ -8,7 +8,7 @@ use super::config::KvCache;
 use super::engine::{Params, TREE_MAX_ROWS, tree_plan, tree_rows};
 use crate::{DType, MetalDevice, Tensor};
 
-fn random(n: usize, seed: u64) -> Vec<f32> {
+pub(super) fn random(n: usize, seed: u64) -> Vec<f32> {
     let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     (0..n)
         .map(|_| {
@@ -22,7 +22,7 @@ fn random(n: usize, seed: u64) -> Vec<f32> {
 
 /// llama.cpp q8_0 rounding of `x` in the Q8 cache layout (every value, then
 /// every block scale), and the values the kernels see after dequantizing to F16.
-fn quantize_q8(x: &[f32]) -> (Vec<u8>, Vec<f32>) {
+pub(super) fn quantize_q8(x: &[f32]) -> (Vec<u8>, Vec<f32>) {
     let mut values = Vec::with_capacity(x.len());
     let mut scales = Vec::new();
     let mut seen = Vec::with_capacity(x.len());
@@ -41,7 +41,7 @@ fn quantize_q8(x: &[f32]) -> (Vec<u8>, Vec<f32>) {
     (values, seen)
 }
 
-fn f16(x: f32) -> f32 {
+pub(super) fn f16(x: f32) -> f32 {
     half::f16::from_f32(x).to_f32()
 }
 

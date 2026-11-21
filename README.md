@@ -19,6 +19,7 @@ You give it a model file and then either chat in the terminal, use the full-scre
 > - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts. A request can also lower an image's token budget below `--image-tokens` ([per-request image sizes](docs/server.md#image-size-per-request)). Slots take turns on the GPU.
 > - **Image generation.** Qwen-Image-2.1-Turbo drawing and editing in the CLI, server and TUI, and the TUI tools `generate_image` and `view_image`.
 > - **LFM3.** LiquidAI LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input (WAV). LFM3-Omni is not supported.
+> - **Inkling 2 Mini.** Thinking Machines' looped MoE, text and still images, from Unsloth's UD-Q4_K_XL GGUF. No speculative decoding yet.
 
 ## Highlights
 
@@ -70,13 +71,14 @@ hf download peculiar-ragdoll/Tiel-Coder-35B-A3B-GGUF-MTP \
 
 **Qwen3.8-Flash-Next is supported.** The Q2_0 pack loads in the CLI, server and TUI, with its experts streamed from the SSD: 16.8–18.4 tok/s decode and 232–315 tok/s prefill on a 32 GB M5, and 26.5 tok/s (1.42×) with a DFlash2 drafter in the TUI chat benchmark. The sparse-attention indexer is not loaded, so past 2,048 tokens Ferrum attends to every position, which the model was not trained to do. Contexts past 2,048 are not validated ([details](docs/models.md#qwen38-flash-next)).
 
-**Also supported, with the gaps in [models.md](docs/models.md):** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks), Spark-X2.6-4B (XHToken, dense, sliding windows and per-head gates) and LFM3 (LiquidAI: LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input). One quant of Flint and of Spark is validated. LFM3's checks are in [models.md](docs/models.md#lfm3-17b), [models.md](docs/models.md#lfm3-vl-2b) and [models.md](docs/models.md#lfm3-audio-2b). LFM3-Omni is not supported.
+**Also supported, with the gaps in [models.md](docs/models.md):** Flint (unsloth, 49 layers, 256 experts, sliding windows and sinks), Spark-X2.6-4B (XHToken, dense, sliding windows and per-head gates), Inkling 2 Mini (Thinking Machines: a looped MoE with attention over depth; text and still images) and LFM3 (LiquidAI: LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input). One quant each of Flint, Spark and Inkling is validated. LFM3's checks are in [models.md](docs/models.md#lfm3-17b), [models.md](docs/models.md#lfm3-vl-2b) and [models.md](docs/models.md#lfm3-audio-2b). LFM3-Omni is not supported.
 
 | Model | Hugging Face repo | File | Size |
 |---|---|---|---|
 | Flint Preview (MoE) | [`unsloth/flint-GGUF`](https://huggingface.co/unsloth/flint-GGUF) | `flint-UD-Q3_K_XL.gguf` | 18.5 GB |
 | Qwen3.8-Flash-Next (MoE, experts streamed) | [`ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF`](https://huggingface.co/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-GGUF) | `Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00001-of-00002.gguf` and `-00002-of-00002.gguf` | 37.6 + 28.8 GB |
 | Spark-X2.6-4B (dense) | [`XHToken/Spark-X2.6-4B-GGUF`](https://huggingface.co/XHToken/Spark-X2.6-4B-GGUF) | `Spark-X2.6-4B-Q4_K_M.gguf` | 3.5 GB |
+| Inkling 2 Mini (looped MoE, still images) | [`unsloth/Inkling-2-Mini-GGUF`](https://huggingface.co/unsloth/Inkling-2-Mini-GGUF) | `Inkling-2-Mini-UD-Q4_K_XL.gguf` and `mmproj-F16.gguf` | 17.6 GB + 639 MB |
 | LFM3-1.7B (text) | [`LiquidAI/LFM3-1.7B-GGUF`](https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF) | `LFM3-1.7B-Q4_K_M.gguf` | 1.1 GB |
 | LFM3-VL-2B (still images) | [`LiquidAI/LFM3-VL-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF) | `LFM3-VL-2B-Q4_K_M.gguf` and `mmproj-LFM3-VL-2B-Q8_0.gguf` | 1.1 GB + 194 MB |
 | LFM3-Audio-2B (speech input) | [`LiquidAI/LFM3-Audio-2B-GGUF`](https://huggingface.co/LiquidAI/LFM3-Audio-2B-GGUF) | `LFM3-Audio-2B-Q4_K_M.gguf` and `mmproj-LFM3-Audio-2B-Q8_0.gguf` | 1.1 GB + 304 MB |
@@ -143,6 +145,13 @@ These are measured on a 32 GB Apple M5 in October 2026, with Ferrum and llama.cp
 | Tiel 35B-A3B pp512 / pp16384 | 920 / 683 | **941 / 730** |
 | Tiel 35B-A3B tg at empty / 32K context | **42.8 / 31.0** | 40.6 / 29.7 |
 
+**Inkling 2 Mini** (November 2026, same Mac, `Inkling-2-Mini-UD-Q4_K_XL.gguf`, against `llama-bench` from Unsloth's llama.cpp build `b12568-mix-8eebad4`, which this file needs; two interleaved rounds, best shown; [record](docs/measurements/inkling2/README.md)):
+
+| Benchmark (tok/s) | Ferrum | llama.cpp |
+|---|---|---|
+| Inkling 2 Mini pp512 / pp2048 | **535.7 / 501.5** | 259.6 / 221.9 |
+| Inkling 2 Mini tg128 | **24.2** | 23.1 |
+
 **With speculative decoding** (8 chat prompts × 128 tokens through each server, greedy; llama.cpp's drafters converted to Q8_0 GGUF, Ferrum's quantized to Q4_0 at load):
 
 | Setup (tok/s) | Ferrum | llama.cpp |
@@ -185,7 +194,7 @@ flowchart TD
     PLAN[hybrid::plan<br/>memory planner] -.sizes.-> ENG
     ENG --> MTL
     DRF --> MTL
-    VIS[vision<br/>Qwen3-VL, LFM3-VL, LFM3-Audio] --> MTL
+    VIS[vision<br/>Qwen3-VL, LFM3-VL, Inkling 2, LFM3-Audio] --> MTL
     MTL[metal backend<br/>command batching, residency, the library's only unsafe code] --> SH[(7.5K lines of MSL kernels)]
 ```
 
@@ -227,7 +236,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 | [Development](docs/development.md) | Building, testing (including Metal validation layers), profiling, using Ferrum as a library |
 | [Architecture](docs/architecture.md) | Tensor and storage model, Metal backend, safety argument, the hybrid engine |
 | [Vision](docs/vision.md) | How image and speech input is encoded and positioned |
-| [Models](docs/models.md) | Flint, Qwen3.8-Flash-Next, Spark, LFM3 (not Omni), MLX checkpoints, KFlash, parallel requests and image generation: what is checked and what is still open |
+| [Models](docs/models.md) | Flint, Qwen3.8-Flash-Next, Spark, Inkling 2 Mini, LFM3 (not Omni), MLX checkpoints, KFlash, parallel requests and image generation: what is checked and what is still open |
 | [Journals](docs/README.md) | Phase-by-phase engineering log with measurements |
 | [Contributing](AGENTS.md) | Branch and PR flow (topic → `experimental` → `main`), checks, docs and regression rules |
 
@@ -235,8 +244,8 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - Batch size 1. `ferrum-server --parallel N` serves up to 8 requests at once in separate sessions that take turns on the GPU, so their streams interleave but total throughput is that of one request.
-- The server and TUI run Qwen3.5-family hybrids (GGUF, and dense MLX 4-bit checkpoints, one of which is checked), Qwen3.8-Flash-Next (the Q2_0 pack; its sparse-attention indexer is not loaded, and contexts past 2,048 are not validated), and Flint, Spark and LFM3 text, still images and speech input. LFM3-Omni is not supported. Other architectures go through the developer runner, built with `--features legacy-engine`. Open gaps: [models.md](docs/models.md).
-- Vision supports the Qwen3-VL projector and LFM3-VL still images. No video. LFM3-Audio hears WAV clips of up to 120 s each (also the TUI's Audio tab); it does not speak.
+- The server and TUI run Qwen3.5-family hybrids (GGUF, and dense MLX 4-bit checkpoints, one of which is checked), Qwen3.8-Flash-Next (the Q2_0 pack; its sparse-attention indexer is not loaded, and contexts past 2,048 are not validated), and Flint, Spark, Inkling 2 Mini (text and still images; no speculative decoding) and LFM3 text, still images and speech input. LFM3-Omni is not supported. Other architectures go through the developer runner, built with `--features legacy-engine`. Open gaps: [models.md](docs/models.md).
+- Vision supports the Qwen3-VL projector, LFM3-VL and Inkling 2 still images. No video. LFM3-Audio hears WAV clips of up to 120 s each (also the TUI's Audio tab); it does not speak.
 - Image generation and editing (`ferrum-cli image`, `ferrum-server --image-model` with `/v1/images/generations` and `/v1/images/edits`, the TUI Image tab, and the chat and agent tool `generate_image`) supports Qwen-Image-2.1-Turbo from safetensors, and the base model's transformer from GGUF; a new 1024² picture takes about 69 s ([server.md](docs/server.md#image-generation)). The base schedule has no guidance and is not checked against diffusers.
 - No training and no language bindings.
 

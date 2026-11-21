@@ -2,6 +2,7 @@
 //! `llama-perplexity --kl-divergence-base` file for the same GGUF.
 //!
 //! usage: hybrid_kld MODEL.gguf BASE.kld [max_chunks] [--write OUT.kld]
+//! (FERRUM_KLD_ROWS=N runs N positions per forward instead of 64)
 //!
 //! With `--write`, Ferrum's own logits for the base file's tokens are also
 //! written in the same format, so llama-perplexity (or this tool) can be
@@ -52,7 +53,12 @@ fn main() -> Result<()> {
     let scored = n_ctx - 1 - first;
 
     let device = MetalDevice::new()?;
-    let rows = 64;
+    // Rows per forward; FERRUM_KLD_ROWS checks the decode (1) and
+    // verify-width (2..16) attention paths.
+    let rows = std::env::var("FERRUM_KLD_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(64);
     let loaded = hybrid::load(&device, &args[1], rows, rows)?;
     let model = &loaded.model;
     assert_eq!(

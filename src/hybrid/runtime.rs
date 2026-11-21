@@ -400,7 +400,7 @@ fn tool_opening(variant: Variant, tool: &ForcedTool) -> Option<String> {
         }
         (Variant::Flint, ForcedTool::Any) => "<tool_call>".into(),
         (Variant::Flint, ForcedTool::Named(name)) => format!("<tool_call>{name}"),
-        (Variant::Spark | Variant::Lfm3, _) => return None,
+        (Variant::Spark | Variant::Lfm3 | Variant::Inkling, _) => return None,
     })
 }
 
@@ -1121,7 +1121,10 @@ impl Runtime {
         prompt: ChatPrompt,
         hooks: &mut impl ChatHooks,
     ) -> Result<Turn> {
-        let starts_in_reasoning = prompt.text.trim_end().ends_with("<think>");
+        let starts_in_reasoning = {
+            let end = prompt.text.trim_end();
+            end.ends_with("<think>") || end.ends_with(INKLING_THINKING)
+        };
         if let Some((at, pin)) = prompt.checkpoint {
             self.slot_mut(slot).set_checkpoint(at, pin);
         }
@@ -1156,6 +1159,7 @@ impl Runtime {
             request.grammar.clone(),
             request.logit_bias.clone(),
             forced,
+            (variant == Variant::Inkling).then(|| InklingText::after(&prompt.text)),
             hooks,
         )?;
         if let Some(placed) = &prompt.placed {
@@ -1245,6 +1249,7 @@ impl Runtime {
             None,
             Vec::new(),
             None,
+            None,
             hooks,
         )
     }
@@ -1264,6 +1269,7 @@ impl Runtime {
         grammar: Option<Arc<Grammar>>,
         bias: Vec<(u32, f32)>,
         mut forced: Option<Forced>,
+        protocol: Option<InklingText>,
         hooks: &mut impl ChatHooks,
     ) -> Result<Turn> {
         // A forced opening with no reasoning before it is part of the prompt.
@@ -1301,6 +1307,7 @@ impl Runtime {
             close: self.loaded.tokenizer.encode(close_text)?,
             close_text,
             count: 0,
+            protocol,
         };
         let session = match slot {
             0 => &mut self.session,
@@ -1366,6 +1373,11 @@ impl Runtime {
         let driver = &mut turn.driver;
         if let Some(e) = driver.failure.take() {
             return Err(e);
+        }
+        if let Some(rest) = driver.protocol.as_mut().map(InklingText::finish) {
+            for delta in driver.splitter.push(&rest) {
+                hooks.delta(delta)?;
+            }
         }
         for delta in driver.splitter.finish() {
             hooks.delta(delta)?;
@@ -1465,6 +1477,9 @@ struct Driver {
     close: Vec<u32>,
     close_text: &'static str,
     count: usize,
+    /// Inkling 2 chat replies: rewrites its message markers to `<think>`
+    /// and `<tool_call>` text before the splitter sees them.
+    protocol: Option<InklingText>,
 }
 
 /// The opening of a forced tool call: the text the reply's content starts
@@ -1537,6 +1552,10 @@ impl<H: ChatHooks> GenerationHooks for Hooked<'_, H> {
             self.driver.reasoning_tokens += 1;
         }
         let piece = self.driver.stream.step(self.tokenizer, token)?;
+        let piece = match (piece, self.driver.protocol.as_mut()) {
+            (Some(p), Some(t)) => Some(t.push(&p)).filter(|p| !p.is_empty()),
+            (piece, _) => piece,
+        };
         let piece_tail = piece.clone().unwrap_or_default();
         if let Some(piece) = piece {
             if !self.emit(&piece) {
@@ -1594,8 +1613,11 @@ impl<H: ChatHooks> GenerationHooks for Hooked<'_, H> {
                 .is_some_and(|b| self.driver.reasoning_tokens >= b)
         {
             self.driver.budget_exhausted = true;
-            let text = self.driver.close_text;
-            if !self.emit(text) {
+            let text = match self.driver.protocol.as_mut() {
+                Some(t) => t.push(self.driver.close_text),
+                None => self.driver.close_text.to_owned(),
+            };
+            if !self.emit(&text) {
                 return Ok(Flow::Stop);
             }
             let mut inject = self.driver.close.clone();
@@ -1646,6 +1668,12 @@ fn cache_identity(path: &Path) -> String {
 /// turn's prompt reuses this turn's cached prefix. Other templates switch
 /// thinking themselves.
 pub fn generation_prefix(template: &ChatTemplate, vars: &Map<String, Json>) -> &'static str {
+    // Inkling 2 opens every message of its reply itself, choosing thinking,
+    // text or a tool call (as llama.cpp, which adds nothing); its effort
+    // level, which `normalize_thinking` sets, steers whether it reasons.
+    if is_inkling_template(template.source()) {
+        return "";
+    }
     if !template.opens_thinking() {
         return "";
     }
@@ -1660,6 +1688,8 @@ pub fn generation_prefix(template: &ChatTemplate, vars: &Map<String, Json>) -> &
 fn reasoning_close(variant: Variant) -> &'static str {
     match variant {
         Variant::Flint | Variant::Spark | Variant::Lfm3 => "</think>",
+        // Reasoning is its own message: close it and open the answer.
+        Variant::Inkling => "<|end_message|><|message_model|><|content_text|>",
         Variant::Dense | Variant::Moe | Variant::Qwen4Exp => "\n</think>\n\n",
     }
 }
@@ -1669,6 +1699,15 @@ fn reasoning_close(variant: Variant) -> &'static str {
 /// other efforts snap to the nearest level the template names (e.g. "high"
 /// becomes "xhigh" for a template that only knows low/medium/xhigh).
 pub fn normalize_thinking(template: &str, vars: &mut Map<String, Json>) {
+    normalize_thinking_vars(template, vars);
+    // Inkling 2's template knows only an effort; level "none" (0) turns
+    // thinking off.
+    if is_inkling_template(template) && vars.get("enable_thinking") == Some(&Json::Bool(false)) {
+        vars.insert("reasoning_effort".into(), Json::String("none".into()));
+    }
+}
+
+fn normalize_thinking_vars(template: &str, vars: &mut Map<String, Json>) {
     for key in ["enable_thinking", "thinking"] {
         if let Some(Json::String(s)) = vars.get(key) {
             let on = !matches!(
@@ -1797,6 +1836,174 @@ pub fn recommended_sampling(file: &GgufFile) -> SamplingParams {
         },
         ..SamplingParams::default()
     }
+}
+
+/// Inkling 2 opens a reply that reasons first, or one that answers directly.
+const INKLING_THINKING: &str = "<|message_model|><|content_thinking|>";
+const INKLING_TEXT: &str = "<|message_model|><|content_text|>";
+
+/// Whether `template` is Inkling 2's (messages typed by content markers).
+fn is_inkling_template(template: &str) -> bool {
+    template.contains("<|content_thinking|>") && template.contains("<|message_model|>")
+}
+
+/// Inkling 2 replies as a series of messages, each
+/// `<|message_model|>[NAME]<|content_KIND|>BODY<|end_message|>`. This rewrites
+/// them into the text the splitter and `parse_output` read: a thinking body
+/// becomes `<think>BODY</think>`, a text body stays as it is, and a JSON tool
+/// call (`{"name":…,"args":{…}}`) becomes `<tool_call>{"name":…,"arguments":{…}}</tool_call>`.
+struct InklingText {
+    state: InklingState,
+    /// Text that may be the start of a marker.
+    pending: String,
+}
+
+enum InklingState {
+    /// Between messages.
+    Idle,
+    /// After `<|message_model|>`: the sender name (a tool call's function).
+    Header(String),
+    Thinking,
+    Text,
+    Tool {
+        name: String,
+        body: String,
+    },
+}
+
+impl InklingText {
+    /// The rewriter for a reply that follows `prompt`, whose end may already
+    /// open the first message.
+    fn after(prompt: &str) -> Self {
+        let end = prompt.trim_end();
+        let state = if end.ends_with(INKLING_THINKING) {
+            InklingState::Thinking
+        } else if end.ends_with(INKLING_TEXT) {
+            InklingState::Text
+        } else {
+            InklingState::Idle
+        };
+        Self {
+            state,
+            pending: String::new(),
+        }
+    }
+
+    fn push(&mut self, piece: &str) -> String {
+        self.pending.push_str(piece);
+        let mut out = String::new();
+        loop {
+            let Some(start) = self.pending.find("<|") else {
+                // A trailing `<` may begin the next piece's marker.
+                let keep = usize::from(self.pending.ends_with('<'));
+                let text = self.pending[..self.pending.len() - keep].to_owned();
+                self.pending.drain(..self.pending.len() - keep);
+                self.text(&text, &mut out);
+                return out;
+            };
+            // A marker is `<|`, name characters, `|>`.
+            let name = self.pending[start + 2..]
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                .map(|n| start + 2 + n);
+            let Some(close) = name else {
+                // Hold a possible marker back until it closes or `finish`.
+                let text = self.pending[..start].to_owned();
+                self.pending.drain(..start);
+                self.text(&text, &mut out);
+                return out;
+            };
+            if !self.pending[close..].starts_with("|>") {
+                if self.pending[close..] == *"|" {
+                    let text = self.pending[..start].to_owned();
+                    self.pending.drain(..start);
+                    self.text(&text, &mut out);
+                    return out;
+                }
+                // Not a marker: release the `<|` as text.
+                let text = self.pending[..start + 2].to_owned();
+                self.pending.drain(..start + 2);
+                self.text(&text, &mut out);
+                continue;
+            }
+            let end = close + 2;
+            let text = self.pending[..start].to_owned();
+            let marker = self.pending[start..end].to_owned();
+            self.pending.drain(..end);
+            self.text(&text, &mut out);
+            self.marker(&marker, &mut out);
+        }
+    }
+
+    fn finish(&mut self) -> String {
+        let rest = std::mem::take(&mut self.pending);
+        let mut out = String::new();
+        self.text(&rest, &mut out);
+        if let InklingState::Thinking = self.state {
+            out.push_str("</think>");
+        }
+        out
+    }
+
+    fn text(&mut self, text: &str, out: &mut String) {
+        match &mut self.state {
+            InklingState::Header(name) => name.push_str(text),
+            InklingState::Tool { body, .. } => body.push_str(text),
+            _ => out.push_str(text),
+        }
+    }
+
+    fn marker(&mut self, marker: &str, out: &mut String) {
+        let state = std::mem::replace(&mut self.state, InklingState::Idle);
+        self.state = match (marker, state) {
+            ("<|message_model|>", InklingState::Thinking) => {
+                out.push_str("</think>");
+                InklingState::Header(String::new())
+            }
+            ("<|message_model|>", _) => InklingState::Header(String::new()),
+            ("<|content_thinking|>", _) => {
+                out.push_str("<think>");
+                InklingState::Thinking
+            }
+            ("<|content_text|>", _) => InklingState::Text,
+            ("<|content_invoke_tool_json|>", InklingState::Header(name)) => InklingState::Tool {
+                name: name.trim().to_owned(),
+                body: String::new(),
+            },
+            ("<|end_message|>", InklingState::Thinking) => {
+                out.push_str("</think>");
+                InklingState::Idle
+            }
+            ("<|end_message|>", InklingState::Tool { name, body }) => {
+                out.push_str("<tool_call>");
+                out.push_str(&inkling_call(&name, &body));
+                out.push_str("</tool_call>");
+                InklingState::Idle
+            }
+            ("<|end_message|>" | "<|content_model_end_sampling|>", _) => InklingState::Idle,
+            (other, state) => {
+                // Not a marker of the reply format: keep it as text.
+                self.state = state;
+                self.text(other, out);
+                return;
+            }
+        };
+    }
+}
+
+/// An Inkling call body (`{"name":…,"args":{…}}`) as `{"name":…,"arguments":{…}}`;
+/// the header's name stands in for a missing one.
+fn inkling_call(name: &str, body: &str) -> String {
+    let mut call = match serde_json::from_str::<Json>(body.trim()) {
+        Ok(Json::Object(call)) => call,
+        _ => return body.to_owned(),
+    };
+    if let Some(args) = call.remove("args") {
+        call.insert("arguments".into(), args);
+    }
+    if !call.contains_key("name") && !name.is_empty() {
+        call.insert("name".into(), Json::String(name.to_owned()));
+    }
+    Json::Object(call).to_string()
 }
 
 /// Routes streamed text: reasoning until `</think>`, then content, holding
@@ -2031,6 +2238,51 @@ fn locate_media(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Feed `reply` to an `InklingText` in `step`-byte pieces (markers split
+    /// across pieces), as a sampler streams it.
+    fn inkling_rewrite(prompt: &str, reply: &str, step: usize) -> String {
+        let mut rewrite = InklingText::after(prompt);
+        let chars: Vec<char> = reply.chars().collect();
+        let mut out = String::new();
+        for piece in chars.chunks(step) {
+            out.push_str(&rewrite.push(&piece.iter().collect::<String>()));
+        }
+        out + &rewrite.finish()
+    }
+
+    #[test]
+    fn rewrites_inkling_messages() {
+        let reply = "17*23 is 391.<|end_message|><|message_model|><|content_text|>391<|end_message|><|content_model_end_sampling|>";
+        for step in [1, 3, 7, 1000] {
+            assert_eq!(
+                inkling_rewrite(&format!("x{INKLING_THINKING}"), reply, step),
+                "17*23 is 391.</think>391",
+                "step {step}"
+            );
+        }
+        // Thinking off: the reply is text from the start; a stray `<|` stays.
+        assert_eq!(
+            inkling_rewrite(INKLING_TEXT, "a <| b<|end_message|>", 2),
+            "a <| b"
+        );
+        // A reply that opens its own messages, then calls a tool.
+        let call = "<|message_model|><|content_thinking|>look it up<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Paris\"}}<|end_message|>";
+        for step in [1, 5, 1000] {
+            assert_eq!(
+                inkling_rewrite("<|end_message|>", call, step),
+                "<think>look it up</think><tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>",
+                "step {step}"
+            );
+        }
+        // Cut off mid-thought: the reasoning still closes.
+        assert_eq!(inkling_rewrite(INKLING_THINKING, "hmm", 1), "hmm</think>");
+        // The header's name fills a body without one.
+        assert_eq!(
+            inkling_call("f", "{\"args\":{}}"),
+            "{\"arguments\":{},\"name\":\"f\"}"
+        );
+    }
 
     #[test]
     fn splices_and_locates_adjacent_clips_and_images() {

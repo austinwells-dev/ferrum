@@ -126,6 +126,7 @@ fn synthetic(d: &MetalDevice, config: VisionConfig, seed: u64) -> VisionModel {
         weight_bytes: 0,
         score_bytes: SCORE_BYTES,
         lfm3: None,
+        inkling: None,
         marker: "<|image_pad|>",
         filter: image::imageops::FilterType::CatmullRom,
     }

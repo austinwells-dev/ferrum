@@ -1,0 +1,9 @@
+chunk 0: ppl 23.2278 (llama.cpp 23.2052) mean KLD 0.000116 same top 99.22%
+chunk 1: ppl 19.0243 (llama.cpp 18.8786) mean KLD 0.000108 same top 99.41%
+chunk 2: ppl 13.3120 (llama.cpp 13.2319) mean KLD 0.000114 same top 99.22%
+chunk 3: ppl 9.6966 (llama.cpp 9.6649) mean KLD 0.000182 same top 99.31%
+chunk 4: ppl 8.4582 (llama.cpp 8.4326) mean KLD 0.000183 same top 99.45%
+chunk 5: ppl 10.0969 (llama.cpp 10.0630) mean KLD 0.000172 same top 99.35%
+chunk 6: ppl 9.2048 (llama.cpp 9.1779) mean KLD 0.000157 same top 99.27%
+chunk 7: ppl 9.2611 (llama.cpp 9.2375) mean KLD 0.000145 same top 99.36%
+positions 2040; Ferrum PPL 9.2611; llama.cpp PPL 9.2375; mean KLD 0.000145; median 0.000045; p99 0.000744; max 0.070800; same top-1 99.36%; 7.2 s
