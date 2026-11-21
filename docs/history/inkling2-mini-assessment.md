@@ -86,6 +86,12 @@ Branch `feat/inkling2-mini`, from `experimental` at `0c20d64`. Steps 1–4 and 7
 
 Results and gaps: [models.md](../models.md#inkling-2-mini), raw logs in [measurements/inkling2](../measurements/inkling2/README.md).
 
+## 2026-11-21, later: speculation, effort, long context
+
+- **Prompt lookup.** Verify runs `h_ink_conv` in tape mode: each visit's four convolution inputs go to `Spec::tape_ink`, and `commit` pushes the accepted rows into the histories (`h_ple_push`, as qwen4exp's n-gram conv). The first check failed in a near-tie at token 19, with verify KL 3.9e-3 from decode. `FERRUM_HYBRID_EXACT=1` brought it to 5e-9, which pointed at the verify tiles: they round weights to F16, and Inkling's gates are small F32 matrices. An exact GEMV for F32 and BF16 at 2–16 rows gives 5.3e-6 and greedy-identical output. Lookup does not pay yet (23.3 against 23.2 tok/s): a 4-row verify costs 1.9 decode steps and lookup accepts 1.9 tokens.
+- **Effort.** At level 0 the model still reasons, under llama.cpp too (identical greedy reply). With thinking off and no tools, Ferrum now opens the reply as text. The TUI's Effort setting lists the levels each template names, and the TUI's catalog now admits `inkling2` (it had been greyed out: architecture list, pre-tokenizer, NVFP4 and the BF16 projections).
+- **Long context.** Needle tests pass at 53k and 105k tokens. llama.cpp runs out of memory at a 64K depth on this Mac, where Ferrum decodes at 14.7 tok/s.
+
 ## Sources
 
 - https://thinkingmachines.ai/news/inkling-2-mini/

@@ -736,6 +736,9 @@ pub(crate) struct Spec {
     tape_b: Vec<Tensor>,
     /// `[rows, streams * hidden]`: the n-gram conv inputs of the verify rows.
     tape_ple: Option<Tensor>,
+    /// Inkling 2, per visit: `[rows, inkling_conv_channels]`, the inputs of
+    /// its four short convolutions for the verify rows.
+    tape_ink: Vec<Tensor>,
     /// Recurrent-layer index of each layer (None for attention layers).
     recurrent_index: Vec<Option<usize>>,
     logits: Tensor,
@@ -754,6 +757,7 @@ impl Spec {
             .chain(&self.tape_g)
             .chain(&self.tape_b)
             .chain(&self.tape_ple)
+            .chain(&self.tape_ink)
             .chain([&self.logits, &self.candidates, &self.tokens, &self.gather])
             .map(|t| page(t.byte_size()))
             .sum()
@@ -789,6 +793,9 @@ pub fn spec_bytes(c: &HybridConfig, chunk: usize, g: &SpecGeometry) -> usize {
         c.recurrent_layer_count()
             * (f32s(g.rows * c.conv_channels()) + 2 * f32s(g.rows * c.ssm_v_heads))
     };
+    if c.inkling.is_some() {
+        total += c.layers * f32s(g.rows * super::config::inkling_conv_channels(c));
+    }
     total
         + qwen4exp::ple_tape_bytes(c, g.rows)
         + f32s(g.rows * c.vocab)
@@ -1320,9 +1327,12 @@ impl HybridModel {
                 c.layers
             )));
         }
-        if c.inkling.is_some() {
+        // Inkling's stack captures no layer outputs, so only drafters that
+        // read none (prompt lookup) can run on it.
+        if c.inkling.is_some() && (!g.aux_layers.is_empty() || g.final_hidden) {
             return Err(Error::Config(
-                "speculative decoding is not available for Inkling 2 yet".into(),
+                "Inkling 2 speculates with prompt lookup only; no drafter model reads its layers yet"
+                    .into(),
             ));
         }
         *self.spec.borrow_mut() = None;
@@ -1363,6 +1373,12 @@ impl HybridModel {
             tape_ple: match qwen4exp::ple_tape_bytes(c, g.rows) {
                 0 => None,
                 _ => Some(f(&[g.rows, qwen4exp::ple_width(c)])?),
+            },
+            tape_ink: match c.inkling {
+                Some(_) => (0..c.layers)
+                    .map(|_| f(&[g.rows, super::config::inkling_conv_channels(c)]))
+                    .collect::<Result<_>>()?,
+                None => Vec::new(),
             },
             recurrent_index,
             logits: f(&[g.rows, c.vocab])?,
@@ -1557,7 +1573,7 @@ impl HybridModel {
         {
             return Err(Error::Parameter("one penalty set per verify row".into()));
         }
-        if parents.is_some() && self.config.variant == Variant::Lfm3 {
+        if parents.is_some() && matches!(self.config.variant, Variant::Lfm3 | Variant::Inkling) {
             return Err(Error::Parameter(
                 "draft trees are not supported for this model".into(),
             ));
@@ -1600,6 +1616,7 @@ impl HybridModel {
         let e = d.execution_with_shared_encoder(true)?;
         self.replay(d, &s, spec, state, n, None)?;
         self.commit_ple(d, spec, state, n)?;
+        self.commit_inkling(d, spec, state, n)?;
         e.finish()?;
         state.len += n;
         state.verified = 0;
@@ -2006,12 +2023,13 @@ impl HybridModel {
         let spec = self.spec.borrow();
         let spec = spec.as_ref();
         if self.weights.inkling.is_some() {
-            if tree.is_some() || verify {
+            if tree.is_some() {
                 return Err(Error::Parameter(
-                    "speculative verifies are not available for Inkling 2 yet".into(),
+                    "draft trees are not supported for this model".into(),
                 ));
             }
-            self.inkling_layers(d, &s, state, &x0, &xn, m, pos)?;
+            let tapes = spec.filter(|_| verify).map(|s| s.tape_ink.as_slice());
+            self.inkling_layers(d, &s, state, &x0, &xn, m, pos, tapes)?;
         } else if self.weights.hc_head.is_some() {
             if tree.is_some() {
                 return Err(Error::Parameter(
@@ -3540,6 +3558,24 @@ impl HybridModel {
         let outputs: [Binding; 1] = [y.binding()];
         // MLX from 3 rows: the integer-code tiles (2 rows: the batched GEMV,
         // 133 against 148 ms per 27B forward; 3 rows: 185 against 148).
+        // Full-precision weights stay full precision at verify widths: the
+        // tiles round them to F16, and the small F32 matrices that drive
+        // gates (Inkling's routers, loop controllers and sinks) then move a
+        // verify row's logits away from decode's (KL 3.9e-3 against 5.3e-6).
+        // They are small, so one GEMV per row costs little.
+        let small_rows = (2..=MMS_MAX_ROWS).contains(&m);
+        if small_rows && matches!(w.format, Format::F32 | Format::Bf16) {
+            let (name, rows_per_group, simds, shared) = mv_kernel(w.format, false);
+            return d.dispatch_hybrid(
+                name,
+                &inputs,
+                &outputs,
+                &args,
+                [w.rows.div_ceil(rows_per_group), m, 1],
+                [32, simds, 1],
+                shared,
+            );
+        }
         if w.format == Format::Mlx4 && (3..=MMS_MAX_ROWS).contains(&m) && !exact_math() {
             return Self::project_mlx_tiles(d, w, x, m, y);
         }

@@ -1059,7 +1059,11 @@ fn handle(
                 ) {
                     // The same prompt a chat request feeds the model.
                     Ok(mut prompt) => {
-                        prompt.push_str(hybrid::runtime::generation_prefix(&model.template, &vars));
+                        prompt.push_str(hybrid::runtime::generation_prefix(
+                            &model.template,
+                            &vars,
+                            !tools.is_empty(),
+                        ));
                         http::json(stream, 200, &json!({"prompt": prompt}), ka)
                     }
                     Err(e) => http::json(

@@ -199,7 +199,7 @@ pub fn fields() -> Vec<Field> {
             Both,
             Kind::Cycle(&["default", "low", "medium", "high"]),
             "default",
-            "Reasoning effort passed to the chat template.",
+            "Reasoning effort passed to the chat template. The choices are the levels the selected model's template names; \"none\" turns thinking off.",
         ),
         field(
             "budget",

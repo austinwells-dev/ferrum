@@ -1073,7 +1073,11 @@ impl Runtime {
             true,
             &vars,
         )?;
-        prompt.push_str(generation_prefix(&self.template, &vars));
+        prompt.push_str(generation_prefix(
+            &self.template,
+            &vars,
+            !request.tools.is_empty(),
+        ));
         Ok(prompt)
     }
 
@@ -1666,13 +1670,25 @@ fn cache_identity(path: &Path) -> String {
 /// applies as for Qwen). Off: an empty think block. Both are written as the
 /// template writes past reasoning (`<think>…</think>`, no newlines), so the next
 /// turn's prompt reuses this turn's cached prefix. Other templates switch
-/// thinking themselves.
-pub fn generation_prefix(template: &ChatTemplate, vars: &Map<String, Json>) -> &'static str {
+/// thinking themselves, except Inkling 2's (below). `tools` says whether the
+/// request declares tools.
+pub fn generation_prefix(
+    template: &ChatTemplate,
+    vars: &Map<String, Json>,
+    tools: bool,
+) -> &'static str {
     // Inkling 2 opens every message of its reply itself, choosing thinking,
-    // text or a tool call (as llama.cpp, which adds nothing); its effort
-    // level, which `normalize_thinking` sets, steers whether it reasons.
+    // text or a tool call (llama.cpp adds nothing). Its effort level 0 still
+    // lets it reason (as under llama.cpp: identical greedy output), so with
+    // thinking off a reply opens as text. Not when tools are declared:
+    // opened as text, the model never calls one.
     if is_inkling_template(template.source()) {
-        return "";
+        let off = vars.get("enable_thinking") == Some(&Json::Bool(false));
+        return if off && !tools {
+            "<|message_model|><|content_text|>"
+        } else {
+            ""
+        };
     }
     if !template.opens_thinking() {
         return "";
@@ -1707,6 +1723,35 @@ pub fn normalize_thinking(template: &str, vars: &mut Map<String, Json>) {
     }
 }
 
+/// Reasoning efforts in increasing order; a template names some of them.
+const LEVELS: [&str; 8] = [
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "extreme",
+    "ultracode",
+];
+
+fn names_level(template: &str, level: &str) -> bool {
+    template.contains(&format!("'{level}'")) || template.contains(&format!("\"{level}\""))
+}
+
+/// The `reasoning_effort` values a chat template understands, lowest first:
+/// the named levels it compares against, with "none" first when it names
+/// that too. Empty when the template has no effort.
+pub fn effort_levels(template: &str) -> Vec<&'static str> {
+    if !template.contains("reasoning_effort") {
+        return Vec::new();
+    }
+    let none = names_level(template, "none").then_some("none");
+    none.into_iter()
+        .chain(LEVELS.into_iter().filter(|l| names_level(template, l)))
+        .collect()
+}
+
 fn normalize_thinking_vars(template: &str, vars: &mut Map<String, Json>) {
     for key in ["enable_thinking", "thinking"] {
         if let Some(Json::String(s)) = vars.get(key) {
@@ -1729,23 +1774,8 @@ fn normalize_thinking_vars(template: &str, vars: &mut Map<String, Json>) {
         vars.insert("enable_thinking".into(), Json::Bool(false));
         return;
     }
-    const LEVELS: [&str; 8] = [
-        "minimal",
-        "low",
-        "medium",
-        "high",
-        "xhigh",
-        "max",
-        "extreme",
-        "ultracode",
-    ];
-    let known: Vec<usize> = LEVELS
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| {
-            template.contains(&format!("'{l}'")) || template.contains(&format!("\"{l}\""))
-        })
-        .map(|(i, _)| i)
+    let known: Vec<usize> = (0..LEVELS.len())
+        .filter(|&i| names_level(template, LEVELS[i]))
         .collect();
     let Some(wanted) = LEVELS.iter().position(|l| *l == effort) else {
         return;
@@ -2252,6 +2282,19 @@ mod tests {
     }
 
     #[test]
+    fn lists_template_efforts() {
+        let inkling = r#"{%- set effort_map = {"none": 0.0, "minimal": 0.1, "low": 0.2, "medium": 0.7, "high": 0.9, "xhigh": 0.99, "max": 0.99} -%}{{ reasoning_effort }}"#;
+        assert_eq!(
+            effort_levels(inkling),
+            ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        );
+        let qwen = "{% if reasoning_effort not in ('xhigh', 'medium', 'low') %}";
+        assert_eq!(effort_levels(qwen), ["low", "medium", "xhigh"]);
+        // Level names alone, without the variable, are not efforts.
+        assert!(effort_levels("{{ 'low' }}").is_empty());
+    }
+
+    #[test]
     fn rewrites_inkling_messages() {
         let reply = "17*23 is 391.<|end_message|><|message_model|><|content_text|>391<|end_message|><|content_model_end_sampling|>";
         for step in [1, 3, 7, 1000] {
@@ -2411,13 +2454,20 @@ mod thinking_tests {
         off.insert("enable_thinking".into(), Json::Bool(false));
         let mut on = Map::new();
         on.insert("enable_thinking".into(), Json::Bool(true));
-        assert_eq!(generation_prefix(&flint, &off), "<think></think>");
-        assert_eq!(generation_prefix(&flint, &on), "<think>");
-        assert_eq!(generation_prefix(&flint, &Map::new()), "<think>");
-        assert_eq!(generation_prefix(&qwen, &off), "");
-        assert_eq!(generation_prefix(&qwen, &Map::new()), "");
+        assert_eq!(generation_prefix(&flint, &off, false), "<think></think>");
+        assert_eq!(generation_prefix(&flint, &on, false), "<think>");
+        assert_eq!(generation_prefix(&flint, &Map::new(), false), "<think>");
+        assert_eq!(generation_prefix(&qwen, &off, false), "");
+        assert_eq!(generation_prefix(&qwen, &Map::new(), false), "");
         let plain = ChatTemplate::new("{{ messages[0].content }}").unwrap();
-        assert_eq!(generation_prefix(&plain, &Map::new()), "");
+        assert_eq!(generation_prefix(&plain, &Map::new(), false), "");
+        let inkling = ChatTemplate::new(
+            "{{ '<|message_model|><|content_thinking|>' }}{{ reasoning_effort }}",
+        )
+        .unwrap();
+        assert_eq!(generation_prefix(&inkling, &off, false), INKLING_TEXT);
+        assert_eq!(generation_prefix(&inkling, &off, true), "");
+        assert_eq!(generation_prefix(&inkling, &on, false), "");
         let named = ForcedTool::Named("read".into());
         assert_eq!(
             tool_opening(Variant::Moe, &ForcedTool::Any).as_deref(),

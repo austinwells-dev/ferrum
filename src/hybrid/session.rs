@@ -351,7 +351,12 @@ impl Session {
             .ok_or_else(|| Error::Parameter("a draft tree needs a drafter".into()))?;
         // A tree row would need its parent's short-conv window. Chains replay
         // one B*x tape and stay available.
-        if budget.is_some() && model.config.variant == super::config::Variant::Lfm3 {
+        if budget.is_some()
+            && matches!(
+                model.config.variant,
+                super::config::Variant::Lfm3 | super::config::Variant::Inkling
+            )
+        {
             return Err(Error::Parameter(
                 "draft trees are not supported for this model".into(),
             ));

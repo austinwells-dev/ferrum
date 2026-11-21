@@ -1,0 +1,9 @@
+lock 09:27:07: 0
+depth 0.10: 53384 prompt tokens, prefill 156.5 s (341 tok/s), decode 15.6 tok/s, answer "1000-amber" -> PASS
+depth 0.50: 53384 prompt tokens, prefill 156.4 s (341 tok/s), decode 15.7 tok/s, answer "8919-violet" -> PASS
+depth 0.90: 53384 prompt tokens, prefill 156.4 s (341 tok/s), decode 15.4 tok/s, answer "7838-cobalt" -> PASS
+device memory: 19983.8 MiB at start, 19984.0 MiB at end (plan predicted 20082.5 MiB)
+lock 09:35:04: 0
+depth 0.50: 105426 prompt tokens, prefill 372.4 s (283 tok/s), decode 11.9 tok/s, answer "1000-amber" -> PASS
+device memory: 22031.8 MiB at start, 22032.0 MiB at end (plan predicted 22130.5 MiB)
+lock 09:41:21: 0

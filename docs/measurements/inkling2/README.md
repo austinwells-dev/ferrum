@@ -86,3 +86,44 @@ The change touches the shared 128- and 256-wide attention templates (the `_rel` 
 | tg128 | 53.70 | 52.89 | 39.65 | 39.63 |
 
 Qwen3.6 drifted during that run (base pp512 ranged 788–939, tg128 51.1–53.7). Two more A-B-B-A rounds of pp512 and tg128 alone ([regression/bench-qwen36-decode-abba.txt](regression/bench-qwen36-decode-abba.txt)) gave base 940.74 / 54.96 and branch 951.51 / 55.14 (best of four), so the first run's gap is within its spread.
+
+## Speculation
+
+Prompt lookup, after verify tapes for the short convolutions and the exact F32/BF16 verify GEMV (logs in [speculation/](speculation/)).
+
+- `cargo run --release --example hybrid_spec_check -- <gguf>` ([log](speculation/spec-inkling.txt)): speculative output equals greedy for 96 tokens. Verify rows against single-row decode: max KL 5.29e-6. Replay after `commit(5)` equals a plain forward (max |dlogit| 0.0000). With `FERRUM_HYBRID_EXACT=1` (every projection exact), max KL 5.09e-9 ([log](speculation/spec-inkling-exact.txt)).
+- Before the exact GEMV, with F32 and BF16 weights rounded to F16 in the verify tiles: max KL 3.92e-3 and output diverging from greedy at token 19, a near-tie (margin 0.0033) ([log](speculation/spec-inkling-tiled-f32.txt); the tiling was restored for this run only).
+- `hybrid_session_check <gguf> --draft lookup` ([log](speculation/session-inkling-lookup.txt)): PASS.
+- `hybrid_spec <gguf> --drafter lookup --baseline --tokens 256` ([log](speculation/spec-lookup-inkling.txt)), 8 prompts: baseline 23.19 tok/s, lookup 23.32 tok/s, acceptance length 1.931, verify 81.8 ms per step against about 43 ms per decode step. Two greedy mismatches, both at near-ties (top-2 margins 0.0400 and 0.0093).
+- On Qwen3.6, `hybrid_spec_check` after the GEMV change ([regression/spec-check-qwen36-verify-gemv.txt](regression/spec-check-qwen36-verify-gemv.txt)) still passes: verify KL 1.22e-6, against 8.3e-7 before.
+
+## Long context
+
+`caffeinate -dims`, preflight as above, screen unlocked at every check. `hybrid_bench <gguf> --pp 512 --tg 128 --reps 2 --pp-depth 16384,65536 --depth 16384,65536` interleaved with `llama-bench -m <gguf> -p 512 -n 32 -d 0,16384,65536 -r 1`, two rounds ([log](long-context/bench-depth-abab.txt)). Ferrum's `pp512 @ dN` is one 512-token chunk after N cached tokens, and `tg@N` 16 decode steps after them, like llama-bench's `-d`.
+
+| tok/s | Ferrum round 1 / 2 | llama.cpp round 1 / 2 |
+|---|---|---|
+| pp512 | 540.49 / 539.30 | 259.29 / 259.69 |
+| pp512 @ d16384 | 400.45 / 402.08 | 126.48 / 125.83 |
+| pp512 @ d65536 | 277.77 / 277.17 | out of memory |
+| tg128 (llama.cpp tg32) | 24.71 / 24.30 | 23.35 / 23.35 |
+| tg @ d16384 | 20.20 / 20.02 | 18.36 / 19.60 |
+| tg @ d65536 | 14.74 / 14.59 | out of memory |
+
+At depth 65,536 llama.cpp's Metal backend fails with `kIOGPUCommandBufferCallbackErrorOutOfMemory` on this 32 GB Mac ([log](long-context/llama-bench-d65536-oom.txt)); Ferrum's plan fits 177,408 tokens.
+
+`hybrid_needle <gguf> FILLER 65536 0.1,0.5,0.9`, then `... 131072 0.5`, hides a passphrase in a filler document (the repository's `docs/history/*.md` concatenated) and asks for it through the chat template ([log](long-context/needle.txt)). The prompts came to 53,384 and 105,426 tokens. All four answers are right. Prefill ran at 341 and 283 tok/s over the whole prompt, the answers decoded at 15.4–15.7 and 11.9 tok/s, and device memory stayed flat (within 0.2 MiB) and under the plan's prediction.
+
+## Verify cost after the exact F32/BF16 GEMV
+
+`hybrid_verify_cost <gguf> --widths 1,2,4,8,16 --reps 5`, base (`c2a3230`, the tiled path) and branch A-B-B-A ([log](regression/verify-cost-abba.txt)), best per side in ms:
+
+| rows | Qwen3.6 base / branch | Spark base / branch | Inkling base / branch |
+|---|---|---|---|
+| 1 | 18.7 / 18.7 | 27.0 / 27.1 | 43.8 / 43.8 |
+| 2 | 22.4 / 22.5 | 27.0 / 26.9 | 51.5 / 54.7 |
+| 4 | 31.8 / 31.8 | 32.5 / 32.0 | 76.5 / 79.6 |
+| 8 | 54.4 / 54.3 | 38.8 / 37.9 | 97.4 / 91.2 |
+| 16 | 75.6 / 75.3 | 46.9 / 47.6 | 131.3 / 125.1 |
+
+Qwen3.6 and Spark are unchanged within their spread. Inkling, whose F32 controller and router matrices take the GEMV, pays about 3 ms at 2 and 4 rows and gains 5–6 ms at 8 and 16.

@@ -19,7 +19,7 @@ You give it a model file and then either chat in the terminal, use the full-scre
 > - **Parallel requests (`--parallel N`).** The server serves up to 8 conversations at once, each keeping its own cache, so concurrent users or agents don't evict each other and re-run long prompts. A request can also lower an image's token budget below `--image-tokens` ([per-request image sizes](docs/server.md#image-size-per-request)). Slots take turns on the GPU.
 > - **Image generation.** Qwen-Image-2.1-Turbo drawing and editing in the CLI, server and TUI, and the TUI tools `generate_image` and `view_image`.
 > - **LFM3.** LiquidAI LFM3-1.7B text, LFM3-VL-2B still images and LFM3-Audio-2B speech input (WAV). LFM3-Omni is not supported.
-> - **Inkling 2 Mini.** Thinking Machines' looped MoE, text and still images, from Unsloth's UD-Q4_K_XL GGUF. No speculative decoding yet.
+> - **Inkling 2 Mini.** Thinking Machines' looped MoE, text and still images, from Unsloth's UD-Q4_K_XL GGUF. Speculation is prompt lookup only, and it does not speed it up yet.
 
 ## Highlights
 
@@ -151,6 +151,8 @@ These are measured on a 32 GB Apple M5 in October 2026, with Ferrum and llama.cp
 |---|---|---|
 | Inkling 2 Mini pp512 / pp2048 | **535.7 / 501.5** | 259.6 / 221.9 |
 | Inkling 2 Mini tg128 | **24.2** | 23.1 |
+| Inkling 2 Mini pp512 / tg at 16K context | **402.1 / 20.2** | 126.5 / 19.6 |
+| Inkling 2 Mini pp512 / tg at 64K context | **277.8 / 14.7** | out of memory |
 
 **With speculative decoding** (8 chat prompts × 128 tokens through each server, greedy; llama.cpp's drafters converted to Q8_0 GGUF, Ferrum's quantized to Q4_0 at load):
 
@@ -244,7 +246,7 @@ Weight formats: safetensors (F32/F16/BF16), GGUF Q4/Q5/Q6/Q8 including K-quants 
 
 - Apple Silicon only. Everything was developed and measured on an M5; older chips should work but haven't been validated, and `ferrum info` reports what your GPU supports.
 - Batch size 1. `ferrum-server --parallel N` serves up to 8 requests at once in separate sessions that take turns on the GPU, so their streams interleave but total throughput is that of one request.
-- The server and TUI run Qwen3.5-family hybrids (GGUF, and dense MLX 4-bit checkpoints, one of which is checked), Qwen3.8-Flash-Next (the Q2_0 pack; its sparse-attention indexer is not loaded, and contexts past 2,048 are not validated), and Flint, Spark, Inkling 2 Mini (text and still images; no speculative decoding) and LFM3 text, still images and speech input. LFM3-Omni is not supported. Other architectures go through the developer runner, built with `--features legacy-engine`. Open gaps: [models.md](docs/models.md).
+- The server and TUI run Qwen3.5-family hybrids (GGUF, and dense MLX 4-bit checkpoints, one of which is checked), Qwen3.8-Flash-Next (the Q2_0 pack; its sparse-attention indexer is not loaded, and contexts past 2,048 are not validated), and Flint, Spark, Inkling 2 Mini (text and still images; speculation by prompt lookup only, with no speedup yet) and LFM3 text, still images and speech input. LFM3-Omni is not supported. Other architectures go through the developer runner, built with `--features legacy-engine`. Open gaps: [models.md](docs/models.md).
 - Vision supports the Qwen3-VL projector, LFM3-VL and Inkling 2 still images. No video. LFM3-Audio hears WAV clips of up to 120 s each (also the TUI's Audio tab); it does not speak.
 - Image generation and editing (`ferrum-cli image`, `ferrum-server --image-model` with `/v1/images/generations` and `/v1/images/edits`, the TUI Image tab, and the chat and agent tool `generate_image`) supports Qwen-Image-2.1-Turbo from safetensors, and the base model's transformer from GGUF; a new 1024² picture takes about 69 s ([server.md](docs/server.md#image-generation)). The base schedule has no guidance and is not checked against diffusers.
 - No training and no language bindings.

@@ -73,7 +73,7 @@ Any of these request fields turn reasoning on or off, or set its effort:
 
 Server-wide defaults: `--no-think`, `--reasoning-effort`, `--reasoning-budget`, `--reasoning-format`, `--chat-template-kwargs`.
 
-Inkling 2's template knows only an effort level (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a number up to 0.99; default 0.9). Turning thinking off sends level 0, at which the model may still reason briefly before a tool call. Its reply arrives in the same `reasoning_content`, `content` and `tool_calls` fields as other models'.
+An effort the template does not name snaps to the nearest level it does (Spark's names only `low` and `high`, so `medium` becomes `high`), and `none` turns thinking off. Inkling 2's template knows only an effort level (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a number up to 0.99; default 0.9). Turning thinking off sends level 0 and, when the request declares no tools, opens the reply as text, since at level 0 the model still reasons. With tools it may reason briefly before a call. Its reply arrives in the same `reasoning_content`, `content` and `tool_calls` fields as other models'.
 
 ### Structured output
 
@@ -190,7 +190,7 @@ ferrum-cli --model model.gguf     # --kv-cache q8 as for the server
 
 In a terminal the prompt has line editing and history (↑/↓, kept in `~/.cache/ferrum/cli-history`, or under `$XDG_CACHE_HOME`). Ctrl-C stops the reply being written and keeps the conversation; at the prompt, Ctrl-C or Ctrl-D leaves. Piped input without `--prompt` is read one message per line, as before.
 
-Commands: `/reset`, `/think on|off`, `/image PATH [low|high|auto|N]`, `/detail low|high|auto|N`, `/stats`, `/exit`. To continue a message on the next line, end the line with `\`. A size after `/image PATH` applies to that image; `/detail` sets it for the images that follow (see [Image size per request](#image-size-per-request)).
+Commands: `/reset`, `/think on|off`, `/effort [LEVEL|default]` (bare `/effort` lists the levels the model's template names), `/image PATH [low|high|auto|N]`, `/detail low|high|auto|N`, `/stats`, `/exit`. To continue a message on the next line, end the line with `\`. A size after `/image PATH` applies to that image; `/detail` sets it for the images that follow (see [Image size per request](#image-size-per-request)).
 
 ## Speculative decoding
 

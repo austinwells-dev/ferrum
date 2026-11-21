@@ -271,6 +271,7 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
         audio: false,
         problem: None,
         tokenizer: Default::default(),
+        efforts: Vec::new(),
     });
     let dense = app.models.len() - 1;
     let b = app.bench.as_mut().unwrap();
@@ -334,4 +335,43 @@ fn a_running_speed_bench_lists_only_ticked_candidates() {
     let text = screen_text(&app, 240, 60);
     assert!(!text.contains("T15, auto"), "trees planned on an MoE model");
     assert!(text.contains("4 runs"), "an MoE plan still counts trees");
+}
+
+#[test]
+fn effort_cycles_the_selected_models_levels() {
+    let model = |name: &str, efforts: Vec<&'static str>| crate::catalog::Model {
+        path: format!("/m/{name}.gguf").into(),
+        name: name.into(),
+        origin: String::new(),
+        size: 1,
+        info: None,
+        hybrid: None,
+        mtp: false,
+        mtp_why: String::new(),
+        vision: None,
+        audio: false,
+        problem: None,
+        tokenizer: Default::default(),
+        efforts,
+    };
+    let mut app = App::new(None);
+    app.models = vec![
+        model("inkling", vec!["none", "low", "medium", "high", "max"]),
+        model("plain", Vec::new()),
+    ];
+    app.cursor = 0;
+    let i = app.fields.iter().position(|f| f.key == "effort").unwrap();
+    for _ in 0..5 {
+        app.step(i, 1);
+    }
+    assert_eq!(app.value("effort"), "max");
+    app.step(i, 1);
+    assert_eq!(app.value("effort"), "default");
+    app.step(i, -1);
+    assert_eq!(app.value("effort"), "max");
+    // A model without the level drops it rather than passing it on.
+    app.cursor = 1;
+    app.load_info();
+    assert_eq!(app.value("effort"), "default");
+    assert_eq!(app.effort_values(), ["default"]);
 }

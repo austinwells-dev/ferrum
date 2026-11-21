@@ -182,6 +182,7 @@ impl HybridModel {
         xn: &Tensor,
         m: usize,
         pos: usize,
+        tapes: Option<&[Tensor]>,
     ) -> Result<()> {
         let c = &self.config;
         let ink = c.inkling.as_ref().expect("inkling geometry");
@@ -214,6 +215,9 @@ impl HybridModel {
         let block = |i: usize| rows(&is.blocks[i], 0, m, h);
         let (mut depth, mut prelude, mut bank) = (0usize, 0usize, 0usize);
         for v in 0..c.layers {
+            // A verify records each convolution's inputs for `commit` and
+            // leaves the visit's history alone.
+            let tape = tapes.map(|t| &t[v]);
             let ip = ink.layer_of(v);
             let layer = &w.layers[ip];
             let pass = ink.pass_of(v);
@@ -287,7 +291,7 @@ impl HybridModel {
                 }
             };
             let out = rows(&s.mix, 0, m, h)?;
-            self.ink_attention(d, s, is, layer, state, v, &n, &out, m, pos)?;
+            self.ink_attention(d, s, is, layer, state, v, &n, &out, m, pos, tape)?;
             let conv = state.conv[v].as_ref().expect("inkling visit conv state");
             let kv = c.kv_heads * c.head_dim;
             if ip.is_multiple_of(ink.block_size) {
@@ -297,6 +301,7 @@ impl HybridModel {
                 self.ink_conv(
                     d,
                     &is.z_in,
+                    tape,
                     &out,
                     &layer.attn_conv,
                     None,
@@ -310,6 +315,7 @@ impl HybridModel {
                 self.ink_conv(
                     d,
                     &is.z_in,
+                    tape,
                     &out,
                     &layer.attn_conv,
                     None,
@@ -337,6 +343,7 @@ impl HybridModel {
             self.ink_conv(
                 d,
                 &is.z_in,
+                tape,
                 &out,
                 &layer.ffn_conv,
                 None,
@@ -444,13 +451,15 @@ impl HybridModel {
 
     /// Kernel-4 causal convolution of `x` (`[m, channels]`) into `y`, with
     /// the visit's history at channel `offset` of its state row. `dynamic`
-    /// adds per-head input-dependent taps (`[m, heads * 4]`). `spare` is bound
-    /// as the (unwritten) verify tape.
+    /// adds per-head input-dependent taps (`[m, heads * 4]`). With `tape` (a
+    /// verify) each row's input is recorded there at the same channel and the
+    /// history is left alone; otherwise `spare` is bound, unwritten.
     #[allow(clippy::too_many_arguments)]
     fn ink_conv(
         &self,
         d: &MetalDevice,
         spare: &Tensor,
+        tape: Option<&Tensor>,
         x: &Tensor,
         taps: &Tensor,
         dynamic: Option<&Tensor>,
@@ -471,7 +480,11 @@ impl HybridModel {
                 taps.binding(),
                 dynamic.unwrap_or(taps).binding(),
             ],
-            &[y.binding(), state.binding(), spare.binding()],
+            &[
+                y.binding(),
+                state.binding(),
+                tape.unwrap_or(spare).binding(),
+            ],
             &Params::default()
                 .u(m)?
                 .u(channels)?
@@ -480,13 +493,39 @@ impl HybridModel {
                 .u(offset)?
                 .u(heads)?
                 .u(width)?
-                .u(0)?
+                .u(usize::from(tape.is_some()))?
                 .f(scale)
                 .0,
             [channels.div_ceil(256), 1, 1],
             [256, 1, 1],
             0,
         )
+    }
+
+    /// After a verify, the first `n` rows of each visit's convolution
+    /// inputs join its history, which keeps the newest `kernel - 1` rows.
+    pub(super) fn commit_inkling(
+        &self,
+        d: &MetalDevice,
+        spec: &Spec,
+        state: &HybridState,
+        n: usize,
+    ) -> Result<()> {
+        let c = &self.config;
+        let channels = inkling_conv_channels(c);
+        for (v, tape) in spec.tape_ink.iter().enumerate() {
+            let history = state.conv[v].as_ref().expect("inkling visit conv state");
+            d.dispatch_hybrid(
+                "h_ple_push",
+                &[rows(tape, 0, n, channels)?.binding()],
+                &[history.binding()],
+                &Params::default().u(channels)?.u(n)?.u(c.conv_kernel - 1)?.0,
+                [channels.div_ceil(256), 1, 1],
+                [256, 1, 1],
+                0,
+            )?;
+        }
+        Ok(())
     }
 
     /// `y += x`.
@@ -517,6 +556,7 @@ impl HybridModel {
         out: &Tensor,
         m: usize,
         pos: usize,
+        tape: Option<&Tensor>,
     ) -> Result<()> {
         let c = &self.config;
         let ink = c.inkling.as_ref().expect("inkling geometry");
@@ -552,6 +592,7 @@ impl HybridModel {
         self.ink_conv(
             d,
             &is.z_in,
+            tape,
             &k,
             &layer.k_conv,
             dyn_k.as_ref(),
@@ -563,6 +604,7 @@ impl HybridModel {
         self.ink_conv(
             d,
             &is.z_in,
+            tape,
             &vv,
             &layer.v_conv,
             dyn_v.as_ref(),
