@@ -1,0 +1,11 @@
+0.01.574.471 I cmn          init: llama threadpool init, n_threads = 4
+0.01.667.037 I 
+0.01.667.072 I system_info: n_threads = 4 (n_threads_batch = 4) / 10 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | SME = 1 | SME2 = 1 | ACCELERATE = 1 | REPACK = 1 | 
+0.01.667.311 I perplexity: saving all logits to ref/inkling-metal.kld
+0.01.667.319 I perplexity: tokenizing the input ..
+0.01.726.863 I perplexity: tokenization took 59.543 ms
+0.01.726.877 I perplexity: calculating perplexity over 8 chunks, n_ctx=512, batch_size=2048, n_seq=4
+0.10.766.322 I perplexity: 9.03 seconds per pass - ETA 0.30 minutes
+[1]7.4933,[2]7.9912,[3]5.9444,[4]4.9966,[5]4.6538,[6]5.0757,[7]5.0533,[8]5.1218,
+0.20.090.397 I Final estimate: PPL = 5.1218 +/- 0.28046
+

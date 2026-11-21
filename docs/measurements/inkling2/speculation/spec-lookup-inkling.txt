@@ -1,0 +1,20 @@
+drafter lookup (max 3 drafts); memory predicted 8.6 MiB, measured 8.6 MiB
+prompt 0: baseline 256 tokens, 23.3 tok/s
+prompt 0 chain: 256 tokens, 24.7 tok/s, acceptance 2.16 (56 steps), identical
+prompt 1: baseline 255 tokens, 23.2 tok/s
+prompt 1 chain: 256 tokens, 25.1 tok/s, acceptance 2.15 (71 steps), diverges at 189 (target top-2 margin 0.0400)
+prompt 2: baseline 256 tokens, 23.3 tok/s
+prompt 2 chain: 256 tokens, 22.4 tok/s, acceptance 1.57 (30 steps), identical
+prompt 3: baseline 256 tokens, 23.2 tok/s
+prompt 3 chain: 256 tokens, 23.1 tok/s, acceptance 1.84 (25 steps), diverges at 206 (target top-2 margin 0.0093)
+prompt 4: baseline 256 tokens, 23.2 tok/s
+prompt 4 chain: 256 tokens, 22.1 tok/s, acceptance 1.43 (28 steps), identical
+prompt 5: baseline 256 tokens, 23.1 tok/s
+prompt 5 chain: 256 tokens, 22.6 tok/s, acceptance 1.77 (47 steps), identical
+prompt 6: baseline 256 tokens, 23.0 tok/s
+prompt 6 chain: 256 tokens, 23.0 tok/s, acceptance 1.90 (49 steps), identical
+prompt 7: baseline 106 tokens, 23.2 tok/s
+prompt 7 chain: 106 tokens, 25.1 tok/s, acceptance 2.54 (13 steps), identical
+
+baseline: 23.19 tok/s
+chain: 23.32 tok/s, acceptance length 1.931, 3.0 drafts/step, draft 0.0 ms/step, verify 81.8 ms/step, accepted by depth 49% 28% 16%, speedup 1.01x, greedy mismatches 2

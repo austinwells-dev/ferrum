@@ -1,0 +1,4 @@
+13 verify steps, 7.38 tokens/step, 4 corrupted blocks
+speculative output == greedy reference (96 tokens)
+verify rows vs single-row decode over 9 positions: max |dlogit| 0.0088, max KL 1.22e-6
+replay after commit(5) vs plain forward: max |dlogit| 0.0000 (scale 22.8), argmax 709 vs 709

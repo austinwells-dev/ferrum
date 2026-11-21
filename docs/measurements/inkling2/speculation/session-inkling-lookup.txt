@@ -1,0 +1,12 @@
+drafter lookup
+drafter lookup
+extend        prompt  115 tokens, reused   76: identical (32 tokens, 10 verify steps, acceptance 2.60)
+rewind        prompt   38 tokens, reused   36: identical (32 tokens, 2 verify steps, acceptance 2.00)
+retry         prompt   37 tokens, reused   36: identical (32 tokens, 3 verify steps, acceptance 1.00)
+replace       prompt   35 tokens, reused    0: identical (32 tokens, 4 verify steps, acceptance 3.50)
+extend again  prompt  115 tokens, reused    0: identical (32 tokens, 9 verify steps, acceptance 2.67)
+pin           prompt  115 tokens, reused    0: identical (32 tokens, 10 verify steps, acceptance 2.60)
+long turn     prompt  993 tokens, reused  114: identical (32 tokens, 5 verify steps, acceptance 3.80)
+later turn    prompt 1033 tokens, reused  992: identical (32 tokens, 6 verify steps, acceptance 3.17)
+pinned rewind prompt  119 tokens, reused  106: identical (32 tokens, 10 verify steps, acceptance 2.60)
+PASS

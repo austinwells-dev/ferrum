@@ -54,13 +54,19 @@ fn main() -> Result<()> {
         logits = next;
     }
 
-    // Speculative run with oracle drafts.
+    // Speculative run with oracle drafts. Capturing drafter features rides
+    // along where the model has them (Inkling's stack has none).
+    let captures = model.config.inkling.is_none();
     model.enable_speculation(
         &d,
         &SpecGeometry {
             rows: block + 1,
-            aux_layers: vec![1, model.config.layers / 2],
-            final_hidden: true,
+            aux_layers: if captures {
+                vec![1, model.config.layers / 2]
+            } else {
+                Vec::new()
+            },
+            final_hidden: captures,
         },
     )?;
     let mut state = HybridState::new(&d, &model.config, capacity, model.max_forward_rows())?;

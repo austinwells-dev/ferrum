@@ -2,7 +2,8 @@
 
 Image input for the hybrid engine. Qwen3.5-family models (`qwen35`, `qwen35moe`) use the
 Qwen3-VL projector (`clip.projector_type = qwen3vl_merger`). LFM3-VL uses
-`clip.vision.projector_type = lfm3vl` ([below](#lfm3-vl)), and LFM3-Audio's speech input is
+`clip.vision.projector_type = lfm3vl` ([below](#lfm3-vl)), Inkling 2 uses `inkling2v`
+([below](#inkling-2)), and LFM3-Audio's speech input is
 `clip.audio.projector_type = lfm3a` ([below](#lfm3-audio)). All ship as `mmproj*.gguf`.
 
 ## Pathways, front to back
@@ -46,6 +47,30 @@ projector. The score buffer caps one image at 1773 language tokens.
 LFM3-Omni's combined projector is not a checked vision model
 ([models.md](models.md#lfm3-omni)). Numbers: [measurements/lfm3](measurements/lfm3/README.md).
 
+## Inkling 2
+
+`clip.vision.projector_type = inkling2v` on an `inkling2` language model (`vision/inkling.rs`).
+A ViT of 23 pre-norm blocks (hidden 1024, 16 heads of 64, patch 20, GELU-erf MLP of 4096, LayerNorm
+epsilon 1e-5) with a class token, a pre-norm and a layer scale on each branch (folded into the output
+projections at load). The learned 32×32 position table is resized bilinearly with half-pixel centres
+(`ggml_interpolate`, not the corner-aligned resize Qwen uses). Attention uses 2-D rotary positions,
+the column on the first half of each head and the row on the second, rotating adjacent pairs; Q and K
+rows are permuted per head at load so the half-split `v_rope` kernel computes the same scores. The class
+token's output is dropped, each 2×2 block of patches is concatenated and `mm.1`, GELU-erf, `mm.2` project
+it to 2304. An image is not stretched: each side is padded to a multiple of 40 pixels with the value of a
+pixel of −1, as llama.cpp's `mtmd` does. Only an image whose padded area is over the token cap is first
+scaled down (preserving aspect ratio, antialiased bicubic). Upstream Inkling never resizes; this bound is
+llama.cpp's. The template writes `<|content_image|><|unused_200054|><|end_message|>` per image part, and
+`<|unused_200054|>` is repeated once per language token, each with its own position. `mtmd` caps an image
+at 4096 tokens; here the score buffer caps it at 1773.
+
+`examples/hybrid_vision_parity` compares the projector output with a dump of llama.cpp's
+(`MTMD_DEBUG_EMBEDDINGS=PATH`): cosine 0.99999 (relative RMS 0.5%) on a 640×488 PNG, 0.99997 on a
+640×640 one, and 0.99996 on a 1680×960 one that upsamples the position table. On a 2600×1500 image that
+both scale down to 1680×960, cosine is 0.999 and the worst token 0.79: the two resamplers round
+differently (Pillow-style passes through 8-bit values). A JPEG also decodes slightly differently from
+stb_image (cosine 0.9995 on the 640×488 test picture). Numbers: [measurements/inkling2](measurements/inkling2/README.md).
+
 ## LFM3-Audio
 
 `clip.audio.projector_type = lfm3a` (`src/vision/lfm3a.rs`, front end in `src/vision/audio.rs`) is a
@@ -82,6 +107,9 @@ at most 8 clips. Numbers and the other limits:
   `vision::lfm3::tests::encoder_matches_cpu_reference` does the same for a tiny LFM3-VL tower, and
   `vision::lfm3a::tests::encoder_matches_cpu_reference` for a tiny speech encoder. `vision::audio` tests the
   WAV reader, the resampler, the FFT and the mel features on synthetic signals.
+* `vision::inkling::tests` check that the permuted half-split rotation equals the reference's adjacent-pair
+  rotation, and the padding and downscale sizes. `examples/hybrid_vision_parity` compares a whole image
+  with llama.cpp ([Inkling 2](#inkling-2)).
 * `examples/hybrid_audio_check` encodes a WAV clip and compares its rows with a dump of llama.cpp's
   `mtmd` output for the same samples ([record](measurements/lfm3-audio/)).
 * `hybrid::engine::tests::attention_prep_follows_the_position_table` checks the rotary kernel against a CPU
@@ -97,6 +125,7 @@ at most 8 clips. Numbers and the other limits:
 ## Cost
 
 Encoding 1024 tokens (a 1024x1024 image) takes about 4.7 s on an M5; a 640x480 picture (300 tokens) about 0.8 s.
+Inkling 2's tower encodes a 640x488 picture (208 tokens) in 0.38 s.
 The GEMMs are plain simdgroup-matrix tiles, not the tensor-op path the language model uses, so there is room
 to speed this up.
 

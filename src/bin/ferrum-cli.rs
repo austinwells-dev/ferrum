@@ -21,7 +21,7 @@
 //! ferrum-cli image --model DIR --prompt TEXT [--size WxH] [--seed N] [--out FILE.png]
 //!                  (text-to-image with Qwen-Image-2.1; see `ferrum-cli image --help`)
 //!
-//! Commands: /reset, /think on|off, /image PATH [low|high|auto|N],
+//! Commands: /reset, /think on|off, /effort [LEVEL|default], /image PATH [low|high|auto|N],
 //! /audio PATH.wav, /detail low|high|auto|N, /stats, /exit. End a line with `\`
 //! to continue the message on the next line. Ctrl-C stops a reply; at the
 //! prompt it leaves. In a terminal the prompt has line editing and history
@@ -35,7 +35,7 @@ use ferrum::{
     hybrid::{
         KvCache,
         plan::PlanOptions,
-        runtime::{ChatRequest, Delta, Runtime, SpecOptions},
+        runtime::{ChatRequest, Delta, Runtime, SpecOptions, effort_levels},
     },
     vision::{ImageBudget, media},
 };
@@ -392,14 +392,23 @@ fn run() -> Result<()> {
         rt.loaded.load_time.as_secs_f64()
     );
     eprintln!(
-        "sampling: temperature {} top-p {} top-k {} min-p {}; /reset /think on|off /stats /exit",
-        sampling.temperature, sampling.top_p, sampling.top_k, sampling.min_p
+        "sampling: temperature {} top-p {} top-k {} min-p {}; /reset /think on|off{} /stats /exit",
+        sampling.temperature,
+        sampling.top_p,
+        sampling.top_k,
+        sampling.min_p,
+        if effort_levels(rt.template.source()).is_empty() {
+            ""
+        } else {
+            " /effort LEVEL"
+        }
     );
     let mut messages: Vec<Json> = Vec::new();
     if let Some(system) = &o.system {
         messages.push(json!({"role": "system", "content": system}));
     }
     let mut think = o.think;
+    let mut effort = o.effort.clone();
     let mut attachments: Vec<Json> = Vec::new();
     let mut detail = ImageBudget::default();
     let mut source = Input::new(o.prompt.as_deref())?;
@@ -432,7 +441,36 @@ fn run() -> Result<()> {
                 eprintln!("(thinking {})", if think { "on" } else { "off" });
                 continue;
             }
+            "/effort" => {
+                let levels = effort_levels(rt.template.source());
+                if levels.is_empty() {
+                    eprintln!("(this model's chat template has no reasoning effort)");
+                } else {
+                    let current = effort.as_deref().unwrap_or("template default");
+                    eprintln!("(effort {current}; levels: {})", levels.join(", "));
+                }
+                continue;
+            }
             _ => {}
+        }
+        if let Some(value) = input.strip_prefix("/effort ") {
+            let value = value.trim().to_ascii_lowercase();
+            let levels = effort_levels(rt.template.source());
+            if value == "default" {
+                effort = None;
+                eprintln!("(effort: template default)");
+            } else if levels.is_empty() {
+                eprintln!("(this model's chat template has no reasoning effort)");
+            } else if levels.contains(&value.as_str()) {
+                eprintln!("(effort {value})");
+                effort = Some(value);
+            } else {
+                eprintln!(
+                    "unknown effort {value:?}; levels: default, {}",
+                    levels.join(", ")
+                );
+            }
+            continue;
         }
         if let Some(value) = input.strip_prefix("/detail ") {
             match media::parse_detail(value) {
@@ -492,7 +530,7 @@ fn run() -> Result<()> {
         }
         let mut vars = Map::new();
         vars.insert("enable_thinking".into(), Json::Bool(think));
-        if let Some(effort) = &o.effort {
+        if let Some(effort) = &effort {
             vars.insert("reasoning_effort".into(), Json::String(effort.clone()));
         }
         let request = ChatRequest {

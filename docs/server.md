@@ -1,6 +1,6 @@
 # Server and CLI guide
 
-`ferrum-server` and `ferrum-cli` run Qwen3.5-family GGUF models (`qwen35` dense and `qwen35moe` hybrids) on the hybrid engine, and also Flint, Spark, LFM3 and Qwen3.8-Flash-Next ([models.md](models.md)). LFM3-Omni is not supported. Both of them:
+`ferrum-server` and `ferrum-cli` run Qwen3.5-family GGUF models (`qwen35` dense and `qwen35moe` hybrids) on the hybrid engine, and also Flint, Spark, Inkling 2 Mini, LFM3 and Qwen3.8-Flash-Next ([models.md](models.md)). LFM3-Omni is not supported. Both of them:
 
 - render the chat template embedded in the GGUF, the same way Hugging Face's `apply_chat_template` does,
 - stream the model's reasoning separately from its answer (as `reasoning_content`),
@@ -73,6 +73,8 @@ Any of these request fields turn reasoning on or off, or set its effort:
 
 Server-wide defaults: `--no-think`, `--reasoning-effort`, `--reasoning-budget`, `--reasoning-format`, `--chat-template-kwargs`.
 
+An effort the template does not name snaps to the nearest level it does (Spark's names only `low` and `high`, so `medium` becomes `high`), and `none` turns thinking off. Inkling 2's template knows only an effort level (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, or a number up to 0.99; default 0.9). Turning thinking off sends level 0 and, when the request declares no tools, opens the reply as text, since at level 0 the model still reasons. With tools it may reason briefly before a call. Its reply arrives in the same `reasoning_content`, `content` and `tool_calls` fields as other models'.
+
 ### Structured output
 
 `/v1/chat/completions` can hold a reply to JSON. Every token is checked against a grammar before it is chosen, so the content always parses (unless `max_tokens` cuts it short, which reports `finish_reason: "length"`).
@@ -102,7 +104,7 @@ A constraint steers the model, it does not make it smarter: a small model held t
 
 **`tool_choice`.** `"none"` drops the tools. `"required"`, or a named function (`{"type": "function", "function": {"name": N}}`; on `/v1/messages`, `{"type": "any"}` and `{"type": "tool", "name": N}`), makes the reply call a tool: the server writes the opening of the model's tool-call format where the reply's content starts (after the reasoning when thinking is on, including a reasoning budget's forced close), and the model continues from there. A name that is not in `tools` is refused with 400. Things to know:
 
-- This is enforced for Qwen3.5-family models (dense and MoE) and Flint, whose tool-call formats the server knows how to open. For Spark and LFM3 it is not: the request runs, the model decides, and the log says so.
+- This is enforced for Qwen3.5-family models (dense and MoE) and Flint, whose tool-call formats the server knows how to open. For Spark, LFM3 and Inkling 2 it is not: the request runs, the model decides, and the log says so.
 - Only the opening is forced (and for a named function, its name). The arguments are the model's and are not checked against the tool's schema; a call the parser cannot read comes back as content.
 - With thinking on and reasoning left inline (`--reasoning-format none`), nothing is forced.
 - Checked on a 35B MoE: [record](measurements/qol-2026-11/README.md#tool_choice). Flint's opening has not been run.
@@ -188,7 +190,7 @@ ferrum-cli --model model.gguf     # --kv-cache q8 as for the server
 
 In a terminal the prompt has line editing and history (↑/↓, kept in `~/.cache/ferrum/cli-history`, or under `$XDG_CACHE_HOME`). Ctrl-C stops the reply being written and keeps the conversation; at the prompt, Ctrl-C or Ctrl-D leaves. Piped input without `--prompt` is read one message per line, as before.
 
-Commands: `/reset`, `/think on|off`, `/image PATH [low|high|auto|N]`, `/detail low|high|auto|N`, `/stats`, `/exit`. To continue a message on the next line, end the line with `\`. A size after `/image PATH` applies to that image; `/detail` sets it for the images that follow (see [Image size per request](#image-size-per-request)).
+Commands: `/reset`, `/think on|off`, `/effort [LEVEL|default]` (bare `/effort` lists the levels the model's template names), `/image PATH [low|high|auto|N]`, `/detail low|high|auto|N`, `/stats`, `/exit`. To continue a message on the next line, end the line with `\`. A size after `/image PATH` applies to that image; `/detail` sets it for the images that follow (see [Image size per request](#image-size-per-request)).
 
 ## Speculative decoding
 
@@ -235,7 +237,7 @@ Responses include `draft_n` and `draft_n_accepted` in `timings`, as llama-server
 
 ## Vision (images)
 
-The Qwen3.5-family models can read images once you load their vision projector (the `mmproj*.gguf` published alongside the model). If a projector with a matching width sits in the same folder as the model, Ferrum loads it automatically. It takes about 1 GiB of the memory budget, and the auto-fitted context shrinks to make room. LFM3-VL uses the same flags. The pair checked here is `LFM3-VL-2B-Q4_K_M.gguf` with `mmproj-LFM3-VL-2B-Q8_0.gguf` (that repo publishes no Q4_K_M projector). Its template marker is `<|image|>`, and a prompt that contains `<|video|>` is refused. LFM3-Omni's combined projector is not this path. Limits: [models.md](models.md#lfm3-vl-2b).
+The Qwen3.5-family models can read images once you load their vision projector (the `mmproj*.gguf` published alongside the model). If a projector with a matching width sits in the same folder as the model, Ferrum loads it automatically. It takes about 1 GiB of the memory budget, and the auto-fitted context shrinks to make room. LFM3-VL uses the same flags. The pair checked here is `LFM3-VL-2B-Q4_K_M.gguf` with `mmproj-LFM3-VL-2B-Q8_0.gguf` (that repo publishes no Q4_K_M projector). Its template marker is `<|image|>`, and a prompt that contains `<|video|>` is refused. LFM3-Omni's combined projector is not this path. Limits: [models.md](models.md#lfm3-vl-2b). Inkling 2 Mini reads images through `mmproj-F16.gguf` from the same repo ([models.md](models.md#inkling-2-mini)).
 
 | Flag | Effect |
 |---|---|

@@ -1,0 +1,41 @@
+CPU preflight exempting: dasd
+CPU preflight passed: peak total 65.2% of one core; largest process 27.9% of one core.
+lock check 09:07:02: 
+=== round 1 ferrum
+| model | test | t/s |
+|---|---|---|
+| Inkling-2-Mini | pp512 @ d16384 | 400.45 |
+| Inkling-2-Mini | pp512 @ d65536 | 277.77 |
+| Inkling-2-Mini | tg@16384 | 20.20 (step 49.52 ms) |
+| Inkling-2-Mini | tg@65536 | 14.74 (step 67.85 ms) |
+| Inkling-2-Mini | pp512 | 540.49 ± 0.40 |
+| Inkling-2-Mini | tg128 | 24.71 ± 0.02 |
+decode step: wall 40.66 ms; 1550 dispatches in 4 command buffers; encode 0.61 ms; wait 39.61 ms; GPU 40.09 ms
+lock check 09:14:50: 
+=== round 1 llama.cpp
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |           pp512 |        259.29 ± 0.00 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |            tg32 |         23.35 ± 0.00 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |  pp512 @ d16384 |        126.48 ± 0.00 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |   tg32 @ d16384 |         18.36 ± 0.00 |
+lock check 09:16:49: 
+=== round 2 ferrum
+| model | test | t/s |
+|---|---|---|
+| Inkling-2-Mini | pp512 @ d16384 | 402.08 |
+| Inkling-2-Mini | pp512 @ d65536 | 277.17 |
+| Inkling-2-Mini | tg@16384 | 20.02 (step 49.96 ms) |
+| Inkling-2-Mini | tg@65536 | 14.59 (step 68.53 ms) |
+| Inkling-2-Mini | pp512 | 539.30 ± 0.57 |
+| Inkling-2-Mini | tg128 | 24.30 ± 0.02 |
+decode step: wall 41.32 ms; 1550 dispatches in 4 command buffers; encode 0.63 ms; wait 40.26 ms; GPU 40.73 ms
+lock check 09:24:39: 
+=== round 2 llama.cpp
+| model                          |       size |     params | backend    | threads |            test |                  t/s |
+| ------------------------------ | ---------: | ---------: | ---------- | ------: | --------------: | -------------------: |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |           pp512 |        259.69 ± 0.00 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |            tg32 |         23.35 ± 0.00 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |  pp512 @ d16384 |        125.83 ± 0.00 |
+| inkling2 ?B Q8_0               |  16.41 GiB |    26.07 B | MTL,BLAS   |       4 |   tg32 @ d16384 |         19.60 ± 0.00 |
+lock check 09:26:38: 

@@ -110,6 +110,7 @@ pub fn block_layout(type_id: u32) -> Result<BlockLayout> {
         22 => (256, 82),  // IQ2_S
         23 => (256, 136), // IQ4_XS
         30 => (1, 2),     // BF16
+        40 => (64, 36),   // NVFP4: four UE4M3 scales, 32 bytes of E2M1 codes
         42 => (64, 18),   // Q2_0: f16 scale, 64 two-bit codes meaning code - 1
         _ => {
             return Err(Error::Gguf(format!(

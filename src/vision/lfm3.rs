@@ -959,6 +959,7 @@ mod tests {
             weight_bytes: 0,
             score_bytes: SCORE_BYTES,
             lfm3: Some(tower),
+            inkling: None,
             marker: "<|image|>",
             filter: image::imageops::FilterType::CatmullRom,
         };

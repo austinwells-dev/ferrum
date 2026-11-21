@@ -107,6 +107,15 @@ impl App {
                 opts[(at + dir).rem_euclid(opts.len() as i32) as usize].clone();
             return;
         }
+        if self.fields[idx].key == "effort" {
+            let opts = self.effort_values();
+            let at = opts
+                .iter()
+                .position(|o| *o == self.fields[idx].value)
+                .unwrap_or(0) as i32;
+            self.fields[idx].value = opts[(at + dir).rem_euclid(opts.len() as i32) as usize].into();
+            return;
+        }
         let f = &mut self.fields[idx];
         match &f.kind {
             Kind::Cycle(opts) => {

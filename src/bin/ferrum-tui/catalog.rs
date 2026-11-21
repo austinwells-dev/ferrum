@@ -30,6 +30,8 @@ pub struct Model {
     pub problem: Option<String>,
     /// The header's scalar `tokenizer.*` keys, to check GGUF drafters against.
     pub tokenizer: BTreeMap<String, MetadataValue>,
+    /// `reasoning_effort` values its chat template understands, lowest first.
+    pub efforts: Vec<&'static str>,
 }
 
 pub fn make_model(path: PathBuf, name: String, size: u64) -> Model {
@@ -57,6 +59,7 @@ pub fn make_model(path: PathBuf, name: String, size: u64) -> Model {
         mtp_why: checked.mtp_why,
         problem: checked.problem,
         tokenizer: checked.tokenizer,
+        efforts: checked.efforts,
     }
 }
 
@@ -350,6 +353,9 @@ pub fn drafter_problem(d: &Drafter, m: &Model) -> Option<String> {
         return Some(p.clone());
     }
     let (c, t) = (d.config.as_ref()?, m.hybrid.as_ref()?);
+    if t.inkling.is_some() {
+        return Some("Inkling 2 speculates with prompt lookup only".into());
+    }
     if d.is_gguf() {
         // The loader's own checks; memoised, as lists redraw every frame.
         let mut fits = d.fits.lock().unwrap_or_else(|e| e.into_inner());
@@ -478,6 +484,7 @@ pub struct Checked {
     pub mtp_why: String,
     pub problem: Option<String>,
     pub tokenizer: BTreeMap<String, MetadataValue>,
+    pub efforts: Vec<&'static str>,
 }
 
 /// `general.architecture` of llama.cpp's DFlash / DFlash2 drafters.
@@ -509,6 +516,7 @@ pub fn type_name(id: u32) -> String {
         23 => "IQ4_XS",
         29 => "IQ1_M",
         30 => "BF16",
+        40 => "NVFP4",
         42 => "Q2_0",
         n => return format!("type {n}"),
     }
@@ -516,7 +524,7 @@ pub fn type_name(id: u32) -> String {
 }
 
 /// Weight types the hybrid engine has kernels for (see `hybrid::weights`).
-pub const SUPPORTED: [u32; 14] = [0, 2, 6, 8, 11, 12, 13, 14, 18, 20, 21, 22, 23, 42];
+pub const SUPPORTED: [u32; 15] = [0, 2, 6, 8, 11, 12, 13, 14, 18, 20, 21, 22, 23, 40, 42];
 
 /// Types the token-embedding lookup reads (`HybridModel::get_rows`).
 const EMBEDDING: [u32; 11] = [2, 6, 8, 11, 12, 13, 14, 20, 23, 30, 42];
@@ -530,6 +538,7 @@ pub fn check(path: &Path) -> Checked {
         mtp_why: String::new(),
         problem: Some(problem),
         tokenizer: BTreeMap::new(),
+        efforts: Vec::new(),
     };
     let opened = fs::File::open(path)
         .map_err(|e| ferrum::Error::Gguf(format!("{}: {e}", path.display())))
@@ -617,6 +626,9 @@ pub fn check(path: &Path) -> Checked {
             })
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect(),
+        efforts: text("tokenizer.chat_template")
+            .map(|t| ferrum::hybrid::runtime::effort_levels(&t))
+            .unwrap_or_default(),
     };
     if arch == DFLASH_ARCH {
         result.problem = Some("a DFlash drafter, not a chat model".into());
@@ -629,16 +641,16 @@ pub fn check(path: &Path) -> Checked {
     }
     if !matches!(
         arch.as_str(),
-        "qwen35" | "qwen35moe" | "qwen4exp" | "flint" | "spark2_5" | "lfm3"
+        "qwen35" | "qwen35moe" | "qwen4exp" | "flint" | "spark2_5" | "lfm3" | "inkling2"
     ) {
         result.problem = Some(format!(
-            "architecture {arch}: needs qwen35, qwen35moe, qwen4exp, flint, spark2_5 or lfm3"
+            "architecture {arch}: needs qwen35, qwen35moe, qwen4exp, flint, spark2_5, lfm3 or inkling2"
         ));
         return result;
     }
     let pre = text("tokenizer.ggml.pre");
     let pre_ok = match arch.as_str() {
-        "flint" | "spark2_5" => pre.as_deref() == Some(arch.as_str()),
+        "flint" | "spark2_5" | "inkling2" => pre.as_deref() == Some(arch.as_str()),
         "lfm3" => pre.as_deref() == Some("lfm2"),
         _ => pre.as_deref() == Some("qwen35"),
     };
@@ -667,13 +679,18 @@ pub fn check(path: &Path) -> Checked {
     for t in file.tensors().values() {
         // BF16 routers, embeddings and LM heads load as BF16 (the hybrid
         // engine has kernels for them), and so do Spark's head gates and
-        // fused QKV; see `Loader::matrix_or_bf16` and `Loader::split`.
+        // fused QKV, and Inkling 2's sink and conv projections; see
+        // `Loader::matrix_or_bf16` and `Loader::split`.
         let bf16_ok = t.type_id == 30
             && (t.name.ends_with("ffn_gate_inp.weight")
                 || matches!(t.name.as_str(), "token_embd.weight" | "output.weight")
                 || (arch == "spark2_5"
                     && (t.name.ends_with("attn_gate.weight")
-                        || t.name.ends_with("attn_qkv.weight"))));
+                        || t.name.ends_with("attn_qkv.weight")))
+                // Inkling 2's small sink and dynamic-conv projections.
+                || (arch == "inkling2"
+                    && (t.name.ends_with("attn_sink_proj.weight")
+                        || t.name.ends_with("_conv_proj.weight"))));
         // qwen4exp keeps its hyper-connection, router, indexer, gate and
         // n-gram weights in BF16 (some 1-D) and its n-gram conv in F16; its
         // loader reads every one of them.
@@ -707,7 +724,7 @@ pub fn check(path: &Path) -> Checked {
     };
     if !trunk.is_empty() {
         result.problem = Some(format!(
-            "unsupported quant {} (runs Q4_0 Q8_0 Q4_K Q5_K Q6_K IQ3_XXS IQ3_S IQ2_S IQ4_XS)",
+            "unsupported quant {} (runs Q4_0 Q8_0 Q4_K Q5_K Q6_K IQ3_XXS IQ3_S IQ2_S IQ4_XS NVFP4)",
             names(trunk)
         ));
         return result;

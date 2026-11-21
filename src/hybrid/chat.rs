@@ -366,15 +366,33 @@ pub fn parse_output(text: &str, starts_in_reasoning: bool, tools: &[Json]) -> Pa
     }
 }
 
-/// One `<tool_call>` body in either format: Qwen3.5's `<function=…>` with
-/// `<parameter=…>` blocks, or Flint's `name<arg_key>…</arg_key><arg_value>…`
-/// pairs. `None` leaves the text in the content.
+/// One `<tool_call>` body in any format: Qwen3.5's `<function=…>` with
+/// `<parameter=…>` blocks, a JSON object (`{"name": …, "arguments": {…}}`,
+/// which Inkling 2's calls are rewritten to), or Flint's
+/// `name<arg_key>…</arg_key><arg_value>…` pairs. `None` leaves the text in
+/// the content.
 fn parse_tool_call(body: &str, tools: &[Json]) -> Option<ToolCall> {
     if body.contains("<function=") {
         parse_qwen_tool_call(body, tools)
+    } else if body.trim_start().starts_with('{') {
+        parse_json_tool_call(body)
     } else {
         parse_flint_tool_call(body, tools)
     }
+}
+
+/// `{"name": NAME, "arguments": {…}}` (or `"args"`); arguments may be absent.
+fn parse_json_tool_call(body: &str) -> Option<ToolCall> {
+    let Json::Object(call) = serde_json::from_str::<Json>(body.trim()).ok()? else {
+        return None;
+    };
+    let name = call.get("name")?.as_str()?.to_owned();
+    let arguments = match call.get("arguments").or_else(|| call.get("args")) {
+        Some(Json::Object(args)) => args.clone(),
+        None | Some(Json::Null) => Map::new(),
+        Some(_) => return None,
+    };
+    Some(ToolCall { name, arguments })
 }
 
 /// The function object of tool `name` in the OpenAI tool list.
@@ -579,6 +597,24 @@ mod tests {
         // A boolean from the schema is a JSON boolean, not the text "false".
         assert_eq!(parsed.tool_calls[1].arguments["inject"], Json::Bool(false));
         assert_eq!(parsed.tool_calls[1].arguments["seed"], Json::from(7));
+    }
+
+    #[test]
+    fn parses_json_tool_calls() {
+        let out = parse_output(
+            "<think>plan</think>Checking.<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\",\"days\":2}}</tool_call>",
+            false,
+            &[],
+        );
+        assert_eq!(out.reasoning.as_deref(), Some("plan"));
+        assert_eq!(out.content, "Checking.");
+        assert_eq!(out.tool_calls.len(), 1);
+        assert_eq!(out.tool_calls[0].name, "get_weather");
+        assert_eq!(out.tool_calls[0].arguments["days"], 2);
+        let bare = parse_output("<tool_call>{\"name\":\"now\"}</tool_call>", false, &[]);
+        assert!(bare.tool_calls[0].arguments.is_empty());
+        let bad = parse_output("<tool_call>{\"args\":{}}</tool_call>", false, &[]);
+        assert!(bad.tool_calls.is_empty());
     }
 
     #[test]

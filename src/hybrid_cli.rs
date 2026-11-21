@@ -155,7 +155,7 @@ pub fn run(d: &MetalDevice) -> Result<()> {
         let vars = serde_json::Map::new();
         let message = serde_json::json!({"role": "user", "content": o.prompt});
         template.render(&[message], None, true, &vars)?
-            + hybrid::runtime::generation_prefix(&template, &vars)
+            + hybrid::runtime::generation_prefix(&template, &vars, false)
     };
     let prompt = loaded.tokenizer.encode(&text)?;
     let before_state = d.allocated_bytes();

@@ -1,0 +1,11 @@
+0.06.429.562 I cmn          init: llama threadpool init, n_threads = 4
+0.06.861.546 I 
+0.06.861.562 I system_info: n_threads = 4 (n_threads_batch = 4) / 10 | MTL : EMBED_LIBRARY = 1 | CPU : NEON = 1 | ARM_FMA = 1 | FP16_VA = 1 | MATMUL_INT8 = 1 | DOTPROD = 1 | SME = 1 | SME2 = 1 | ACCELERATE = 1 | REPACK = 1 | 
+0.06.861.643 I perplexity: saving all logits to ref/qwen36.kld
+0.06.861.647 I perplexity: tokenizing the input ..
+0.06.880.064 I perplexity: tokenization took 18.414 ms
+0.06.880.069 I perplexity: calculating perplexity over 8 chunks, n_ctx=512, batch_size=2048, n_seq=4
+0.09.533.177 I perplexity: 2.64 seconds per pass - ETA 0.08 minutes
+[1]22.6808,[2]16.2177,[3]10.1024,[4]8.9165,[5]8.3919,[6]9.5033,[7]9.0063,[8]9.0247,
+0.12.273.524 I Final estimate: PPL = 9.0247 +/- 0.56278
+

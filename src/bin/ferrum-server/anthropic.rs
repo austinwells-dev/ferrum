@@ -250,7 +250,11 @@ pub fn count_tokens(
                 &vars,
             )
             .and_then(|mut text| {
-                text.push_str(generation_prefix(&server.model(body).template, &vars));
+                text.push_str(generation_prefix(
+                    &server.model(body).template,
+                    &vars,
+                    !tools.is_empty(),
+                ));
                 server.model(body).tokenizer.encode(&text)
             })
             .map_err(|e| e.to_string())

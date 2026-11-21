@@ -1,0 +1,11 @@
+memory plan: budget 23552 MiB = weights 16805 + experts 0 + scratch 340 + recurrent 4 + snapshots 508 + overhead 96 + KV 5795 (32.0 KiB/token x 177408); max context 177408 (trained 1048576)
+Inkling-2-Mini (Inkling): 48 layers (48 attention), hidden 2304, vocab 200058; weights 16.41 GiB; scratch 339.6 MiB; load 3.54 s
+measured: weights+scratch 17142 MiB (predicted 17144), state 5798 MiB (predicted 5799)
+prompt 7 tokens; state 5797.8 MiB for 177408 positions
+ with the invention of movable type by Johannes Gutenberg in the 15th century. This revolutionary technology allowed for the mass production of books and other printed materials, leading to the spread of knowledge and ideas across Europe and beyond.
+
+The printing press had a profound impact on society, enabling the dissemination of information and ideas to a wider audience. It played a crucial role in the Reformation, the Scientific Revolution, and the Enlightenment, as it allowed for the rapid spread of new ideas and beliefs.
+
+Over time, the printing press evolved and was adapted to different cultures and languages, leading to the development of
+round 0: prefill 7 tok in 305.5 ms (22.9 tok/s); decode 127 tok in 5353.9 ms (23.72 tok/s, median 41.9 ms, GPU 41.57 ms/tok)
+generated IDs: [149899, 149876, 155520, 149879, 156775, 784, 150227, 149910, 175981, 220, 48686, 4309, 149881, 149876, 220, 68063, 258, 156963, 13, 150078, 165514, 947, 151792, 154421, 149887, 149876, 151121, 151370, 149879, 155350, 149880, 150064, 171051, 152443, 11, 154384, 149882, 149876, 155872, 149879, 151261, 149880, 153471, 151553, 152192, 149880, 155456, 13, 68014, 371, 174600, 153592, 150105, 149878, 177771, 151097, 149894, 153711, 11, 174346, 149876, 179898, 358, 149879, 150247, 149880, 153471, 149882, 149878, 162285, 163963, 13, 150129, 160278, 149878, 153414, 151172, 149881, 149876, 150010, 72830, 11, 149876, 164840, 170779, 11, 149880, 149876, 150074, 1638, 262, 361, 11, 149891, 149921, 154421, 149887, 149876, 158983, 155872, 149879, 150046, 153471, 149880, 175075, 13, 68014, 3111, 150038, 11, 149876, 174600, 153592, 189471, 149880, 149933, 168102, 149882, 150232, 165666, 149880, 159519, 11, 154384, 149882, 149876, 150667, 149879]

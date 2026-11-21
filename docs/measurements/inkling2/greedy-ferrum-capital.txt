@@ -1,0 +1,15 @@
+memory plan: budget 23552 MiB = weights 16805 + experts 0 + scratch 340 + recurrent 4 + snapshots 508 + overhead 96 + KV 5795 (32.0 KiB/token x 177408); max context 177408 (trained 1048576)
+Inkling-2-Mini (Inkling): 48 layers (48 attention), hidden 2304, vocab 200058; weights 16.41 GiB; scratch 339.6 MiB; load 3.79 s
+measured: weights+scratch 17142 MiB (predicted 17144), state 5798 MiB (predicted 5799)
+prompt 5 tokens; state 5797.8 MiB for 177408 positions
+ Paris.
+
+A. Noun clause
+
+B. Adjective clause
+
+C. Adverb clause
+
+D.
+round 0: prefill 5 tok in 403.8 ms (12.4 tok/s); decode 23 tok in 966.8 ms (23.79 tok/s, median 41.7 ms, GPU 41.34 ms/tok)
+generated IDs: [152717, 13, 68014, 32, 13, 220, 44781, 164452, 68014, 33, 13, 220, 57345, 745, 164452, 68014, 34, 13, 150980, 4306, 164452, 68014, 35, 13]

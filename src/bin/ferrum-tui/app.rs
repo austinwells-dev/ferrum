@@ -150,8 +150,30 @@ impl App {
         self.models.iter().filter(|m| m.problem.is_none()).count()
     }
 
-    /// Drop a drafter the newly selected model cannot use.
+    /// The Effort field's choices: the selected model's own levels, or the
+    /// common three when no model is selected.
+    pub fn effort_values(&self) -> Vec<&'static str> {
+        match self.selected() {
+            Some(m) => std::iter::once("default")
+                .chain(m.efforts.iter().copied())
+                .collect(),
+            None => vec!["default", "low", "medium", "high"],
+        }
+    }
+
+    /// Drop a drafter or an effort the newly selected model cannot use.
     pub fn load_info(&mut self) {
+        let efforts = self.effort_values();
+        if let Some(f) = self.fields.iter_mut().find(|f| f.key == "effort")
+            && !f.value.is_empty()
+            && !efforts.contains(&f.value.as_str())
+        {
+            f.value = "default".into();
+            self.status = Some((
+                "effort reset: this model's template has no such level".into(),
+                false,
+            ));
+        }
         let Some(m) = self.selected() else {
             return;
         };
