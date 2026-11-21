@@ -1344,7 +1344,7 @@ impl Loader<'_> {
 /// (the head keeps only the `vocab` real rows), and the loop message queries
 /// regrouped per core layer: layer `core_start + i` mixes its Q, K, V and
 /// expert messages with rows 2i and 2i + 1 of `loop_res_query` and of
-/// `loop_kv_res_query`, ordered q[2i], kv[2i], kv[2i + 1], q[2i + 1].
+/// `loop_kv_res_query`, ordered `q[2i]`, `kv[2i]`, `kv[2i + 1]`, `q[2i + 1]`.
 pub fn load_inkling(
     device: &MetalDevice,
     file: &mut GgufFile,
